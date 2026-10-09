@@ -275,19 +275,18 @@ Since `S`, `cf_specs` and the data all come from the same snapshot, a bootstrap 
 - The replication server is shared code. It runs over a `LogSource` trait, implemented by both master and slave:
 
 ```rust
-trait LogSource: Send + Sync {
+pub(crate) trait LogSource: Send + Sync + 'static {
+    fn node_id(&self) -> &str;
     fn role(&self) -> Role;
-    fn node_state(&self) -> NodeState;
-    fn origin_identity(&self) -> Option<DbIdentity>;
-    fn last_seq(&self) -> Seq;
-    fn origin_last_seq(&self) -> Seq;
-    fn first_retained_seq(&self) -> Seq;
-    fn entry_crc(&self, seq: Seq) -> Option<u32>;
-    fn read_entries(&self, from: Seq, max: usize) -> Result<Vec<LogEntry>>;
-    fn snapshot_for_bootstrap(&self) -> Result<BootstrapSnapshot>;
+    fn is_ready(&self) -> bool;                                 // false while bootstrapping
+    fn identity(&self) -> Option<(DbIdentity, Vec<EpochStart>)>;
+    fn store(&self) -> &Store;                                  // log, snapshots, CRCs, guards
+    fn origin_last_seq(&self) -> Seq;                           // master: last_seq
+    fn upstream_chain(&self) -> Vec<String>;                    // [] on master, closest upstream first
+    fn max_entry_bytes(&self) -> u64;                           // master's value, forwarded down the chain
+    fn heartbeat(&self) -> Duration;
     fn subscribe(&self) -> watch::Receiver<Seq>;
-    fn upstream_chain(&self) -> Vec<String>;   // [] on master, closest upstream first
-    fn max_entry_bytes(&self) -> u64;          // master's value, forwarded down the chain
+    fn resets(&self) -> watch::Receiver<u64>;                   // bumped when served streams must end
 }
 ```
 

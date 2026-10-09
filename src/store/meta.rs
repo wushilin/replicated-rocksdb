@@ -23,6 +23,9 @@ pub(crate) mod key {
     pub const CF_SPECS: &[u8] = b"cf_specs";
     pub const PENDING_CF_DROPS: &[u8] = b"pending_cf_drops";
     pub const CF_CREATE_INTENT: &[u8] = b"cf_create_intent";
+    pub const NODE_STATE: &[u8] = b"node_state";
+    pub const MAX_ENTRY_BYTES: &[u8] = b"max_entry_bytes";
+    pub const BOOTSTRAP_CFS: &[u8] = b"bootstrap_cfs";
 }
 
 pub(crate) fn be64(b: &[u8]) -> Result<u64> {
@@ -96,6 +99,12 @@ pub(crate) struct MetaSnapshot {
     pub cf_specs: Vec<CfEntry>,
     pub pending_drops: Vec<CfEntry>,
     pub cf_create_intent: Option<CfEntry>,
+    /// Slave only: `ready`, `bootstrapping` or `halted:<Reason>`. `None` means ready.
+    pub node_state: Option<Vec<u8>>,
+    /// Slave only: the master's `max_entry_bytes` as learnt from upstream.
+    pub max_entry_bytes: Option<u64>,
+    /// Slave only: physical CFs created by a bootstrap that has not finished.
+    pub bootstrap_cfs: Vec<CfEntry>,
 }
 
 impl MetaSnapshot {
@@ -118,6 +127,9 @@ impl MetaSnapshot {
             cf_specs: get(key::CF_SPECS)?.map(|v| decode_cf_list(&v)).transpose()?.unwrap_or_default(),
             pending_drops: get(key::PENDING_CF_DROPS)?.map(|v| decode_cf_list(&v)).transpose()?.unwrap_or_default(),
             cf_create_intent: get(key::CF_CREATE_INTENT)?.map(|v| decode_cf_entry(&v)).transpose()?,
+            node_state: get(key::NODE_STATE)?,
+            max_entry_bytes: get(key::MAX_ENTRY_BYTES)?.map(|v| be64(&v)).transpose()?,
+            bootstrap_cfs: get(key::BOOTSTRAP_CFS)?.map(|v| decode_cf_list(&v)).transpose()?.unwrap_or_default(),
         }))
     }
 }

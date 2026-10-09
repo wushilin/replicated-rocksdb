@@ -5,6 +5,7 @@ pub(crate) mod cfs;
 pub(crate) mod log;
 pub(crate) mod meta;
 pub(crate) mod read;
+pub(crate) mod repl;
 pub(crate) mod retention;
 pub(crate) mod snapshot;
 pub(crate) mod ttl;
@@ -89,7 +90,7 @@ impl Store {
         ];
         let known: HashMap<String, CfEntry> = prior
             .iter()
-            .flat_map(|m| m.cf_specs.iter().chain(&m.pending_drops).chain(&m.cf_create_intent))
+            .flat_map(|m| m.cf_specs.iter().chain(&m.pending_drops).chain(&m.cf_create_intent).chain(&m.bootstrap_cfs))
             .map(|e| (e.physical_name(), e.clone()))
             .collect();
         for name in existing.iter().filter(|n| n.starts_with("u:")) {

@@ -49,6 +49,7 @@ pub use types::{Batch, CfSpec, DbIdentity, Direction, EpochStart, IterMode, LogE
 #[doc(hidden)]
 pub mod codec;
 pub(crate) mod store;
+pub(crate) mod source;
 pub use codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 pub use tuning::{CfKind, ComparatorRegistry, Compression, RocksTuning, Tunable};
 pub use read::{ReadApi, ReadSnapshot};
