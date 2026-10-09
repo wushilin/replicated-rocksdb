@@ -125,7 +125,7 @@ Rules:
 - `CreateCf` and `DropCf` are always the **only op** in their entry. A data batch never contains CF ops.
 - A data entry may touch several CFs.
 - `Put` carries the user value. Each node builds the envelope (`write_seq = entry.seq`, plus `expire_at_ms`) when it applies the op.
-- There is no merge. The crate rejects any `Options` that set a merge operator, including options set through the `RocksTuning` callback.
+- There is no merge. `RocksTuning`'s callback receives a restricted `Tunable`, not raw `rocksdb::Options`, so a merge operator, compaction filter or native TTL cannot be set at all.
 
 ## 5. Master write path
 
@@ -445,8 +445,8 @@ pub struct MasterConfig {
     pub max_entry_bytes: u64,           // default 16 MiB
     pub heartbeat: Duration,            // default 5 s
     pub bump_epoch_on_open: bool,       // set when opening a restored backup (§13)
-    pub rocksdb: RocksTuning,           // per-CF Options callback + comparator registry;
-                                        // merge operators rejected
+    pub rocksdb: RocksTuning,           // comparator registry + callback over a restricted
+                                        // `Tunable` (no merge/filter/TTL setters exist)
 }
 
 impl Master {

@@ -10,6 +10,7 @@ pub(crate) use proto::replication::v1 as pb;
 
 pub mod clock;
 pub mod error;
+pub mod tuning;
 pub mod types;
 
 pub use clock::{Clock, ManualClock, SystemClock};
@@ -18,3 +19,4 @@ pub use types::{Batch, CfSpec, DbIdentity, Direction, EpochStart, IterMode, LogE
 
 pub mod codec;
 pub use codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
+pub use tuning::{CfKind, ComparatorRegistry, Compression, RocksTuning, Tunable};
