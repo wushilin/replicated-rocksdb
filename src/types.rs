@@ -128,7 +128,6 @@ pub(crate) fn epoch_for(history: &[EpochStart], seq: Seq) -> Option<u64> {
 }
 
 /// The fork point after `epoch`: the first seq of the next epoch, if any.
-#[allow(dead_code)] // used by the replication server (Plan 2)
 pub(crate) fn fork_after(history: &[EpochStart], epoch: u64) -> Option<Seq> {
     history.iter().find(|e| e.epoch > epoch).map(|e| e.start_seq)
 }

@@ -58,3 +58,4 @@ pub use store::read::DbIter;
 pub use config::{MasterConfig, ReaperConfig, Retention};
 pub use log::{EntryIter, LogApi};
 pub use master::{Master, ReapStats};
+pub(crate) mod server;
