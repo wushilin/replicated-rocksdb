@@ -5,6 +5,7 @@ pub(crate) mod cfs;
 pub(crate) mod log;
 pub(crate) mod meta;
 pub(crate) mod read;
+pub(crate) mod retention;
 pub(crate) mod snapshot;
 pub(crate) mod ttl;
 #[cfg(test)]
@@ -38,6 +39,7 @@ pub(crate) struct Store {
     pub(crate) cfs: CfRegistry,
     pos: RwLock<Position>,
     first_retained: AtomicU64,
+    pub(crate) guards: Arc<Mutex<retention::GuardSet>>,
 }
 
 /// The RocksDB handle plus state that must live exactly as long as it. Shared by `Arc`
@@ -98,6 +100,7 @@ impl Store {
             cfs: CfRegistry::default(),
             pos: RwLock::new(Position::default()),
             first_retained: AtomicU64::new(1),
+            guards: Arc::new(Mutex::new(retention::GuardSet::default())),
         };
         let meta = match prior {
             Some(m) => m,
@@ -198,7 +201,7 @@ impl Store {
     }
 
     pub(crate) fn live_ctx(&self, now_ms: u64) -> read::ReadCtx<'_> {
-        read::ReadCtx { db: &*self.db, snap: None, now_ms }
+        read::ReadCtx { db: &self.db, snap: None, now_ms }
     }
 
     /// Takes a snapshot. The registry read lock is held while the RocksDB snapshot is taken;

@@ -47,6 +47,10 @@ impl Inner {
         }
     }
 
+    pub(crate) fn trim_changelog(&self) -> Result<u64> {
+        self.store.trim_changelog(self.now_ms(), &self.cfg.retention)
+    }
+
     pub(crate) fn now_ms(&self) -> u64 {
         self.cfg.clock.now_ms()
     }

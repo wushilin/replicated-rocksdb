@@ -225,6 +225,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
         apply(&store, vec![create("c")]).unwrap();
+        #[allow(clippy::type_complexity)]
         let cases: Vec<(Vec<Op>, fn(&Error) -> bool)> = vec![
             (vec![], |e| matches!(e, Error::EmptyBatch)),
             (vec![put("missing", b"k", b"v")], |e| matches!(e, Error::NoSuchCf(_))),

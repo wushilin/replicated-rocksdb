@@ -1,5 +1,6 @@
 //! The writable master node.
 
+mod maintenance;
 mod reaper;
 pub(crate) mod writer;
 
@@ -64,7 +65,8 @@ impl Master {
         if bump && !fresh {
             inner.bump_epoch()?;
         }
-        Ok(Master { inner, task: None })
+        let task = maintenance::spawn(inner.clone());
+        Ok(Master { inner, task: Some(task) })
     }
 
     pub fn identity(&self) -> DbIdentity {
