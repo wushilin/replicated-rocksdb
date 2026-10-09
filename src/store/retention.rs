@@ -11,7 +11,6 @@ use crate::config::Retention;
 use crate::error::Result;
 use crate::types::{LogEntry, Seq};
 
-#[allow(dead_code)] // used by the replication server (Plan 2)
 #[derive(Debug, Default)]
 pub(crate) struct GuardSet {
     next_id: u64,
@@ -19,7 +18,6 @@ pub(crate) struct GuardSet {
 }
 
 /// While held, retention keeps every entry with seq greater than the guarded seq.
-#[allow(dead_code)] // used by the replication server (Plan 2)
 #[derive(Debug)]
 pub(crate) struct RetentionGuard {
     set: Arc<Mutex<GuardSet>>,
@@ -38,8 +36,7 @@ impl Store {
     /// A guard only protects entries that are still present: callers must check
     /// `first_retained_seq()` AFTER acquiring the guard (`trim_changelog` holds the same
     /// lock for its whole critical section, so taking a guard serialises against a trim).
-    #[allow(dead_code)] // used by the replication server (Plan 2)
-    pub(crate) fn guard(&self, seq: Seq) -> RetentionGuard {
+        pub(crate) fn guard(&self, seq: Seq) -> RetentionGuard {
         let mut set = self.guards.lock().unwrap_or_else(PoisonError::into_inner);
         let id = set.next_id;
         set.next_id += 1;

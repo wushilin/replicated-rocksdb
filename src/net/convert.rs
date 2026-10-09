@@ -19,6 +19,7 @@ pub(crate) fn cf_to_pb(e: &CfEntry) -> pb::CfSpec {
     pb::CfSpec { name: e.spec.name.clone(), comparator: e.spec.comparator.clone(), create_seq: e.create_seq }
 }
 
+#[allow(dead_code)] // used by the replication client (later Plan 2 task)
 pub(crate) fn cf_from_pb(p: &pb::CfSpec) -> CfEntry {
     CfEntry { spec: CfSpec { name: p.name.clone(), comparator: p.comparator.clone() }, create_seq: p.create_seq }
 }
@@ -27,6 +28,7 @@ pub(crate) fn epochs_to_pb(h: &[EpochStart]) -> Vec<pb::EpochStart> {
     h.iter().map(|e| pb::EpochStart { epoch: e.epoch, start_seq: e.start_seq }).collect()
 }
 
+#[allow(dead_code)] // used by the replication client (later Plan 2 task)
 pub(crate) fn epochs_from_pb(h: &[pb::EpochStart]) -> Vec<EpochStart> {
     h.iter().map(|e| EpochStart { epoch: e.epoch, start_seq: e.start_seq }).collect()
 }
@@ -34,6 +36,7 @@ pub(crate) fn epochs_from_pb(h: &[pb::EpochStart]) -> Vec<EpochStart> {
 /// Validates an epoch history received from upstream (PROTOCOL.md §5.5) for `identity`:
 /// non-empty, starting with `{1, 1}`, epochs strictly increasing, start seqs non-decreasing,
 /// and ending with the identity's epoch. Anything else is `Corrupt`.
+#[allow(dead_code)] // used by the replication client (later Plan 2 task)
 pub(crate) fn checked_history(identity: &DbIdentity, h: &[pb::EpochStart]) -> Result<Vec<EpochStart>> {
     let history = epochs_from_pb(h);
     let bad = |why: &str| Err(Error::corrupt(format!("invalid epoch history {history:?}: {why}")));
@@ -56,6 +59,7 @@ pub(crate) fn entry_to_pb(e: LogEntry) -> pb::LogEntry {
     pb::LogEntry { seq: e.seq, epoch: e.epoch, ts_ms: e.ts_ms, ops: e.ops, crc32c: e.crc32c }
 }
 
+#[allow(dead_code)] // used by the replication client (later Plan 2 task)
 pub(crate) fn entry_from_pb(p: pb::LogEntry) -> LogEntry {
     LogEntry { seq: p.seq, epoch: p.epoch, ts_ms: p.ts_ms, ops: p.ops, crc32c: p.crc32c }
 }

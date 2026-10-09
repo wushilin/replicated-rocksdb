@@ -54,6 +54,8 @@ pub struct MasterConfig {
     pub bump_epoch_on_open: bool,
     pub rocksdb: RocksTuning,
     pub clock: Arc<dyn Clock>,
+    /// Replication server. `None` runs an embedded, non-replicating master.
+    pub serve: Option<ServeConfig>,
 }
 
 impl MasterConfig {
@@ -68,6 +70,7 @@ impl MasterConfig {
             bump_epoch_on_open: false,
             rocksdb: RocksTuning::default(),
             clock: Arc::new(SystemClock),
+            serve: None,
         }
     }
 
@@ -84,6 +87,9 @@ impl MasterConfig {
         }
         if self.retention.check_interval.is_zero() || self.reaper.interval.is_zero() {
             return Err(Error::Config("maintenance intervals must be positive".into()));
+        }
+        if let Some(serve) = &self.serve {
+            serve.validate()?;
         }
         Ok(())
     }
@@ -146,6 +152,7 @@ pub struct TlsClientConfig {
 }
 
 impl TlsClientConfig {
+    #[allow(dead_code)] // used by the replication client (later Plan 2 task)
     pub(crate) fn to_tonic(&self, default_domain: &str) -> tonic::transport::ClientTlsConfig {
         use tonic::transport::{Certificate, ClientTlsConfig, Identity};
         let mut t = ClientTlsConfig::new()

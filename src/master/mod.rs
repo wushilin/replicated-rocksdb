@@ -2,10 +2,12 @@
 
 mod maintenance;
 mod reaper;
+mod source;
 pub(crate) mod writer;
 
 pub use reaper::ReapStats;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +19,7 @@ use crate::config::MasterConfig;
 use crate::error::Result;
 use crate::log::{EntryIter, LogApi};
 use crate::read::{ReadApi, ReadSnapshot};
+use crate::server::ServerHandle;
 use crate::store::meta::{self, key};
 use crate::store::read::DbIter;
 use crate::store::Store;
@@ -41,6 +44,7 @@ use writer::Inner;
 pub struct Master {
     inner: Arc<Inner>,
     task: Option<JoinHandle<()>>,
+    server: Option<ServerHandle>,
 }
 
 impl Master {
@@ -71,8 +75,10 @@ impl Master {
         if bump && !fresh {
             inner.bump_epoch()?;
         }
+        // The epoch bump above happens before the replication port opens (DESIGN.md §13).
+        let server = crate::server::start_for(&inner, inner.cfg.serve.clone()).await?;
         let task = maintenance::spawn(&inner);
-        Ok(Master { inner, task: Some(task) })
+        Ok(Master { inner, task: Some(task), server })
     }
 
     /// The origin identity (`db_uuid` and current epoch) stamped on every entry.
@@ -178,14 +184,28 @@ impl Master {
         self.inner.bump_epoch()
     }
 
-    /// Stops background work and waits for it to finish. Outstanding [`ReadSnapshot`]s (and
-    /// iterators borrowed from them) keep the database open, with its LOCK held, until dropped.
+    /// The address the replication server listens on, if this master serves replication.
+    pub fn serve_addr(&self) -> Option<SocketAddr> {
+        self.server.as_ref().map(ServerHandle::addr)
+    }
+
+    /// Ends every replication stream with `SHUTTING_DOWN`, stops background work, and waits
+    /// until the database is closed, so the directory can be reopened at once.
+    /// `Err(Timeout)` if something still holds the database after 10 s (for example an
+    /// outstanding [`ReadSnapshot`], which keeps the database open until dropped).
     pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(server) = self.server.take() {
+            server.shutdown().await;
+        }
         self.inner.shutdown_tx.send_replace(true);
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
-        Ok(())
+        if crate::server::await_sole_owner(&self.inner, Duration::from_secs(10)).await {
+            Ok(())
+        } else {
+            Err(crate::Error::Timeout)
+        }
     }
 }
 

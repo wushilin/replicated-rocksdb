@@ -250,6 +250,9 @@ impl Authenticator for AllowMethods {
 /// number of checked attempts past `max` by up to the number of concurrent attempts.
 /// IPv4-mapped IPv6 addresses count as their IPv4 address and IPv6 addresses are bucketed by
 /// /64. Memory is bounded: at most [`FailureLimiter::MAX_TRACKED`] addresses, `max` timestamps each.
+///
+/// This is per-address throttling, not a global brute-force bound: under an address flood a
+/// blocked entry can be evicted.
 #[derive(Debug)]
 pub(crate) struct FailureLimiter {
     max: usize,

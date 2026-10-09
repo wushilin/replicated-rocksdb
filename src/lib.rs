@@ -67,3 +67,4 @@ pub use config::{
 pub use log::{EntryIter, LogApi};
 pub use master::{Master, ReapStats};
 pub(crate) mod server;
+pub(crate) mod failpoint;

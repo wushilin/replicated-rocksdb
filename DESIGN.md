@@ -258,7 +258,7 @@ Used when a slave has no data, is behind the retention window, or (by policy) af
 3. Read through `snap`: `S = __meta.last_seq`, `last_entry_crc`, `origin_identity`, `cf_specs`.
 4. Register a **retention guard** for `S` and issue a lease (`lease_id`, `lease_ttl`).
 5. Stream `Header`, then `Records` for each CF in `cf_specs` order with **raw envelopes** (including values that are expired but not yet reaped), then `Footer { record_count, digest }`.
-6. Keep the guard until the client's `Tail` presents the lease, or the lease expires (default 15 min), or the stream fails before the footer. Without this, retention could remove `S + 1` between the end of the bootstrap and the start of the tail, and the slave would loop through bootstraps.
+6. Keep the guard until the client's `Tail` that presents the lease has read the entries after `S` (or ends), or the lease expires (default 15 min), or the stream fails before the footer. Without this, retention could remove `S + 1` between the end of the bootstrap and the tail's first read, and the slave would loop through bootstraps.
 
 **Receiving slave:**
 1. Persist `node_state = Bootstrapping { target_seq }`. Reads return `NotReady`. A crash in this state restarts the bootstrap from scratch.
@@ -443,7 +443,7 @@ pub struct ServeConfig {
 pub struct MasterConfig {
     pub identifier: String,
     pub path: PathBuf,
-    pub serve: ServeConfig,
+    pub serve: Option<ServeConfig>,     // None = embedded, non-replicating master
     pub retention: Retention,
     pub reaper: ReaperConfig,           // { interval: 30 s, max_deletes_per_entry: 1 000,
                                         //   max_deletes_per_round: 100 000 }
@@ -457,6 +457,7 @@ pub struct MasterConfig {
 impl Master {
     pub async fn open(cfg: MasterConfig) -> Result<Self>;
     pub fn identity(&self) -> DbIdentity;
+    pub fn serve_addr(&self) -> Option<SocketAddr>;     // bound replication address (port 0 picks one)
 
     pub fn put(&self, cf: &str, k: &[u8], v: &[u8]) -> Result<Seq>;
     pub fn put_with_ttl(&self, cf: &str, k: &[u8], v: &[u8], ttl: Duration) -> Result<Seq>;

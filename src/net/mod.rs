@@ -18,6 +18,7 @@ pub(crate) const MD_AUTHORIZATION: &str = "authorization";
 /// `google.rpc.ErrorInfo.domain` of every replication error.
 pub(crate) const ERROR_DOMAIN: &str = "rrdb.replication.v1";
 /// Extra room on top of the payload size for protobuf framing (PROTOCOL.md §11.4).
+#[allow(dead_code)] // used by the replication client (later Plan 2 task)
 pub(crate) const DECODE_SLACK: usize = 64 << 10;
 /// Requests are small; the server never accepts larger ones.
 pub(crate) const MAX_REQUEST_BYTES: usize = 4 << 20;
@@ -58,6 +59,7 @@ pub(crate) fn internal_status(message: impl Into<String>) -> Status {
 }
 
 /// The protocol reason carried by `status`, if any.
+#[allow(dead_code)] // used by the replication client (later Plan 2 task)
 pub(crate) fn reason_of(status: &Status) -> Option<pb::Reason> {
     let details = status.get_error_details();
     let info = details.error_info()?;

@@ -26,6 +26,8 @@ pub(crate) struct Inner {
     identity: RwLock<(DbIdentity, Vec<EpochStart>)>,
     pub seq_tx: watch::Sender<Seq>,
     pub shutdown_tx: watch::Sender<bool>,
+    /// Bumped by `bump_epoch`: every served replication stream ends with `UPSTREAM_RESET`.
+    pub reset_tx: watch::Sender<u64>,
 }
 
 impl Inner {
@@ -44,6 +46,7 @@ impl Inner {
             identity: RwLock::new((identity, history)),
             seq_tx: watch::channel(last_seq).0,
             shutdown_tx: watch::channel(false).0,
+            reset_tx: watch::channel(0).0,
         }
     }
 
@@ -61,6 +64,11 @@ impl Inner {
 
     pub(crate) fn epoch_history(&self) -> Vec<EpochStart> {
         self.identity.read().unwrap_or_else(PoisonError::into_inner).1.clone()
+    }
+
+    /// Identity and epoch history, read under one lock.
+    pub(crate) fn identity_and_history(&self) -> (DbIdentity, Vec<EpochStart>) {
+        self.identity.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     pub(crate) fn lock_writer(&self) -> Result<MutexGuard<'_, WriterState>> {
@@ -136,6 +144,8 @@ impl Inner {
             return Err(e);
         }
         *guard = (id, history);
+        drop(guard);
+        self.reset_tx.send_modify(|n| *n += 1);
         tracing::info!(epoch = id.epoch, start_seq = start, "epoch bumped");
         Ok(id)
     }

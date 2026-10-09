@@ -359,7 +359,7 @@ Before sending anything, the server MUST check the following and fail the call o
 | `prev_crc32c` present, the server holds entry `from_seq − 1`, and its `crc32c` differs | `FAILED_PRECONDITION` / `DIVERGED` |
 | `from_seq < first_retained_seq` | `OUT_OF_RANGE` / `LOG_GAP` |
 
-If `bootstrap_lease` matches a lease this server issued to the same `client_id`, and `from_seq ≤ snapshot_seq + 1`, the server releases that lease as soon as the stream is established.
+If `bootstrap_lease` matches a lease this server issued to the same `client_id`, and `from_seq ≤ snapshot_seq + 1`, the stream takes the lease over and the server releases it as soon as the stream has read the entries following the snapshot from its log (or when the stream ends). Releasing it earlier would let aggressive retention remove entry `snapshot_seq + 1` before the stream reads it.
 
 ### 7.3 Stream
 
@@ -469,7 +469,7 @@ If the client crashes in any step before 6, it MUST start the bootstrap again fr
 The guard registered in §8.1 step 4 MUST be kept until the first of these happens:
 
 - the stream fails before the footer is sent;
-- a `Tail` from the same `client_id` presents the `lease_id` with `from_seq ≤ S + 1` (§7.2);
+- a `Tail` from the same `client_id` that presented the `lease_id` with `from_seq ≤ S + 1` has read the entries after `S` from the log, or has ended (§7.2);
 - `lease_ttl_ms` passes after the footer is sent (RECOMMENDED: 15 min).
 
 Without the lease, retention could remove entry `S + 1` in the window between bootstrap and tail, and the client would have to bootstrap again, possibly forever.
