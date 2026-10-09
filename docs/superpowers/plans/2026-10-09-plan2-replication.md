@@ -23,14 +23,14 @@
 - Slaves apply each entry with `Store::prepare` + `Store::commit(sync = false)`; one entry is one `WriteBatch`. Bootstrap records are written unsynced; the final bootstrap batch is synced.
 - `PROTOCOL_VERSION = 1` and `ENVELOPE_VERSION = 1` must match exactly. Handshake reports a mismatch in its body; every other RPC requires `x-rrdb-protocol-version` and fails with `FAILED_PRECONDITION / PROTOCOL_MISMATCH`.
 - Request metadata on every call: `x-rrdb-protocol-version`, `x-rrdb-node-id`, and `authorization: Bearer <token>` with token auth.
-- Every protocol failure is a gRPC status with `google.rpc.ErrorInfo { domain: "rrdb.replication.v1", reason: <Reason name> }`; authentication failures (`UNAUTHENTICATED`, `PERMISSION_DENIED`) carry no `ErrorInfo`.
+- Every protocol failure is a gRPC status with `google.rpc.ErrorInfo { domain: "rrdb.replication.v1", reason: <Reason name> }`, including unexpected server failures (`INTERNAL` with reason `REASON_UNSPECIFIED`, `net::internal_status`); authentication failures (`UNAUTHENTICATED`, `PERMISSION_DENIED`) carry no `ErrorInfo`; malformed requests are `INVALID_ARGUMENT` and the Verify stubs `UNIMPLEMENTED`.
 - Tail fetch batching (PROTOCOL.md §7.5): `TailMessage` carries `EntryBatch { repeated LogEntry entries }` or `Heartbeat`; the server sends a pending batch when `min_batch_bytes = 0` and it is non-empty, when it reaches `min_batch_bytes`, when `max_wait_ms` has passed since its oldest entry became available, or when the next entry would exceed `max_batch_bytes` (a single larger entry goes alone); `max_wait_ms` ≤ `heartbeat_ms`, `max_batch_bytes` ≤ `ServeLimits::max_tail_batch_bytes` (default 4 MiB), 0 → 1 MiB. Catch-up is never slowed by `max_wait_ms`. Slaves apply each entry of a batch as its own atomic write. `SlaveConfig::fetch` defaults to `{ min_batch_bytes: 0, max_wait: 100 ms, max_batch_bytes: 1 MiB }`.
 - Decode limits: server requests 4 MiB; client Tail `max(max_entry_bytes, max_batch_bytes) + 64 KiB`; client Bootstrap `max(max_entry_bytes, 16 MiB) + 64 KiB`; `bootstrap_chunk_bytes` ≤ 16 MiB.
 - Defaults (DESIGN.md §18): heartbeat 5 s, idle timeout 3 × heartbeat, reconnect 100 ms → 30 s ×2 with full jitter (reset after 60 s of streaming), bootstrap lease TTL 15 min, 2 concurrent bootstraps, 4 verify sessions, chunk 1 MiB, 10 failed authentications per minute per address, `IdentityPolicy::Refuse`, `DivergencePolicy::Halt`, `GapPolicy::Rebootstrap`.
 - Token authentication on a plaintext listener is refused unless `allow_plaintext_token`. Tokens are compared in constant time (`subtle`) and never logged or printed.
 - Data-related halts (`IdentityChanged`, `Diverged`, `LogGap`, `Corrupt`, `SpecMismatch`) are persisted in `__meta.node_state` and survive restart; configuration halts (`ProtocolMismatch`, `EnvelopeMismatch`, `AuthRejected`, `LoopDetected`) are not.
 - TTL stays master-driven: slaves never reap and have no `__ttl_index`; promotion rebuilds it.
-- Plan 1 code conventions apply to new code: every `create_cf` is followed by `Store::retain_cf_options(opts)`; snapshot iterators are created and consumed where the `ReadSnapshot` is owned (the bootstrap job iterates inside the blocking closure that owns it); background tasks (slave driver, slave maintenance) hold `Weak<Inner>` and upgrade only for one unit of work, so dropping a node releases its database.
+- Plan 1 code conventions apply to new code: every `create_cf` is followed by `Store::retain_cf_options(opts)`; snapshot iterators are created and consumed where the `ReadSnapshot` is owned (the bootstrap job iterates inside the blocking closure that owns it); periodic background tasks (master and slave maintenance) hold `Weak<Inner>` and upgrade only for one tick; the slave driver holds `Weak<Inner>` while it waits (halted, backing off) and a strong reference only for one session, and Tail producers hold the source for one stream — sessions and streams are cancelled by the shutdown signal that `shutdown()` and `Drop` send, so dropping a node releases its database. RocksDB I/O that may fsync (halts, epoch adoption, meta writes) runs on blocking threads (`background::blocking`), never on async workers.
 - Every epoch history received from upstream (handshake `EPOCH_ADVANCED`, bootstrap header) is validated: non-empty, first record `{1, 1}`, epochs strictly increasing, start seqs non-decreasing, last epoch equal to the identity's epoch; otherwise the slave halts `Corrupt`.
 - On a slave, a failed `Store::prepare` or `Store::commit` halts the slave (`SpecMismatch` for an unknown comparator, otherwise `Corrupt`); the same entry is never retried in-process.
 - The Verify RPCs exist (generated service) but return `UNIMPLEMENTED` until Plan 3.
@@ -61,47 +61,54 @@ Each owning task updates DESIGN.md or PROTOCOL.md with the exact text given ther
 - **Refused promotion shuts the slave down** (Task 10, DESIGN.md §13.1): `promote(self)` consumes the slave, so on refusal it is shut down cleanly and its directory is unchanged. An outstanding `ReadSnapshot` is detected after shutdown (it still holds the shared `DbCore`) and reported as `Error::Config` naming the snapshot.
 - **Rulings from the Plan 1 final review:** upstream epoch histories are validated (Global Constraints); a failed commit on a slave halts it `Corrupt` instead of retrying; a `failpoints`-gated test covers the master's `bump_epoch` fence (point `master-bump-epoch-write`, Task 12).
 - **Test-only `Slave::kill`** behind feature `failpoints` (Task 12, DESIGN.md §16). The feature enables `fail/failpoints` as well (the design notes listed only `dep:fail`, but `fail` compiles every point to a no-op without its own feature). `futures-util` from the design notes is not added: nothing needs it.
+- **Pre-flight rulings:** shared helpers instead of duplicated blocks (`server::{start_for, end_stream}`, `background::{every, run_logged, blocking}`, `Store::delete_all_keys`); bootstrap jobs drop their snapshot before returning their permit and `ServerHandle::shutdown` waits (≤ 5 s) for all permits; the stream-ending send also gives up on reset; tests never use sleep as synchronisation and bound every wait (10 s); Plan 1 placeholder `allow`s are removed as their items get used, and the items Plan 2 does not use are deleted (Task 12). The server-test helpers (`test_client::{eventually, within, T0}`) duplicate the integration harness on purpose: unit tests cannot use `tests/support`.
 
 ## File Structure
 
 ```
 Cargo.toml                    + tonic, tonic-prost, tonic-types, tokio-stream, subtle, async-trait, fail; rcgen (Task 1); [[test]] failpoints (Task 12)
 build.rs                      server + client codegen (Task 1)
-src/lib.rs                    module tree and re-exports (Tasks 1, 2, 4, 5, 6, 7)
-src/net/mod.rs                metadata keys, Reason <-> status with ErrorInfo, decode limits (Task 1)
-src/net/convert.rs            DbIdentity / CfEntry / EpochStart / LogEntry <-> pb (Task 1)
+src/lib.rs                    module tree and re-exports (Tasks 1, 2, 3, 4, 5, 6, 7)
+src/net/mod.rs                metadata keys, Reason <-> status with ErrorInfo, internal_status, decode limits (Task 1)
+src/net/convert.rs            DbIdentity / CfEntry / EpochStart / LogEntry <-> pb, checked_history (Task 1)
 src/store/meta.rs             + node_state, max_entry_bytes, bootstrap_cfs keys and fields (Task 2)
-src/store/mod.rs              + bootstrap_cfs in the known set at open; new modules (Tasks 2, 6, 10)
+src/store/mod.rs              + bootstrap_cfs in the known set at open; new modules (Tasks 2, 6, 10); drop unused Store::role (Task 12)
 src/store/repl.rs             entry_crc, read_entries, ReadSnapshot::{meta, phys, raw_ctx}, ReadCtx::iter_raw (Task 2)
 src/source.rs                 LogSource trait (Task 2)
+src/server/mod.rs             module list (Task 3); replaced by the full server (Task 5)
 src/server/handshake.rs       pure decision table, one test per rule (Task 3)
+src/types.rs                  drop the stale allow on fork_after (Task 3) and epoch_for (Task 7)
 src/auth.rs                   Method, PeerInfo, Authenticator, tokens, mTLS allow-list, AllowMethods, limiter, CN parser (Task 4)
 src/config.rs                 + TLS configs, ServeLimits, ServeConfig (Task 4); MasterConfig.serve (Task 5)
 src/failpoint.rs              `fire(name)`: fail::eval behind feature `failpoints` (Task 5); `io_error(name)` (Task 12)
-src/server/mod.rs             ServerState, leases, auth gate, start/ServerHandle, Handshake, Verify stubs (Task 5)
 src/server/tail.rs            Tail validation, fetch batching (§7.5) and producer (Task 5)
 src/server/bootstrap.rs       Bootstrap producer, digest, lease hand-over (Task 5)
-src/server/test_client.rs     bare protocol client for server unit tests (Task 5)
+src/server/test_client.rs     bare protocol client and bounded-wait helpers for server unit tests (Task 5)
 src/server/tests.rs           server unit tests against a real master (Task 5)
+src/store/retention.rs        drop the stale allows on GuardSet, RetentionGuard, guard (Task 5)
 src/master/source.rs          LogSource for the master; slow-reader test (Task 5)
-src/master/writer.rs          + reset_tx, identity_and_history (Task 5)
-src/master/mod.rs             + server start, serve_addr, shutdown waits for the DB (Task 5)
+src/master/writer.rs          + reset_tx, identity_and_history (Task 5); failpoint in bump_epoch (Task 12)
+src/master/mod.rs             + server start (start_for), serve_addr, shutdown waits for the DB (Task 5)
 src/error.rs                  + Error::Halted (Task 6)
 src/listener.rs               ReplicationListener (Task 6)
-src/store/bootstrap.rs        reset_for_bootstrap, begin_bootstrap_cf, write_bootstrap_records, finish_bootstrap, adopt_identity (Task 6)
-src/slave/config.rs           SlaveConfig, UpstreamConfig, policies, Backoff (Task 6)
+src/store/bootstrap.rs        reset_for_bootstrap, begin_bootstrap_cf, write_bootstrap_records, finish_bootstrap, adopt_identity, delete_all_keys (Task 6)
+src/slave/mod.rs              module list (Task 6); Slave API, ReadApi, LogApi (Task 7); clear_halt (Task 8); serving (Task 9); promote module (Task 10); kill (Task 12)
+src/slave/config.rs           SlaveConfig, UpstreamConfig, FetchConfig, policies, Backoff (Task 6)
 src/slave/state.rs            HaltReason, SlaveState, HaltAction, NodeState, SlaveStatus (Task 6)
 src/slave/policy.rs           pure handshake/status → action table (Task 6)
+src/background.rs             every, run_logged, blocking: helpers for background and blocking work (Task 7)
+src/master/maintenance.rs     uses the background helpers (Task 7)
 src/slave/inner.rs            shared slave state (Task 7)
 src/slave/client.rs           upstream channel + metadata interceptor (Task 7)
 src/slave/driver.rs           connect → handshake → act loop, tail (Task 7)
 src/slave/apply.rs            per-entry checks and apply (Task 7)
 src/slave/bootstrap.rs        bootstrap install (Task 7)
 src/slave/maintenance.rs      retention and CF drops on slaves (Task 7)
-src/slave/mod.rs              Slave API, ReadApi, LogApi (Task 7); clear_halt (Task 8); serving (Task 9); kill (Task 12)
 src/slave/source.rs           LogSource for slaves (Task 9)
 src/store/promote.rs          rebuild_ttl_index, promote_to_master (Task 10)
 src/slave/promote.rs          Slave::promote (Task 10)
+src/store/cfs.rs              drop unused pending_entries, push_pending (Task 12)
+src/codec/mod.rs              drop the unused decode_ops re-export (Task 12)
 tests/support/mod.rs          Cluster harness, dump, edge cases, RecordingListener (Task 7; serving in Task 9)
 tests/replication.rs          core replication (Task 7)
 tests/rebootstrap.rs          policies, re-bootstrap, restore, epoch bump (Task 8)
@@ -110,7 +117,6 @@ tests/promotion.rs            promotion (Task 10)
 tests/security.rs             TLS, mTLS, tokens (Task 11)
 tests/failure_resume.rs       restarts, downstream ahead, persisted LogGap (Task 12)
 tests/failpoints.rs           fault injection, serial, --features failpoints (Task 12)
-src/master/writer.rs          + failpoint in bump_epoch's synced write (Task 12)
 ```
 
 ---
@@ -156,7 +162,6 @@ tonic = { version = "0.14.6", features = ["tls-ring"] }
 tonic-prost = "0.14.6"
 tonic-types = "0.14.6"
 tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
-futures-util = "0.3.34"
 subtle = "2.6.1"
 async-trait = "0.1.92"
 fail = { version = "0.5.1", optional = true }
@@ -227,6 +232,13 @@ mod tests {
         assert_eq!(code_for(R::ShuttingDown), Code::Unavailable);
         assert_eq!(code_for(R::Corrupt), Code::DataLoss);
         assert_eq!(code_for(R::StaleEpoch), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn internal_failures_carry_error_info() {
+        let s = internal_status("disk on fire");
+        assert_eq!(s.code(), Code::Internal);
+        assert_eq!(reason_of(&s), Some(pb::Reason::Unspecified));
     }
 
     #[test]
@@ -400,6 +412,14 @@ pub(crate) fn reason_status(reason: pb::Reason, message: impl Into<String>) -> S
     Status::with_error_details(code_for(reason), message, details)
 }
 
+/// An unexpected server-side failure: `INTERNAL`, still with `ErrorInfo`
+/// (`REASON_UNSPECIFIED`), so every failure carries the error domain.
+pub(crate) fn internal_status(message: impl Into<String>) -> Status {
+    let details =
+        ErrorDetails::with_error_info(pb::Reason::Unspecified.as_str_name(), ERROR_DOMAIN, HashMap::new());
+    Status::with_error_details(Code::Internal, message, details)
+}
+
 /// The protocol reason carried by `status`, if any.
 pub(crate) fn reason_of(status: &Status) -> Option<pb::Reason> {
     let details = status.get_error_details();
@@ -504,7 +524,7 @@ pub(crate) fn entry_from_pb(p: pb::LogEntry) -> LogEntry {
 - [ ] **Step 7: Run the tests**
 
 Run: `cargo test --lib net`
-Expected: PASS, 9 tests (`net::tests` 4, `net::convert::tests` 5 including `epoch_histories_are_validated`). Dead-code warnings for helpers first used in Task 5 are expected until then.
+Expected: PASS, 10 tests (`net::tests` 5 including `internal_failures_carry_error_info`, `net::convert::tests` 5 including `epoch_histories_are_validated`). Dead-code warnings for helpers first used in Task 5 are expected until then.
 
 Run: `cargo build --features failpoints`
 Expected: builds.
@@ -1101,6 +1121,8 @@ Add to `src/lib.rs`:
 ```rust
 pub(crate) mod server;
 ```
+
+`fork_after` is now used: in `src/types.rs`, delete the line `#[allow(dead_code)] // used by the replication server (Plan 2)` above `pub(crate) fn fork_after`.
 
 - [ ] **Step 2: Run them to confirm they fail**
 
@@ -1886,6 +1908,46 @@ with:
 - The server limits the rate of failed authentications per remote address (`ServeLimits::max_auth_failures_per_minute`, default 10; then `UNAUTHENTICATED` without checking the token).
 ```
 
+and replace the trait block:
+
+```
+#[async_trait]
+pub trait Authenticator: Send + Sync {
+    async fn authenticate(&self, peer: &PeerInfo, method: Method, token: Option<&[u8]>)
+        -> Result<(), AuthError>;     // AuthError::{Unauthenticated, PermissionDenied}
+}
+pub trait CredentialsProvider: Send + Sync {
+    fn token(&self) -> Option<Vec<u8>>;
+}
+```
+
+with:
+
+```
+#[async_trait]
+pub trait Authenticator: Send + Sync + 'static {
+    async fn authenticate(&self, peer: &PeerInfo, method: Method, token: Option<&[u8]>)
+        -> Result<(), AuthError>;     // AuthError::{Unauthenticated, PermissionDenied}
+    /// True for token-based authenticators: refused on plaintext unless allow_plaintext_token.
+    fn uses_tokens(&self) -> bool { false }
+}
+pub trait CredentialsProvider: Send + Sync + 'static {
+    fn token(&self) -> Option<Vec<u8>>;
+}
+```
+
+In DESIGN.md §17, replace:
+
+```
+- The client sets the Tail decode limit to `max_entry_bytes + 64 KiB` from the handshake. Only the master enforces the size limit; downstream nodes accept what arrives.
+```
+
+with:
+
+```
+- The client sets the Tail decode limit to `max(max_entry_bytes, max_batch_bytes) + 64 KiB` (`max_entry_bytes` from the handshake) and the Bootstrap decode limit to `max(max_entry_bytes, 16 MiB) + 64 KiB`; servers keep `bootstrap_chunk_bytes` at most 16 MiB. Only the master enforces the size limit; downstream nodes accept what arrives.
+```
+
 In DESIGN.md §16, replace:
 
 ```
@@ -2083,14 +2145,36 @@ pub(crate) fn tail_req(id: &DbIdentity, from_seq: u64) -> pb::TailRequest {
     }
 }
 
+/// Awaits `fut` for at most 10 s, so a regression fails the test instead of hanging it.
+pub(crate) async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(10), fut).await.unwrap_or_else(|_| panic!("timed out after 10 s: {what}"))
+}
+
 /// The next entry batch of a Tail stream, skipping heartbeats.
 pub(crate) async fn next_batch(s: &mut tonic::Streaming<pb::TailMessage>) -> Vec<LogEntry> {
-    loop {
-        match s.message().await.unwrap().unwrap().kind.unwrap() {
-            Kind::Batch(b) => return b.entries.into_iter().map(entry_from_pb).collect(),
-            Kind::Heartbeat(_) => {}
+    within("the next entry batch", async {
+        loop {
+            match s.message().await.unwrap().unwrap().kind.unwrap() {
+                Kind::Batch(b) => return b.entries.into_iter().map(entry_from_pb).collect(),
+                Kind::Heartbeat(_) => {}
+            }
         }
-    }
+    })
+    .await
+}
+
+/// The status a stream ends with, skipping its remaining messages.
+pub(crate) async fn stream_error<T>(s: &mut tonic::Streaming<T>) -> Status {
+    within("the stream to end with a status", async {
+        loop {
+            match s.message().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("stream ended without a status"),
+                Err(e) => return e,
+            }
+        }
+    })
+    .await
 }
 
 /// A handshake from a client with no data.
@@ -2138,7 +2222,9 @@ use std::time::{Duration, Instant};
 
 use tonic::Code;
 
-use super::test_client::{client, client_with, eventually, hello, next_batch, serving_master, tail_req, Meta};
+use super::test_client::{
+    client, client_with, eventually, hello, next_batch, serving_master, stream_error, tail_req, within, Meta,
+};
 use crate::auth::{AllowMethods, Method, TokenAuthenticator};
 use crate::codec::digest::Digest;
 use crate::codec::{envelope, PROTOCOL_VERSION};
@@ -2221,7 +2307,7 @@ async fn tail_streams_entries_in_order_then_heartbeats_then_new_entries() {
     assert_eq!(backlog.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
     backlog.iter().for_each(|e| e.verify_crc().unwrap());
     // Idle: heartbeats only, carrying the server's position.
-    match s.message().await.unwrap().unwrap().kind.unwrap() {
+    match within("a heartbeat", s.message()).await.unwrap().unwrap().kind.unwrap() {
         Msg::Heartbeat(h) => assert_eq!((h.upstream_last_seq, h.origin_last_seq), (3, 3)),
         Msg::Batch(b) => panic!("unexpected batch of {}", b.entries.len()),
     }
@@ -2278,13 +2364,7 @@ async fn bump_epoch_ends_streams_with_upstream_reset() {
     let mut s = client(m.serve_addr().unwrap(), "b").tail(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
     assert_eq!(next_entry(&mut s).await.seq, 1);
     m.bump_epoch().unwrap();
-    let err = loop {
-        match s.message().await {
-            Ok(Some(_)) => continue,
-            Ok(None) => panic!("stream ended without a status"),
-            Err(e) => break e,
-        }
-    };
+    let err = stream_error(&mut s).await;
     assert_eq!((err.code(), reason_of(&err)), (Code::Unavailable, Some(pb::Reason::UpstreamReset)));
 }
 
@@ -2296,13 +2376,7 @@ async fn shutdown_ends_streams_and_releases_the_database() {
     let mut s = client(m.serve_addr().unwrap(), "b").tail(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
     assert_eq!(next_entry(&mut s).await.seq, 1);
     m.shutdown().await.unwrap();
-    let err = loop {
-        match s.message().await {
-            Ok(Some(_)) => continue,
-            Ok(None) => panic!("stream ended without a status"),
-            Err(e) => break e,
-        }
-    };
+    let err = stream_error(&mut s).await;
     assert_eq!((err.code(), reason_of(&err)), (Code::Unavailable, Some(pb::Reason::ShuttingDown)));
     // The directory can be reopened immediately.
     let (m, _) = serving_master(dir.path(), |_| {}).await;
@@ -2366,16 +2440,19 @@ async fn verify_is_not_implemented_yet() {
 async fn read_bootstrap(
     c: &mut super::test_client::Client,
 ) -> (pb::BootstrapHeader, Vec<pb::BootstrapRecords>, pb::BootstrapFooter) {
-    let mut s = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
-    let Chunk::Header(h) = s.message().await.unwrap().unwrap().kind.unwrap() else { panic!("header first") };
-    let mut msgs = Vec::new();
-    loop {
-        match s.message().await.unwrap().unwrap().kind.unwrap() {
-            Chunk::Records(r) => msgs.push(r),
-            Chunk::Footer(f) => return (h, msgs, f),
-            Chunk::Header(_) => panic!("second header"),
+    within("a whole bootstrap stream", async {
+        let mut s = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
+        let Chunk::Header(h) = s.message().await.unwrap().unwrap().kind.unwrap() else { panic!("header first") };
+        let mut msgs = Vec::new();
+        loop {
+            match s.message().await.unwrap().unwrap().kind.unwrap() {
+                Chunk::Records(r) => msgs.push(r),
+                Chunk::Footer(f) => return (h, msgs, f),
+                Chunk::Header(_) => panic!("second header"),
+            }
         }
-    }
+    })
+    .await
 }
 
 #[tokio::test]
@@ -2440,7 +2517,8 @@ async fn bootstrap_lease_holds_retention_until_tail_presents_it() {
     for i in 0..5u8 {
         m.put("c", &[i], b"v").unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(200)).await; // ten retention rounds
+    eventually("retention to trim up to the lease", || m.first_retained_seq() == s + 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await; // five more retention rounds
     assert_eq!(m.first_retained_seq(), s + 1, "the lease keeps S + 1");
 
     let mut req = tail_req(&m.identity(), s + 1);
@@ -2456,7 +2534,7 @@ async fn an_unclaimed_lease_expires() {
     let (m, _) = serving_master(dir.path(), |cfg| {
         cfg.retention.max_entries = Some(1);
         cfg.retention.check_interval = Duration::from_millis(20);
-        cfg.serve.as_mut().unwrap().limits.bootstrap_lease_ttl = Duration::from_millis(100);
+        cfg.serve.as_mut().unwrap().limits.bootstrap_lease_ttl = Duration::from_millis(1500);
     })
     .await;
     m.create_cf(CfSpec::new("c")).unwrap();
@@ -2464,8 +2542,9 @@ async fn an_unclaimed_lease_expires() {
     for i in 0..3u8 {
         m.put("c", &[i], b"v").unwrap();
     }
-    assert!(m.first_retained_seq() <= h.snapshot_seq + 1);
-    eventually("lease expiry (1 s sweep)", || m.first_retained_seq() == m.last_seq()).await;
+    // Held by the unclaimed lease first, then released when it expires (1 s sweep).
+    eventually("retention to stop at the lease", || m.first_retained_seq() == h.snapshot_seq + 1).await;
+    eventually("lease expiry", || m.first_retained_seq() == m.last_seq()).await;
 }
 
 #[tokio::test]
@@ -2505,9 +2584,10 @@ async fn shutdown_with_unread_streams_releases_the_database() {
     }
     let mut c = client(m.serve_addr().unwrap(), "b");
     let mut tail = c.tail(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
-    assert!(tail.message().await.unwrap().is_some());
+    assert!(within("the first tail message", tail.message()).await.unwrap().is_some());
     let mut boot = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
-    assert!(matches!(boot.message().await.unwrap().unwrap().kind, Some(Chunk::Header(_))));
+    let first = within("the bootstrap header", boot.message()).await.unwrap().unwrap();
+    assert!(matches!(first.kind, Some(Chunk::Header(_))));
     tokio::time::timeout(Duration::from_secs(20), m.shutdown()).await.expect("shutdown hangs").unwrap();
     let (m, _) = serving_master(dir.path(), |_| {}).await;
     assert_eq!(m.last_seq(), 129);
@@ -2526,16 +2606,18 @@ fn batch_bytes(batch: &[LogEntry]) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_time_mode_delivers_each_entry_promptly_one_batch_at_a_time() {
     let dir = tempfile::tempdir().unwrap();
-    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_secs(1)).await;
     m.create_cf(CfSpec::new("c")).unwrap();
     let mut s = client(m.serve_addr().unwrap(), "b").tail(tail_req(&m.identity(), 2)).await.unwrap().into_inner();
     for i in 0..5u8 {
-        let t0 = Instant::now();
         let seq = m.put("c", &[i], b"v").unwrap();
+        let t0 = Instant::now(); // after the fsynced put returned
         let batch = next_batch(&mut s).await;
         let latency = t0.elapsed();
-        assert_eq!(batch.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![seq]);
-        assert!(latency < Duration::from_millis(200), "entry {seq} took {latency:?}");
+        assert_eq!(batch.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![seq], "one entry per batch");
+        // Real time: nothing waits for more data (the generous bound only guards against a
+        // regression to the 1 s heartbeat or a max_wait; it is not a latency benchmark).
+        assert!(latency < Duration::from_millis(900), "entry {seq} took {latency:?}");
     }
 }
 
@@ -2546,35 +2628,36 @@ async fn small_writes_wait_for_max_wait_and_arrive_together() {
     m.create_cf(CfSpec::new("c")).unwrap();
     let req = fetch_req(&m.identity(), 2, 1 << 20, 300, 0);
     let mut s = client(m.serve_addr().unwrap(), "b").tail(req).await.unwrap().into_inner();
-    let t0 = Instant::now();
-    for i in 0..3u8 {
+    m.put("c", &[0], b"v").unwrap();
+    let t0 = Instant::now(); // entry 2 became available no later than this
+    for i in 1..3u8 {
         m.put("c", &[i], b"v").unwrap();
     }
     let batch = next_batch(&mut s).await;
     let waited = t0.elapsed();
     assert_eq!(batch.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3, 4], "one batch");
-    assert!(waited >= Duration::from_millis(250), "sent before max_wait: {waited:?}");
-    assert!(waited < Duration::from_millis(900), "sent long after max_wait: {waited:?}");
+    assert!(waited >= Duration::from_millis(200), "sent before max_wait (300 ms): {waited:?}");
+    assert!(waited < Duration::from_secs(3), "sent long after max_wait: {waited:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reaching_min_batch_bytes_sends_before_max_wait() {
     let dir = tempfile::tempdir().unwrap();
-    let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_secs(10)).await;
+    let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_secs(30)).await;
     m.create_cf(CfSpec::new("c")).unwrap();
     m.put("c", &[0], &[7; 100]).unwrap();
     let one = m.entries_since(1).unwrap().next().unwrap().unwrap().encoded_len();
-    let req = fetch_req(&m.identity(), 3, u32::try_from(3 * one).unwrap(), 5_000, 0);
+    let req = fetch_req(&m.identity(), 3, u32::try_from(3 * one).unwrap(), 20_000, 0);
     let mut s = client(m.serve_addr().unwrap(), "b").tail(req).await.unwrap().into_inner();
-    let t0 = Instant::now();
     for i in 1..=3u8 {
         m.put("c", &[i], &[7; 100]).unwrap();
     }
+    let t0 = Instant::now(); // min_batch_bytes is reached no later than this
     let batch = next_batch(&mut s).await;
     let waited = t0.elapsed();
     assert_eq!(batch.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
     assert!(batch_bytes(&batch) >= 3 * one);
-    assert!(waited < Duration::from_secs(1), "waited {waited:?} although min_batch_bytes was reached");
+    assert!(waited < Duration::from_secs(5), "waited {waited:?} (max_wait is 20 s) although min_batch_bytes was reached");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2592,7 +2675,6 @@ async fn catch_up_is_split_at_max_batch_bytes_without_gaps() {
     // min_batch_bytes is huge and max_wait long: catch-up must still not wait.
     let req = fetch_req(&m.identity(), 1, u32::MAX, 100, 1 << 20);
     let mut s = client(m.serve_addr().unwrap(), "b").tail(req).await.unwrap().into_inner();
-    let t0 = Instant::now();
     let mut batches = Vec::new();
     let mut seqs = Vec::new();
     while seqs.len() < 1001 {
@@ -2603,7 +2685,8 @@ async fn catch_up_is_split_at_max_batch_bytes_without_gaps() {
     }
     assert_eq!(seqs, (1..=1001).collect::<Vec<_>>(), "consecutive, no gaps or duplicates");
     assert!(batches.len() >= 16, "1 MiB of backlog needs at least 16 batches of 64 KiB, got {}", batches.len());
-    assert!(t0.elapsed() < Duration::from_secs(5));
+    // Catch-up is not paced by max_wait: with 100 ms per batch it would take over 1.6 s.
+    // (Each `next_batch` is bounded at 10 s; the shape assertions above carry the test.)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2629,15 +2712,15 @@ async fn max_wait_is_clamped_to_the_heartbeat() {
     let dir = tempfile::tempdir().unwrap();
     let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_millis(200)).await;
     m.create_cf(CfSpec::new("c")).unwrap();
-    let req = fetch_req(&m.identity(), 2, 1 << 20, 10_000, 0);
+    let req = fetch_req(&m.identity(), 2, 1 << 20, 30_000, 0);
     let mut s = client(m.serve_addr().unwrap(), "b").tail(req).await.unwrap().into_inner();
-    let t0 = Instant::now();
     m.put("c", b"k", b"v").unwrap();
+    let t0 = Instant::now();
     let batch = next_batch(&mut s).await;
     let waited = t0.elapsed();
     assert_eq!(batch.len(), 1);
-    assert!(waited >= Duration::from_millis(150), "{waited:?}");
-    assert!(waited < Duration::from_millis(1_500), "max_wait was not clamped to the 200 ms heartbeat: {waited:?}");
+    assert!(waited >= Duration::from_millis(100), "sent before the clamped max_wait: {waited:?}");
+    assert!(waited < Duration::from_secs(5), "max_wait (30 s) was not clamped to the 200 ms heartbeat: {waited:?}");
 }
 ```
 
@@ -2654,7 +2737,7 @@ mod tests {
         use crate::net::reason_of;
     use crate::pb;
     use crate::pb::tail_message::Kind;
-    use crate::server::test_client::{client, next_batch, serving_master, tail_req};
+    use crate::server::test_client::{client, next_batch, serving_master, tail_req, within};
     use crate::types::CfSpec;
 
     /// Retention overtakes a reader that stopped consuming: the stream ends with LOG_GAP
@@ -2677,19 +2760,22 @@ mod tests {
         let keep_one = Retention { max_age: None, max_entries: Some(1), check_interval: Duration::from_secs(1) };
         m.inner.store.trim_changelog(0, &keep_one).unwrap();
 
-        let err = loop {
-            match s.message().await {
-                Ok(Some(pb::TailMessage { kind: Some(Kind::Batch(b)) })) => {
-                    for e in b.entries {
-                        assert_eq!(e.seq, last + 1);
-                        last = e.seq;
+        let err = within("the slow reader's LOG_GAP", async {
+            loop {
+                match s.message().await {
+                    Ok(Some(pb::TailMessage { kind: Some(Kind::Batch(b)) })) => {
+                        for e in b.entries {
+                            assert_eq!(e.seq, last + 1);
+                            last = e.seq;
+                        }
                     }
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("stream ended without a status"),
+                    Err(e) => return e,
                 }
-                Ok(Some(_)) => {}
-                Ok(None) => panic!("stream ended without a status"),
-                Err(e) => break e,
             }
-        };
+        })
+        .await;
         // Entries the producer had already read are delivered; the next read hits the gap.
         assert!(last < 200 && last % crate::server::READ_BATCH as u64 == 0, "last delivered: {last}");
         assert_eq!((err.code(), reason_of(&err)), (Code::OutOfRange, Some(pb::Reason::LogGap)));
@@ -2702,7 +2788,7 @@ and add `mod source;` to the module list at the top of `src/master/mod.rs`.
 - [ ] **Step 3: Run them to confirm they fail**
 
 Run: `cargo test --lib -- server:: master::source`
-Expected: FAIL to compile: `file not found for module test_client`, `no method named serve_addr found for struct Master`, `cannot find value READ_BATCH in module crate::server`.
+Expected: FAIL to compile: unresolved import `crate::server::test_client` (the file exists but `server/mod.rs` does not declare it until Step 5), `no method named serve_addr found for struct Master`, `cannot find value READ_BATCH in module crate::server`.
 
 - [ ] **Step 4: Add the failpoint shim**
 
@@ -2718,10 +2804,10 @@ Create `src/failpoint.rs`:
 //! `master-bump-epoch-write` (the synced write of `bump_epoch` fails).
 //!
 //! Configure with `fail::cfg(name, "1*return")` to make the point fire once, or
-//! `fail::cfg(name, "1*sleep(1500)")` to delay the thread once without firing.
+//! `fail::cfg(name, "pause")` to block the thread there until `fail::remove(name)`.
 
-/// True when the named point is configured to fire (`return`). A `sleep(ms)` action blocks
-/// the calling thread for that long and returns false.
+/// True when the named point is configured to fire (`return`). A `pause` action blocks the
+/// calling thread until the point is removed, then returns false.
 #[cfg(feature = "failpoints")]
 pub(crate) fn fire(name: &str) -> bool {
     fail::eval(name, |_| ()).is_some()
@@ -2765,7 +2851,7 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::net::TcpListener;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::Server;
@@ -2882,7 +2968,7 @@ pub(crate) fn store_status(e: Error) -> Status {
     match e {
         Error::Corrupt(m) => reason_status(pb::Reason::Corrupt, m),
         e @ Error::Gap { .. } => reason_status(pb::Reason::LogGap, e.to_string()),
-        other => Status::internal(other.to_string()),
+        other => net::internal_status(other.to_string()),
     }
 }
 
@@ -2988,10 +3074,15 @@ impl ServerHandle {
         self.addr
     }
 
-    /// Ends every stream with `SHUTTING_DOWN`, stops accepting calls and waits (up to 5 s)
-    /// for the server task.
+    /// Ends every stream with `SHUTTING_DOWN`, stops accepting calls, and waits (up to 5 s
+    /// each) until every bootstrap job has returned its permit (and dropped its snapshot)
+    /// and the server task has finished.
     pub(crate) async fn shutdown(mut self) {
         self.shutdown_tx.send_replace(true);
+        let all = u32::try_from(self.state.cfg.limits.max_concurrent_bootstraps).unwrap_or(u32::MAX);
+        if tokio::time::timeout(Duration::from_secs(5), self.state.bootstraps.acquire_many(all)).await.is_err() {
+            tracing::warn!(addr = %self.addr, "bootstrap jobs did not stop in 5 s");
+        }
         self.state.leases().clear();
         if let Some(sweep) = self.sweep.take() {
             let _ = sweep.await;
@@ -3065,6 +3156,35 @@ async fn sweep_leases(state: Arc<ServerState>, mut shutdown: watch::Receiver<boo
     }
 }
 
+/// Ends a stream with `status`. If the channel is full it waits for room, so a slow client
+/// still learns why (for example `LOG_GAP`), but gives up on shutdown or reset.
+pub(crate) async fn end_stream<T>(
+    tx: &mpsc::Sender<Result<T, Status>>,
+    status: Status,
+    shutdown: &mut watch::Receiver<bool>,
+    resets: &mut watch::Receiver<u64>,
+) {
+    if let Err(mpsc::error::TrySendError::Full(msg)) = tx.try_send(Err(status)) {
+        tokio::select! {
+            biased;
+            _ = tx.send(msg) => {}
+            _ = stopped(shutdown) => {}
+            _ = resets.changed() => {}
+        }
+    }
+}
+
+/// Starts serving `source` if `serve` is configured.
+pub(crate) async fn start_for<S: LogSource>(source: &Arc<S>, serve: Option<ServeConfig>) -> Result<Option<ServerHandle>> {
+    match serve {
+        Some(cfg) => {
+            let weak: Weak<dyn LogSource> = Arc::downgrade(source) as Weak<dyn LogSource>;
+            Ok(Some(start(weak, cfg).await?))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Resolves once `rx` holds `true` (or its sender is gone).
 pub(crate) async fn stopped(rx: &mut watch::Receiver<bool>) {
     let _ = rx.wait_for(|stop| *stop).await;
@@ -3104,7 +3224,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::error::Error;
 use crate::failpoint;
 use crate::net::convert::{entry_to_pb, identity_from_pb};
-use crate::net::reason_status;
+use crate::net::{internal_status, reason_status};
 use crate::pb;
 use crate::pb::tail_message::Kind;
 use crate::source::LogSource;
@@ -3197,16 +3317,8 @@ impl Out {
         }
     }
 
-    /// Ends the stream with `status`. If the channel is full it waits for room, so a slow
-    /// client still learns why (for example `LOG_GAP`), but gives up on shutdown.
     async fn end(&mut self, status: Status) {
-        if let Err(mpsc::error::TrySendError::Full(msg)) = self.tx.try_send(Err(status)) {
-            tokio::select! {
-                biased;
-                _ = self.tx.send(msg) => {}
-                _ = super::stopped(&mut self.shutdown) => {}
-            }
-        }
+        super::end_stream(&self.tx, status, &mut self.shutdown, &mut self.resets).await;
     }
 }
 
@@ -3317,7 +3429,7 @@ async fn produce(
                 }
                 Ok(Err(e @ Error::Gap { .. })) => Some(reason_status(pb::Reason::LogGap, e.to_string())),
                 Ok(Err(e)) => Some(store_status(e)),
-                Err(e) => Some(Status::internal(format!("log read failed: {e}"))),
+                Err(e) => Some(internal_status(format!("log read failed: {e}"))),
             };
             if let Some(status) = failure {
                 // Entries already read are valid: deliver them before ending the stream.
@@ -3404,7 +3516,7 @@ Create `src/server/bootstrap.rs`:
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, watch, OwnedSemaphorePermit};
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -3476,9 +3588,13 @@ pub(super) async fn bootstrap(
         tx,
         resets,
         runtime: tokio::runtime::Handle::current(),
-        _permit: permit,
     };
-    tokio::task::spawn_blocking(move || job.run());
+    // The permit is returned only after the job, and with it the snapshot, is gone:
+    // `ServerHandle::shutdown` waits for all permits, so no snapshot outlives a shutdown.
+    tokio::task::spawn_blocking(move || {
+        job.run();
+        drop(permit);
+    });
     Ok(Response::new(ReceiverStream::new(rx)))
 }
 
@@ -3493,7 +3609,6 @@ struct Job {
     tx: mpsc::Sender<Result<pb::BootstrapChunk, Status>>,
     resets: watch::Receiver<u64>,
     runtime: tokio::runtime::Handle,
-    _permit: OwnedSemaphorePermit,
 }
 
 fn chunk(kind: Kind) -> Result<pb::BootstrapChunk, Status> {
@@ -3501,10 +3616,10 @@ fn chunk(kind: Kind) -> Result<pb::BootstrapChunk, Status> {
 }
 
 impl Job {
-    /// Runs on a blocking thread. Any send failure means the client went away: the guard
-    /// and permit are released by dropping `self`.
+    /// Runs on a blocking thread and consumes the job: the snapshot and the guard are dropped
+    /// when it returns. Any send failure means the client went away.
     fn run(self) {
-        let Job { state, snap, meta, header, guard, lease_id, client_id, tx, resets, runtime, _permit } = self;
+        let Job { state, snap, meta, header, guard, lease_id, client_id, tx, resets, runtime } = self;
         // A send also gives up on shutdown or reset, so a client that stops reading cannot
         // keep this job (and the node's database) alive.
         let mut stop = state.shutdown.clone();
@@ -3518,19 +3633,9 @@ impl Job {
                 }
             })
         };
-        // Ends the stream with an error; waits for room in the channel unless shutting down.
-        let mut stop_end = state.shutdown.clone();
-        let mut end = |status: Status| {
-            if let Err(mpsc::error::TrySendError::Full(msg)) = tx.try_send(Err(status)) {
-                runtime.block_on(async {
-                    tokio::select! {
-                        biased;
-                        _ = tx.send(msg) => {}
-                        _ = super::stopped(&mut stop_end) => {}
-                    }
-                })
-            }
-        };
+        // Ends the stream with an error (see `end_stream`).
+        let (mut stop_end, mut reset_end) = (state.shutdown.clone(), resets.clone());
+        let mut end = |status: Status| runtime.block_on(super::end_stream(&tx, status, &mut stop_end, &mut reset_end));
         if !send(chunk(Kind::Header(header))) {
             return;
         }
@@ -3596,7 +3701,9 @@ impl Job {
 
 Notes for the implementer:
 - `ServerState` holds the source **weakly**; each handler upgrades it per call. Tonic runs every connection on its own spawned task that outlives an aborted server task, so a strong reference there could keep a closed node's database open.
-- Every producer send also watches shutdown and resets (`Out::send` in `tail.rs`, the `send` closure in `bootstrap.rs`), for the same reason: a client that stops reading must not keep a producer alive. `Handle::block_on` is used from the bootstrap job's `spawn_blocking` thread, which is not an async context.
+- Every producer send also watches shutdown and resets (`Out::send` in `tail.rs`, the `send` closure in `bootstrap.rs`), for the same reason: a client that stops reading must not keep a producer alive. Ending a stream with an error goes through one helper, `end_stream`, which waits for room (so a slow client still learns the reason) but also gives up on shutdown or reset. `Handle::block_on` is used from the bootstrap job's `spawn_blocking` thread, which is not an async context.
+- The bootstrap job owns its `ReadSnapshot` and iterates it inside the blocking closure; it returns its semaphore permit only after the job (and so the snapshot) is dropped, and `ServerHandle::shutdown` waits (≤ 5 s) until every permit is back. So after `Master::shutdown`/`Slave::shutdown` no server-side snapshot keeps the database open.
+- `store_status` keeps `CORRUPT` and `LOG_GAP`; any other store failure becomes `net::internal_status` (`INTERNAL` with `ErrorInfo`). Server start for master and slave goes through `server::start_for`.
 - The bootstrap guard is registered at `position().last_seq` *before* the snapshot (a provisional guard) and then at the snapshot's `S`, so retention can never remove `S + 1` in between. The lease is inserted before the footer is sent, so the client's Tail always finds it; the Tail producer then owns it until it has read entries past `S`.
 - Fetch batching (`produce` in `tail.rs`): available entries are read ahead in blocks of `READ_BATCH` and moved into a pending batch. The batch is flushed when adding the next entry would exceed `max_bytes` (an oversize entry alone fills a batch), when it reaches `min_bytes` (if `min_bytes > 0`), and — once everything available is pending — at once in real-time mode (`min_bytes == 0`) or when the oldest pending entry has waited `max_wait`. So catch-up always sends full batches without waiting, and real-time mode sends each newly committed entry immediately. Before ending a stream with an error (for example `LOG_GAP`), entries already read are delivered, and the error itself is sent with an awaited send, so a slow client still learns the reason.
 
@@ -3669,7 +3776,7 @@ Replace `use std::sync::Arc;` and `use std::time::Duration;` with:
 
 ```rust
 use std::net::SocketAddr;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 ```
 
@@ -3677,10 +3784,11 @@ After `use crate::read::{ReadApi, ReadSnapshot};` add:
 
 ```rust
 use crate::server::ServerHandle;
-use crate::source::LogSource;
 ```
 
-Add the field `server: Option<ServerHandle>,` to `struct Master` (after `task`). In `Master::open`, replace:
+Add the field `server: Option<ServerHandle>,` to `struct Master` (after `task`).
+
+The retention guard is now used by the server: in `src/store/retention.rs`, delete the three `#[allow(dead_code)] // used by the replication server (Plan 2)` lines (on `GuardSet`, `RetentionGuard` and `Store::guard`). In `Master::open`, replace:
 
 ```rust
         let task = maintenance::spawn(&inner);
@@ -3691,13 +3799,7 @@ with:
 
 ```rust
         // The epoch bump above happens before the replication port opens (DESIGN.md §13).
-        let server = match inner.cfg.serve.clone() {
-            Some(serve) => {
-                let source: Weak<dyn LogSource> = Arc::downgrade(&inner) as Weak<dyn LogSource>;
-                Some(crate::server::start(source, serve).await?)
-            }
-            None => None,
-        };
+        let server = crate::server::start_for(&inner, inner.cfg.serve.clone()).await?;
         let task = maintenance::spawn(&inner);
         Ok(Master { inner, task: Some(task), server })
 ```
@@ -3732,12 +3834,12 @@ Replace `Master::shutdown` with:
 - [ ] **Step 7: Run the tests**
 
 Run: `cargo test --lib -- server:: master::source`
-Expected: PASS: 22 tests in `server::tests` — including the fetch-batching tests `real_time_mode_delivers_each_entry_promptly_one_batch_at_a_time` (each entry within 200 ms, one per batch), `small_writes_wait_for_max_wait_and_arrive_together` (three writes, one batch, 250–900 ms after the first), `reaching_min_batch_bytes_sends_before_max_wait`, `catch_up_is_split_at_max_batch_bytes_without_gaps` (1 000-entry backlog, every batch ≤ the server's 64 KiB cap, consecutive seqs), `an_entry_larger_than_max_batch_bytes_is_sent_alone` and `max_wait_is_clamped_to_the_heartbeat` — 14 in `server::handshake`, `server::tail::tests::fetch_parameters_are_clamped_to_server_limits`, and `master::source::tests::slow_reader_gets_log_gap_when_retention_overtakes_it`.
+Expected: PASS: 22 tests in `server::tests` — including the fetch-batching tests `real_time_mode_delivers_each_entry_promptly_one_batch_at_a_time` (one entry per batch, well under the 1 s heartbeat), `small_writes_wait_for_max_wait_and_arrive_together` (three writes, one batch, not before ~max_wait), `reaching_min_batch_bytes_sends_before_max_wait` (far sooner than the 20 s max_wait), `catch_up_is_split_at_max_batch_bytes_without_gaps` (1 000-entry backlog, every batch ≤ the server's 64 KiB cap, consecutive seqs), `an_entry_larger_than_max_batch_bytes_is_sent_alone` and `max_wait_is_clamped_to_the_heartbeat` (a 30 s max_wait behaves like the 200 ms heartbeat). Timers start after the fsynced `put` returns; lower bounds carry the semantics and upper bounds are generous, so slow CI disks do not fail them. Every stream wait is bounded at 10 s (`within`, `next_batch`, `stream_error`) — a regression fails instead of hanging. Also 14 in `server::handshake`, `server::tail::tests::fetch_parameters_are_clamped_to_server_limits`, and `master::source::tests::slow_reader_gets_log_gap_when_retention_overtakes_it`.
 
 Run: `cargo test`
 Expected: PASS, including every Plan 1 test (an embedded master has `serve: None`).
 
-- [ ] **Step 8: Update DESIGN.md §16 and PROTOCOL.md §7.2**
+- [ ] **Step 8: Update DESIGN.md §10 and §16, and PROTOCOL.md §7.2 and §8.4**
 
 Replace:
 
@@ -3769,6 +3871,30 @@ with:
 If `bootstrap_lease` matches a lease this server issued to the same `client_id`, and `from_seq ≤ snapshot_seq + 1`, the stream takes the lease over and the server releases it as soon as the stream has read the entries following the snapshot from its log (or when the stream ends). Releasing it earlier would let aggressive retention remove entry `snapshot_seq + 1` before the stream reads it.
 ```
 
+In PROTOCOL.md §8.4, replace:
+
+```
+- a `Tail` from the same `client_id` presents the `lease_id` with `from_seq ≤ S + 1` (§7.2);
+```
+
+with:
+
+```
+- a `Tail` from the same `client_id` that presented the `lease_id` with `from_seq ≤ S + 1` has read the entries after `S` from the log, or has ended (§7.2);
+```
+
+In DESIGN.md §10 (serving side), replace:
+
+```
+6. Keep the guard until the client's `Tail` presents the lease, or the lease expires (default 15 min), or the stream fails before the footer. Without this, retention could remove `S + 1` between the end of the bootstrap and the start of the tail, and the slave would loop through bootstraps.
+```
+
+with:
+
+```
+6. Keep the guard until the client's `Tail` that presents the lease has read the entries after `S` (or ends), or the lease expires (default 15 min), or the stream fails before the footer. Without this, retention could remove `S + 1` between the end of the bootstrap and the tail's first read, and the slave would loop through bootstraps.
+```
+
 Run: `cargo test --test proto_sync`
 Expected: PASS.
 
@@ -3796,7 +3922,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `slave::policy::{Policies { identity, divergence, gap }, Action { Tail, AdoptEpochThenTail, Bootstrap, Halt(HaltReason), Retry(String), Again }, after_handshake(&pb::HandshakeResponse, &Policies, force_bootstrap: bool) -> Action, after_status(&Status, &Policies) -> Action}`.
   - `pub trait ReplicationListener: Send + Sync + 'static { on_entry, on_bootstrap_begin, on_bootstrap_complete, on_state_change }` (all default no-ops).
   - `Error::Halted(HaltReason)`.
-  - `store::bootstrap::{NODE_READY = b"ready", NODE_BOOTSTRAPPING = b"bootstrapping", BootstrapFinish { identity, epoch_history, cf_specs, snapshot_seq, snapshot_crc, max_entry_bytes }}`, `Store::{reset_for_bootstrap(&self) -> Result<()>, begin_bootstrap_cf(&self, &CfEntry) -> Result<()>, write_bootstrap_records(&self, &CfEntry, &[(Vec<u8>, Vec<u8>)]) -> Result<()>, finish_bootstrap(&self, &BootstrapFinish) -> Result<()>, adopt_identity(&self, &DbIdentity, &[EpochStart]) -> Result<()>}`.
+  - `store::bootstrap::{NODE_READY = b"ready", NODE_BOOTSTRAPPING = b"bootstrapping", BootstrapFinish { identity, epoch_history, cf_specs, snapshot_seq, snapshot_crc, max_entry_bytes }}`, `Store::{reset_for_bootstrap(&self) -> Result<()>, begin_bootstrap_cf(&self, &CfEntry) -> Result<()>, write_bootstrap_records(&self, &CfEntry, &[(Vec<u8>, Vec<u8>)]) -> Result<()>, finish_bootstrap(&self, &BootstrapFinish) -> Result<()>, adopt_identity(&self, &DbIdentity, &[EpochStart]) -> Result<()>, delete_all_keys(&self, &impl AsColumnFamilyRef) -> Result<()>}` (unsynced batches of 1 000; also used by Task 10).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4632,7 +4758,7 @@ pub(crate) fn after_status(s: &Status, p: &Policies) -> Action {
 
 use std::sync::PoisonError;
 
-use rocksdb::{IteratorMode, WriteBatch, WriteOptions};
+use rocksdb::{AsColumnFamilyRef, IteratorMode, WriteBatch, WriteOptions};
 
 use super::cfs::PhysCf;
 use super::meta::{self, key, CF_CHANGELOG, CF_META, CF_TTL_INDEX};
@@ -4696,11 +4822,8 @@ impl Store {
             }
             // Changelog keys are 8 bytes; [0xFF; 9] sorts after all of them.
             batch.delete_range_cf(&self.cf(CF_CHANGELOG), &[][..], &[0xFFu8; 9][..]);
-            let ttl = self.cf(CF_TTL_INDEX);
-            for item in self.db().iterator_cf(&ttl, IteratorMode::Start) {
-                batch.delete_cf(&ttl, item?.0);
-            }
             self.sync_write(batch)?;
+            self.delete_all_keys(&self.cf(CF_TTL_INDEX))?;
             self.set_position(Position::default());
             self.set_first_retained_seq(1);
         }
@@ -4753,9 +4876,14 @@ impl Store {
             .db()
             .cf_handle(physical)
             .ok_or_else(|| Error::corrupt(format!("physical column family {physical} is missing")))?;
+        self.delete_all_keys(&handle)
+    }
+
+    /// Deletes every key of a CF, in unsynced batches of `CLEAR_BATCH` keys.
+    pub(crate) fn delete_all_keys(&self, cf: &impl AsColumnFamilyRef) -> Result<()> {
         let mut batch = WriteBatch::default();
-        for item in self.db().iterator_cf(&handle, IteratorMode::Start) {
-            batch.delete_cf(&handle, item?.0);
+        for item in self.db().iterator_cf(cf, IteratorMode::Start) {
+            batch.delete_cf(cf, item?.0);
             if batch.len() >= CLEAR_BATCH {
                 self.db().write(std::mem::take(&mut batch))?;
             }
@@ -4823,7 +4951,7 @@ impl Store {
 Run: `cargo test --lib -- store::bootstrap slave::`
 Expected: PASS: 5 tests in `store::bootstrap`, 3 in `slave::config`, 2 in `slave::state`, 5 in `slave::policy`.
 
-- [ ] **Step 10: Update DESIGN.md**
+- [ ] **Step 10: Update DESIGN.md and PROTOCOL.md**
 
 In the §3.2 table, replace:
 
@@ -4865,13 +4993,35 @@ with:
 In the §16.3 table, replace:
 
 ```
+| `Ready` | `Connecting` or `Streaming` |
 | `Bootstrapping { target_seq }` | `Bootstrapping { .. }`. After a restart, the bootstrap starts over. |
+| `Halted(reason)`, data-related reasons only | `Halted(reason)`. The slave does not contact its upstream until `clear_halt`. |
 ```
 
 with:
 
 ```
+| `ready` (or absent) | `Connecting` or `Streaming` |
 | `bootstrapping` | `Bootstrapping { .. }`. After a restart, the bootstrap starts over. |
+| `halted:<Reason>`, data-related reasons only | `Halted(reason)`. The slave does not contact its upstream until `clear_halt`. |
+```
+
+In PROTOCOL.md §10, replace:
+
+```
+| `CORRUPT` | `DATA_LOSS` | no | Stored data failed an integrity check. |
+```
+
+with:
+
+```
+| `CORRUPT` | `DATA_LOSS` | client: yes, with backoff | Stored data failed an integrity check on the server. The client's own data is intact, so it backs off and retries; the server's operator must repair it. |
+```
+
+In the PROTOCOL.md §11.2 table, after the row `` | `REJECT` / `NOT_READY` | Back off and retry the handshake. | `` add:
+
+```
+| A call or stream fails with `CORRUPT` (the server's stored data) | Back off and retry. The client's data is not affected. |
 ```
 
 In §16 `SlaveConfig`, replace:
@@ -4902,7 +5052,7 @@ and in `SlaveStatus`, after `pub last_error: Option<String>, …` add:
 - [ ] **Step 11: Commit**
 
 ```bash
-git add src DESIGN.md
+git add src DESIGN.md PROTOCOL.md
 git commit -m "feat: slave config, persisted states, policy table and crash-safe bootstrap store helpers
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -4921,7 +5071,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Produces:
   - Tail requests carry `SlaveConfig::fetch` (`min_batch_bytes`, `max_wait_ms`, `max_batch_bytes`); each `EntryBatch` is applied entry by entry, each its own atomic write; Tail decode limit `max(max_entry_bytes, fetch.max_batch_bytes) + 64 KiB`.
   - `pub struct Slave` with `async open(SlaveConfig) -> Result<Slave>`, `status() -> SlaveStatus`, `applied_seq() -> Seq`, `async wait_for_seq(seq, timeout) -> Result<()>` (`Err(Halted(r))`, `Err(Timeout)`), `watch_state() -> watch::Receiver<SlaveState>`, `snapshot() -> Result<ReadSnapshot>` (`Err(NotReady)` without data), `async shutdown(self) -> Result<()>`; `impl ReadApi for Slave` (all reads `Err(NotReady)` without data), `impl LogApi for Slave`.
-  - `slave::inner::Inner` with `pub store, pub cfg, pub state_tx, pub seq_tx, pub reset_tx, pub shutdown_tx, pub origin_last_seq, pub upstream_last_seq, pub max_entry_bytes, pub force_bootstrap, pub halt_cleared` and `new(Store, SlaveConfig, &MetaSnapshot)`, `policies()`, `ident()`, `set_ident(..)`, `is_ready()`, `now_ms()`, `state()`, `set_state(SlaveState)`, `halt(HaltReason)`, `reset_downstream()`, `upstream_chain()`, `note_upstream(&pb::HandshakeResponse)`, `note_positions(upstream, origin)`, `note_contact()`, `set_last_error(Option<String>)`, `notify(impl FnOnce(&dyn ReplicationListener))`, `status()`.
+  - `slave::inner::Inner` with `pub store, pub cfg, pub state_tx, pub seq_tx, pub reset_tx, pub shutdown_tx, pub origin_last_seq, pub upstream_last_seq, pub max_entry_bytes, pub force_bootstrap, pub halt_cleared` and `new(Store, SlaveConfig, &MetaSnapshot)`, `policies()`, `ident()`, `set_ident(..)`, `is_ready()`, `now_ms()`, `state()`, `set_state(SlaveState)`, `halt(HaltReason)` (a synced write: called through `background::blocking`), `reset_downstream()`, `upstream_chain()`, `note_upstream(&pb::HandshakeResponse) -> Option<u64>` (the changed `max_entry_bytes`, persisted by the driver on a blocking thread), `note_positions(upstream, origin)`, `note_contact()`, `set_last_error(Option<String>)`, `notify(impl FnOnce(&dyn ReplicationListener))`, `status()`.
   - `slave::client::{Client, connect(&SlaveConfig) -> Result<Client>}`; `slave::driver::{SessionEnd { Retry(String), Again, Halt(HaltReason) }, spawn(&Arc<Inner>) -> JoinHandle<()>, end_for, status_end}` (the driver holds `Weak<Inner>` while waiting; `Inner.halt_cleared` is an `Arc<Notify>` it shares); `slave::maintenance::spawn(&Arc<Inner>) -> JoinHandle<()>` (Weak, upgraded per tick); `slave::apply::{Applied, apply(&Arc<Inner>, LogEntry)}`; `slave::bootstrap::install(&Arc<Inner>, &Client, &pb::HandshakeResponse) -> Result<Vec<u8> /* lease */, SessionEnd>`.
   - Harness (`tests/support/mod.rs`): `Cluster { clock } (new, path, serve, master_config, master, restart_master, restart_master_after_backup, slave_config, slave)`, `wait_until`, `wait_state`, `Node`, `Dump`, `dump`, `assert_same`, `assert_converged`, `edge_cases`, `write_edge_cases`, `check_edge_cases`, `copy_dir`, `restore_dir`, `RecordingListener`, constants `T0`, `HEARTBEAT`, `WAIT`.
 
@@ -5352,8 +5502,8 @@ async fn status_and_wait_for_seq() {
     let m = c.master("a").await;
     m.create_cf(CfSpec::new("c")).unwrap();
     let (b, listener) = c.slave("b", m.serve_addr().unwrap()).await;
-    let mut states = b.watch_state();
-    states.wait_for(|s| *s == SlaveState::Streaming).await.unwrap();
+    wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
+    assert_eq!(*b.watch_state().borrow(), SlaveState::Streaming);
     m.put("c", b"k", b"v").unwrap();
     b.wait_for_seq(2, WAIT).await.unwrap();
     wait_until("heartbeat positions", || b.status().upstream_last_seq == 2).await;
@@ -5382,7 +5532,6 @@ async fn a_slave_without_data_is_not_ready_and_reports_the_connection_error() {
     wait_until("a connection error", || b.status().last_error.is_some()).await;
     assert_eq!(b.status().state, SlaveState::Connecting);
     assert!(dump(&b).is_empty());
-    wait_state(&b, "still connecting", |s| *s == SlaveState::Connecting).await;
 }
 
 /// With fetch batching on, entries arrive in batches but are still applied one entry per
@@ -5434,7 +5583,92 @@ async fn a_panicking_listener_is_disabled_and_replication_goes_on() {
 Run: `cargo test --test replication`
 Expected: FAIL to compile: `unresolved import replicated_rocksdb::Slave`.
 
-- [ ] **Step 4: Implement the slave's shared state**
+- [ ] **Step 4: Add the background helpers and the slave's shared state**
+
+Create `src/background.rs` (periodic ticks, logged maintenance runs, and the one place that turns a failed `spawn_blocking` into `Error::Io`):
+
+```rust
+//! Helpers for background and blocking work, shared by master and slave.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::time::{interval_at, Instant, Interval, MissedTickBehavior};
+
+use crate::error::{Error, Result};
+
+/// A tick every `period`, the first one after one period; missed ticks are delayed.
+pub(crate) fn every(period: Duration) -> Interval {
+    let mut t = interval_at(Instant::now() + period, period);
+    t.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    t
+}
+
+/// Runs one unit of maintenance on a blocking thread. Failures are logged, not returned.
+pub(crate) async fn run_logged<T: Send + Sync + 'static>(inner: Arc<T>, task: &'static str, f: fn(&T) -> Result<()>) {
+    match tokio::task::spawn_blocking(move || f(&inner)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(task, error = %e, "maintenance task failed"),
+        Err(e) => tracing::error!(task, error = %e, "maintenance task panicked"),
+    }
+}
+
+/// Runs `f` (RocksDB I/O, fsync) on a blocking thread, off the async workers.
+/// A panic in `f` becomes `Error::Io`.
+pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(format!("blocking task failed: {e}"))))?
+}
+```
+
+Add to `src/lib.rs`:
+
+```rust
+pub(crate) mod background;
+```
+
+Replace `src/master/maintenance.rs` with the same task using these helpers (behaviour unchanged):
+
+```rust
+//! Background work: retention, TTL reaping and physical CF drops.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::task::JoinHandle;
+
+use super::writer::Inner;
+use crate::background::{every, run_logged};
+use crate::error::Result;
+
+const CF_DROP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The task holds only a `Weak<Inner>`, upgraded for the duration of one tick, so dropping the
+/// `Master` releases the database (and its LOCK) without waiting for the task.
+pub(crate) fn spawn(inner: &Arc<Inner>) -> JoinHandle<()> {
+    let mut shutdown = inner.shutdown_tx.subscribe();
+    let (retention_every, reaper_every) = (inner.cfg.retention.check_interval, inner.cfg.reaper.interval);
+    let weak = Arc::downgrade(inner);
+    tokio::spawn(async move {
+        let mut retention = every(retention_every);
+        let mut reaper = every(reaper_every);
+        let mut cf_drops = every(CF_DROP_INTERVAL);
+        loop {
+            let (name, f): (&'static str, fn(&Inner) -> Result<()>) = tokio::select! {
+                _ = shutdown.changed() => break,
+                _ = retention.tick() => ("retention", |i| i.trim_changelog().map(drop)),
+                _ = reaper.tick() => ("reaper", |i| i.reap_round().map(drop)),
+                _ = cf_drops.tick() => ("cf-drop", |i| i.store.drop_unreferenced_cfs().map(drop)),
+            };
+            let Some(inner) = weak.upgrade() else { break };
+            run_logged(inner, name, f).await;
+        }
+    })
+}
+```
+
+`epoch_for` is now used by the slave: in `src/types.rs`, delete the line `#[allow(dead_code)] // used by the replication server (Plan 2)` above `pub(crate) fn epoch_for`.
 
 Create `src/slave/inner.rs`:
 
@@ -5557,7 +5791,8 @@ impl Inner {
         }
     }
 
-    /// Stops advancing. Data-related reasons are persisted first, so they survive restart.
+    /// Stops advancing. Data-related reasons are persisted first (a synced write: call it on a
+    /// blocking thread), so they survive restart.
     pub(crate) fn halt(&self, reason: HaltReason) {
         if reason.is_persisted() {
             let state = NodeState::Halted(reason).encode();
@@ -5584,18 +5819,16 @@ impl Inner {
         self.upstream_chain.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    /// Records what the upstream said about itself in a handshake.
-    pub(crate) fn note_upstream(&self, r: &crate::pb::HandshakeResponse) {
+    /// Records what the upstream said about itself in a handshake. Returns the upstream's
+    /// `max_entry_bytes` if it changed, for the caller to persist off the async thread.
+    pub(crate) fn note_upstream(&self, r: &crate::pb::HandshakeResponse) -> Option<u64> {
         let mut chain = vec![r.server_id.clone()];
         chain.extend(r.upstream_chain.iter().cloned());
         *self.upstream_chain.write().unwrap_or_else(PoisonError::into_inner) = chain;
         self.note_positions(r.last_seq, r.origin_last_seq);
-        if r.max_entry_bytes > 0 && self.max_entry_bytes.swap(r.max_entry_bytes, Ordering::SeqCst) != r.max_entry_bytes {
-            if let Err(e) = self.store.write_meta(&[(key::MAX_ENTRY_BYTES, &r.max_entry_bytes.to_be_bytes())], false) {
-                tracing::warn!(error = %e, "could not persist max_entry_bytes");
-            }
-        }
         self.note_contact();
+        let changed = r.max_entry_bytes > 0 && self.max_entry_bytes.swap(r.max_entry_bytes, Ordering::SeqCst) != r.max_entry_bytes;
+        changed.then_some(r.max_entry_bytes)
     }
 
     pub(crate) fn note_positions(&self, upstream_last_seq: Seq, origin_last_seq: Seq) {
@@ -5873,12 +6106,10 @@ use crate::pb::bootstrap_chunk::Kind;
 use crate::store::bootstrap::BootstrapFinish;
 use crate::types::{CfEntry, DbIdentity, EpochStart, Seq};
 
-/// Runs `f` on a blocking thread with the slave's state.
+/// Runs `f` with the slave's state on a blocking thread.
 async fn blocking<T: Send + 'static>(inner: &Arc<Inner>, f: impl FnOnce(&Inner) -> Result<T> + Send + 'static) -> Result<T> {
     let i = inner.clone();
-    tokio::task::spawn_blocking(move || f(&i))
-        .await
-        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?
+    crate::background::blocking(move || f(&i)).await
 }
 
 fn retry(msg: impl Into<String>) -> SessionEnd {
@@ -6087,11 +6318,13 @@ use super::config::BackoffState;
 use super::inner::Inner;
 use super::policy::{self, Action};
 use super::state::{HaltReason, SlaveState};
+use crate::background::blocking;
 use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 use crate::net::convert::{checked_history, entry_from_pb, identity_from_pb, identity_to_pb};
 use crate::net::DECODE_SLACK;
 use crate::pb;
 use crate::pb::tail_message::Kind;
+use crate::store::meta::key;
 
 /// How a session ended.
 #[derive(Debug)]
@@ -6161,7 +6394,12 @@ async fn run(weak: Weak<Inner>, mut shutdown: watch::Receiver<bool>, halt_cleare
         };
         let pause = match end {
             SessionEnd::Halt(reason) => {
-                inner.halt(reason);
+                let i = inner.clone();
+                let _ = blocking(move || {
+                    i.halt(reason);
+                    Ok(())
+                })
+                .await;
                 continue;
             }
             SessionEnd::Again => AGAIN_PAUSE,
@@ -6208,14 +6446,20 @@ async fn session(inner: &Arc<Inner>, client: &mut Option<Client>, backoff: &mut 
         Err(s) => return status_end(inner, &s),
     };
     if hs.decision() != pb::Decision::Reject {
-        inner.note_upstream(&hs);
+        if let Some(max) = inner.note_upstream(&hs) {
+            let i = inner.clone();
+            let persisted = blocking(move || i.store.write_meta(&[(key::MAX_ENTRY_BYTES, &max.to_be_bytes())], false));
+            if let Err(e) = persisted.await {
+                tracing::warn!(error = %e, "could not persist max_entry_bytes");
+            }
+        }
     } else {
         inner.note_contact();
     }
     let force = inner.force_bootstrap.load(Ordering::SeqCst);
     match policy::after_handshake(&hs, &inner.policies(), force) {
         Action::Tail => tail(inner, &c, &hs, None, backoff).await,
-        Action::AdoptEpochThenTail => match adopt_epoch(inner, &hs) {
+        Action::AdoptEpochThenTail => match adopt_epoch(inner, &hs).await {
             Ok(()) => tail(inner, &c, &hs, None, backoff).await,
             Err(end) => end,
         },
@@ -6231,14 +6475,15 @@ async fn session(inner: &Arc<Inner>, client: &mut Option<Client>, backoff: &mut 
 
 /// RESUME / EPOCH_ADVANCED: persist the new identity and history atomically, then tail.
 /// An invalid identity or history from the upstream halts the slave (`Corrupt`).
-fn adopt_epoch(inner: &Inner, hs: &pb::HandshakeResponse) -> Result<(), SessionEnd> {
+async fn adopt_epoch(inner: &Arc<Inner>, hs: &pb::HandshakeResponse) -> Result<(), SessionEnd> {
     let id = hs.identity.as_ref().ok_or(SessionEnd::Halt(HaltReason::Corrupt))?;
     let id = identity_from_pb(id).map_err(|_| SessionEnd::Halt(HaltReason::Corrupt))?;
     let history = checked_history(&id, &hs.epoch_history).map_err(|e| {
         tracing::error!(node = %inner.cfg.identifier, error = %e, "upstream sent an invalid epoch history");
         SessionEnd::Halt(HaltReason::Corrupt)
     })?;
-    inner.store.adopt_identity(&id, &history).map_err(|e| SessionEnd::Retry(e.to_string()))?;
+    let (i, h) = (inner.clone(), history.clone());
+    blocking(move || i.store.adopt_identity(&id, &h)).await.map_err(|e| SessionEnd::Retry(e.to_string()))?;
     tracing::info!(node = %inner.cfg.identifier, epoch = id.epoch, "adopted new epoch from upstream");
     inner.set_ident(Some((id, history)));
     inner.reset_downstream();
@@ -6319,9 +6564,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
-use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
 use super::inner::Inner;
+use crate::background::{every, run_logged};
 use crate::error::Result;
 
 const CF_DROP_INTERVAL: Duration = Duration::from_secs(5);
@@ -6333,11 +6578,6 @@ pub(crate) fn spawn(inner: &Arc<Inner>) -> JoinHandle<()> {
     let retention_every = inner.cfg.retention.check_interval;
     let weak = Arc::downgrade(inner);
     tokio::spawn(async move {
-        let every = |period: Duration| {
-            let mut t = interval_at(Instant::now() + period, period);
-            t.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            t
-        };
         let mut retention = every(retention_every);
         let mut cf_drops = every(CF_DROP_INTERVAL);
         loop {
@@ -6347,17 +6587,9 @@ pub(crate) fn spawn(inner: &Arc<Inner>) -> JoinHandle<()> {
                 _ = cf_drops.tick() => ("cf-drop", |i| i.store.drop_unreferenced_cfs().map(drop)),
             };
             let Some(inner) = weak.upgrade() else { break };
-            run(inner, name, f).await;
+            run_logged(inner, name, f).await;
         }
     })
-}
-
-async fn run(inner: Arc<Inner>, task: &'static str, f: fn(&Inner) -> Result<()>) {
-    match tokio::task::spawn_blocking(move || f(&inner)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(task, error = %e, "slave maintenance task failed"),
-        Err(e) => tracing::error!(task, error = %e, "slave maintenance task panicked"),
-    }
 }
 ```
 
@@ -6463,8 +6695,9 @@ impl Slave {
         if self.inner.is_ready() { Ok(()) } else { Err(Error::NotReady) }
     }
 
-    /// Stops replication and serving, and waits until the database is closed.
-    /// `Err(Timeout)` if something (for example a `ReadSnapshot`) still holds it after 10 s.
+    /// Stops replication and serving and waits until every task has released the slave
+    /// (`Err(Timeout)` after 10 s). It does not wait for `ReadSnapshot`s: each keeps the
+    /// database open until it is dropped.
     pub async fn shutdown(mut self) -> Result<()> {
         if let Some(server) = self.server.take() {
             server.shutdown().await;
@@ -6544,7 +6777,7 @@ Expected: PASS: `b64token_rules`, and 9 tests in `replication` (`slave_bootstrap
 Run: `cargo test`
 Expected: PASS (all unit and integration tests so far).
 
-- [ ] **Step 11: Update DESIGN.md §15**
+- [ ] **Step 11: Update DESIGN.md §6 and §15, and PROTOCOL.md §11.2**
 
 Replace:
 
@@ -6559,10 +6792,48 @@ with:
 - Called before the new seq is published to `wait_for_seq` and `subscribe`, so whoever waits for a seq also sees what the listener did with it.
 ```
 
+In DESIGN.md §6, replace the lines of the apply loop from:
+
+```
+  ops = decode + validate (PROTOCOL.md §5.2)           → Halted(Corrupt / SpecMismatch)
+```
+
+through:
+
+```
+  listener.on_entry(&entry)
+```
+
+with:
+
+```
+  ops = decode + validate (PROTOCOL.md §5.2)           → Halted(Corrupt / SpecMismatch)
+  wb = WriteBatch:
+         ops with envelopes (write_seq = entry.seq)
+         __changelog[seq] = entry (unchanged)
+         __meta.last_seq = seq, last_entry_crc = entry.crc32c
+  db.write(wb)          (sync = false by default)      failure → Halted(Corrupt), never retried in-process
+  if a verify capture is requested at this seq: take the snapshot now (§12)
+  listener.on_entry(&entry)
+  publish seq to wait_for_seq and downstream tail subscribers
+```
+
+and after the bullet that starts with `- **One entry is one WriteBatch, and an entry is never split.**` add:
+
+```
+- **Upstream epoch histories are validated** (in an `EPOCH_ADVANCED` handshake and in a bootstrap header): non-empty, first record `{1, 1}`, epochs strictly increasing, start seqs non-decreasing, last epoch equal to the identity's epoch. An invalid history halts the slave with `Corrupt`.
+```
+
+In the PROTOCOL.md §11.2 table, after the row that starts with `` | `RESUME` / `EPOCH_ADVANCED` | `` add:
+
+```
+| An epoch history (handshake or bootstrap header) that is empty, does not start with `{1, 1}`, has non-increasing epochs or decreasing start seqs, or does not end with the identity's epoch; or a local failure to apply or commit a received entry | Halt with `Corrupt` (persisted). The entry is never retried in the same process. |
+```
+
 - [ ] **Step 12: Commit**
 
 ```bash
-git add src tests DESIGN.md
+git add src tests DESIGN.md PROTOCOL.md
 git commit -m "feat: slave with bootstrap install, tail apply, read API and end-to-end tests
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -6838,9 +7109,8 @@ and add to `impl Slave`, before `pub fn snapshot`:
             return Err(Error::Config("the slave is not halted".into()));
         };
         let i = self.inner.clone();
-        tokio::task::spawn_blocking(move || i.store.write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true))
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))??;
+        crate::background::blocking(move || i.store.write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true))
+            .await?;
         if action == HaltAction::Rebootstrap {
             self.inner.force_bootstrap.store(true, Ordering::SeqCst);
         }
@@ -7116,18 +7386,11 @@ impl LogSource for Inner {
 }
 ```
 
-In `src/slave/mod.rs`, add `mod source;` to the module list; replace `use std::sync::Arc;` with:
+In `src/slave/mod.rs`, add `mod source;` to the module list and `use std::net::SocketAddr;` to the imports. In `Slave::open`, replace these lines (as Task 7 wrote them):
 
 ```rust
-use std::net::SocketAddr;
-use std::sync::{Arc, Weak};
-```
-
-and add `use crate::source::LogSource;`. In `Slave::open`, replace:
-
-```rust
-        let driver = tokio::spawn(driver::run(inner.clone()));
-        let maintenance = maintenance::spawn(inner.clone());
+        let driver = driver::spawn(&inner);
+        let maintenance = maintenance::spawn(&inner);
         Ok(Slave { inner, driver: Some(driver), maintenance: Some(maintenance), server: None })
     }
 ```
@@ -7135,13 +7398,7 @@ and add `use crate::source::LogSource;`. In `Slave::open`, replace:
 with:
 
 ```rust
-        let server = match inner.cfg.serve.clone() {
-            Some(serve) => {
-                let source: Weak<dyn LogSource> = Arc::downgrade(&inner) as Weak<dyn LogSource>;
-                Some(crate::server::start(source, serve).await?)
-            }
-            None => None,
-        };
+        let server = crate::server::start_for(&inner, inner.cfg.serve.clone()).await?;
         let driver = driver::spawn(&inner);
         let maintenance = maintenance::spawn(&inner);
         Ok(Slave { inner, driver: Some(driver), maintenance: Some(maintenance), server })
@@ -7187,7 +7444,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Modify: `src/store/mod.rs`, `src/slave/mod.rs`, `DESIGN.md` (§13.1)
 
 **Interfaces:**
-- Consumes: Plan 1 `ttl::index_key`, `Store::{ttl_due, handle, cfs}`, `Master::open`, `MasterConfig::validate`; Task 6 `Store::finish_bootstrap` (tests); Task 7 `Slave::shutdown`, `Inner::{state, is_ready, reset_downstream}`.
+- Consumes: Task 6 `Store::delete_all_keys`; Task 7 `background::blocking`; Plan 1 `ttl::index_key`, `Store::{ttl_due, handle, cfs}`, `Master::open`, `MasterConfig::validate`; Task 6 `Store::finish_bootstrap` (tests); Task 7 `Slave::shutdown`, `Inner::{state, is_ready, reset_downstream}`.
 - Produces: `Store::rebuild_ttl_index(&self) -> Result<u64>`, `Store::promote_to_master(&self) -> Result<DbIdentity>`, `Slave::promote(self, cfg: MasterConfig) -> Result<Master>` (async; `Err(Config)` naming the `ReadSnapshot` if one still holds the database after the slave shut down).
 
 - [ ] **Step 1: Write the failing tests**
@@ -7261,7 +7518,9 @@ mod support;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use replicated_rocksdb::{CfSpec, DivergencePolicy, EpochStart, Error, HaltReason, LogApi, Master, ReadApi, Slave, SlaveState};
+use replicated_rocksdb::{
+    CfSpec, DivergencePolicy, EpochStart, Error, HaltReason, LogApi, Master, Op, ReadApi, Slave, SlaveState,
+};
 use support::{assert_converged, check_edge_cases, wait_state, wait_until, write_edge_cases, Cluster};
 
 /// Reopens slave `name` (shut down by the caller) pointed at `upstream`.
@@ -7333,10 +7592,13 @@ async fn promotion_end_to_end() {
     // Writes on the new master replicate; the TTL written on A before promotion is reaped by B.
     b.put("c", b"after promotion", b"3").unwrap();
     c.clock.advance(Duration::from_secs(60));
+    let before_reap = b.last_seq();
     assert_eq!(b.reap_expired().unwrap().deleted, 1);
     write_edge_cases(&b, "edge");
     assert_converged(&b, &[("c", &cn), ("e", &e)]).await;
-    assert_eq!(cn.get("c", b"session").unwrap(), None);
+    // The new master's reaper Delete itself reached C through the log.
+    let reaped: Vec<Op> = cn.entries_since(before_reap).unwrap().flat_map(|e| e.unwrap().decode_ops().unwrap()).collect();
+    assert!(reaped.contains(&Op::Delete { cf: "c".into(), key: b"session".to_vec() }), "{reaped:?}");
     check_edge_cases(&cn, "edge");
     check_edge_cases(&e, "edge");
 
@@ -7447,11 +7709,8 @@ impl Store {
     /// entry per stored value that has an expiry. Returns how many entries were added.
     pub(crate) fn rebuild_ttl_index(&self) -> Result<u64> {
         let ttl = self.cf(CF_TTL_INDEX);
+        self.delete_all_keys(&ttl)?;
         let mut batch = WriteBatch::default();
-        for item in self.db().iterator_cf(&ttl, IteratorMode::Start) {
-            batch.delete_cf(&ttl, item?.0);
-        }
-        self.db().write(std::mem::take(&mut batch))?;
         let mut added = 0u64;
         let live: Vec<_> = self.cfs.read().values().cloned().collect();
         for phys in live {
@@ -7563,15 +7822,14 @@ impl Slave {
                     .into(),
             ));
         }
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::background::blocking(move || {
             let (store, _) = Store::open(&path, Role::Slave, tuning)?;
             let indexed = store.rebuild_ttl_index()?;
             let identity = store.promote_to_master()?;
             tracing::info!(epoch = identity.epoch, ttl_entries = indexed, "slave promoted to master");
             Ok(())
         })
-        .await
-        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))??;
+        .await?;
         Master::open(cfg).await
     }
 }
@@ -7582,7 +7840,7 @@ Add `mod promote;` to the module list in `src/slave/mod.rs`.
 - [ ] **Step 5: Run the end-to-end tests**
 
 Run: `cargo test --test promotion`
-Expected: PASS, 3 tests: `promotion_end_to_end`, `the_old_master_is_refused_with_stale_epoch_and_the_client_retries`, `promotion_is_refused_without_data_and_needs_released_snapshots`.
+Expected: PASS, 3 tests: `promotion_end_to_end` (including that the new master's reaper `Delete` reaches C through `entries_since`), `the_old_master_is_refused_with_stale_epoch_and_the_client_retries`, `promotion_is_refused_without_data_and_needs_released_snapshots` (`Error::Config` naming the open `ReadSnapshot`; the directory reopens as a slave afterwards).
 
 - [ ] **Step 6: Update DESIGN.md §13.1**
 
@@ -7799,7 +8057,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `tests/failure_resume.rs`, `tests/failpoints.rs`
-- Modify: `src/slave/mod.rs` (`kill`), `src/failpoint.rs` (`io_error`), `src/master/writer.rs` (failpoint in `bump_epoch`), `Cargo.toml` (`[[test]]`), `DESIGN.md` (§16)
+- Modify: `src/slave/mod.rs` (`kill`), `src/failpoint.rs` (`io_error`), `src/master/writer.rs` (failpoint in `bump_epoch`), `src/store/cfs.rs`, `src/store/mod.rs`, `src/codec/mod.rs` (unused Plan 1 placeholders), `Cargo.toml` (`[[test]]`), `DESIGN.md` (§16)
 
 **Interfaces:**
 - Consumes: Task 5 `failpoint::fire` points `server-tail-after-entry`; Task 7 points `slave-after-apply`, `slave-bootstrap-after-chunk`; Task 5 `ServerHandle::abort`, `await_sole_owner`; Plan 1 `Inner::bump_epoch` (fences the writer when its synced write fails); harness (`restart_master`, `restart_slave`, `copy_dir`, `restore_dir`).
@@ -7990,6 +8248,11 @@ async fn crash_mid_bootstrap_restarts_the_bootstrap() {
     let c = Cluster::new();
     let mut mcfg = c.master_config("a");
     mcfg.serve.as_mut().unwrap().limits.bootstrap_chunk_bytes = 64;
+    mcfg.retention.max_entries = Some(1);
+    mcfg.retention.check_interval = Duration::from_millis(20);
+    // The server may finish streaming before the slave is killed; its lease then holds the
+    // guard until it expires.
+    mcfg.serve.as_mut().unwrap().limits.bootstrap_lease_ttl = Duration::from_millis(500);
     let m = Master::open(mcfg).await.unwrap();
     m.create_cf(CfSpec::new("c")).unwrap();
     for i in 0..100u8 {
@@ -8004,6 +8267,12 @@ async fn crash_mid_bootstrap_restarts_the_bootstrap() {
     .await;
     b.kill().await.unwrap();
     fail::remove("slave-bootstrap-after-chunk");
+    // The abandoned bootstrap's guard is released (the job ends when the client is gone, or
+    // its unclaimed lease expires): retention runs past its S again.
+    for i in 0..3u8 {
+        m.put("c", &[b'x', i], b"v").unwrap();
+    }
+    wait_until("the abandoned guard is released", || m.first_retained_seq() == m.last_seq()).await;
 
     let (cfg, listener) = c.slave_config("b", m.serve_addr().unwrap());
     let b = Slave::open(cfg).await.unwrap();
@@ -8090,19 +8359,21 @@ async fn bootstrap_lease_survives_aggressive_retention() {
         m.put("c", &[i], &[i; 100]).unwrap();
     }
     let s = m.last_seq();
-    // The slave stalls for 1.5 s after its first chunk while the master writes on.
-    fail::cfg("slave-bootstrap-after-chunk", "1*sleep(1500)").unwrap();
+    // The slave pauses after its first chunk (until the point is removed) while the master
+    // writes on and retention runs.
+    fail::cfg("slave-bootstrap-after-chunk", "pause").unwrap();
     let (b, listener) = c.slave("b", m.serve_addr().unwrap()).await;
-    wait_until("bootstrap started", || matches!(b.status().state, SlaveState::Bootstrapping { records, .. } if records > 0)).await;
+    wait_until("bootstrap paused", || matches!(b.status().state, SlaveState::Bootstrapping { records, .. } if records > 0)).await;
     for i in 0..10u8 {
         m.put("c", &[b'x', i], b"v").unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(300)).await; // thirty retention rounds
+    wait_until("retention trims up to the bootstrap guard", || m.first_retained_seq() == s + 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await; // ten more retention rounds
     assert_eq!(m.first_retained_seq(), s + 1, "the bootstrap guard keeps S + 1");
+    fail::remove("slave-bootstrap-after-chunk"); // unpauses the slave
     assert_converged(&m, &[("b", &b)]).await;
     assert_eq!(listener.bootstraps(), 1, "tailed from S + 1 with the lease: no second bootstrap");
     wait_until("retention resumes after the lease", || m.first_retained_seq() == m.last_seq()).await;
-    fail::remove("slave-bootstrap-after-chunk");
     scenario.teardown();
 }
 
@@ -8205,9 +8476,19 @@ with:
 - [ ] **Step 6: Run the fault-injection tests**
 
 Run: `cargo test --features failpoints --test failpoints`
-Expected: PASS, 5 tests (run one at a time through the file-level mutex): `crash_mid_bootstrap_restarts_the_bootstrap`, `crash_after_apply_resumes_without_gap_or_duplicate`, `connection_drop_mid_tail_resumes`, `bootstrap_lease_survives_aggressive_retention`, `a_failed_epoch_bump_fences_the_master_writer`.
+Expected: PASS, 5 tests (run one at a time through the file-level mutex): `crash_mid_bootstrap_restarts_the_bootstrap` (also asserts the abandoned bootstrap's guard is released: retention passes its `S` again), `crash_after_apply_resumes_without_gap_or_duplicate`, `connection_drop_mid_tail_resumes`, `bootstrap_lease_survives_aggressive_retention` (the slave is held with the `pause` action — no sleeps as synchronisation, no blocked timing windows — and released with `fail::remove`), `a_failed_epoch_bump_fences_the_master_writer`.
 
-- [ ] **Step 7: Run everything, lint and document**
+- [ ] **Step 7: Remove Plan 1 placeholders Plan 2 does not use**
+
+These items were kept for Plan 2 behind `allow`s, but Plan 2 uses `cfs.pending.lock()`, `LogEntry::decode_ops()` and `LogSource::role()` instead. Delete them:
+- in `src/store/cfs.rs`: the methods `pending_entries` and `push_pending`, each with its `#[allow(dead_code)] // used by bootstrap (Plan 2)` line;
+- in `src/store/mod.rs`: the method `role(&self) -> Role` with its `#[allow(dead_code)] // used by the slave (later task)` line (the `role` field stays; `initialise_meta` uses it);
+- in `src/codec/mod.rs`: the lines `#[allow(unused_imports)] // used by the replication client (Plan 2)` and `pub(crate) use entry::decode_ops;`.
+
+Run: `grep -rn "Plan 2)" src`
+Expected: no output.
+
+- [ ] **Step 8: Run everything, lint and document**
 
 Run: `cargo test && cargo test --features failpoints`
 Expected: PASS: every unit, integration and doc test, with and without the feature.
@@ -8215,16 +8496,29 @@ Expected: PASS: every unit, integration and doc test, with and without the featu
 Run: `cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features failpoints -- -D warnings && cargo doc --no-deps`
 Expected: no warnings; docs build. Fix anything flagged (typically an import left unused by an earlier stage).
 
-- [ ] **Step 8: Update DESIGN.md §16**
+- [ ] **Step 9: Update DESIGN.md §16**
 
-In `impl Slave`, after `pub async fn shutdown(self) -> Result<()>;` add:
+In `impl Slave` (the block that ends `pub fn replicas(&self) -> Vec<ReplicaStatus>;` followed by `pub async fn shutdown(self) -> Result<()>;` — `impl Master` has a `shutdown` line too), replace:
 
 ```
+    pub fn replicas(&self) -> Vec<ReplicaStatus>;
+    pub async fn shutdown(self) -> Result<()>;
+}
+impl ReadApi for Slave {}  impl LogApi for Slave {}
+```
+
+with:
+
+```
+    pub fn replicas(&self) -> Vec<ReplicaStatus>;
+    pub async fn shutdown(self) -> Result<()>;
     #[cfg(feature = "failpoints")]
     pub async fn kill(self) -> Result<()>;   // test-only: abort every task, emulating a crash
+}
+impl ReadApi for Slave {}  impl LogApi for Slave {}
 ```
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add Cargo.toml src tests DESIGN.md
