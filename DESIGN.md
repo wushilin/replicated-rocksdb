@@ -352,28 +352,31 @@ After promotion:
 pub enum Method { Handshake, Tail, Bootstrap, Verify }
 
 pub struct PeerInfo {
-    pub peer_id: String,              // mTLS certificate subject if present, else x-rrdb-node-id
+    pub peer_id: String,              // mTLS certificate subject CommonName if present, else x-rrdb-node-id
     pub peer_id_verified: bool,       // true only when taken from a verified client certificate
     pub remote_addr: SocketAddr,
     pub client_cert: Option<Vec<u8>>,
 }
 
 #[async_trait]
-pub trait Authenticator: Send + Sync {
+pub trait Authenticator: Send + Sync + 'static {
     async fn authenticate(&self, peer: &PeerInfo, method: Method, token: Option<&[u8]>)
         -> Result<(), AuthError>;     // AuthError::{Unauthenticated, PermissionDenied}
+    /// True for token-based authenticators: refused on plaintext unless allow_plaintext_token.
+    fn uses_tokens(&self) -> bool { false }
 }
-pub trait CredentialsProvider: Send + Sync {
+pub trait CredentialsProvider: Send + Sync + 'static {
     fn token(&self) -> Option<Vec<u8>>;
 }
 ```
 
 Built-in implementations:
 - `TokenAuthenticator::new(Vec<secret>)` and `TokenCredentials::new(secret)`. The token is sent as `authorization: Bearer <token>` on **every** RPC (via a tonic interceptor), with no session state. Comparison is constant-time (`subtle`). Multiple secrets are accepted so they can be rotated. Tokens are never logged.
-- `AllowAll` (for tests) and `MtlsSubjectAllowList`.
+- `AllowAll` (for tests) and `MtlsSubjectAllowList` (verified client certificate whose subject CommonName is listed, per method).
+- `AllowMethods::new(inner, &[Method])` restricts any authenticator to some methods (`PERMISSION_DENIED` otherwise); `NoCredentials` sends no token.
 - **Token auth without TLS is refused** unless `allow_plaintext_token: true` is set.
 - `method` lets deployments allow `Bootstrap` and `Verify` only to some peers. Those calls expose the whole database.
-- The server limits the rate of failed authentications per remote address (default: 10/min, then `UNAUTHENTICATED` without checking the token).
+- The server limits the rate of failed authentications per remote address (`ServeLimits::max_auth_failures_per_minute`, default 10; then `UNAUTHENTICATED` without checking the token).
 
 ## 15. Listener
 
@@ -431,8 +434,9 @@ pub struct ServeConfig {
     pub authenticator: Arc<dyn Authenticator>,
     pub allow_plaintext_token: bool,
     pub limits: ServeLimits,   // { max_concurrent_bootstraps: 2, max_verify_sessions: 4,
-                               //   bootstrap_chunk_bytes: 1 MiB, bootstrap_lease_ttl: 15 min,
-                               //   verify_session_timeout: 5 min }
+                               //   bootstrap_chunk_bytes: 1 MiB (at most 16 MiB),
+                               //   bootstrap_lease_ttl: 15 min, verify_session_timeout: 5 min,
+                               //   max_auth_failures_per_minute: 10, max_tail_batch_bytes: 4 MiB }
 }
 
 // ---------------- Master ----------------
@@ -578,7 +582,7 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 
 - Every call carries `x-rrdb-protocol-version`, `x-rrdb-node-id` and, with token auth, `authorization`.
 - Failures carry a gRPC status plus `google.rpc.ErrorInfo { domain: "rrdb.replication.v1", reason }`.
-- The client sets the Tail decode limit to `max_entry_bytes + 64 KiB` from the handshake. Only the master enforces the size limit; downstream nodes accept what arrives.
+- The client sets the Tail decode limit to `max(max_entry_bytes, max_batch_bytes) + 64 KiB` (`max_entry_bytes` from the handshake) and the Bootstrap decode limit to `max(max_entry_bytes, 16 MiB) + 64 KiB`; servers keep `bootstrap_chunk_bytes` at most 16 MiB. Only the master enforces the size limit; downstream nodes accept what arrives.
 - A Tail stream with no message for `3 × heartbeat` is cancelled and reconnected.
 
 ## 18. Defaults

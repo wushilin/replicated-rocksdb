@@ -98,3 +98,163 @@ pub(crate) fn validate_identifier(id: &str) -> Result<()> {
         Err(Error::Config(format!("identifier {id:?} must be 1-128 characters of [A-Za-z0-9._-]")))
     }
 }
+
+// ---------------- Replication serving and TLS (Plan 2) ----------------
+
+/// PEM-encoded certificate chain and private key.
+#[derive(Clone)]
+pub struct TlsIdentity {
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+}
+
+impl std::fmt::Debug for TlsIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TlsIdentity(..)")
+    }
+}
+
+/// TLS for a replication server. With `client_ca_pem`, clients must present a certificate
+/// signed by that CA (mutual TLS); its subject CommonName becomes the peer id.
+#[derive(Clone, Debug)]
+pub struct TlsServerConfig {
+    pub identity: TlsIdentity,
+    pub client_ca_pem: Option<Vec<u8>>,
+}
+
+impl TlsServerConfig {
+    pub(crate) fn to_tonic(&self) -> tonic::transport::ServerTlsConfig {
+        use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+        let mut t = ServerTlsConfig::new()
+            .identity(Identity::from_pem(&self.identity.cert_pem, &self.identity.key_pem));
+        if let Some(ca) = &self.client_ca_pem {
+            t = t.client_ca_root(Certificate::from_pem(ca));
+        }
+        t
+    }
+}
+
+/// TLS for connecting to an upstream.
+#[derive(Clone, Debug)]
+pub struct TlsClientConfig {
+    /// PEM of the CA that signed the upstream's certificate.
+    pub ca_pem: Vec<u8>,
+    /// Name to verify the upstream certificate against; defaults to `UpstreamConfig::server`.
+    pub domain_name: Option<String>,
+    /// Client certificate for mutual TLS.
+    pub identity: Option<TlsIdentity>,
+}
+
+impl TlsClientConfig {
+    pub(crate) fn to_tonic(&self, default_domain: &str) -> tonic::transport::ClientTlsConfig {
+        use tonic::transport::{Certificate, ClientTlsConfig, Identity};
+        let mut t = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(&self.ca_pem))
+            .domain_name(self.domain_name.clone().unwrap_or_else(|| default_domain.to_string()));
+        if let Some(id) = &self.identity {
+            t = t.identity(Identity::from_pem(&id.cert_pem, &id.key_pem));
+        }
+        t
+    }
+}
+
+/// Server-side limits (PROTOCOL.md §12).
+#[derive(Clone, Debug)]
+pub struct ServeLimits {
+    pub max_concurrent_bootstraps: usize,
+    pub max_verify_sessions: usize,
+    /// Soft size of one `BootstrapRecords` message. At most [`MAX_BOOTSTRAP_CHUNK_BYTES`].
+    pub bootstrap_chunk_bytes: usize,
+    pub bootstrap_lease_ttl: Duration,
+    pub verify_session_timeout: Duration,
+    /// Failed authentications per remote address per minute before calls are refused unchecked.
+    pub max_auth_failures_per_minute: u32,
+    /// Cap on a Tail client's `max_batch_bytes` (PROTOCOL.md §7.5).
+    pub max_tail_batch_bytes: usize,
+}
+
+/// Upper bound for `bootstrap_chunk_bytes`; clients size their Bootstrap decode limit with it.
+pub const MAX_BOOTSTRAP_CHUNK_BYTES: usize = 16 << 20;
+
+impl Default for ServeLimits {
+    fn default() -> Self {
+        ServeLimits {
+            max_concurrent_bootstraps: 2,
+            max_verify_sessions: 4,
+            bootstrap_chunk_bytes: 1 << 20,
+            bootstrap_lease_ttl: Duration::from_secs(15 * 60),
+            verify_session_timeout: Duration::from_secs(5 * 60),
+            max_auth_failures_per_minute: 10,
+            max_tail_batch_bytes: 4 << 20,
+        }
+    }
+}
+
+/// Where and how a node serves replication to downstream replicas.
+#[derive(Clone)]
+pub struct ServeConfig {
+    pub bind: std::net::IpAddr,
+    /// 0 picks a free port; read it back with `serve_addr()`.
+    pub port: u16,
+    pub tls: Option<TlsServerConfig>,
+    pub authenticator: Arc<dyn crate::auth::Authenticator>,
+    /// Allows token authentication without TLS. Loopback and tests only.
+    pub allow_plaintext_token: bool,
+    pub limits: ServeLimits,
+}
+
+impl ServeConfig {
+    pub fn new(bind: std::net::IpAddr, port: u16, authenticator: Arc<dyn crate::auth::Authenticator>) -> Self {
+        ServeConfig { bind, port, tls: None, authenticator, allow_plaintext_token: false, limits: ServeLimits::default() }
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.tls.is_none() && self.authenticator.uses_tokens() && !self.allow_plaintext_token {
+            return Err(Error::Config(
+                "token authentication without TLS is refused; configure tls or set allow_plaintext_token".into(),
+            ));
+        }
+        let l = &self.limits;
+        if l.max_concurrent_bootstraps == 0
+            || l.max_verify_sessions == 0
+            || l.max_auth_failures_per_minute == 0
+            || l.max_tail_batch_bytes == 0
+        {
+            return Err(Error::Config("serve limits must be positive".into()));
+        }
+        if l.bootstrap_chunk_bytes == 0 || l.bootstrap_chunk_bytes > MAX_BOOTSTRAP_CHUNK_BYTES {
+            return Err(Error::Config(format!("bootstrap_chunk_bytes must be 1..={MAX_BOOTSTRAP_CHUNK_BYTES}")));
+        }
+        if l.bootstrap_lease_ttl.is_zero() || l.verify_session_timeout.is_zero() {
+            return Err(Error::Config("serve timeouts must be positive".into()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod serve_tests {
+    use super::*;
+    use crate::auth::{AllowAll, TokenAuthenticator};
+
+    #[test]
+    fn token_auth_on_plaintext_is_refused_unless_allowed() {
+        let localhost = std::net::IpAddr::from([127, 0, 0, 1]);
+        let mut cfg = ServeConfig::new(localhost, 0, Arc::new(TokenAuthenticator::new(["t"])));
+        assert!(matches!(cfg.validate(), Err(Error::Config(m)) if m.contains("without TLS")));
+        cfg.allow_plaintext_token = true;
+        cfg.validate().unwrap();
+        ServeConfig::new(localhost, 0, Arc::new(AllowAll)).validate().unwrap();
+    }
+
+    #[test]
+    fn limits_are_validated() {
+        let mut cfg = ServeConfig::new(std::net::IpAddr::from([127, 0, 0, 1]), 0, Arc::new(AllowAll));
+        cfg.limits.bootstrap_chunk_bytes = MAX_BOOTSTRAP_CHUNK_BYTES + 1;
+        assert!(cfg.validate().is_err());
+        cfg.limits.bootstrap_chunk_bytes = 1;
+        cfg.validate().unwrap();
+        cfg.limits.max_concurrent_bootstraps = 0;
+        assert!(cfg.validate().is_err());
+    }
+}

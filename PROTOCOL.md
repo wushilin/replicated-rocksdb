@@ -601,7 +601,7 @@ A failed bootstrap (bad footer, lost connection) also returns to `Connecting` th
 
 - If no `TailMessage` arrives for `3 × heartbeat_ms`, the client MUST cancel the stream and reconnect.
 - Reconnect backoff SHOULD be exponential with full jitter (RECOMMENDED: initial 100 ms, factor 2, maximum 30 s), reset after 60 s of successful streaming.
-- The client sets its maximum decode size for `Tail` to `max(max_entry_bytes, max_batch_bytes) + 64 KiB`, and for `Bootstrap` to `max(max_entry_bytes, bootstrap_chunk_bytes) + 64 KiB`.
+- The client sets its maximum decode size for `Tail` to `max(max_entry_bytes, max_batch_bytes) + 64 KiB`, and for `Bootstrap` to `max(max_entry_bytes, 16 MiB) + 64 KiB`. The client does not know the server's `bootstrap_chunk_bytes`, so servers MUST keep it at most 16 MiB.
 
 ## 12. Timing and limits
 
@@ -610,7 +610,7 @@ A failed bootstrap (bad footer, lost connection) also returns to `Connecting` th
 | `heartbeat_ms` | server, sent in handshake | 5 000 |
 | Client idle timeout | client | 3 × `heartbeat_ms` |
 | `max_entry_bytes` | master, sent down the chain | 16 MiB |
-| `bootstrap_chunk_bytes` | server | 1 MiB |
+| `bootstrap_chunk_bytes` | server | 1 MiB (at most 16 MiB) |
 | `min_batch_bytes` / `max_wait_ms` / `max_batch_bytes` (Tail) | client, per stream | 0 / 100 / 1 MiB |
 | `max_tail_batch_bytes` (cap on the client's `max_batch_bytes`) | server | 4 MiB |
 | `lease_ttl_ms` | server | 900 000 (15 min) |

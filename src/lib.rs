@@ -33,6 +33,7 @@ pub(crate) mod net;
 
 pub(crate) use proto::replication::v1 as pb;
 
+pub mod auth;
 pub mod clock;
 pub mod config;
 pub mod log;
@@ -55,7 +56,14 @@ pub use tuning::{CfKind, ComparatorRegistry, Compression, RocksTuning, Tunable};
 pub use read::{ReadApi, ReadSnapshot};
 pub use store::read::DbIter;
 
-pub use config::{MasterConfig, ReaperConfig, Retention};
+pub use auth::{
+    AllowAll, AllowMethods, AuthError, Authenticator, CredentialsProvider, Method, MtlsSubjectAllowList, NoCredentials,
+    PeerInfo, TokenAuthenticator, TokenCredentials,
+};
+pub use config::{
+    MasterConfig, ReaperConfig, Retention, ServeConfig, ServeLimits, TlsClientConfig, TlsIdentity, TlsServerConfig,
+    MAX_BOOTSTRAP_CHUNK_BYTES,
+};
 pub use log::{EntryIter, LogApi};
 pub use master::{Master, ReapStats};
 pub(crate) mod server;
