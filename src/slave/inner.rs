@@ -18,6 +18,28 @@ use crate::store::meta::{key, MetaSnapshot};
 use crate::store::Store;
 use crate::types::{DbIdentity, EpochStart, Seq};
 
+/// A requested bootstrap, tagged with the repoint generation it was requested for. A request
+/// of an older generation (a session of the previous upstream still winding down) is inert:
+/// only the consent given for the current upstream counts.
+#[derive(Default)]
+pub(crate) struct ForcedBootstrap(AtomicU64);
+
+impl ForcedBootstrap {
+    /// 0 means none, so generation `g` is stored as `g + 1`.
+    pub(crate) fn request(&self, generation: u64) {
+        self.0.store(generation + 1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_requested_for(&self, generation: u64) -> bool {
+        self.0.load(Ordering::SeqCst) == generation + 1
+    }
+
+    /// Clears the request of `generation` (a request of another generation stays).
+    pub(crate) fn clear(&self, generation: u64) {
+        let _ = self.0.compare_exchange(generation + 1, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
 pub(crate) struct Inner {
     pub store: Store,
     pub cfg: SlaveConfig,
@@ -35,8 +57,9 @@ pub(crate) struct Inner {
     pub max_entry_bytes: AtomicU64,
     last_contact: Mutex<Option<SystemTime>>,
     last_error: Mutex<Option<String>>,
-    /// Set by `clear_halt(Rebootstrap)` and by a gap seen mid-stream.
-    pub force_bootstrap: AtomicBool,
+    /// Set by `clear_halt(Rebootstrap)`, by a gap seen mid-stream, and by a `DIVERGED` answer
+    /// under a `Rebootstrap` policy. Scoped to the repoint generation that requested it.
+    pub force_bootstrap: ForcedBootstrap,
     /// Shared with the driver, which waits on it without holding the `Inner`.
     pub halt_cleared: Arc<Notify>,
     listener_failed: AtomicBool,
@@ -85,7 +108,7 @@ impl Inner {
             max_entry_bytes: AtomicU64::new(meta.max_entry_bytes.unwrap_or(0)),
             last_contact: Mutex::new(None),
             last_error: Mutex::new(None),
-            force_bootstrap: AtomicBool::new(false),
+            force_bootstrap: ForcedBootstrap::default(),
             halt_cleared: Arc::new(Notify::new()),
             listener_failed: AtomicBool::new(false),
             replicas: Arc::default(),
@@ -238,5 +261,29 @@ impl Inner {
             last_error: self.last_error.lock().unwrap_or_else(PoisonError::into_inner).clone(),
             listener_failed: self.listener_failed.load(Ordering::SeqCst),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ForcedBootstrap;
+
+    #[test]
+    fn a_forced_bootstrap_only_counts_for_the_generation_that_requested_it() {
+        let f = ForcedBootstrap::default();
+        assert!(!f.is_requested_for(0));
+        f.request(0);
+        assert!(f.is_requested_for(0));
+        // A repoint moved on to generation 1: the request is inert there.
+        assert!(!f.is_requested_for(1));
+        // A late request of the old generation does not turn into consent for the new one.
+        f.request(0);
+        assert!(!f.is_requested_for(1));
+        f.request(1);
+        assert!(f.is_requested_for(1) && !f.is_requested_for(0));
+        f.clear(0);
+        assert!(f.is_requested_for(1), "clearing another generation is a no-op");
+        f.clear(1);
+        assert!(!f.is_requested_for(1));
     }
 }

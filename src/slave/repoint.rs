@@ -127,12 +127,6 @@ pub(crate) fn divergence(local_epoch: u64, local_last: Seq, hs: &pb::HandshakeRe
     Error::Diverged { fork_seq, local_last_seq: local_last, divergent_entries: local_last + 1 - fork_seq.min(local_last + 1) }
 }
 
-/// `Error::Diverged` when only the local position is known (a Tail or Bootstrap stream ended
-/// `DIVERGED` after the handshake): the last entry differs, earlier ones may too.
-pub(crate) fn divergence_at(local_last: Seq) -> Error {
-    Error::Diverged { fork_seq: local_last, local_last_seq: local_last, divergent_entries: local_last.min(1) }
-}
-
 /// The error a repoint reports when `mode` halts on divergence: `diverged` for `Refuse`,
 /// `Unsupported` for `Repair`.
 pub(crate) fn mode_error(mode: RepointDivergence, diverged: impl FnOnce() -> Error) -> Error {
@@ -184,10 +178,6 @@ impl Slave {
             tracing::info!(node = %self.inner.cfg.identifier, upstream = %upstream.uri(), "repointing");
             self.inner.set_upstream(upstream);
             self.inner.clear_upstream_chain();
-            // Only this repoint's mode consents to discarding data: a leftover forced bootstrap
-            // (a gap, an earlier `Rebootstrap`) must not resolve the new upstream's divergence.
-            // A `clear_halt(Rebootstrap)` issued after this call still applies.
-            self.inner.force_bootstrap.store(false, Ordering::SeqCst);
             *self.inner.repoint_divergence.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(opts.on_divergence);
             let generation = *self.inner.repoint_tx.borrow() + 1;
             *pending = Some(PendingRepoint { generation, halt_error: None, reply });

@@ -15,7 +15,6 @@ mod source;
 mod state;
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -125,7 +124,7 @@ impl Slave {
         crate::background::blocking(move || i.store.write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true))
             .await?;
         if action == HaltAction::Rebootstrap {
-            self.inner.force_bootstrap.store(true, Ordering::SeqCst);
+            self.inner.force_bootstrap.request(*self.inner.repoint_tx.borrow());
         }
         tracing::info!(node = %self.inner.cfg.identifier, reason = reason.name(), ?action, "halt cleared");
         self.inner.set_last_error(None);

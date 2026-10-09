@@ -47,12 +47,12 @@ const AGAIN_PAUSE: Duration = Duration::from_millis(50);
 const STABLE_STREAMING: Duration = Duration::from_secs(60);
 
 /// Maps a policy action for a failed call to how the session ends.
-pub(crate) fn end_for(inner: &Inner, action: Action) -> SessionEnd {
+pub(crate) fn end_for(inner: &Inner, generation: u64, action: Action) -> SessionEnd {
     match action {
         Action::Halt(r) => SessionEnd::Halt(r),
         Action::Retry(m) => SessionEnd::Retry(m),
         Action::Bootstrap => {
-            inner.force_bootstrap.store(true, Ordering::SeqCst);
+            inner.force_bootstrap.request(generation);
             SessionEnd::Again
         }
         Action::Again | Action::Tail | Action::AdoptEpochThenTail => SessionEnd::Again,
@@ -75,17 +75,14 @@ pub(crate) fn status_end(inner: &Inner, generation: u64, s: &Status) -> SessionE
     // After a repoint, a Tail or Bootstrap ending with DIVERGED follows the repoint's mode.
     if crate::net::reason_of(s) == Some(pb::Reason::Diverged) {
         match inner.repoint_mode() {
-            Some(RepointDivergence::Rebootstrap { .. }) => return end_for(inner, Action::Bootstrap),
-            Some(mode @ (RepointDivergence::Refuse | RepointDivergence::Repair { .. })) => {
-                // A repoint still waiting for its first answer learns why the slave halts.
-                let last = inner.store.position().last_seq;
-                inner.fail_repoint_on_halt(generation, repoint::mode_error(mode, || repoint::divergence_at(last)));
-                return SessionEnd::Halt(HaltReason::Diverged);
-            }
+            Some(RepointDivergence::Rebootstrap { .. }) => return end_for(inner, generation, Action::Bootstrap),
+            // No handshake here to compute the fork from: handshake again, which answers
+            // `DIVERGED` under the same mode and halts with the exact `Error::Diverged`.
+            Some(RepointDivergence::Refuse | RepointDivergence::Repair { .. }) => return SessionEnd::Again,
             None => {}
         }
     }
-    end_for(inner, policy::after_status(s, &inner.policies()))
+    end_for(inner, generation, policy::after_status(s, &inner.policies()))
 }
 
 /// Starts the driver. It holds only a `Weak<Inner>` while it waits (halted, or backing off),
@@ -242,7 +239,7 @@ async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, 
     } else {
         inner.note_contact();
     }
-    let force = inner.force_bootstrap.load(Ordering::SeqCst);
+    let force = inner.force_bootstrap.is_requested_for(generation);
     let mut action = policy::after_handshake(&hs, &inner.policies(), force);
     // An explicit repoint never resolves divergence by the configured policy.
     if let Some(mode) = inner.repoint_mode() {
@@ -380,7 +377,7 @@ async fn tail(
                 }
                 // Each entry is its own atomic write, so a crash mid-batch leaves a clean boundary.
                 for e in batch.entries {
-                    match apply::apply(inner, entry_from_pb(e)).await {
+                    match apply::apply(inner, generation, entry_from_pb(e)).await {
                         Applied::Committed => {
                             if !cleared {
                                 inner.set_last_error(None);

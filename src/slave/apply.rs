@@ -23,7 +23,7 @@ enum Failure {
     Commit(Error),
 }
 
-pub(crate) async fn apply(inner: &Arc<Inner>, entry: LogEntry) -> Applied {
+pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) -> Applied {
     let seq = entry.seq;
     // 1. CRC
     if let Err(e) = entry.verify_crc() {
@@ -46,7 +46,7 @@ pub(crate) async fn apply(inner: &Arc<Inner>, entry: LogEntry) -> Applied {
         return Applied::End(match inner.cfg.on_log_gap {
             GapPolicy::Halt => SessionEnd::Halt(HaltReason::LogGap),
             GapPolicy::Rebootstrap => {
-                inner.force_bootstrap.store(true, Ordering::SeqCst);
+                inner.force_bootstrap.request(generation);
                 SessionEnd::Again
             }
         });

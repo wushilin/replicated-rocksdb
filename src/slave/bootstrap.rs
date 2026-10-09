@@ -93,7 +93,7 @@ pub(crate) async fn install(
     c: &Client,
     hs: &pb::HandshakeResponse,
 ) -> std::result::Result<Vec<u8>, SessionEnd> {
-    inner.force_bootstrap.store(false, Ordering::SeqCst);
+    inner.force_bootstrap.clear(generation);
     inner.set_ident(None);
     inner.reset_downstream();
     inner.seq_tx.send_replace(0);
