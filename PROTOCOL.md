@@ -301,7 +301,7 @@ The server evaluates these rules **in order** and applies the first that matches
 
 Notes:
 
-- **Rule 7.** The client follows a newer epoch than the server. The server is stale: typically an old master that came back after a replica was promoted. Following it would mix histories.
+- **Rule 7.** The client follows a newer epoch than the server. Following the server would mix histories. Either the server is a replica that has not yet learned the new epoch (temporary), or it is an old master that came back after a promotion (permanent). The client backs off and retries (§11.2).
 - **Rules 8–10, epoch continuity.** After an epoch bump or a promotion, a replica of an older epoch can keep its data if its history is a prefix of the server's. That holds when its last entry comes before the fork point and the server holds the same entry, proven by `crc32c`. Such a client continues without a bootstrap (`EPOCH_ADVANCED`). A client that has entries at or past the fork point holds writes the new history does not have (`DIVERGED`). When the needed entry has been trimmed, continuity cannot be proven and the client is treated as having a changed identity.
 - **Rule 11.** The master commits with fsync, so a replica can never be ahead of it legitimately. If one is, the master has lost history, typically because it was restored from a backup without an epoch bump. Accepting the replica would let the same seq carry different writes on different nodes.
 - **Rule 14 with a replica server.** When the server is a replica, a client can legitimately be ahead of it: the server may have crashed after forwarding entries it had not yet flushed. The answer is still `RESUME`, and the client's Tail waits until the server catches up (§7.3).
@@ -525,7 +525,7 @@ RPC failures use standard gRPC status codes. The status MUST carry a `google.rpc
 | `NOT_READY` | `UNAVAILABLE` | yes, with backoff | The server is bootstrapping itself. |
 | `IDENTITY_CHANGED` | `FAILED_PRECONDITION` | after a new handshake | The client's identity is not the server's. |
 | `DIVERGED` | `FAILED_PRECONDITION` | per divergence policy | The client's history disagrees with the server's. |
-| `STALE_EPOCH` | `FAILED_PRECONDITION` | no | The server is behind the client's epoch (e.g. a demoted master). |
+| `STALE_EPOCH` | `FAILED_PRECONDITION` | yes, with backoff | The server is behind the client's epoch: a replica that has not caught up yet, or a demoted master. |
 | `LOG_GAP` | `OUT_OF_RANGE` | after a new handshake | The requested entries are no longer retained. |
 | `LOOP_DETECTED` | `FAILED_PRECONDITION` | no | The client is upstream of the server. |
 | `BUSY` | `RESOURCE_EXHAUSTED` | yes, with backoff | Concurrency limit reached. |
@@ -557,7 +557,7 @@ A conforming client keeps, and updates atomically with every applied entry or co
 | `BOOTSTRAP` / `IDENTITY_CHANGED` | Identity policy *Refuse* (default) → halt `IdentityChanged`. *Rebootstrap* → bootstrap. |
 | `BOOTSTRAP` / `LOG_GAP` | Gap policy *Rebootstrap* (default) → bootstrap. *Halt* → halt `LogGap`. |
 | `REJECT` / `DIVERGED` | Divergence policy *Halt* (default) → halt `Diverged`. *Rebootstrap* → bootstrap. |
-| `REJECT` / `STALE_EPOCH` | Halt `StaleUpstream`. Not persisted: re-evaluated on restart, after the operator re-points the replica. |
+| `REJECT` / `STALE_EPOCH` | Back off and retry the handshake. An upstream replica may still be catching up; a demoted master never will, and the operator must re-point the replica. The client SHOULD surface the condition in its status. |
 | `REJECT` / `PROTOCOL_MISMATCH`, `ENVELOPE_MISMATCH`, `LOOP_DETECTED` | Halt with that reason. Not persisted: re-evaluated on restart. |
 | `REJECT` / `NOT_READY` | Back off and retry the handshake. |
 | A stream ends with a retryable error, or the connection is lost | Back off and handshake again. |

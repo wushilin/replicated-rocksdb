@@ -329,7 +329,7 @@ Normative messages: PROTOCOL.md §9.
 - **Policies on the slave:**
   - `on_identity_change: IdentityPolicy` — `Refuse` (default) halts with `IdentityChanged`; `Rebootstrap` bootstraps. Applies when `db_uuid` differs, or when continuity across an epoch change cannot be proven.
   - `on_divergence: DivergencePolicy` — `Halt` (default) halts with `Diverged`; `Rebootstrap` bootstraps. Applies to `DIVERGED`.
-  - `STALE_EPOCH` (the upstream is behind the slave's epoch, e.g. a demoted master) always halts with `StaleUpstream`. That halt is not persisted, so a restart after the operator re-points the slave retries.
+  - `STALE_EPOCH` (the upstream is behind the slave's epoch) is retried with backoff and reported in `SlaveStatus.last_error`. An upstream replica that has not yet learned the new epoch catches up; a demoted master never does, and the operator must re-point the slave.
 - **Restoring a master from a backup** must change its epoch before any replica connects. Open it with `MasterConfig { bump_epoch_on_open: true, .. }`. That bumps the epoch before the replication port opens. Slaves at or behind the restored seq with matching entries continue; slaves past it get `DIVERGED`. If the bump is forgotten, the backstop still applies: a slave ahead of the master, or one whose last entry has a different CRC, gets `DIVERGED` instead of silently diverging.
 - **`PROTOCOL_VERSION: u32` must match exactly** in the handshake, and on every RPC through the `x-rrdb-protocol-version` metadata. The crate version is not compared. Upgrade procedure: stop all nodes, upgrade, start. `envelope_version` must also match exactly.
 
@@ -345,7 +345,7 @@ Normative messages: PROTOCOL.md §9.
 
 After promotion:
 - Former siblings and downstream slaves re-pointed at the new master continue if they are at or behind its `last_seq` with matching entries. Those that received entries it never saw are `DIVERGED` and follow their divergence policy.
-- The old master can never rejoin as master. Replicas of the new epoch reject it (`STALE_EPOCH`). To reuse the machine, wipe its directory and start it as a new slave, which bootstraps.
+- The old master can never rejoin as master. Replicas of the new epoch refuse to follow it (`STALE_EPOCH`, retried and reported). To reuse the machine, wipe its directory and start it as a new slave, which bootstraps.
 ## 14. Auth and TLS
 
 ```rust
@@ -508,7 +508,7 @@ pub enum HaltReason {
     // Data-related: persisted, survive restart, cleared only by clear_halt.
     IdentityChanged, Diverged, LogGap, Corrupt, SpecMismatch,
     // Configuration-related: not persisted, re-evaluated on restart.
-    ProtocolMismatch, EnvelopeMismatch, AuthRejected, LoopDetected, StaleUpstream,
+    ProtocolMismatch, EnvelopeMismatch, AuthRejected, LoopDetected,
 }
 
 pub enum HaltAction { Retry, Rebootstrap }
@@ -524,6 +524,7 @@ pub struct SlaveStatus {
     pub upstream_chain: Vec<String>,
     pub last_contact: Option<SystemTime>,
     pub last_verify: Option<VerifyReport>,
+    pub last_error: Option<String>,          // last connection/handshake problem, e.g. STALE_EPOCH
 }
 
 impl Slave {
