@@ -80,6 +80,7 @@ message HandshakeRequest {
   optional Identity known_identity = 4;
   uint64 last_seq                  = 5;
   optional fixed32 last_crc32c     = 6;
+  optional uint64 known_epoch_start = 7;  // start_seq of known_identity.epoch in the client's history
 }
 
 message HandshakeResponse {
@@ -202,4 +203,5 @@ message StatusResponse {
   string   upstream                 = 9;   // empty on the master
   repeated ReplicaSummary replicas  = 10;
   optional fixed32 probe_crc        = 11;  // crc32c of the entry at probe_seq, if held
+  uint64   max_burned_epoch         = 12;  // highest epoch the node gave up by demoting; 0 = none
 }

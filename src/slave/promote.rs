@@ -26,14 +26,22 @@ impl Slave {
     /// last snapshot is dropped).
     ///
     /// Downstream streams end with `UPSTREAM_RESET`. The new master starts epoch
-    /// `1 + max(epoch history)` at `applied_seq() + 1` and rebuilds its TTL index, so values
-    /// written with a TTL before the promotion are reaped by it.
+    /// `1 + max(epoch history, max_burned_epoch)` at `applied_seq() + 1` and rebuilds its TTL
+    /// index, so values written with a TTL before the promotion are reaped by it.
+    ///
+    /// **Epoch numbers.** Plain `promote` asks no peer, so it only knows the epochs this node
+    /// has seen itself (its history, and any epoch it gave up with `Master::demote`). If another
+    /// node was promoted by mistake, demoted again, and replicas followed it in between, they
+    /// may hold the same epoch number this promotion picks. The handshake still tells the two
+    /// epochs apart by their start seq (PROTOCOL.md §6.3, `known_epoch_start`), so no history
+    /// is mixed, but [`promote_checked`](Self::promote_checked), which chooses an epoch above
+    /// every epoch its reachable peers report, is the safe path.
     pub async fn promote(self, cfg: MasterConfig) -> Result<Master> {
         if let Some(msg) = self.promote_refusal(&cfg) {
             self.shutdown().await?;
             return Err(Error::Config(msg));
         }
-        self.promote_now(cfg).await
+        self.promote_now(cfg, 0).await
     }
 
     /// Why `promote(cfg)` would be refused before it changes anything, if it would.
@@ -50,7 +58,8 @@ impl Slave {
     }
 
     /// The irreversible part of `promote`: from here on a failure loses the slave handle.
-    async fn promote_now(self, cfg: MasterConfig) -> Result<Master> {
+    /// The new epoch is above `epoch_floor` (the highest epoch the peers reported).
+    async fn promote_now(self, cfg: MasterConfig, epoch_floor: u64) -> Result<Master> {
         let path = cfg.path.clone();
         let tuning = cfg.rocksdb.clone();
         // Snapshots share the database handle; one that outlives the slave keeps the DB open.
@@ -66,7 +75,7 @@ impl Slave {
         crate::background::blocking(move || {
             let (store, _) = Store::open(&path, Role::Slave, tuning)?;
             let indexed = store.rebuild_ttl_index()?;
-            let identity = store.promote_to_master()?;
+            let identity = store.promote_to_master(epoch_floor)?;
             tracing::info!(epoch = identity.epoch, ttl_entries = indexed, "slave promoted to master");
             Ok(())
         })
@@ -87,6 +96,10 @@ pub struct PromotionCheck {
     /// Peers behind this slave whose history cannot be verified against it (`node_id`,
     /// `last_seq`): following it may discard entries they hold.
     pub unverifiable: Vec<(String, Seq)>,
+    /// The highest epoch number any reachable peer of this database reported (its identity,
+    /// every record of its history, and the epoch it burned by demoting). `promote_checked`
+    /// starts an epoch above it, so an epoch number is never reused.
+    pub max_peer_epoch: u64,
 }
 
 impl Slave {
@@ -141,6 +154,10 @@ impl Slave {
             if info.role == Role::Master {
                 return Err(Error::MasterReachable { peer: info.node_id });
             }
+            let same_db = info.identity.is_some_and(|id| me.identity.is_some_and(|mine| mine.db_uuid == id.db_uuid));
+            if same_db || info.identity.is_none() {
+                check.max_peer_epoch = check.max_peer_epoch.max(info.max_epoch_seen());
+            }
             if info.last_seq > 0 && info.last_seq < me.last_seq {
                 let crc = self.inner.store.entry_crc(info.last_seq)?;
                 me.probes.insert(info.last_seq, crc);
@@ -169,7 +186,9 @@ impl Slave {
     }
 
     /// [`check_promotion`](Self::check_promotion), then [`promote`](Self::promote), refusing
-    /// by default. **A refusal hands the slave back untouched and still running**
+    /// by default. The new epoch is above every epoch a reachable peer reports
+    /// ([`PromotionCheck::max_peer_epoch`]), so it never reuses the number of an undone
+    /// promotion that some replica followed. **A refusal hands the slave back untouched and still running**
     /// ([`PromoteRefused::into_slave`]): the checks of `promote` (bootstrapping, no data,
     /// halted `Corrupt`/`SpecMismatch`, wrong `cfg.path`, invalid `cfg`), a later reachable peer
     /// (`Error::NotMostAdvanced`), a peer at least as far whose history cannot be verified
@@ -190,7 +209,7 @@ impl Slave {
                 if !check.unreachable.is_empty() || !check.diverged.is_empty() || !check.foreign.is_empty() || !check.unverifiable.is_empty() {
                     tracing::warn!(?check, "promoting despite unreachable, diverged or foreign peers");
                 }
-                self.promote_now(cfg).await.map_err(|error| PromoteRefused { error, slave: None })
+                self.promote_now(cfg, check.max_peer_epoch).await.map_err(|error| PromoteRefused { error, slave: None })
             }
             Err(error) => Err(PromoteRefused { error, slave: Some(Box::new(self)) }),
         }

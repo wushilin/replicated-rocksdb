@@ -41,11 +41,16 @@ impl Store {
 
     /// One synced batch: role = master, a new epoch starting at `last_seq + 1`, `last_ts`
     /// from the entry at `last_seq` (0 if it is no longer retained), slave-only keys removed.
-    pub(crate) fn promote_to_master(&self) -> Result<DbIdentity> {
+    ///
+    /// The new epoch number is `1 + max(own history, own identity, max_burned_epoch, floor)`:
+    /// it never reuses a number this node gave up by demoting, nor one at or below `floor`
+    /// (the highest epoch the caller saw on its peers, 0 for none).
+    pub(crate) fn promote_to_master(&self, floor: u64) -> Result<DbIdentity> {
         let m = self.load_meta()?.ok_or_else(|| Error::corrupt("__meta is empty"))?;
         let old = m.identity.ok_or_else(|| Error::Config("this slave has no data to promote".into()))?;
         let mut history = m.epoch_history;
-        let epoch = history.iter().map(|e| e.epoch).max().unwrap_or(old.epoch).max(old.epoch) + 1;
+        let own = history.iter().map(|e| e.epoch).max().unwrap_or(old.epoch).max(old.epoch);
+        let epoch = own.max(m.max_burned_epoch).max(floor) + 1;
         history.push(EpochStart { epoch, start_seq: m.last_seq + 1 });
         let identity = DbIdentity { db_uuid: old.db_uuid, epoch };
         let last_ts = match self.db().get_cf(&self.cf(CF_CHANGELOG), m.last_seq.to_be_bytes())? {
@@ -69,9 +74,21 @@ impl Store {
 }
 
 impl Store {
+    /// `__meta.max_burned_epoch`: the highest epoch number this node gave up by demoting
+    /// (0 if none). Reported by `Status` so promotion tooling never reuses it.
+    pub(crate) fn max_burned_epoch(&self) -> Result<u64> {
+        match self.db().get_cf(&self.cf(CF_META), key::MAX_BURNED_EPOCH)? {
+            Some(v) => meta::be64(&v),
+            None => Ok(0),
+        }
+    }
+
     /// Undoes a promotion that has not taken writes (addendum §4): one synced batch sets
     /// role = slave and restores the identity and history from before the newest epoch,
-    /// whose record is removed. Refused (`Error::Config`, nothing written) if the newest epoch
+    /// whose record is removed. The removed epoch number is **burned**: it is kept in
+    /// `max_burned_epoch` (same batch), and a later promotion of this node never reuses it,
+    /// because replicas that followed the undone promotion may still hold it.
+    /// Refused (`Error::Config`, nothing written) if the newest epoch
     /// already has entries, or if there is no earlier epoch to return to.
     pub(crate) fn demote_to_slave(&self) -> Result<DbIdentity> {
         let m = self.load_meta()?.ok_or_else(|| Error::corrupt("__meta is empty"))?;
@@ -95,6 +112,7 @@ impl Store {
         batch.put_cf(&meta_cf, key::ORIGIN_IDENTITY, meta::encode_identity(&previous));
         batch.put_cf(&meta_cf, key::EPOCH_HISTORY, meta::encode_epoch_history(&history));
         batch.put_cf(&meta_cf, key::NODE_STATE, crate::store::bootstrap::NODE_READY);
+        batch.put_cf(&meta_cf, key::MAX_BURNED_EPOCH, m.max_burned_epoch.max(newest.epoch).to_be_bytes());
         batch.delete_cf(&meta_cf, key::LAST_TS);
         let mut wo = WriteOptions::default();
         wo.set_sync(true);
@@ -140,7 +158,7 @@ mod tests {
             let c = CfEntry { spec: CfSpec::new("c"), create_seq: 1 };
             assert!(due.iter().all(|e| e.cf_name == c.spec.name && e.create_seq == c.create_seq));
 
-            let promoted = store.promote_to_master().unwrap();
+            let promoted = store.promote_to_master(0).unwrap();
             assert_eq!(promoted, DbIdentity { db_uuid: id.db_uuid, epoch: 3 });
         }
         let (_, m) = Store::open(dir.path(), Role::Master, Default::default()).unwrap();
@@ -168,7 +186,7 @@ mod tests {
                 })
                 .unwrap();
             apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
-            store.promote_to_master().unwrap();
+            store.promote_to_master(0).unwrap();
         }
         {
             let store = Store::open(dir.path(), Role::Master, Default::default()).unwrap().0;
@@ -177,13 +195,42 @@ mod tests {
         let (store, m) = Store::open(dir.path(), Role::Slave, Default::default()).unwrap();
         assert_eq!(m.epoch_history, vec![EpochStart { epoch: 1, start_seq: 1 }]);
         assert_eq!(m.last_seq, 1);
+        assert_eq!(m.max_burned_epoch, 2, "the undone epoch number is burned");
         assert!(matches!(store.demote_to_slave(), Err(Error::Config(_))), "first epoch: nothing to undo");
+    }
+
+    /// Epoch numbers are never reused: a promotion after a demotion skips the burned number,
+    /// and a caller-supplied floor (the peers' highest epoch) is honoured too.
+    #[test]
+    fn a_burned_epoch_and_the_peer_floor_are_never_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path(), Role::Slave, Default::default()).unwrap().0;
+            let id = DbIdentity { db_uuid: uuid::Uuid::from_u128(5), epoch: 1 };
+            store
+                .finish_bootstrap(&BootstrapFinish {
+                    identity: id,
+                    epoch_history: vec![EpochStart { epoch: 1, start_seq: 1 }],
+                    cf_specs: vec![],
+                    snapshot_seq: 0,
+                    snapshot_crc: None,
+                    max_entry_bytes: 1 << 20,
+                })
+                .unwrap();
+            apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
+            assert_eq!(store.promote_to_master(0).unwrap().epoch, 2);
+            assert_eq!(store.demote_to_slave().unwrap().epoch, 1);
+            assert_eq!(store.promote_to_master(0).unwrap().epoch, 3, "epoch 2 is burned");
+            assert_eq!(store.demote_to_slave().unwrap().epoch, 1);
+            assert_eq!(store.load_meta().unwrap().unwrap().max_burned_epoch, 3);
+            assert_eq!(store.promote_to_master(7).unwrap().epoch, 8, "above every epoch a peer reported");
+        }
     }
 
     #[test]
     fn a_slave_without_data_cannot_be_promoted() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), Role::Slave, Default::default()).unwrap().0;
-        assert!(matches!(store.promote_to_master(), Err(Error::Config(_))));
+        assert!(matches!(store.promote_to_master(0), Err(Error::Config(_))));
     }
 }

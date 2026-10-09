@@ -378,7 +378,9 @@ async fn promote_checked_refuses_while_another_master_is_reachable() {
     let b = b_master.demote(b_cfg).await.unwrap();
     let b_peer = UpstreamConfig::from_addr(b.serve_addr().unwrap());
     let c_master = cn.promote_checked(c.master_config("c"), std::slice::from_ref(&b_peer)).await.unwrap();
-    assert_eq!(c_master.identity().epoch, 2);
+    // b burned epoch 2 by demoting (a replica may have followed it): c starts epoch 3.
+    assert_eq!(b.promotion_info().max_burned_epoch, 2);
+    assert_eq!(c_master.identity().epoch, 3);
 }
 
 /// A peer that is reachable but refuses `Status` (here: its authenticator excludes it) has an
@@ -462,4 +464,104 @@ async fn promotion_that_would_discard_entries_is_refused() {
     // The other way round nothing is discarded: reported, not blocking.
     let check = cn.check_promotion(std::slice::from_ref(&d_peer)).await.unwrap();
     assert_eq!(check.diverged, vec![("d".to_string(), fork)]);
+}
+
+// ---------------- Epoch numbers are never reused (C1) ----------------
+
+/// The setup of the epoch-reuse failure: A → {W, X, R}. W and X stop at `s_w`; R follows A to
+/// `s_r > s_w`; A is lost. W is promoted by mistake (epoch 2 from `s_w + 1`), X follows it
+/// (adopting that epoch), and W is demoted again: epoch 2 is burned, but X still holds it.
+/// Returns W (a slave again), X, R (a slave of the dead A), X's listener and `s_w`.
+async fn wrong_promotion_followed_then_undone(c: &Cluster) -> (Slave, Slave, Slave, std::sync::Arc<support::RecordingListener>, u64) {
+    let a = c.master("a").await;
+    let a_addr = a.serve_addr().unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (w, _) = c.slave("w", a_addr).await;
+    let (x, _) = c.slave("x", a_addr).await;
+    let (r, _) = c.slave("r", a_addr).await;
+    for (name, s) in [("w", &w), ("x", &x), ("r", &r)] {
+        wait_state(s, name, |st| *st == SlaveState::Streaming).await;
+    }
+    for i in 0..3u8 {
+        a.put("c", &[i], &[i]).unwrap();
+    }
+    assert_converged(&a, &[("w", &w), ("x", &x), ("r", &r)]).await;
+    let s_w = a.last_seq();
+    w.shutdown().await.unwrap();
+    x.shutdown().await.unwrap();
+    a.put("c", b"only r", b"1").unwrap();
+    a.put("c", b"only r too", b"2").unwrap();
+    assert_converged(&a, &[("r", &r)]).await;
+    a.shutdown().await.unwrap();
+
+    let (w, _) = reopen(c, "w", a_addr, |_| {}).await;
+    let w_master = w.promote(c.master_config("w")).await.unwrap();
+    assert_eq!(w_master.epoch_history().last(), Some(&EpochStart { epoch: 2, start_seq: s_w + 1 }));
+    let (x, lx) = reopen(c, "x", w_master.serve_addr().unwrap(), |_| {}).await;
+    wait_until("x adopts w's epoch", || x.status().origin_identity.is_some_and(|id| id.epoch == 2)).await;
+    let w = w_master.demote(c.slave_config("w", a_addr).0).await.unwrap();
+    assert_eq!(w.promotion_info().max_burned_epoch, 2, "the undone epoch is burned");
+    assert_eq!(x.promotion_info().epoch_history.last(), Some(&EpochStart { epoch: 2, start_seq: s_w + 1 }));
+    (w, x, r, lx, s_w)
+}
+
+/// `promote_checked` never reuses an epoch number a peer reports (here: W's burned epoch and
+/// X's history), so the sibling X that followed the undone promotion is told apart from the new
+/// master's epoch, continues without a loop, and loses nothing: it never held an entry of W's
+/// epoch, so continuity is proven (EPOCH_ADVANCED) and no bootstrap is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promote_checked_never_reuses_a_burned_epoch_and_the_sibling_converges() {
+    let c = Cluster::new();
+    let (w, x, r, lx, _) = wrong_promotion_followed_then_undone(&c).await;
+    let peers = [UpstreamConfig::from_addr(w.serve_addr().unwrap()), UpstreamConfig::from_addr(x.serve_addr().unwrap())];
+    let r = r.promote_checked(c.master_config("r"), &peers).await.unwrap();
+    assert!(r.identity().epoch > 2, "the new epoch {} reuses the burned epoch 2", r.identity().epoch);
+    assert_eq!(r.identity().epoch, 3);
+
+    let outcome = tokio::time::timeout(
+        support::WAIT,
+        x.repoint(UpstreamConfig::from_addr(r.serve_addr().unwrap()), replicated_rocksdb::RepointOptions::default()),
+    )
+    .await
+    .expect("repoint settles")
+    .unwrap();
+    assert_eq!(outcome, replicated_rocksdb::RepointOutcome::EpochAdvanced);
+    r.put("c", b"after", b"v").unwrap();
+    assert_converged(&r, &[("x", &x)]).await;
+    assert_eq!(x.promotion_info().epoch_history, r.epoch_history(), "x follows r's history");
+    assert_eq!(lx.bootstraps(), 0, "no bootstrap since x was reopened");
+    assert_eq!(x.status().last_error, None);
+    lx.assert_no_violations();
+    drop(w);
+}
+
+/// Plain `promote` asks no peer and picks epoch 2 again (from another seq). The handshake's
+/// `known_epoch_start` tells the two epochs 2 apart: X is not resumed into a history that
+/// contradicts its own (which looped every 50 ms before), it advances to R's epoch 2 and
+/// converges, or it would be refused DIVERGED had it held entries of W's epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_epoch_number_is_detected_by_its_start_seq() {
+    let c = Cluster::new();
+    let (w, x, r, lx, s_w) = wrong_promotion_followed_then_undone(&c).await;
+    let s_r = r.last_seq();
+    let r = r.promote(c.master_config("r")).await.unwrap();
+    assert_eq!(r.epoch_history().last(), Some(&EpochStart { epoch: 2, start_seq: s_r + 1 }), "same number, other start");
+    assert_ne!(s_r, s_w);
+
+    let outcome = tokio::time::timeout(
+        support::WAIT,
+        x.repoint(UpstreamConfig::from_addr(r.serve_addr().unwrap()), replicated_rocksdb::RepointOptions::default()),
+    )
+    .await
+    .expect("repoint settles")
+    .unwrap();
+    assert_eq!(outcome, replicated_rocksdb::RepointOutcome::EpochAdvanced);
+    r.put("c", b"after", b"v").unwrap();
+    assert_converged(&r, &[("x", &x)]).await;
+    assert_eq!(x.promotion_info().epoch_history, r.epoch_history());
+    assert_eq!(x.get("c", b"only r").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(lx.bootstraps(), 0, "no bootstrap since x was reopened: nothing lost");
+    assert_eq!(x.status().last_error, None);
+    lx.assert_no_violations();
+    drop(w);
 }

@@ -44,6 +44,10 @@ pub struct NodeInfo {
     /// entry there, `None` if it does not hold that entry. [`compare`] uses the longer node's
     /// probe at the shorter node's `last_seq`; [`gather`] and `Slave::check_promotion` fill it.
     pub probes: BTreeMap<Seq, Option<u32>>,
+    /// The highest epoch number this node started as a master and gave up with
+    /// `Master::demote` (0 if none). Replicas that followed that promotion may hold it, so a
+    /// promotion never reuses it (`Slave::promote_checked` chooses a higher epoch).
+    pub max_burned_epoch: u64,
 }
 
 /// One direct downstream replica, as reported by `Status`.
@@ -77,7 +81,15 @@ impl NodeInfo {
                 .map(|r| ReplicaSummary { node_id: r.node_id, applied_seq: r.applied_seq, in_sync: r.in_sync })
                 .collect(),
             probes: probe_seq.map(|seq| (seq, p.probe_crc)).into_iter().collect(),
+            max_burned_epoch: p.max_burned_epoch,
         })
+    }
+
+    /// The highest epoch number this node knows of: its identity, every history record, and
+    /// the epoch it burned by demoting. A new epoch must be above it.
+    pub fn max_epoch_seen(&self) -> u64 {
+        let history = self.epoch_history.iter().map(|e| e.epoch).max().unwrap_or(0);
+        history.max(self.identity.map_or(0, |id| id.epoch)).max(self.max_burned_epoch)
     }
 
     fn newest(&self) -> (u64, Seq) {
@@ -352,6 +364,7 @@ mod tests {
             upstream: None,
             replicas: vec![],
             probes: BTreeMap::new(),
+            max_burned_epoch: 0,
         }
     }
 

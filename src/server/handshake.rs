@@ -34,7 +34,7 @@ fn verdict(decision: pb::Decision, reason: pb::Reason, detail: impl Into<String>
     Verdict { decision, reason, detail: detail.into() }
 }
 
-/// Evaluates PROTOCOL.md §6.3 rules 1–14 in order; the first match wins.
+/// Evaluates PROTOCOL.md §6.3 rules 1–14 (with 10a/10b) in order; the first match wins.
 pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
     use pb::Decision::{Bootstrap, Reject, Resume};
     use pb::Reason as R;
@@ -71,9 +71,9 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
         let d = format!("client epoch {} is newer than server epoch {}", known.epoch, ident.epoch);
         return verdict(Reject, R::StaleEpoch, d);
     }
-    if known.epoch < ident.epoch {
-        // 8: the client holds entries at or past the fork point after its epoch.
-        match fork_after(&v.epoch_history, known.epoch) {
+    if let Some(cfork) = changed_epoch_fork(v, known.epoch, ident.epoch, r.known_epoch_start) {
+        // 8: the client holds entries at or past the point where its history leaves the server's.
+        match cfork {
             Some(fork) if r.last_seq >= fork => {
                 let d = format!("client last_seq {} is at or past fork point {fork} of epoch {}", r.last_seq, known.epoch);
                 return verdict(Reject, R::Diverged, d);
@@ -88,7 +88,11 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
         if client_crc_matches {
             return verdict(Resume, R::EpochAdvanced, format!("epoch {} -> {}", known.epoch, ident.epoch));
         }
-        // 10
+        // 10a: a proven mismatch below the fork.
+        if r.last_crc32c.is_some() && v.crc_at_client_last.is_some() {
+            return verdict(Reject, R::Diverged, format!("entry {} differs", r.last_seq));
+        }
+        // 10b
         return verdict(Bootstrap, R::IdentityChanged, "continuity across the epoch change cannot be proven");
     }
     // 11: nobody can be ahead of the fsyncing master.
@@ -107,6 +111,25 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
     }
     // 14
     verdict(Resume, R::Unspecified, "")
+}
+
+/// `Some(cfork)` when the client's epoch is *changed* (PROTOCOL.md §6.3): an older epoch number,
+/// or the same number with another start seq (`known_epoch_start`) than the server's record of
+/// it. `cfork` is where the client's history leaves the server's (`None`: inconsistent).
+/// `None` when the client follows the server's epoch.
+fn changed_epoch_fork(v: &ServerView, known_epoch: u64, server_epoch: u64, known_start: Option<Seq>) -> Option<Option<Seq>> {
+    let server_start = v.epoch_history.iter().find(|e| e.epoch == known_epoch).map(|e| e.start_seq);
+    // The client's epoch began at another seq than the server's epoch of the same number (or
+    // the server never had that epoch): the histories differ from the lower start on.
+    let start_fork = known_start.filter(|&k| server_start != Some(k)).map(|k| server_start.map_or(k, |s| s.min(k)));
+    if known_epoch == server_epoch && start_fork.is_none() {
+        return None;
+    }
+    let fork = match (fork_after(&v.epoch_history, known_epoch), start_fork) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    Some(fork)
 }
 
 #[cfg(test)]
@@ -147,7 +170,17 @@ mod tests {
             known_identity: Some(pb::Identity { db_uuid: uuid().as_bytes().to_vec(), epoch: 2 }),
             last_seq: 150,
             last_crc32c: Some(0xAAAA),
+            known_epoch_start: Some(101),
         }
+    }
+
+    /// `req()` at an older epoch: the client follows epoch 1 (start 1).
+    fn epoch_1(last_seq: Seq) -> pb::HandshakeRequest {
+        let mut r = req();
+        r.known_identity.as_mut().unwrap().epoch = 1;
+        r.known_epoch_start = Some(1);
+        r.last_seq = last_seq;
+        r
     }
 
     fn check(v: &ServerView, r: &pb::HandshakeRequest, decision: pb::Decision, reason: pb::Reason) {
@@ -220,29 +253,34 @@ mod tests {
 
     #[test]
     fn rule_08_diverged_at_or_past_fork() {
-        let mut r = req();
-        r.known_identity.as_mut().unwrap().epoch = 1;
-        r.last_seq = 101;
+        let r = epoch_1(101);
         check(&master(), &r, Reject, R::Diverged);
-        r.last_seq = 100;
+        // Without known_epoch_start (the field is optional) the fork is the same.
+        let mut r = epoch_1(101);
+        r.known_epoch_start = None;
+        check(&master(), &r, Reject, R::Diverged);
+    }
+
+    /// M1: below the fork, a CRC mismatch the server can prove is DIVERGED, not
+    /// IDENTITY_CHANGED (which would invite a bootstrap under a Rebootstrap identity policy).
+    #[test]
+    fn rule_10a_proven_mismatch_below_the_fork_is_diverged() {
+        let mut r = epoch_1(100);
         r.last_crc32c = Some(0xBBBB);
-        check(&master(), &r, Bootstrap, R::IdentityChanged);
+        check(&master(), &r, Reject, R::Diverged);
+        check(&replica(), &r, Reject, R::Diverged);
     }
 
     #[test]
     fn rule_09_epoch_advanced_when_crc_proves_continuity() {
-        let mut r = req();
-        r.known_identity.as_mut().unwrap().epoch = 1;
-        r.last_seq = 100;
+        let r = epoch_1(100);
         check(&master(), &r, Resume, R::EpochAdvanced);
         check(&replica(), &r, Resume, R::EpochAdvanced);
     }
 
     #[test]
-    fn rule_10_epoch_change_without_proof() {
-        let mut r = req();
-        r.known_identity.as_mut().unwrap().epoch = 1;
-        r.last_seq = 30;
+    fn rule_10b_epoch_change_without_proof() {
+        let mut r = epoch_1(30);
         r.last_crc32c = Some(0xAAAA);
         let mut v = master();
         v.crc_at_client_last = None; // entry 30 was trimmed
@@ -257,10 +295,56 @@ mod tests {
     fn rule_08_inconsistent_history_fails_closed() {
         let mut v = master();
         v.epoch_history = vec![EpochStart { epoch: 1, start_seq: 1 }];
-        let mut r = req();
-        r.known_identity.as_mut().unwrap().epoch = 1;
-        r.last_seq = 100;
+        let r = epoch_1(100);
         check(&v, &r, Reject, R::Diverged);
+    }
+
+    /// C1: the same epoch number started at another seq is another epoch. The server's epoch 2
+    /// starts at 101; the client's epoch 2 at 81 (a promotion that was undone) or at 121.
+    #[test]
+    fn same_epoch_number_with_another_start_is_an_epoch_change() {
+        // The client has nothing at or past min(81, 101) = 81, and the server holds its last
+        // entry with the same CRC: continuity is proven, the client adopts the server's epoch.
+        let mut r = req();
+        r.known_epoch_start = Some(81);
+        r.last_seq = 80;
+        check(&master(), &r, Resume, R::EpochAdvanced);
+        check(&replica(), &r, Resume, R::EpochAdvanced);
+        // Entries at or past the lower start: diverged, whichever side started first.
+        r.last_seq = 81;
+        check(&master(), &r, Reject, R::Diverged);
+        let mut r = req();
+        r.known_epoch_start = Some(121);
+        r.last_seq = 101;
+        check(&master(), &r, Reject, R::Diverged);
+        r.last_seq = 100;
+        check(&master(), &r, Resume, R::EpochAdvanced);
+        // Below the fork, a proven CRC mismatch is DIVERGED; no proof is IDENTITY_CHANGED.
+        r.last_crc32c = Some(0xBBBB);
+        check(&master(), &r, Reject, R::Diverged);
+        let mut v = master();
+        v.crc_at_client_last = None;
+        check(&v, &r, Bootstrap, R::IdentityChanged);
+        // The same start (or none sent) is the same epoch: plain resume.
+        check(&master(), &req(), Resume, R::Unspecified);
+        let mut r = req();
+        r.known_epoch_start = None;
+        check(&master(), &r, Resume, R::Unspecified);
+    }
+
+    /// An epoch the server never had (it skipped the number) forks at the client's start, even
+    /// when the server's next epoch starts later.
+    #[test]
+    fn an_epoch_the_server_never_had_forks_at_the_clients_start() {
+        let mut v = master();
+        v.identity = Some(DbIdentity { db_uuid: uuid(), epoch: 3 });
+        v.epoch_history = vec![EpochStart { epoch: 1, start_seq: 1 }, EpochStart { epoch: 3, start_seq: 101 }];
+        let mut r = req(); // epoch 2 from 81
+        r.known_epoch_start = Some(81);
+        r.last_seq = 90;
+        check(&v, &r, Reject, R::Diverged);
+        r.last_seq = 80;
+        check(&v, &r, Resume, R::EpochAdvanced);
     }
 
     #[test]

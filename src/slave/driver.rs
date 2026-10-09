@@ -213,6 +213,8 @@ fn handshake_request(inner: &Inner) -> pb::HandshakeRequest {
         known_identity: ident.as_ref().map(|(id, _)| identity_to_pb(id)),
         last_seq: if ident.is_some() { pos.last_seq } else { 0 },
         last_crc32c: if ident.is_some() { pos.last_entry_crc } else { None },
+        // Tells the server which promotion's epoch this is, not only its number (PROTOCOL §6.3).
+        known_epoch_start: ident.as_ref().and_then(|(id, h)| h.iter().find(|e| e.epoch == id.epoch).map(|e| e.start_seq)),
     }
 }
 

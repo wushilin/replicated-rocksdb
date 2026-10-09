@@ -26,6 +26,9 @@ pub(crate) mod key {
     pub const NODE_STATE: &[u8] = b"node_state";
     pub const MAX_ENTRY_BYTES: &[u8] = b"max_entry_bytes";
     pub const BOOTSTRAP_CFS: &[u8] = b"bootstrap_cfs";
+    /// The highest epoch number this node ever started and then gave up (`Master::demote`).
+    /// A later promotion of this node never reuses it.
+    pub const MAX_BURNED_EPOCH: &[u8] = b"max_burned_epoch";
 }
 
 pub(crate) fn be64(b: &[u8]) -> Result<u64> {
@@ -105,6 +108,8 @@ pub(crate) struct MetaSnapshot {
     pub max_entry_bytes: Option<u64>,
     /// Slave only: physical CFs created by a bootstrap that has not finished.
     pub bootstrap_cfs: Vec<CfEntry>,
+    /// The highest epoch number this node started and gave up by demoting; 0 if none.
+    pub max_burned_epoch: u64,
 }
 
 impl MetaSnapshot {
@@ -130,6 +135,7 @@ impl MetaSnapshot {
             node_state: get(key::NODE_STATE)?,
             max_entry_bytes: get(key::MAX_ENTRY_BYTES)?.map(|v| be64(&v)).transpose()?,
             bootstrap_cfs: get(key::BOOTSTRAP_CFS)?.map(|v| decode_cf_list(&v)).transpose()?.unwrap_or_default(),
+            max_burned_epoch: u64_or(key::MAX_BURNED_EPOCH, 0)?,
         }))
     }
 }

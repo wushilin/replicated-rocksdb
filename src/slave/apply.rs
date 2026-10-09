@@ -23,6 +23,17 @@ enum Failure {
     Commit(Error),
 }
 
+/// `last_error` when an upstream sends an entry whose epoch disagrees with the history the
+/// session started with.
+pub(crate) const EPOCH_CONTRADICTION: &str = "upstream sent an entry whose epoch contradicts the shared history";
+
+/// PROTOCOL.md §7.4 check 2: `Some(Retry)` (normal backoff, `last_error` set) when `entry.epoch`
+/// is not the epoch of `entry.seq` in `history`.
+fn epoch_mismatch(history: &[crate::types::EpochStart], entry: &LogEntry) -> Option<SessionEnd> {
+    (epoch_for(history, entry.seq) != Some(entry.epoch))
+        .then(|| SessionEnd::Retry(format!("{EPOCH_CONTRADICTION} (entry {} has epoch {})", entry.seq, entry.epoch)))
+}
+
 pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) -> Applied {
     let seq = entry.seq;
     // 1. CRC
@@ -30,11 +41,14 @@ pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) 
         tracing::error!(node = %inner.cfg.identifier, seq, error = %e, "received a corrupt entry");
         return Applied::End(SessionEnd::Halt(HaltReason::Corrupt));
     }
-    // 2. Epoch: the upstream's history changed; the next handshake brings it.
+    // 2. Epoch. A server ends its streams when its identity changes, and the handshake that
+    // started this session reconciled both histories (an equal identity, an adopted epoch, or a
+    // bootstrap). An entry whose epoch disagrees therefore contradicts the shared history: back
+    // off and handshake again, never loop at once (the upstream would send it again).
     let history = inner.ident().map(|(_, h)| h).unwrap_or_default();
-    if epoch_for(&history, seq) != Some(entry.epoch) {
-        tracing::info!(node = %inner.cfg.identifier, seq, epoch = entry.epoch, "entry epoch differs from local history; handshaking again");
-        return Applied::End(SessionEnd::Again);
+    if let Some(end) = epoch_mismatch(&history, &entry) {
+        tracing::warn!(node = %inner.cfg.identifier, seq, epoch = entry.epoch, "entry epoch contradicts the local history; retrying");
+        return Applied::End(end);
     }
     // 3, 4. Exactly once, no gaps.
     let last = inner.store.position().last_seq;
@@ -104,4 +118,28 @@ pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) 
     // Published after the listener, so whoever waits for this seq also sees its effects.
     inner.seq_tx.send_replace(seq);
     Applied::Committed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::EpochStart;
+
+    /// C1: an entry whose epoch contradicts the history the session started with ends the
+    /// session with a backed-off `Retry` and a `last_error`, never an immediate `Again` (which
+    /// looped every 50 ms against an upstream that sends the same entry again).
+    #[test]
+    fn an_epoch_contradiction_is_retried_with_backoff() {
+        let history = [EpochStart { epoch: 1, start_seq: 1 }, EpochStart { epoch: 2, start_seq: 11 }];
+        let entry = |seq, epoch| LogEntry::new(seq, epoch, 0, bytes::Bytes::new());
+        assert!(epoch_mismatch(&history, &entry(10, 1)).is_none());
+        assert!(epoch_mismatch(&history, &entry(11, 2)).is_none());
+        for (seq, epoch) in [(11, 1), (10, 2), (12, 3)] {
+            match epoch_mismatch(&history, &entry(seq, epoch)) {
+                Some(SessionEnd::Retry(m)) => assert!(m.starts_with(EPOCH_CONTRADICTION), "{m}"),
+                other => panic!("entry {seq}@{epoch}: expected Retry, got {other:?}"),
+            }
+        }
+        assert!(matches!(epoch_mismatch(&[], &entry(1, 1)), Some(SessionEnd::Retry(_))), "no history");
+    }
 }

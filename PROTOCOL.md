@@ -264,6 +264,7 @@ rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
 | `known_identity` | The origin identity the client has data for. Absent if the client has no data. |
 | `last_seq` | The client's `last_seq` (0 if it has no data). |
 | `last_crc32c` | The `crc32c` of the client's entry at `last_seq`, if known. Used to detect divergence. |
+| `known_epoch_start` | The `start_seq` of the record for `known_identity.epoch` in the client's epoch history. Absent if the client has no data. A client with data SHOULD send it: two histories can carry the same epoch *number* with different start seqs (two promotions that chose the same number), and only this field lets the server tell them apart (§6.3). |
 
 ### 6.2 Response
 
@@ -282,6 +283,11 @@ rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
 
 ### 6.3 Decision table
 
+Two derived values are used by rules 8–10:
+
+- The client's epoch is **changed** when `known_identity.epoch < identity.epoch`, or when `known_identity.epoch = identity.epoch`, `known_epoch_start` is present and differs from the `start_seq` of the server's record for that epoch. In the second case the two histories share the epoch number but not the epoch: the client follows another promotion that happened to choose the same number, and it is treated exactly like an older epoch.
+- The **client fork** `cfork` is `fork(known_identity.epoch)` in the server's history, lowered to `min(known_epoch_start, start_seq of the server's record for known_identity.epoch)` when `known_epoch_start` is present and the server has no record of that epoch with that `start_seq` (if the server has no record of the epoch at all, the server's side of the minimum is omitted). Entries before `cfork` are shared; entries at or after it may differ. `cfork` is "none" only when the epoch is changed and the server's history has no later epoch and no differing start, which is an inconsistent history.
+
 The server evaluates these rules **in order** and applies the first that matches:
 
 | # | Condition | `decision` | `reason` |
@@ -293,9 +299,10 @@ The server evaluates these rules **in order** and applies the first that matches
 | 5 | `known_identity` absent | `BOOTSTRAP` | `NO_LOCAL_STATE` |
 | 6 | `known_identity.db_uuid ≠ identity.db_uuid` | `BOOTSTRAP` | `IDENTITY_CHANGED` |
 | 7 | `known_identity.epoch > identity.epoch` | `REJECT` | `STALE_EPOCH` |
-| 8 | `known_identity.epoch < identity.epoch` and `last_seq ≥ fork(known_identity.epoch)` | `REJECT` | `DIVERGED` |
-| 9 | `known_identity.epoch < identity.epoch`, the server holds entry `last_seq`, and its `crc32c` equals `last_crc32c` | `RESUME` | `EPOCH_ADVANCED` |
-| 10 | `known_identity.epoch < identity.epoch` (continuity cannot be proven) | `BOOTSTRAP` | `IDENTITY_CHANGED` |
+| 8 | The client's epoch is changed and `last_seq ≥ cfork` (or `cfork` is none) | `REJECT` | `DIVERGED` |
+| 9 | The client's epoch is changed, the server holds entry `last_seq`, and its `crc32c` equals `last_crc32c` | `RESUME` | `EPOCH_ADVANCED` |
+| 10a | The client's epoch is changed, `last_crc32c` is present, the server holds entry `last_seq`, and its `crc32c` differs | `REJECT` | `DIVERGED` |
+| 10b | The client's epoch is changed (continuity cannot be proven: the entry is not held, or `last_crc32c` is absent) | `BOOTSTRAP` | `IDENTITY_CHANGED` |
 | 11 | `last_seq > server.last_seq` and the server is the master | `REJECT` | `DIVERGED` |
 | 12 | `last_crc32c` present, the server still holds entry `last_seq`, and its `crc32c` differs | `REJECT` | `DIVERGED` |
 | 13 | `last_seq + 1 < first_retained_seq` | `BOOTSTRAP` | `LOG_GAP` |
@@ -304,16 +311,17 @@ The server evaluates these rules **in order** and applies the first that matches
 Notes:
 
 - **Rule 7.** The client follows a newer epoch than the server. Following the server would mix histories. Either the server is a replica that has not yet learned the new epoch (temporary), or it is an old master that came back after a promotion (permanent). The client backs off and retries (§11.2).
-- **Rules 8–10, epoch continuity.** After an epoch bump or a promotion, a replica of an older epoch can keep its data if its history is a prefix of the server's. That holds when its last entry comes before the fork point and the server holds the same entry, proven by `crc32c`. Such a client continues without a bootstrap (`EPOCH_ADVANCED`). A client that has entries at or past the fork point holds writes the new history does not have (`DIVERGED`). When the needed entry has been trimmed, continuity cannot be proven and the client is treated as having a changed identity.
+- **Rules 8–10, epoch continuity.** After an epoch bump or a promotion, a replica of an older epoch can keep its data if its history is a prefix of the server's. That holds when its last entry comes before the fork point and the server holds the same entry, proven by `crc32c`. Such a client continues without a bootstrap (`EPOCH_ADVANCED`): it adopts the server's identity and history, which replaces its own record of a same-numbered epoch. A client that has entries at or past the fork point holds writes the new history does not have (`DIVERGED`), and so does a client whose last entry is held by the server with a different `crc32c` (rule 10a: the mismatch is proven). Only when the needed entry is not held (trimmed, or before the server's bootstrap) or the client sent no `last_crc32c` is continuity unprovable, and the client is treated as having a changed identity (rule 10b).
+- **Same epoch number, different start (`known_epoch_start`).** Epoch numbers are not globally coordinated: a promotion that was undone (`demote`) may have handed its number to replicas that followed it, and another node may later start the same number at another seq. Without `known_epoch_start` such a client would get a plain `RESUME` (equal identities) and then receive entries whose epoch contradicts its history. With it, the server sees that the epochs differ and applies rules 8–10 with the fork at the lower of the two start seqs. A server that receives no `known_epoch_start` compares identities only.
 - **Rule 11.** The master commits with fsync, so a replica can never be ahead of it legitimately. If one is, the master has lost history, typically because it was restored from a backup without an epoch bump. Accepting the replica would let the same seq carry different writes on different nodes.
 - **Rule 14 with a replica server.** When the server is a replica, a client can legitimately be ahead of it: the server may have crashed after forwarding entries it had not yet flushed. The answer is still `RESUME`, and the client's Tail waits until the server catches up (§7.3).
-- **Rules 9 and 12, and Tail's `prev_crc32c` check.** "The server holds entry `n`" includes the case where `n` is the server's own `last_seq` and the server knows that entry's `crc32c` from its own position, even if its log no longer contains the entry (right after the server bootstrapped, or after retention emptied its log).
+- **Rules 9, 10a and 12, and Tail's `prev_crc32c` check.** "The server holds entry `n`" includes the case where `n` is the server's own `last_seq` and the server knows that entry's `crc32c` from its own position, even if its log no longer contains the entry (right after the server bootstrapped, or after retention emptied its log).
 - `BOOTSTRAP` for `IDENTITY_CHANGED` or `LOG_GAP`, and `REJECT` for `DIVERGED`, are subject to the client's local policies (§11.2). The client may halt or bootstrap.
 - A server that is itself halted still answers normally. Its data is consistent but no longer advances.
 
 ### 6.4 Promotion (informative)
 
-A replica is promoted to master by an operator, after the old master has been stopped. The promoted node starts epoch `e' = 1 + (highest epoch in its history)`, appends `{e', last_seq + 1}` to its history, and begins accepting writes at `last_seq + 1`. Its identity keeps the same `db_uuid`.
+A replica is promoted to master by an operator, after the old master has been stopped. The promoted node starts epoch `e' = 1 + max(highest epoch in its history, highest epoch it gave up by demoting, highest epoch reported by the peers it checked)`, appends `{e', last_seq + 1}` to its history, and begins accepting writes at `last_seq + 1`. Its identity keeps the same `db_uuid`. An epoch number SHOULD never be reused: a node that undoes a promotion remembers the number it gave up (`max_burned_epoch`, reported by `Status`), and promotion tooling chooses a number above every epoch any reachable peer reports (identity, every history record and `max_burned_epoch`). A promotion that checks no peers can still choose a number that some unreachable replica already holds; `known_epoch_start` (§6.3) then detects the clash.
 
 Other replicas are then pointed at the new master, directly or through a chain. Under §6.3:
 
@@ -321,7 +329,7 @@ Other replicas are then pointed at the new master, directly or through a chain. 
 - Replicas that had received entries the promoted node never saw are at or past the fork point and get `DIVERGED` (rule 8). Their divergence policy decides whether they halt or bootstrap. When an operator explicitly re-points a replica, an implementation SHOULD NOT discard its divergent entries without an explicit confirmation.
 - The old master, if restarted and asked by a new-epoch replica, answers `STALE_EPOCH` (rule 7). It can rejoin only as a new replica with an empty directory.
 
-The protocol cannot stop an operator from running two masters at once. If two nodes both start the same epoch number with different histories, rule 12 detects the divergence wherever the conflicting entry is still retained.
+The protocol cannot stop an operator from running two masters at once. If two nodes both start the same epoch number at different seqs, `known_epoch_start` makes the handshake treat them as different epochs (§6.3); if they start it at the same seq, rule 12 detects the divergence wherever the conflicting entry is still retained.
 
 ### 6.5 Status
 
@@ -340,6 +348,7 @@ A read-only unary RPC for operators and promotion tooling. It is authenticated a
 | `node_state` | `"ready"`, `"bootstrapping"` or `"halted:<Reason>"`. |
 | `upstream` | The address the node replicates from; empty on the master. |
 | `replicas` | One `ReplicaSummary { node_id, applied_seq, in_sync }` per open Tail stream (§7.6). |
+| `max_burned_epoch` | The highest epoch number this node started as a master and then gave up by undoing the promotion (0 if none). Replicas that followed that promotion may hold the number, so a node being promoted SHOULD choose a higher one (§6.4). |
 | `probe_crc` | Present only if the request set `probe_seq`: the `crc32c` of the server's entry at `probe_seq`, if it holds it (its own `last_entry_crc` counts for `probe_seq = last_seq`, as in §6.3). Absent when the entry is not held (trimmed, before the server's bootstrap, or past its `last_seq`). |
 
 Comparing the `Status` of several replicas shows which one holds the most of the log (newest epoch, then highest `last_seq`) and which ones have diverged from it. Two nodes are compatible only if no seq both hold lies at or past a point where their epoch histories differ, **and** the longer node holds the shorter node's last entry with the same `crc32c` — which a tool learns by asking the longer node with `probe_seq` = the shorter node's `last_seq`. Only a proven CRC mismatch shows divergence; when the longer node no longer holds that entry (no `probe_crc`), compatibility is *unverifiable*, and tools SHOULD NOT treat such a node as safe to ignore. Nothing in the protocol acts on it automatically.
@@ -418,7 +427,7 @@ message Heartbeat   { uint64 upstream_last_seq = 1; uint64 origin_last_seq = 2; 
 For each `entry` of each batch, in order, the client MUST check, in order:
 
 1. `crc32c` (§5.1). Failure → `Corrupt`.
-2. `entry.epoch == epoch_for(entry.seq)` under the client's epoch history (§5.5). On failure the client ends the stream and handshakes again. The upstream's epoch changed, and the handshake brings the new history.
+2. `entry.epoch == epoch_for(entry.seq)` under the client's epoch history (§5.5). On failure the client ends the stream and handshakes again **after its reconnect backoff** (§11.4), surfacing the mismatch in its status. A server ends its streams when its own identity changes (`UPSTREAM_RESET`), and the handshake has already reconciled both histories, so such an entry contradicts the shared history; retrying at once would loop against a misbehaving upstream.
 3. If `entry.seq ≤ last_seq`, skip the entry. This happens only right after a reconnect.
 4. If `entry.seq ≠ last_seq + 1` → `LogGap`.
 5. Decode `ops` and check the rules in §5.2. Failure → `Corrupt`.
@@ -772,6 +781,7 @@ message HandshakeRequest {
   optional Identity known_identity = 4;
   uint64 last_seq                  = 5;
   optional fixed32 last_crc32c     = 6;
+  optional uint64 known_epoch_start = 7;  // start_seq of known_identity.epoch in the client's history
 }
 
 message HandshakeResponse {
@@ -894,6 +904,7 @@ message StatusResponse {
   string   upstream                 = 9;   // empty on the master
   repeated ReplicaSummary replicas  = 10;
   optional fixed32 probe_crc        = 11;  // crc32c of the entry at probe_seq, if held
+  uint64   max_burned_epoch         = 12;  // highest epoch the node gave up by demoting; 0 = none
 }
 ```
 

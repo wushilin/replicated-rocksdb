@@ -39,6 +39,8 @@ pub(crate) fn node_info(src: &dyn LogSource, replicas: &ReplicaRegistry, lag_max
         // `entry_crc` includes this node's own `last_entry_crc` at `last_seq`; a read error
         // reports the entry as not held.
         probes: probes.iter().map(|&seq| (seq, src.store().entry_crc(seq).ok().flatten())).collect(),
+        // A read error reports none; promotion tooling also reads every history record.
+        max_burned_epoch: src.store().max_burned_epoch().unwrap_or(0),
     }
 }
 
@@ -63,5 +65,6 @@ pub(crate) fn to_pb(i: &NodeInfo, probe_seq: Option<Seq>) -> pb::StatusResponse 
             .map(|r| pb::ReplicaSummary { node_id: r.node_id.clone(), applied_seq: r.applied_seq, in_sync: r.in_sync })
             .collect(),
         probe_crc: probe_seq.and_then(|seq| i.probes.get(&seq).copied().flatten()),
+        max_burned_epoch: i.max_burned_epoch,
     }
 }
