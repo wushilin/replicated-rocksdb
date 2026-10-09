@@ -394,7 +394,7 @@ mod tests {
         let m = store.load_meta().unwrap().unwrap();
         assert!(m.bootstrap_cfs.is_empty() && m.pending_drops.is_empty());
         // and a pending ghost (already in pending_drops) is dropped as a no-op
-        store.cfs.push_pending(PhysCf::new(CfEntry { spec: CfSpec::new("h"), create_seq: 5 }));
+        store.cfs.pending.lock().unwrap().push(PhysCf::new(CfEntry { spec: CfSpec::new("h"), create_seq: 5 }));
         assert_eq!(store.drop_unreferenced_cfs().unwrap(), 1);
     }
 

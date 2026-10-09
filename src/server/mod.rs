@@ -300,7 +300,7 @@ impl ServerHandle {
     }
 
     /// Stops immediately, without waiting for anything (emulates a crash).
-    #[allow(dead_code)] // used by the slave crash tests (Task 9)
+    #[cfg_attr(not(feature = "failpoints"), allow(dead_code))] // used by Slave::kill
     pub(crate) fn abort(mut self) {
         self.shutdown_tx.send_replace(true);
         self.state.leases().clear();

@@ -6,8 +6,6 @@ pub mod envelope;
 
 pub use entry::{entry_crc, validate_cf_name};
 pub(crate) use entry::{check_structure, encode_ops};
-#[allow(unused_imports)] // used by the replication client (Plan 2)
-pub(crate) use entry::decode_ops;
 
 /// Wire protocol version. Must match exactly between nodes.
 pub const PROTOCOL_VERSION: u32 = 1;

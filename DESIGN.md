@@ -645,6 +645,8 @@ impl Slave {
     pub fn snapshot(&self) -> Result<ReadSnapshot>;
     pub fn replicas(&self) -> Vec<ReplicaStatus>;
     pub async fn shutdown(self) -> Result<()>;
+    #[cfg(feature = "failpoints")]
+    pub async fn kill(self) -> Result<()>;   // test-only: abort every task, emulating a crash
 }
 impl ReadApi for Slave {}  impl LogApi for Slave {}
 // A Slave has no write methods. Writing to it is a compile error.

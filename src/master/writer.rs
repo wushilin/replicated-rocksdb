@@ -135,13 +135,16 @@ impl Inner {
         id.epoch = history.iter().map(|e| e.epoch).max().unwrap_or(id.epoch).max(id.epoch) + 1;
         let start = self.store.position().last_seq + 1;
         history.push(EpochStart { epoch: id.epoch, start_seq: start });
-        if let Err(e) = self.store.write_meta(
-            &[
-                (key::ORIGIN_IDENTITY, &meta::encode_identity(&id)),
-                (key::EPOCH_HISTORY, &meta::encode_epoch_history(&history)),
-            ],
-            true,
-        ) {
+        let written = crate::failpoint::io_error("master-bump-epoch-write").and_then(|()| {
+            self.store.write_meta(
+                &[
+                    (key::ORIGIN_IDENTITY, &meta::encode_identity(&id)),
+                    (key::EPOCH_HISTORY, &meta::encode_epoch_history(&history)),
+                ],
+                true,
+            )
+        });
+        if let Err(e) = written {
             w.fenced = true;
             tracing::error!(error = %e, "epoch bump failed; writer fenced until reopen");
             return Err(e);

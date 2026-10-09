@@ -170,6 +170,23 @@ impl Slave {
     }
 }
 
+#[cfg(feature = "failpoints")]
+impl Slave {
+    /// Test-only (feature `failpoints`): stops every task at once without any graceful step
+    /// and waits until the database is closed, emulating a process crash.
+    pub async fn kill(mut self) -> Result<()> {
+        self.inner.shutdown_tx.send_replace(true);
+        if let Some(server) = self.server.take() {
+            server.abort();
+        }
+        for task in [self.driver.take(), self.maintenance.take()].into_iter().flatten() {
+            task.abort();
+            let _ = task.await;
+        }
+        if await_sole_owner(&self.inner, Duration::from_secs(10)).await { Ok(()) } else { Err(Error::Timeout) }
+    }
+}
+
 impl Drop for Slave {
     fn drop(&mut self) {
         self.inner.shutdown_tx.send_replace(true);

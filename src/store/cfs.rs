@@ -57,11 +57,6 @@ impl CfRegistry {
     pub(crate) fn live_entries(&self) -> Vec<CfEntry> {
         self.read().values().map(|p| p.entry.clone()).collect()
     }
-
-    #[cfg(test)]
-    pub(crate) fn push_pending(&self, cf: Arc<PhysCf>) {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner).push(cf);
-    }
 }
 
 impl Store {

@@ -22,3 +22,8 @@ pub(crate) fn fire(name: &str) -> bool {
 pub(crate) fn fire(_name: &str) -> bool {
     false
 }
+
+/// `Err(Io)` when the named point fires: injects a storage failure.
+pub(crate) fn io_error(name: &str) -> crate::Result<()> {
+    if fire(name) { Err(crate::Error::Io(std::io::Error::other(format!("failpoint {name}")))) } else { Ok(()) }
+}
