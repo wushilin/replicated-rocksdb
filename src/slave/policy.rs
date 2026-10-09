@@ -38,7 +38,11 @@ fn diverged(p: &Policies) -> Action {
 }
 
 /// The action for a handshake answer. `force_bootstrap` is set by `clear_halt(Rebootstrap)`
-/// and by a gap seen mid-stream: any answer that lets the client proceed becomes a bootstrap.
+/// and by a gap seen mid-stream: any answer that lets the client proceed (RESUME, BOOTSTRAP,
+/// or REJECT/DIVERGED) becomes a bootstrap. A pending force therefore overrides
+/// `IdentityPolicy::Refuse` and `DivergencePolicy::Halt`; that is intended, because the
+/// operator asked for it through `clear_halt`. Rejections that retrying or reconfiguring
+/// cannot fix (protocol, envelope, loop, stale epoch, not ready) are not overridden.
 pub(crate) fn after_handshake(r: &pb::HandshakeResponse, p: &Policies, force_bootstrap: bool) -> Action {
     let decision = Decision::try_from(r.decision).unwrap_or(Decision::Unspecified);
     let reason = Reason::try_from(r.reason).unwrap_or(Reason::Unspecified);
@@ -47,26 +51,55 @@ pub(crate) fn after_handshake(r: &pb::HandshakeResponse, p: &Policies, force_boo
     if force_bootstrap && proceed {
         return Action::Bootstrap;
     }
-    match (decision, reason) {
-        (Decision::Resume, Reason::EpochAdvanced) => Action::AdoptEpochThenTail,
-        (Decision::Resume, _) => Action::Tail,
-        (Decision::Bootstrap, Reason::NoLocalState) => Action::Bootstrap,
-        (Decision::Bootstrap, Reason::IdentityChanged) => match p.identity {
-            IdentityPolicy::Refuse => Action::Halt(HaltReason::IdentityChanged),
-            IdentityPolicy::Rebootstrap => Action::Bootstrap,
+    let unexpected = || Action::Retry(format!("unexpected handshake answer {}/{}", decision.as_str_name(), reason.as_str_name()));
+    match decision {
+        // Any reason on RESUME is informational, except an advanced epoch.
+        Decision::Resume => match reason {
+            Reason::EpochAdvanced => Action::AdoptEpochThenTail,
+            _ => Action::Tail,
         },
-        (Decision::Bootstrap, Reason::LogGap) => match p.gap {
-            GapPolicy::Rebootstrap => Action::Bootstrap,
-            GapPolicy::Halt => Action::Halt(HaltReason::LogGap),
+        Decision::Bootstrap => match reason {
+            Reason::NoLocalState => Action::Bootstrap,
+            Reason::IdentityChanged => match p.identity {
+                IdentityPolicy::Refuse => Action::Halt(HaltReason::IdentityChanged),
+                IdentityPolicy::Rebootstrap => Action::Bootstrap,
+            },
+            Reason::LogGap => match p.gap {
+                GapPolicy::Rebootstrap => Action::Bootstrap,
+                GapPolicy::Halt => Action::Halt(HaltReason::LogGap),
+            },
+            Reason::Unspecified
+            | Reason::ProtocolMismatch
+            | Reason::EnvelopeMismatch
+            | Reason::NotReady
+            | Reason::LoopDetected
+            | Reason::Diverged
+            | Reason::Busy
+            | Reason::SessionNotFound
+            | Reason::UpstreamReset
+            | Reason::Corrupt
+            | Reason::ShuttingDown
+            | Reason::EpochAdvanced
+            | Reason::StaleEpoch => unexpected(),
         },
-        (Decision::Reject, Reason::Diverged) => diverged(p),
-        (Decision::Reject, Reason::StaleEpoch | Reason::NotReady) => {
-            Action::Retry(format!("{}: {}", reason.as_str_name(), r.detail))
-        }
-        (Decision::Reject, Reason::ProtocolMismatch) => Action::Halt(HaltReason::ProtocolMismatch),
-        (Decision::Reject, Reason::EnvelopeMismatch) => Action::Halt(HaltReason::EnvelopeMismatch),
-        (Decision::Reject, Reason::LoopDetected) => Action::Halt(HaltReason::LoopDetected),
-        (d, r) => Action::Retry(format!("unexpected handshake answer {}/{}", d.as_str_name(), r.as_str_name())),
+        Decision::Reject => match reason {
+            Reason::Diverged => diverged(p),
+            Reason::StaleEpoch | Reason::NotReady => Action::Retry(format!("{}: {}", reason.as_str_name(), r.detail)),
+            Reason::ProtocolMismatch => Action::Halt(HaltReason::ProtocolMismatch),
+            Reason::EnvelopeMismatch => Action::Halt(HaltReason::EnvelopeMismatch),
+            Reason::LoopDetected => Action::Halt(HaltReason::LoopDetected),
+            Reason::Unspecified
+            | Reason::NoLocalState
+            | Reason::IdentityChanged
+            | Reason::LogGap
+            | Reason::Busy
+            | Reason::SessionNotFound
+            | Reason::UpstreamReset
+            | Reason::Corrupt
+            | Reason::ShuttingDown
+            | Reason::EpochAdvanced => unexpected(),
+        },
+        Decision::Unspecified => unexpected(),
     }
 }
 
@@ -82,7 +115,18 @@ pub(crate) fn after_status(s: &Status, p: &Policies) -> Action {
         Some(Reason::Diverged) => diverged(p),
         // The next handshake decides (LOG_GAP and identity changes then follow policy).
         Some(Reason::LogGap | Reason::IdentityChanged | Reason::UpstreamReset) => Action::Again,
-        _ => Action::Retry(format!("{:?}: {}", s.code(), s.message())),
+        Some(
+            Reason::Unspecified
+            | Reason::NoLocalState
+            | Reason::NotReady
+            | Reason::Busy
+            | Reason::SessionNotFound
+            | Reason::Corrupt
+            | Reason::ShuttingDown
+            | Reason::EpochAdvanced
+            | Reason::StaleEpoch,
+        )
+        | None => Action::Retry(format!("{:?}: {}", s.code(), s.message())),
     }
 }
 

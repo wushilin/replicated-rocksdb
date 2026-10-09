@@ -6,7 +6,7 @@
 //! Every physical CF a bootstrap creates is first recorded in `__meta.bootstrap_cfs`
 //! (synced), so the next open knows its comparator and the next reset drops it.
 
-use std::sync::PoisonError;
+use std::sync::{Arc, PoisonError};
 
 use rocksdb::{AsColumnFamilyRef, IteratorMode, WriteBatch, WriteOptions};
 
@@ -48,19 +48,30 @@ impl Store {
     /// Discards all replicated state: live CFs and leftovers of an interrupted bootstrap
     /// become pending drops (physically dropped once no snapshot references them), the
     /// changelog and TTL index are cleared, and identity, history and position are removed.
-    /// Persists `node_state = bootstrapping` in the same synced batch.
+    /// Persists `node_state = bootstrapping` in the same synced batch. Disk is written first;
+    /// memory changes only after the write succeeded.
+    ///
+    /// A physical CF never gets a second `Arc<PhysCf>`: CFs taken over by a bootstrap go back
+    /// to `pending` with their original `Arc`, so reader references stay counted.
     pub(crate) fn reset_for_bootstrap(&self) -> Result<()> {
         let leftovers = self.stored_bootstrap_cfs()?;
         {
             let mut live = self.cfs.write();
             let mut pending = self.cfs.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut held = self.cfs.held.lock().unwrap_or_else(PoisonError::into_inner);
+            let known = |p: &Arc<PhysCf>, e: &CfEntry| p.physical == e.physical_name();
+            let mut new_pending: Vec<Arc<PhysCf>> = pending.clone();
+            new_pending.extend(held.iter().cloned());
             for e in leftovers {
-                if !pending.iter().any(|p| p.entry == e) && !live.values().any(|p| p.entry == e) {
-                    pending.push(PhysCf::new(e));
+                // Recorded but never created: nothing to drop.
+                let exists = self.db().cf_handle(&e.physical_name()).is_some();
+                let tracked = new_pending.iter().any(|p| known(p, &e)) || live.values().any(|p| known(p, &e));
+                if exists && !tracked {
+                    new_pending.push(PhysCf::new(e));
                 }
             }
-            pending.extend(std::mem::take(&mut *live).into_values());
-            let pending_list: Vec<CfEntry> = pending.iter().map(|p| p.entry.clone()).collect();
+            new_pending.extend(live.values().cloned());
+            let pending_list: Vec<CfEntry> = new_pending.iter().map(|p| p.entry.clone()).collect();
             let meta_cf = self.cf(CF_META);
             let mut batch = WriteBatch::default();
             batch.put_cf(&meta_cf, key::NODE_STATE, NODE_BOOTSTRAPPING);
@@ -73,6 +84,9 @@ impl Store {
             // Changelog keys are 8 bytes; [0xFF; 9] sorts after all of them.
             batch.delete_range_cf(&self.cf(CF_CHANGELOG), &[][..], &[0xFFu8; 9][..]);
             self.sync_write(batch)?;
+            live.clear();
+            held.clear();
+            *pending = new_pending;
             self.delete_all_keys(&self.cf(CF_TTL_INDEX))?;
             self.set_position(Position::default());
             self.set_first_retained_seq(1);
@@ -83,35 +97,47 @@ impl Store {
 
     /// Prepares the physical CF for one bootstrap CF. It is recorded in `bootstrap_cfs`
     /// before it is created. If a pending CF with the same physical name is still referenced
-    /// by a reader's snapshot, it is taken over and emptied (snapshots keep their view).
+    /// by a reader's snapshot, it is taken over (keeping its reference count) and emptied;
+    /// snapshots keep their view. If the spec differs, fails with the retriable
+    /// [`Error::CfInUse`]; the slave driver retries it with backoff and reports it in
+    /// `SlaveStatus::last_error`.
     pub(crate) fn begin_bootstrap_cf(&self, entry: &CfEntry) -> Result<()> {
         let physical = entry.physical_name();
         // Fails early with UnknownComparator, before anything is recorded.
         let options = self.tuning().cf_options(CfKind::User(&entry.spec))?;
         self.drop_unreferenced_cfs()?;
         let mut recorded = self.stored_bootstrap_cfs()?;
-        recorded.push(entry.clone());
+        if !recorded.contains(entry) {
+            recorded.push(entry.clone());
+        }
         let reused = {
             let mut pending = self.cfs.pending.lock().unwrap_or_else(PoisonError::into_inner);
-            let taken = match pending.iter().position(|p| p.physical == physical) {
-                Some(i) if pending[i].entry != *entry => {
-                    return Err(Error::Config(format!(
-                        "column family {physical} is still referenced by an open snapshot with a different spec; \
-                         release it and the bootstrap will be retried"
-                    )));
+            let mut held = self.cfs.held.lock().unwrap_or_else(PoisonError::into_inner);
+            let index = pending.iter().position(|p| p.physical == physical);
+            if let Some(i) = index {
+                if pending[i].entry != *entry {
+                    return Err(Error::CfInUse { physical });
                 }
-                Some(i) => Some(pending.swap_remove(i)),
-                None => None,
-            };
-            let pending_list: Vec<CfEntry> = pending.iter().map(|p| p.entry.clone()).collect();
+            }
+            let pending_list: Vec<CfEntry> = pending
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| Some(*i) != index)
+                .map(|(_, p)| p.entry.clone())
+                .collect();
             let meta_cf = self.cf(CF_META);
             let mut batch = WriteBatch::default();
             batch.put_cf(&meta_cf, key::BOOTSTRAP_CFS, meta::encode_cf_list(&recorded));
             batch.put_cf(&meta_cf, key::PENDING_CF_DROPS, meta::encode_cf_list(&pending_list));
             self.sync_write(batch)?;
-            taken
+            let taken = index.map(|i| pending.swap_remove(i));
+            let reused = taken.is_some() || held.iter().any(|p| p.physical == physical);
+            if let Some(cf) = taken {
+                held.push(cf);
+            }
+            reused
         };
-        if reused.is_some() || self.db().cf_handle(&physical).is_some() {
+        if reused || self.db().cf_handle(&physical).is_some() {
             self.clear_physical_cf(&physical)
         } else {
             self.db().create_cf(&physical, &options)?;
@@ -159,14 +185,31 @@ impl Store {
         Ok(self.db().write(batch)?)
     }
 
-    /// Commits a completed bootstrap in one synced batch and makes it live.
+    /// Commits a completed bootstrap in one synced batch and makes it live. CFs taken over
+    /// from a snapshot-held pending drop keep their original `Arc`.
     pub(crate) fn finish_bootstrap(&self, f: &BootstrapFinish) -> Result<()> {
         let mut live = self.cfs.write();
+        let mut pending = self.cfs.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.cfs.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut new_live = std::collections::BTreeMap::new();
+        let mut unused = held.clone();
+        for e in &f.cf_specs {
+            let cf = match unused.iter().position(|p| p.entry == *e) {
+                Some(i) => unused.swap_remove(i),
+                None => PhysCf::new(e.clone()),
+            };
+            new_live.insert(e.spec.name.clone(), cf);
+        }
+        // Taken-over CFs the final spec does not use go back to the pending drops.
+        let mut new_pending = pending.clone();
+        new_pending.extend(unused);
+        let pending_list: Vec<CfEntry> = new_pending.iter().map(|p| p.entry.clone()).collect();
         let meta_cf = self.cf(CF_META);
         let mut batch = WriteBatch::default();
         batch.put_cf(&meta_cf, key::ORIGIN_IDENTITY, meta::encode_identity(&f.identity));
         batch.put_cf(&meta_cf, key::EPOCH_HISTORY, meta::encode_epoch_history(&f.epoch_history));
         batch.put_cf(&meta_cf, key::CF_SPECS, meta::encode_cf_list(&f.cf_specs));
+        batch.put_cf(&meta_cf, key::PENDING_CF_DROPS, meta::encode_cf_list(&pending_list));
         batch.put_cf(&meta_cf, key::LAST_SEQ, f.snapshot_seq.to_be_bytes());
         match f.snapshot_crc {
             Some(crc) => batch.put_cf(&meta_cf, key::LAST_ENTRY_CRC, crc.to_be_bytes()),
@@ -176,8 +219,10 @@ impl Store {
         batch.put_cf(&meta_cf, key::NODE_STATE, NODE_READY);
         batch.delete_cf(&meta_cf, key::BOOTSTRAP_CFS);
         self.sync_write(batch)?;
-        *live = f.cf_specs.iter().map(|e| (e.spec.name.clone(), PhysCf::new(e.clone()))).collect();
-        drop(live);
+        *live = new_live;
+        *pending = new_pending;
+        held.clear();
+        drop((live, pending, held));
         self.set_position(Position { last_seq: f.snapshot_seq, last_entry_crc: f.snapshot_crc });
         self.set_first_retained_seq(f.snapshot_seq + 1);
         Ok(())
@@ -200,6 +245,7 @@ mod tests {
     use super::*;
     use crate::codec::envelope;
     use crate::read::ReadApi;
+    use crate::store::cfs::PhysCf;
     use crate::store::test_support::apply;
     use crate::types::{CfSpec, Op, Role};
 
@@ -318,6 +364,74 @@ mod tests {
         drop(snap);
         assert_eq!(store.drop_unreferenced_cfs().unwrap(), 0, "the live CF is no longer pending");
         assert!(store.load_meta().unwrap().unwrap().pending_drops.is_empty());
+    }
+
+    #[test]
+    fn a_recorded_but_never_created_cf_does_not_block_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghost = CfEntry { spec: CfSpec::new("g"), create_seq: 3 };
+        {
+            let store = slave_store(dir.path());
+            store.reset_for_bootstrap().unwrap();
+            store.write_meta(&[(crate::store::meta::key::BOOTSTRAP_CFS, &crate::store::meta::encode_cf_list(std::slice::from_ref(&ghost)))], true).unwrap();
+        }
+        let (store, m) = Store::open(dir.path(), Role::Slave, Default::default()).unwrap();
+        assert_eq!(m.bootstrap_cfs, vec![ghost]);
+        store.reset_for_bootstrap().unwrap();
+        let m = store.load_meta().unwrap().unwrap();
+        assert!(m.bootstrap_cfs.is_empty() && m.pending_drops.is_empty());
+        // and a pending ghost (already in pending_drops) is dropped as a no-op
+        store.cfs.push_pending(PhysCf::new(CfEntry { spec: CfSpec::new("h"), create_seq: 5 }));
+        assert_eq!(store.drop_unreferenced_cfs().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_taken_over_cf_keeps_protecting_the_snapshot_after_finish_and_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = slave_store(dir.path());
+        apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
+        apply(&store, vec![put("c", b"old", b"1")]).unwrap();
+        let snap = store.read_snapshot(0).unwrap();
+        store.reset_for_bootstrap().unwrap();
+        let c = CfEntry { spec: CfSpec::new("c"), create_seq: 1 };
+        store.begin_bootstrap_cf(&c).unwrap();
+        store.finish_bootstrap(&finish(vec![c], 1)).unwrap();
+        apply(&store, vec![Op::DropCf { name: "c".into() }]).unwrap();
+        assert_eq!(store.drop_unreferenced_cfs().unwrap(), 0, "the snapshot still references it");
+        assert_eq!(snap.get("c", b"old").unwrap(), Some(b"1".to_vec()));
+        drop(snap);
+        assert_eq!(store.drop_unreferenced_cfs().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_failed_bootstrap_then_reset_keeps_a_held_cf_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = slave_store(dir.path());
+        apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
+        apply(&store, vec![put("c", b"old", b"1")]).unwrap();
+        let snap = store.read_snapshot(0).unwrap();
+        store.reset_for_bootstrap().unwrap();
+        let c = CfEntry { spec: CfSpec::new("c"), create_seq: 1 };
+        store.begin_bootstrap_cf(&c).unwrap();
+        store.reset_for_bootstrap().unwrap();
+        assert!(store.db().cf_handle("u:c:1").is_some());
+        assert_eq!(snap.get("c", b"old").unwrap(), Some(b"1".to_vec()));
+        drop(snap);
+        assert_eq!(store.drop_unreferenced_cfs().unwrap(), 1);
+        assert!(store.db().cf_handle("u:c:1").is_none());
+    }
+
+    #[test]
+    fn a_snapshot_held_cf_with_another_spec_is_cf_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tuning = crate::tuning::RocksTuning::new();
+        tuning.comparators.register("rev", |a: &[u8], b: &[u8]| b.cmp(a));
+        let store = Store::open(dir.path(), Role::Slave, tuning).unwrap().0;
+        apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
+        let _snap = store.read_snapshot(0).unwrap();
+        store.reset_for_bootstrap().unwrap();
+        let other = CfEntry { spec: CfSpec::new("c").with_comparator("rev"), create_seq: 1 };
+        assert!(matches!(store.begin_bootstrap_cf(&other), Err(Error::CfInUse { .. })));
     }
 
     #[test]

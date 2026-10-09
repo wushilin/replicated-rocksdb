@@ -29,13 +29,16 @@ impl PhysCf {
 pub(crate) struct CfRegistry {
     live: RwLock<BTreeMap<String, Arc<PhysCf>>>,
     pub(crate) pending: Mutex<Vec<Arc<PhysCf>>>,
+    /// Pending CFs taken over by a running bootstrap. They keep their original `Arc`, so
+    /// readers that still hold the CF keep it from being dropped (DESIGN.md §7).
+    pub(crate) held: Mutex<Vec<Arc<PhysCf>>>,
 }
 
 impl CfRegistry {
     pub(crate) fn load(live: &[CfEntry], pending: &[CfEntry]) -> Self {
         let live = live.iter().map(|e| (e.spec.name.clone(), PhysCf::new(e.clone()))).collect();
         let pending = pending.iter().cloned().map(PhysCf::new).collect();
-        CfRegistry { live: RwLock::new(live), pending: Mutex::new(pending) }
+        CfRegistry { live: RwLock::new(live), pending: Mutex::new(pending), held: Mutex::default() }
     }
 
     pub(crate) fn read(&self) -> RwLockReadGuard<'_, BTreeMap<String, Arc<PhysCf>>> {
@@ -76,7 +79,11 @@ impl Store {
             // Pending CFs are not in the live map, so no new references can appear;
             // a count of 1 (ours) means no reader holds it.
             if Arc::strong_count(&pending[i]) == 1 {
-                self.db().drop_cf(&pending[i].physical)?;
+                // A CF recorded but never created (crash or failure before `create_cf`)
+                // is already gone.
+                if self.db().cf_handle(&pending[i].physical).is_some() {
+                    self.db().drop_cf(&pending[i].physical)?;
+                }
                 pending.swap_remove(i);
                 dropped += 1;
             } else {

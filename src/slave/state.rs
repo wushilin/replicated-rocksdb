@@ -97,7 +97,10 @@ impl NodeState {
         match self {
             NodeState::Ready => NODE_READY.to_vec(),
             NodeState::Bootstrapping => NODE_BOOTSTRAPPING.to_vec(),
-            NodeState::Halted(r) => format!("halted:{}", r.name()).into_bytes(),
+            NodeState::Halted(r) => {
+                debug_assert!(r.is_persisted(), "{r:?} is never persisted");
+                format!("halted:{}", r.name()).into_bytes()
+            }
         }
     }
 
@@ -120,8 +123,10 @@ impl NodeState {
     }
 }
 
-/// A snapshot of a slave's replication status.
+/// A snapshot of a slave's replication status. More fields will be added (`lag_ms` and
+/// `last_verify` in Plan 3), hence `non_exhaustive`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct SlaveStatus {
     pub state: SlaveState,
     pub origin_identity: Option<DbIdentity>,
@@ -148,11 +153,13 @@ mod tests {
             assert_eq!(NodeState::decode(Some(&s.encode())).unwrap(), s);
         }
         for r in ALL {
-            let encoded = NodeState::Halted(r).encode();
             if r.is_persisted() {
+                let encoded = NodeState::Halted(r).encode();
                 assert_eq!(NodeState::decode(Some(&encoded)).unwrap(), NodeState::Halted(r));
             } else {
-                assert!(NodeState::decode(Some(&encoded)).is_err(), "{r:?} is never persisted");
+                // encode() debug-asserts on these; a hand-written value must not decode.
+                let raw = format!("halted:{}", r.name());
+                assert!(NodeState::decode(Some(raw.as_bytes())).is_err(), "{r:?} is never persisted");
             }
         }
         assert_eq!(NodeState::decode(None).unwrap(), NodeState::Ready);

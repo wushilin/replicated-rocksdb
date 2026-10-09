@@ -45,6 +45,11 @@ pub enum Error {
     /// An operation did not finish within its deadline.
     #[error("timed out")]
     Timeout,
+    /// A bootstrap needs a physical column family that a reader's snapshot still references
+    /// with a different spec. Retriable: the slave driver retries with backoff and shows it
+    /// in `SlaveStatus::last_error`.
+    #[error("column family {physical} is still referenced by a snapshot; release it to let the bootstrap continue")]
+    CfInUse { physical: String },
     /// The slave stopped advancing; see `SlaveStatus` and `Slave::clear_halt`.
     #[error("replication is halted: {0:?}")]
     Halted(crate::slave::HaltReason),

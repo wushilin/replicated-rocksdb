@@ -14,6 +14,7 @@ use crate::tuning::RocksTuning;
 
 /// The node this slave replicates from: the master or another slave.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct UpstreamConfig {
     /// Host name or IP address.
     pub server: String,
@@ -72,6 +73,7 @@ pub enum GapPolicy {
 /// Tail fetch batching (PROTOCOL.md §7.5), like Kafka's `fetch.min.bytes`,
 /// `fetch.max.wait.ms` and `fetch.max.bytes`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FetchConfig {
     /// The upstream waits until this many bytes of entries are ready. 0 = real-time push.
     pub min_batch_bytes: u32,
@@ -130,6 +132,7 @@ impl BackoffState {
 }
 
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct SlaveConfig {
     /// Unique within the topology: 1–128 characters of `[A-Za-z0-9._-]`.
     pub identifier: String,
