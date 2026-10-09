@@ -1,0 +1,23 @@
+[package]
+name = "replicated-rocksdb"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Single-master, async log-shipping replication for RocksDB"
+
+[dependencies]
+rocksdb = { version = "0.25.0", default-features = false, features = ["lz4", "zstd", "bindgen-runtime", "multi-threaded-cf"] }
+prost = "0.14.4"
+bytes = "1.12"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time"] }
+uuid = { version = "1.27", features = ["v4"] }
+blake3 = "1.8"
+crc32c = "0.6.8"
+thiserror = "2.0"
+tracing = "0.1.44"
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"
+
+[dev-dependencies]
+tempfile = "3.27"

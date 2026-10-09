@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+// Node-local metadata. Never sent on the wire.
+package rrdb.local.v1;
+
+import "replication.proto";
+
+message CfEntryList  { repeated rrdb.replication.v1.CfSpec cfs = 1; }
+message EpochHistory { repeated rrdb.replication.v1.EpochStart epochs = 1; }

@@ -1,0 +1,176 @@
+syntax = "proto3";
+
+package rrdb.replication.v1;
+
+service Replication {
+  rpc Handshake  (HandshakeRequest)          returns (HandshakeResponse);
+  rpc Tail       (TailRequest)               returns (stream TailMessage);
+  rpc Bootstrap  (BootstrapRequest)          returns (stream BootstrapChunk);
+  rpc VerifyBegin(VerifyBeginRequest)        returns (VerifyBeginResponse);
+  rpc VerifyRange(stream VerifyRangeRequest) returns (stream VerifyRangeResponse);
+  rpc VerifyEnd  (VerifyEndRequest)          returns (VerifyEndResponse);
+}
+
+// ---------- shared ----------
+
+message Identity   { bytes db_uuid = 1; uint64 epoch = 2; }
+message CfSpec     { string name = 1; optional string comparator = 2; uint64 create_seq = 3; }
+message EpochStart { uint64 epoch = 1; uint64 start_seq = 2; }
+
+enum Reason {
+  REASON_UNSPECIFIED = 0;
+  NO_LOCAL_STATE     = 1;
+  IDENTITY_CHANGED   = 2;
+  LOG_GAP            = 3;
+  PROTOCOL_MISMATCH  = 4;   // frozen
+  ENVELOPE_MISMATCH  = 5;   // frozen
+  NOT_READY          = 6;
+  LOOP_DETECTED      = 7;
+  DIVERGED           = 8;
+  BUSY               = 9;
+  SESSION_NOT_FOUND  = 10;
+  UPSTREAM_RESET     = 11;
+  CORRUPT            = 12;
+  SHUTTING_DOWN      = 13;
+  EPOCH_ADVANCED     = 14;
+  STALE_EPOCH        = 15;
+}
+
+// ---------- log ----------
+
+message LogEntry {
+  uint64  seq    = 1;
+  uint64  epoch  = 2;
+  uint64  ts_ms  = 3;
+  bytes   ops    = 4;   // serialised OpList; never re-encoded
+  fixed32 crc32c = 5;   // CRC-32C(BE64(seq) ‖ BE64(epoch) ‖ BE64(ts_ms) ‖ ops)
+}
+
+message OpList { repeated Op ops = 1; }
+
+message Op {
+  oneof kind {
+    Put         put          = 1;
+    Delete      delete       = 2;
+    DeleteRange delete_range = 3;
+    CreateCf    create_cf    = 4;
+    DropCf      drop_cf      = 5;
+  }
+}
+message Put         { string cf = 1; bytes key = 2; bytes value = 3; optional uint64 expire_at_ms = 4; }
+message Delete      { string cf = 1; bytes key = 2; }
+message DeleteRange { string cf = 1; bytes start = 2; bytes end = 3; }
+message CreateCf    { string name = 1; optional string comparator = 2; }
+message DropCf      { string name = 1; }
+
+// ---------- handshake ----------
+
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  RESUME               = 1;
+  BOOTSTRAP            = 2;
+  REJECT               = 3;   // frozen
+}
+
+message HandshakeRequest {
+  uint32 protocol_version          = 1;   // frozen
+  uint32 envelope_version          = 2;   // frozen
+  string client_id                 = 3;   // frozen
+  optional Identity known_identity = 4;
+  uint64 last_seq                  = 5;
+  optional fixed32 last_crc32c     = 6;
+}
+
+message HandshakeResponse {
+  uint32   protocol_version        = 1;   // frozen
+  uint32   envelope_version        = 2;   // frozen
+  string   server_id               = 3;   // frozen
+  Decision decision                = 4;   // frozen
+  Reason   reason                  = 5;   // frozen
+  string   detail                  = 6;   // frozen
+  repeated string upstream_chain   = 7;
+  optional Identity identity       = 8;
+  repeated CfSpec cf_specs         = 9;
+  uint64   first_retained_seq      = 10;
+  uint64   last_seq                = 11;
+  uint64   origin_last_seq         = 12;
+  uint64   max_entry_bytes         = 13;
+  uint32   heartbeat_ms            = 14;
+  repeated EpochStart epoch_history = 15;
+}
+
+// ---------- tail ----------
+
+message TailRequest {
+  string   client_id               = 1;
+  Identity identity                = 2;
+  uint64   from_seq                = 3;
+  optional fixed32 prev_crc32c     = 4;
+  optional bytes bootstrap_lease   = 5;
+}
+
+message TailMessage { oneof kind { LogEntry entry = 1; Heartbeat heartbeat = 2; } }
+message Heartbeat   { uint64 upstream_last_seq = 1; uint64 origin_last_seq = 2; uint64 ts_ms = 3; }
+
+// ---------- bootstrap ----------
+
+message BootstrapRequest { string client_id = 1; }
+
+message BootstrapChunk {
+  oneof kind {
+    BootstrapHeader  header  = 1;
+    BootstrapRecords records = 2;
+    BootstrapFooter  footer  = 3;
+  }
+}
+
+message BootstrapHeader {
+  Identity identity                = 1;
+  uint64   snapshot_seq            = 2;
+  optional fixed32 snapshot_crc32c = 3;
+  repeated CfSpec cf_specs         = 4;
+  uint64   max_entry_bytes         = 5;
+  uint32   envelope_version        = 6;
+  bytes    lease_id                = 7;
+  uint64   lease_ttl_ms            = 8;
+  repeated EpochStart epoch_history = 9;
+}
+
+message Record           { bytes key = 1; bytes envelope = 2; }
+message BootstrapRecords { string cf = 1; repeated Record records = 2; }
+message BootstrapFooter  { uint64 record_count = 1; bytes digest = 2; }
+
+// ---------- verify ----------
+
+enum VerifyMode { VERIFY_MODE_UNSPECIFIED = 0; QUICK = 1; FULL = 2; }
+
+message VerifyBeginRequest  { string client_id = 1; VerifyMode mode = 2; }
+message VerifyBeginResponse {
+  bytes    session_id         = 1;
+  Identity identity           = 2;
+  uint64   snapshot_seq       = 3;
+  repeated CfSpec cf_specs    = 4;
+  uint64   session_timeout_ms = 5;
+}
+
+message KeyRange  { string cf = 1; optional bytes lower = 2; optional bytes upper = 3; }
+message HashRange { KeyRange range = 1; uint64 count = 2; bytes hash = 3; }
+message ListRange { KeyRange range = 1; uint32 limit = 2; }
+
+message VerifyRangeRequest {
+  bytes  session_id = 1;
+  uint64 request_id = 2;
+  oneof kind { HashRange hash = 3; ListRange list = 4; }
+}
+
+message VerifyRangeResponse {
+  uint64 request_id = 1;
+  oneof kind { HashResult hash = 2; ListResult list = 3; }
+}
+
+message HashResult { bool matched = 1; uint64 count = 2; bytes hash = 3; }
+message ListResult { repeated KeyDigest keys = 1; bool truncated = 2; }
+message KeyDigest  { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3; }
+
+message VerifyEndRequest  { bytes session_id = 1; }
+message VerifyEndResponse {}
