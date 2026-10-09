@@ -342,6 +342,9 @@ Because the client reads `last_seq` from durable storage, which is written atomi
 | `from_seq` | The first seq the client wants. Normally its `last_seq + 1`. |
 | `prev_crc32c` | The `crc32c` of the client's entry at `from_seq − 1`, if known. |
 | `bootstrap_lease` | The `lease_id` from a `Bootstrap` this client just completed, if any (§8.4). |
+| `min_batch_bytes` | Fetch batching (§7.5). The server delays sending until at least this many bytes of entries are ready. 0 (default) = send each entry as soon as it is available. |
+| `max_wait_ms` | Fetch batching (§7.5). The longest the server delays a ready entry while waiting for `min_batch_bytes`. Ignored when `min_batch_bytes = 0`. |
+| `max_batch_bytes` | Fetch batching (§7.5). The most entry bytes the server puts in one `EntryBatch`. 0 = server default. |
 
 ### 7.2 Server validation
 
@@ -360,11 +363,12 @@ If `bootstrap_lease` matches a lease this server issued to the same `client_id`,
 ### 7.3 Stream
 
 ```proto
-message TailMessage { oneof kind { LogEntry entry = 1; Heartbeat heartbeat = 2; } }
+message TailMessage { oneof kind { EntryBatch batch = 1; Heartbeat heartbeat = 2; } }
+message EntryBatch  { repeated LogEntry entries = 1; }
 message Heartbeat   { uint64 upstream_last_seq = 1; uint64 origin_last_seq = 2; uint64 ts_ms = 3; }
 ```
 
-- Entries are sent in strictly consecutive seq order, starting at `from_seq`, with no gaps or duplicates.
+- Entries are sent in `EntryBatch` messages. Across all batches of a stream, entries are in strictly consecutive seq order, starting at `from_seq`, with no gaps or duplicates. A batch is never empty. When batches are formed is governed by §7.5.
 - If `from_seq > server.last_seq + 1` (only possible when the server is a replica), the server sends heartbeats and no entries until its own `last_seq` reaches `from_seq − 1`, then continues normally.
 - The server sends a `Heartbeat` whenever it has sent no message for `heartbeat_ms`. It SHOULD also send one at least every `heartbeat_ms` while it is streaming entries, so that `origin_last_seq` stays current.
 - `upstream_last_seq` is the server's `last_seq`. `origin_last_seq` is the master's `last_seq` as last known to the server. `ts_ms` is the server's wall clock and is informational only.
@@ -377,7 +381,7 @@ message Heartbeat   { uint64 upstream_last_seq = 1; uint64 origin_last_seq = 2; 
 
 ### 7.4 Client checks on each entry
 
-For each `entry`, the client MUST check, in order:
+For each `entry` of each batch, in order, the client MUST check, in order:
 
 1. `crc32c` (§5.1). Failure → `Corrupt`.
 2. `entry.epoch == epoch_for(entry.seq)` under the client's epoch history (§5.5). On failure the client ends the stream and handshakes again. The upstream's epoch changed, and the handshake brings the new history.
@@ -385,7 +389,22 @@ For each `entry`, the client MUST check, in order:
 4. If `entry.seq ≠ last_seq + 1` → `LogGap`.
 5. Decode `ops` and check the rules in §5.2. Failure → `Corrupt`.
 
-Then it applies the entry atomically, together with its own `last_seq` and a copy of the entry (§11.1).
+Then it applies the entry atomically, together with its own `last_seq` and a copy of the entry (§11.1). Each entry is applied as its own atomic write, even when it arrived in a batch with others, so a crash in the middle of a batch leaves the client at a clean entry boundary.
+
+### 7.5 Fetch batching
+
+The client chooses the trade-off between latency and batching per stream, in the spirit of Kafka's `fetch.min.bytes`, `fetch.max.wait.ms` and `fetch.max.bytes`. The size of an entry is its encoded `LogEntry` size.
+
+The server keeps a *pending* batch of entries that are available (committed on the server, at or after the next seq to send) and not yet sent. It sends the pending batch as soon as any of these holds:
+
+1. `min_batch_bytes = 0` and the pending batch is non-empty (real-time mode);
+2. the pending batch's size is at least `min_batch_bytes`;
+3. `max_wait_ms` has elapsed since the oldest pending entry became available to the stream;
+4. adding the next available entry would exceed `max_batch_bytes`.
+
+A batch never exceeds `max_batch_bytes`, except that a single entry larger than it is sent alone. When the client is far behind, every available entry is "ready" immediately, so batches are full-size and catch-up is not slowed by `max_wait_ms`.
+
+The server clamps the client's values to its own limits: `max_wait_ms` to at most `heartbeat_ms`, and `max_batch_bytes` to at most `max_tail_batch_bytes` (RECOMMENDED default 4 MiB). If `max_batch_bytes` is 0, it uses 1 MiB. Heartbeats are unaffected: a stream with nothing pending still gets one every `heartbeat_ms`.
 
 ## 8. Bootstrap
 
@@ -581,7 +600,7 @@ A failed bootstrap (bad footer, lost connection) also returns to `Connecting` th
 
 - If no `TailMessage` arrives for `3 × heartbeat_ms`, the client MUST cancel the stream and reconnect.
 - Reconnect backoff SHOULD be exponential with full jitter (RECOMMENDED: initial 100 ms, factor 2, maximum 30 s), reset after 60 s of successful streaming.
-- The client sets its maximum decode size for `Tail` to `max_entry_bytes + 64 KiB`, and for `Bootstrap` to `max(max_entry_bytes, bootstrap_chunk_bytes) + 64 KiB`.
+- The client sets its maximum decode size for `Tail` to `max(max_entry_bytes, max_batch_bytes) + 64 KiB`, and for `Bootstrap` to `max(max_entry_bytes, bootstrap_chunk_bytes) + 64 KiB`.
 
 ## 12. Timing and limits
 
@@ -591,6 +610,8 @@ A failed bootstrap (bad footer, lost connection) also returns to `Connecting` th
 | Client idle timeout | client | 3 × `heartbeat_ms` |
 | `max_entry_bytes` | master, sent down the chain | 16 MiB |
 | `bootstrap_chunk_bytes` | server | 1 MiB |
+| `min_batch_bytes` / `max_wait_ms` / `max_batch_bytes` (Tail) | client, per stream | 0 / 100 / 1 MiB |
+| `max_tail_batch_bytes` (cap on the client's `max_batch_bytes`) | server | 4 MiB |
 | `lease_ttl_ms` | server | 900 000 (15 min) |
 | `max_concurrent_bootstraps` | server | 2 |
 | `max_verify_sessions` | server | 4 |
@@ -724,9 +745,13 @@ message TailRequest {
   uint64   from_seq                = 3;
   optional fixed32 prev_crc32c     = 4;
   optional bytes bootstrap_lease   = 5;
+  uint32   min_batch_bytes         = 6;
+  uint32   max_wait_ms             = 7;
+  uint32   max_batch_bytes         = 8;
 }
 
-message TailMessage { oneof kind { LogEntry entry = 1; Heartbeat heartbeat = 2; } }
+message TailMessage { oneof kind { EntryBatch batch = 1; Heartbeat heartbeat = 2; } }
+message EntryBatch  { repeated LogEntry entries = 1; }
 message Heartbeat   { uint64 upstream_last_seq = 1; uint64 origin_last_seq = 2; uint64 ts_ms = 3; }
 
 // ---------- bootstrap ----------

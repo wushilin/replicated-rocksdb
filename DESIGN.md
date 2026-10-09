@@ -495,6 +495,8 @@ pub struct SlaveConfig {
     pub on_divergence: DivergencePolicy,     // Halt (default) | Rebootstrap
     pub on_log_gap: GapPolicy,               // Rebootstrap (default) | Halt
     pub reconnect: Backoff,                  // default 100 ms → 30 s, ×2, full jitter
+    pub fetch: FetchConfig,                  // { min_batch_bytes: 0, max_wait: 100 ms, max_batch_bytes: 1 MiB }
+                                             // 0 = real-time push; larger = batch like Kafka fetch.min.bytes
     pub rocksdb: RocksTuning,
 }
 
@@ -570,7 +572,7 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 | RPC | Shape | Summary |
 |---|---|---|
 | `Handshake` | unary | versions, identity and position → `RESUME` / `BOOTSTRAP` / `REJECT` with a reason |
-| `Tail` | server stream | entries from `from_seq`, plus heartbeats |
+| `Tail` | server stream | entry batches from `from_seq` (client-chosen `min_batch_bytes` / `max_wait_ms` / `max_batch_bytes`), plus heartbeats |
 | `Bootstrap` | server stream | header, records, footer with digest and lease |
 | `VerifyBegin` / `VerifyRange` / `VerifyEnd` | unary / bidi / unary | snapshot-pinned range digests and key listings |
 
@@ -595,6 +597,7 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 | Bootstrap lease TTL | 15 min |
 | Max concurrent bootstraps / verify sessions served | 2 / 4 |
 | Bootstrap chunk size | 1 MiB |
+| Tail fetch batching (slave) | `min_batch_bytes` 0 (real-time), `max_wait` 100 ms, `max_batch_bytes` 1 MiB; server cap 4 MiB |
 | Verify | off by default; `Quick` when enabled |
 | Verify session timeout | 5 min |
 | Mismatch policy | Report |

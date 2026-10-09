@@ -107,9 +107,13 @@ message TailRequest {
   uint64   from_seq                = 3;
   optional fixed32 prev_crc32c     = 4;
   optional bytes bootstrap_lease   = 5;
+  uint32   min_batch_bytes         = 6;
+  uint32   max_wait_ms             = 7;
+  uint32   max_batch_bytes         = 8;
 }
 
-message TailMessage { oneof kind { LogEntry entry = 1; Heartbeat heartbeat = 2; } }
+message TailMessage { oneof kind { EntryBatch batch = 1; Heartbeat heartbeat = 2; } }
+message EntryBatch  { repeated LogEntry entries = 1; }
 message Heartbeat   { uint64 upstream_last_seq = 1; uint64 origin_last_seq = 2; uint64 ts_ms = 3; }
 
 // ---------- bootstrap ----------
