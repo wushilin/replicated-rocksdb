@@ -191,13 +191,17 @@ for each LogEntry received (in order):
          ops with envelopes (write_seq = entry.seq)
          __changelog[seq] = entry (unchanged)
          __meta.last_seq = seq, last_entry_crc = entry.crc32c
-  db.write(wb)          (sync = false by default)
-  publish seq to downstream tail subscribers
+  db.write(wb)          (sync = SlaveConfig::sync_writes, default false)
+                                                       failure → Halted(Corrupt), never retried in-process
   if a verify capture is requested at this seq: take the snapshot now (§12)
   listener.on_entry(&entry)
+  publish seq to wait_for_seq and downstream tail subscribers
+after each batch (coalesced), and at least once per heartbeat:
+  ack applied_seq = last_seq to the upstream (PROTOCOL.md §7.6)
 ```
 
 - **One entry is one WriteBatch, and an entry is never split.** That makes every RocksDB snapshot on a slave a consistent state at some seq.
+- **Upstream epoch histories are validated** (in an `EPOCH_ADVANCED` handshake and in a bootstrap header): non-empty, first record `{1, 1}`, epochs strictly increasing, start seqs non-decreasing, last epoch equal to the identity's epoch. An invalid history halts the slave with `Corrupt`.
 - Writes are not synced on slaves by default (`SlaveConfig::sync_writes = false`). A slave that crashes resumes from its durable `last_seq` and fetches the rest again from upstream. Its acks (§11) then promise that an entry is in its write-ahead log, which survives a process crash but not a power loss. With `sync_writes = true` every applied entry is fsynced, so an acknowledged entry survives a power loss of the replica too.
 - **A downstream replica can be ahead of its upstream slave.** If upstream B crashes unsynced after forwarding to C, C's `last_seq` can exceed B's. On handshake B replies `RESUME`, and the Tail stream sends only heartbeats until B passes C's seq. The content is identical because seqs come from the same origin log. This is allowed only when the upstream is a slave. The master rejects it (§13).
 - **Divergence check on connect.** The slave sends `last_entry_crc` in the handshake and `prev_crc32c` in `Tail`. If the upstream still holds that entry and its CRC differs, the upstream answers `DIVERGED` and the slave halts instead of applying a different history.
@@ -397,7 +401,8 @@ pub trait ReplicationListener: Send + Sync + 'static {
 Listeners exist on slaves only. On the master, the application already sees every write it makes. To observe the log there, use `LogApi::entries_since` or `LogApi::subscribe`.
 
 Guarantees:
-- Strictly increasing `seq`, with no duplicates within a process.
+- Strictly increasing `seq`, with no duplicates within a process, between bootstraps. After `on_bootstrap_complete(S)` delivery continues at `S + 1`; `S` can be lower than a seq delivered before a re-bootstrap, because state was replaced wholesale. Each entry of a Tail batch is committed and delivered on its own.
+- Called before the new seq is published to `wait_for_seq` and `subscribe`, so whoever waits for a seq also sees what the listener did with it.
 - Called **after commit**, so reads already reflect the entry.
 - Called inline in the apply loop. A slow listener slows replication down (back-pressure) and doesn't lose events. Heavy work should be handed off to a channel. A listener must not block on the slave's own replication progress (for example `wait_for_seq`), because that would deadlock the apply loop.
 - **At-most-once across crashes.** For at-least-once delivery, keep your own cursor and use `entries_since(seq)`. It returns `Err(Gap)` if the cursor is older than the retention window, in which case resync with a full read.

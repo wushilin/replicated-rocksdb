@@ -58,12 +58,7 @@ impl CfRegistry {
         self.read().values().map(|p| p.entry.clone()).collect()
     }
 
-    #[allow(dead_code)] // used by bootstrap (Plan 2)
-    pub(crate) fn pending_entries(&self) -> Vec<CfEntry> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner).iter().map(|p| p.entry.clone()).collect()
-    }
-
-    #[allow(dead_code)] // used by bootstrap (Plan 2)
+    #[cfg(test)]
     pub(crate) fn push_pending(&self, cf: Arc<PhysCf>) {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner).push(cf);
     }

@@ -106,19 +106,41 @@ impl Store {
             Some(CfChange::Create(entry)) => {
                 // The registry write lock is held across the fsynced intent, create_cf and the
                 // batch, so readers stall briefly during a CF create. Acceptable: creates are rare.
+                // Lock order: registry write lock, then pending.
                 let mut live = self.cfs.write();
+                let mut pending = self.cfs.pending.lock().unwrap_or_else(PoisonError::into_inner);
+                let physical = entry.physical_name();
+                // A pending (snapshot-held) CF with this physical name keeps its one `Arc`:
+                // it is emptied and made live again, never given a second `Arc<PhysCf>`.
+                let reuse = pending.iter().position(|c| c.physical == physical);
+                if let Some(i) = reuse {
+                    if pending[i].entry != entry {
+                        return Err(Error::CfInUse { physical });
+                    }
+                    let list: Vec<CfEntry> =
+                        pending.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, c)| c.entry.clone()).collect();
+                    p.batch.put_cf(&self.cf(CF_META), key::PENDING_CF_DROPS, meta::encode_cf_list(&list));
+                }
                 // Record the intent durably first: a crash after create_cf leaves a CF whose
                 // comparator would otherwise be unknown at the next open.
                 self.write_meta(&[(key::CF_CREATE_INTENT, &meta::encode_cf_entry(&entry))], true)?;
-                let physical = entry.physical_name();
-                if self.db().cf_handle(&physical).is_none() {
-                    let opts = self.tuning().cf_options(CfKind::User(&entry.spec))?;
-                    self.db().create_cf(&physical, &opts)?;
-                    // create_cf does not keep the custom comparator alive; the CF would dangle.
-                    self.retain_cf_options(opts);
+                match self.db().cf_handle(&physical) {
+                    None => {
+                        let opts = self.tuning().cf_options(CfKind::User(&entry.spec))?;
+                        self.db().create_cf(&physical, &opts)?;
+                        // create_cf does not keep the custom comparator alive; the CF would dangle.
+                        self.retain_cf_options(opts);
+                    }
+                    // Snapshots keep their view; only the live data is emptied.
+                    Some(handle) if reuse.is_some() => self.delete_all_keys(&handle)?,
+                    Some(_) => {}
                 }
                 self.db().write_opt(p.batch, &wo)?;
-                live.insert(entry.spec.name.clone(), PhysCf::new(entry));
+                let cf = match reuse {
+                    Some(i) => pending.swap_remove(i),
+                    None => PhysCf::new(entry.clone()),
+                };
+                live.insert(entry.spec.name.clone(), cf);
             }
             Some(CfChange::Drop(phys)) => {
                 // Lock order: registry write lock, then pending. The persisted pending list is

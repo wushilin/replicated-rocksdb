@@ -33,6 +33,7 @@ pub(crate) mod net;
 
 pub(crate) use proto::replication::v1 as pb;
 
+pub(crate) mod background;
 pub mod admin;
 pub mod auth;
 pub mod clock;
@@ -73,8 +74,8 @@ mod slave;
 
 pub use listener::ReplicationListener;
 pub use slave::{
-    Backoff, DivergencePolicy, FetchConfig, GapPolicy, HaltAction, HaltReason, IdentityPolicy, SlaveConfig, SlaveState,
-    SlaveStatus, UpstreamConfig,
+    Backoff, DivergencePolicy, FetchConfig, GapPolicy, HaltAction, HaltReason, IdentityPolicy, Slave, SlaveConfig,
+    SlaveState, SlaveStatus, UpstreamConfig,
 };
 pub(crate) mod server;
 pub(crate) mod failpoint;

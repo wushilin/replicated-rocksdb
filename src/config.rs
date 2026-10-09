@@ -152,7 +152,6 @@ pub struct TlsClientConfig {
 }
 
 impl TlsClientConfig {
-    #[allow(dead_code)] // used by the replication client (later Plan 2 task)
     pub(crate) fn to_tonic(&self, default_domain: &str) -> tonic::transport::ClientTlsConfig {
         use tonic::transport::{Certificate, ClientTlsConfig, Identity};
         let mut t = ClientTlsConfig::new()

@@ -119,6 +119,9 @@ impl Store {
                     return Err(Error::CfInUse { physical });
                 }
             }
+            if held.iter().any(|p| p.physical == physical && p.entry != *entry) {
+                return Err(Error::CfInUse { physical });
+            }
             let pending_list: Vec<CfEntry> = pending
                 .iter()
                 .enumerate()
@@ -188,6 +191,7 @@ impl Store {
     /// Commits a completed bootstrap in one synced batch and makes it live. CFs taken over
     /// from a snapshot-held pending drop keep their original `Arc`.
     pub(crate) fn finish_bootstrap(&self, f: &BootstrapFinish) -> Result<()> {
+        let created = self.stored_bootstrap_cfs()?;
         let mut live = self.cfs.write();
         let mut pending = self.cfs.pending.lock().unwrap_or_else(PoisonError::into_inner);
         let mut held = self.cfs.held.lock().unwrap_or_else(PoisonError::into_inner);
@@ -203,6 +207,15 @@ impl Store {
         // Taken-over CFs the final spec does not use go back to the pending drops.
         let mut new_pending = pending.clone();
         new_pending.extend(unused);
+        // CFs this bootstrap created that the final spec does not use are dropped later too.
+        for e in created {
+            let physical = e.physical_name();
+            let used = f.cf_specs.contains(&e);
+            let tracked = new_pending.iter().any(|p| p.physical == physical) || held.iter().any(|p| p.physical == physical);
+            if !used && !tracked && self.db().cf_handle(&physical).is_some() {
+                new_pending.push(PhysCf::new(e));
+            }
+        }
         let pending_list: Vec<CfEntry> = new_pending.iter().map(|p| p.entry.clone()).collect();
         let meta_cf = self.cf(CF_META);
         let mut batch = WriteBatch::default();
@@ -432,6 +445,81 @@ mod tests {
         store.reset_for_bootstrap().unwrap();
         let other = CfEntry { spec: CfSpec::new("c").with_comparator("rev"), create_seq: 1 };
         assert!(matches!(store.begin_bootstrap_cf(&other), Err(Error::CfInUse { .. })));
+    }
+
+    #[test]
+    fn create_cf_reuses_the_snapshot_held_arc_after_a_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = slave_store(dir.path());
+        apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
+        apply(&store, vec![put("c", b"old", b"1")]).unwrap();
+        let snap = store.read_snapshot(0).unwrap();
+        let original = snap.cfs["c"].clone();
+        store.reset_for_bootstrap().unwrap();
+        // The same entry (name, create_seq 1) arrives again through the log.
+        apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
+        let live = store.live_cf("c").unwrap();
+        assert!(Arc::ptr_eq(&live, &original), "no second Arc<PhysCf> for one physical CF");
+        assert!(store.cfs.pending.lock().unwrap().is_empty());
+        assert_eq!(store.drop_unreferenced_cfs().unwrap(), 0);
+        assert!(store.db().cf_handle("u:c:1").is_some(), "the live CF is never dropped");
+        apply(&store, vec![put("c", b"new", b"2")]).unwrap();
+        assert_eq!(snap.get("c", b"old").unwrap(), Some(b"1".to_vec()), "the snapshot keeps its view");
+        assert_eq!(snap.get("c", b"new").unwrap(), None);
+        assert_eq!(store.live_ctx(0).get(&live, b"old").unwrap(), None, "reused CF starts empty");
+        assert_eq!(store.live_ctx(0).get(&live, b"new").unwrap().map(|v| v.0), Some(b"2".to_vec()));
+        drop((snap, original, live));
+        assert_eq!(store.drop_unreferenced_cfs().unwrap(), 0);
+        assert_eq!(store.load_meta().unwrap().unwrap().pending_drops.len(), 0);
+    }
+
+    #[test]
+    fn create_cf_with_another_spec_than_a_held_cf_is_cf_in_use_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tuning = crate::tuning::RocksTuning::new();
+        tuning.comparators.register("rev", |a: &[u8], b: &[u8]| b.cmp(a));
+        let store = Store::open(dir.path(), Role::Slave, tuning).unwrap().0;
+        apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
+        let _snap = store.read_snapshot(0).unwrap();
+        store.reset_for_bootstrap().unwrap();
+        let err = apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c").with_comparator("rev") }]).unwrap_err();
+        assert!(matches!(err, Error::CfInUse { .. }), "{err}");
+        assert_eq!(store.position().last_seq, 0);
+        assert!(store.cfs.live_entries().is_empty());
+        assert_eq!(store.load_meta().unwrap().unwrap().pending_drops.len(), 1);
+    }
+
+    #[test]
+    fn begin_bootstrap_cf_refuses_a_different_entry_for_a_held_physical_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tuning = crate::tuning::RocksTuning::new();
+        tuning.comparators.register("rev", |a: &[u8], b: &[u8]| b.cmp(a));
+        let store = Store::open(dir.path(), Role::Slave, tuning).unwrap().0;
+        apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
+        let _snap = store.read_snapshot(0).unwrap();
+        store.reset_for_bootstrap().unwrap();
+        let c = CfEntry { spec: CfSpec::new("c"), create_seq: 1 };
+        store.begin_bootstrap_cf(&c).unwrap();
+        let other = CfEntry { spec: CfSpec::new("c").with_comparator("rev"), create_seq: 1 };
+        assert!(matches!(store.begin_bootstrap_cf(&other), Err(Error::CfInUse { .. })));
+    }
+
+    #[test]
+    fn finish_queues_bootstrap_cfs_missing_from_the_final_specs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = slave_store(dir.path());
+        store.reset_for_bootstrap().unwrap();
+        let kept = CfEntry { spec: CfSpec::new("kept"), create_seq: 1 };
+        let gone = CfEntry { spec: CfSpec::new("gone"), create_seq: 2 };
+        store.begin_bootstrap_cf(&kept).unwrap();
+        store.begin_bootstrap_cf(&gone).unwrap();
+        store.finish_bootstrap(&finish(vec![kept], 4)).unwrap();
+        let m = store.load_meta().unwrap().unwrap();
+        assert_eq!(m.pending_drops, vec![gone], "persisted in the final batch");
+        assert!(m.bootstrap_cfs.is_empty());
+        assert_eq!(store.drop_unreferenced_cfs().unwrap(), 1);
+        assert!(store.db().cf_handle("u:gone:2").is_none());
+        assert!(store.db().cf_handle("u:kept:1").is_some());
     }
 
     #[test]

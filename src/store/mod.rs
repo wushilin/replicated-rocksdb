@@ -168,11 +168,6 @@ impl Store {
         MetaSnapshot::load(|k| Ok(self.db.get_cf(&cf, k)?))
     }
 
-    #[allow(dead_code)] // used by the slave (later task)
-    pub(crate) fn role(&self) -> Role {
-        self.role
-    }
-
     pub(crate) fn tuning(&self) -> &RocksTuning {
         &self.tuning
     }

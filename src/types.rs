@@ -122,7 +122,6 @@ pub struct EpochStart {
 }
 
 /// The epoch an entry with this seq must carry, given a history sorted by epoch.
-#[allow(dead_code)] // used by the replication server (Plan 2)
 pub(crate) fn epoch_for(history: &[EpochStart], seq: Seq) -> Option<u64> {
     history.iter().rev().find(|e| e.start_seq <= seq).map(|e| e.epoch)
 }
