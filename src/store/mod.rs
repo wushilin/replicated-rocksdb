@@ -2,6 +2,7 @@
 
 pub(crate) mod apply;
 pub(crate) mod cfs;
+pub(crate) mod log;
 pub(crate) mod meta;
 pub(crate) mod read;
 pub(crate) mod snapshot;
@@ -150,6 +151,7 @@ impl Store {
         let cf = self.cf(CF_META);
         MetaSnapshot::load(|k| Ok(self.db.get_cf(&cf, k)?))
     }
+    #[allow(dead_code)] // used by the slave (later task)
 
     pub(crate) fn role(&self) -> Role {
         self.role
@@ -227,6 +229,11 @@ impl Store {
         let mut wo = WriteOptions::default();
         wo.set_sync(sync);
         Ok(self.db.write_opt(batch, &wo)?)
+    }
+
+    /// Adds `__ttl_index` entries for TTL puts. Master only. Implemented in Task 9.
+    pub(crate) fn add_ttl_index(&self, _batch: &mut WriteBatch, _ops: &[crate::types::Op]) -> Result<()> {
+        Ok(())
     }
 
     fn first_changelog_seq(&self) -> Result<Option<Seq>> {

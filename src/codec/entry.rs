@@ -139,6 +139,11 @@ fn op_from_pb(op: pb::Op) -> Result<Op> {
     })
 }
 
+/// Encoded size of the entry the master would write for `ops`. Used for `max_entry_bytes`.
+pub fn encoded_entry_len(seq: Seq, epoch: u64, ts_ms: u64, ops: &[Op]) -> usize {
+    LogEntry::new(seq, epoch, ts_ms, encode_ops(ops)).encoded_len()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
