@@ -198,6 +198,7 @@ impl SlaveConfig {
         }
         if let Some(serve) = &self.serve {
             serve.validate()?;
+            serve.check_heartbeat(self.heartbeat)?;
         }
         Ok(())
     }
@@ -234,8 +235,15 @@ mod tests {
         SlaveConfig::new("b", "/tmp/x", up.clone()).validate().unwrap();
         assert!(SlaveConfig::new("bad id", "/tmp/x", up.clone()).validate().is_err());
         assert!(SlaveConfig::new("b", "/tmp/x", UpstreamConfig::new("h", 0)).validate().is_err());
-        let mut cfg = SlaveConfig::new("b", "/tmp/x", up);
+        let mut cfg = SlaveConfig::new("b", "/tmp/x", up.clone());
         cfg.reconnect.max = Duration::from_millis(1);
         assert!(cfg.validate().is_err());
+        // Serving: the heartbeat must be at most half of the in-sync window.
+        let mut cfg = SlaveConfig::new("b", "/tmp/x", up);
+        cfg.serve = Some(ServeConfig::new(std::net::IpAddr::from([127, 0, 0, 1]), 0, Arc::new(crate::auth::AllowAll)));
+        cfg.heartbeat = Duration::from_secs(5);
+        cfg.validate().unwrap();
+        cfg.serve.as_mut().unwrap().limits.replica_lag_time_max = Duration::from_millis(9_999);
+        assert!(matches!(cfg.validate(), Err(Error::Config(m)) if m.contains("replica_lag_time_max")));
     }
 }

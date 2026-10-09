@@ -72,7 +72,8 @@ pub(crate) struct Inner {
     pub repoint_tx: watch::Sender<u64>,
     pending_repoint: Mutex<Option<PendingRepoint>>,
     /// The divergence mode of the latest repoint. It replaces `cfg.on_divergence` for every
-    /// session from then on (until the next repoint), not only for the first handshake.
+    /// session from then on (until the next repoint), not only for the first handshake. A
+    /// consent to lose data (`Rebootstrap`, `Repair`) becomes `Refuse` once its repoint settles.
     pub(crate) repoint_divergence: Mutex<Option<super::repoint::RepointDivergence>>,
     /// A repoint cleared a halt in memory only: `node_state = ready` is persisted once the new
     /// upstream is accepted (so a restart before that reopens halted).

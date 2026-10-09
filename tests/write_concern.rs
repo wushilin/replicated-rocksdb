@@ -85,6 +85,7 @@ async fn concurrent_writers_keep_the_replica_in_sync() {
     let c = Cluster::new();
     let mut cfg = c.master_config("a");
     cfg.serve.as_mut().unwrap().limits.replica_lag_time_max = Duration::from_millis(200);
+    cfg.heartbeat = Duration::from_millis(100); // at most half the window (validated)
     let m = Arc::new(Master::open(cfg).await.unwrap());
     m.create_cf(CfSpec::new("c")).unwrap();
     let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;

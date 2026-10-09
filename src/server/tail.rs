@@ -54,7 +54,7 @@ pub(super) async fn tail(
     // Subscribe before validating, so a reset after validation is never missed.
     let mut resets = src.resets();
     resets.borrow_and_update();
-    validate(&*src, &r)?;
+    let junction = validate(&*src, &r)?;
     state.expire_leases(std::time::Instant::now());
     let lease = r.bootstrap_lease.as_deref().and_then(|id| state.take_lease(id, &r.client_id, r.from_seq));
     let (tx, rx) = mpsc::channel(CHANNEL);
@@ -74,11 +74,21 @@ pub(super) async fn tail(
     tokio::spawn(read_acks(inbound, replica.cell().clone(), src.subscribe(), violation_tx, done_rx));
     let stream = Stream { replica, violation: Some(violation_rx), _done: done_tx };
     let out = Out { tx, shutdown: state.shutdown.clone(), resets };
-    tokio::spawn(produce(src, out, r.from_seq, fetch, lease, stream));
+    tokio::spawn(produce(src, out, r.from_seq, fetch, lease, stream, junction));
     Ok(Response::new(ReceiverStream::new(rx)))
 }
 
-fn validate(src: &dyn LogSource, r: &pb::TailRequest) -> Result<(), Status> {
+/// The client's `prev_crc32c` for entry `seq` (`from_seq - 1`), which the server did not hold
+/// at validation (it is a replica behind the client). The producer checks it once the server
+/// holds that entry, before sending `from_seq`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Junction {
+    pub seq: Seq,
+    pub crc: u32,
+}
+
+/// PROTOCOL.md §7.2. `Ok(Some(junction))` when `prev_crc32c` could not be checked yet.
+fn validate(src: &dyn LogSource, r: &pb::TailRequest) -> Result<Option<Junction>, Status> {
     let ident = src.identity().filter(|_| src.is_ready());
     let Some((server_id, _)) = ident else {
         return Err(reason_status(pb::Reason::NotReady, "server is bootstrapping"));
@@ -96,18 +106,35 @@ fn validate(src: &dyn LogSource, r: &pb::TailRequest) -> Result<(), Status> {
     if src.role() == Role::Master && r.from_seq > last + 1 {
         return Err(reason_status(pb::Reason::Diverged, format!("from_seq {} is past master last_seq {last}", r.from_seq)));
     }
+    let mut junction = None;
     if let Some(prev) = r.prev_crc32c {
-        if let Some(have) = store.entry_crc(r.from_seq - 1).map_err(store_status)? {
-            if have != prev {
+        match store.entry_crc(r.from_seq - 1).map_err(store_status)? {
+            Some(have) if have != prev => {
                 return Err(reason_status(pb::Reason::Diverged, format!("entry {} differs", r.from_seq - 1)));
             }
+            Some(_) => {}
+            // Not held yet (the client is ahead of this replica): checked before `from_seq`
+            // is sent. A trimmed entry stays unknown and is not checked.
+            None => junction = Some(Junction { seq: r.from_seq - 1, crc: prev }),
         }
     }
     let first = store.first_retained_seq();
     if r.from_seq < first {
         return Err(reason_status(pb::Reason::LogGap, format!("from_seq {} < first retained {first}", r.from_seq)));
     }
-    Ok(())
+    Ok(junction)
+}
+
+/// The junction check of a stream that started ahead of this server: `Err(DIVERGED)` if the
+/// server now holds entry `j.seq` and its CRC is not the client's `prev_crc32c`.
+fn check_junction(src: &dyn LogSource, j: Junction) -> Result<(), Status> {
+    match src.store().entry_crc(j.seq).map_err(store_status)? {
+        Some(have) if have != j.crc => Err(reason_status(
+            pb::Reason::Diverged,
+            format!("entry {} differs (checked once this server caught up with the client)", j.seq),
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn heartbeat(src: &dyn LogSource) -> pb::TailMessage {
@@ -286,6 +313,7 @@ async fn produce(
     fetch: Fetch,
     mut lease: Option<Lease>,
     mut stream: Stream,
+    mut junction: Option<Junction>,
 ) {
     let hb: Duration = src.heartbeat();
     let mut seqs = src.subscribe();
@@ -332,6 +360,14 @@ async fn produce(
         }
         if let Some(status) = stream.violation() {
             return out.end(status).await;
+        }
+        // As soon as the server holds `from_seq - 1`, the client's `prev_crc32c` is checked,
+        // before anything is sent (PROTOCOL.md §7.2, §7.3).
+        if let Some(j) = junction.filter(|j| j.seq <= src.store().position().last_seq) {
+            junction = None;
+            if let Err(status) = check_junction(&*src, j) {
+                return out.end(status).await;
+            }
         }
         // Read ahead everything that is available (in blocks of READ_BATCH).
         if ahead.is_empty() && next <= src.store().position().last_seq {
@@ -469,7 +505,7 @@ mod tests {
         let (_violation_tx, violation) = oneshot::channel();
         let (done, _done_rx) = oneshot::channel();
         let stream = Stream { replica, violation: Some(violation), _done: done };
-        tokio::spawn(produce(src, Out { tx, shutdown, resets }, 1, fetch, None, stream));
+        tokio::spawn(produce(src, Out { tx, shutdown, resets }, 1, fetch, None, stream, None));
         let mut rx = rx;
         let err = within("the stream status", async {
             loop {
@@ -482,5 +518,83 @@ mod tests {
         })
         .await;
         assert_eq!(crate::net::reason_of(&err), Some(pb::Reason::UpstreamReset));
+    }
+
+    /// Starts a producer over `m` at `from` (no validation) and returns its receiving end.
+    fn producer(m: &crate::master::Master, from: Seq, junction: Option<Junction>) -> mpsc::Receiver<Result<pb::TailMessage, Status>> {
+        let src = m.log_source();
+        let mut resets = src.resets();
+        resets.borrow_and_update();
+        let (tx, rx) = mpsc::channel(CHANNEL);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        std::mem::forget(shutdown_tx); // keep the stream open for the test's duration
+        let fetch = Fetch::clamp(&req(0, 0, 0), Duration::from_secs(1), 1 << 20);
+        let registry = Arc::new(super::super::replicas::ReplicaRegistry::default());
+        let replica = registry.open(NewReplica {
+            node_id: "b".into(),
+            remote_addr: "127.0.0.1:1".parse().unwrap(),
+            peer_verified: false,
+            epoch: 1,
+            has_up_to: from - 1,
+            fetch: fetch.settings(),
+        });
+        let (violation_tx, violation) = oneshot::channel();
+        std::mem::forget(violation_tx);
+        let (done, _done_rx) = oneshot::channel();
+        let stream = Stream { replica, violation: Some(violation), _done: done };
+        tokio::spawn(produce(src, Out { tx, shutdown, resets }, from, fetch, None, stream, junction));
+        rx
+    }
+
+    /// The first entry batch, or the status that ended the stream.
+    async fn first_batch_or_end(rx: &mut mpsc::Receiver<Result<pb::TailMessage, Status>>) -> Result<Vec<pb::LogEntry>, Status> {
+        crate::server::test_client::within("a batch or the end of the stream", async {
+            loop {
+                match rx.recv().await {
+                    Some(Ok(pb::TailMessage { kind: Some(Kind::Batch(b)) })) => return Ok(b.entries),
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(e),
+                    None => panic!("stream ended without a status"),
+                }
+            }
+        })
+        .await
+    }
+
+    /// I4: a client ahead of this server (a replica that crashed unsynced) sent `prev_crc32c`
+    /// for an entry the server did not hold yet. Once the server holds it, the CRC is checked
+    /// before `from_seq` is sent: a different entry ends the stream DIVERGED, the same one
+    /// streams normally.
+    #[tokio::test]
+    async fn the_junction_crc_is_checked_once_the_server_catches_up() {
+        use crate::server::test_client::serving_master;
+        use crate::types::CfSpec;
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(dir.path(), |cfg| cfg.serve = None).await;
+        m.create_cf(CfSpec::new("c")).unwrap(); // seq 1
+
+        // The client claims entry 2 has CRC 0xDEAD; the server writes 2 and 3 later.
+        let mut diverged = producer(&m, 3, Some(Junction { seq: 2, crc: 0xDEAD }));
+        // The client's entry 2 is the server's (CRC known after the write below).
+        m.put("c", b"k", b"v").unwrap(); // seq 2
+        let crc2 = m.log_source().store().entry_crc(2).unwrap().unwrap();
+        let mut matching = producer(&m, 4, Some(Junction { seq: 3, crc: 0 }));
+        m.put("c", b"k2", b"v").unwrap(); // seq 3
+        let e = first_batch_or_end(&mut diverged).await.expect_err("entry 2 differs");
+        assert_eq!(crate::net::reason_of(&e), Some(pb::Reason::Diverged), "{e:?}");
+        let e = first_batch_or_end(&mut matching).await.expect_err("entry 3 differs (crc 0)");
+        assert_eq!(crate::net::reason_of(&e), Some(pb::Reason::Diverged), "{e:?}");
+
+        let mut ok = producer(&m, 3, Some(Junction { seq: 2, crc: crc2 }));
+        let batch = first_batch_or_end(&mut ok).await.expect("entry 2 matches");
+        assert_eq!(batch[0].seq, 3);
+        // Ahead with a matching junction: nothing is sent until the server catches up.
+        let crc3 = m.log_source().store().entry_crc(3).unwrap().unwrap();
+        let mut ahead = producer(&m, 5, Some(Junction { seq: 4, crc: 0 }));
+        let mut fine = producer(&m, 4, Some(Junction { seq: 3, crc: crc3 }));
+        m.put("c", b"k3", b"v").unwrap(); // seq 4
+        m.put("c", b"k4", b"v").unwrap(); // seq 5
+        assert_eq!(first_batch_or_end(&mut fine).await.unwrap()[0].seq, 4);
+        assert!(first_batch_or_end(&mut ahead).await.is_err(), "entry 4 differs (crc 0)");
     }
 }

@@ -20,8 +20,14 @@ use crate::types::{fork_after, EpochStart, Seq};
 pub struct AcceptDataLoss;
 
 /// What a repoint does when the new upstream answers `DIVERGED`. The slave's configured
-/// `on_divergence` policy is not used after an explicit repoint: this mode decides every
-/// `DIVERGED` answer (handshake or Tail) until the next repoint or a restart.
+/// `on_divergence` policy is not used after an explicit repoint: the repoint's mode decides
+/// every `DIVERGED` answer (handshake, Tail or Bootstrap) until the next repoint or a restart.
+///
+/// **Consent to lose data is single-use.** `Rebootstrap` and `Repair` apply only while their own
+/// repoint is in progress. Once that repoint settles (with any outcome, including
+/// `Retrying` and an error), the mode becomes `Refuse`: a later, unrelated `DIVERGED` halts
+/// the slave with its data intact instead of discarding it again. Repoint again with the
+/// consent to apply it once more.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RepointDivergence {
     /// `repoint` returns `Error::Diverged`; the slave halts `Diverged` with its data intact
@@ -32,7 +38,8 @@ pub enum RepointDivergence {
     /// this version:** `repoint` returns `Error::Unsupported` and the slave halts
     /// `Diverged` with its data intact. It needs verify sessions (Plan 3).
     Repair { accept_loss: AcceptDataLoss },
-    /// Discard all local data and bootstrap from the new upstream.
+    /// Discard all local data and bootstrap from the new upstream, if this repoint's upstream
+    /// answers `DIVERGED` before the repoint settles.
     Rebootstrap { accept_loss: AcceptDataLoss },
 }
 
@@ -78,10 +85,20 @@ impl Inner {
     }
 
     /// Settles the repoint that session `generation` was started for (no-op if there is none).
+    /// Its consent to lose data (`Rebootstrap`, `Repair`) ends here: later `DIVERGED` answers
+    /// are refused.
     pub(crate) fn settle_repoint(&self, generation: u64, result: Result<RepointOutcome>) {
         let mut pending = self.pending_repoint();
         if pending.as_ref().is_some_and(|p| p.generation == generation) {
             let p = pending.take().expect("checked");
+            // Under the `pending` lock, so a newer repoint's mode (set under it too) is never
+            // overwritten.
+            let mut mode = self.repoint_divergence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(*mode, Some(RepointDivergence::Rebootstrap { .. } | RepointDivergence::Repair { .. })) {
+                tracing::info!(node = %self.cfg.identifier, "repoint settled; its consent to discard data has ended");
+                *mode = Some(RepointDivergence::Refuse);
+            }
+            drop(mode);
             if result.is_ok() {
                 // Downstream nodes learn the new upstream chain from a fresh handshake.
                 self.reset_downstream();
@@ -158,6 +175,8 @@ impl Slave {
     ///   `RepointDivergence::Rebootstrap { accept_loss: AcceptDataLoss }`.
     ///   `RepointDivergence::Repair` returns `Err(Unsupported)` in this version (it needs
     ///   Plan 3's verify sessions) and also leaves the slave halted with its data intact.
+    ///   The consent is single-use: it covers `DIVERGED` answers until this repoint settles
+    ///   (this call returns), then the mode reverts to `Refuse` (see [`RepointDivergence`]).
     /// - `Err(Halted(LoopDetected))`: the new upstream is this slave or replicates from it;
     ///   the slave halts until it is repointed again.
     /// - `Err(RepointSuperseded)`: a later repoint replaced this one (or the slave shut down)

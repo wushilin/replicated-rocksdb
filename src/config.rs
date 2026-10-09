@@ -125,6 +125,7 @@ impl MasterConfig {
         }
         if let Some(serve) = &self.serve {
             serve.validate()?;
+            serve.check_heartbeat(self.heartbeat)?;
         }
         if self.write_concern.min_insync_replicas > 0 && self.write_concern.ack_timeout.is_zero() {
             return Err(Error::Config("write_concern.ack_timeout must be positive".into()));
@@ -211,8 +212,13 @@ pub struct ServeLimits {
     pub bootstrap_chunk_bytes: usize,
     pub bootstrap_lease_ttl: Duration,
     pub verify_session_timeout: Duration,
-    /// Failed authentications per remote address per minute before calls are refused unchecked.
+    /// Failed authentications per remote address within `auth_failure_window` before calls
+    /// from that address are refused unchecked with `RESOURCE_EXHAUSTED` / `BUSY` (a
+    /// retryable answer: a correctly configured replica behind the same address backs off and
+    /// retries, it never halts as if its credentials were wrong).
     pub max_auth_failures_per_minute: u32,
+    /// The window of `max_auth_failures_per_minute`. Default 60 s.
+    pub auth_failure_window: Duration,
     /// Cap on a Tail client's `max_batch_bytes` (PROTOCOL.md §7.5).
     pub max_tail_batch_bytes: usize,
     /// A replica counts as in sync only if it was fully caught up within this long.
@@ -231,6 +237,7 @@ impl Default for ServeLimits {
             bootstrap_lease_ttl: Duration::from_secs(15 * 60),
             verify_session_timeout: Duration::from_secs(5 * 60),
             max_auth_failures_per_minute: 10,
+            auth_failure_window: Duration::from_secs(60),
             max_tail_batch_bytes: 4 << 20,
             replica_lag_time_max: Duration::from_secs(10),
         }
@@ -255,6 +262,20 @@ impl ServeConfig {
         ServeConfig { bind, port, tls: None, authenticator, allow_plaintext_token: false, limits: ServeLimits::default() }
     }
 
+    /// A replica acks at least once per heartbeat of its server, and an idle replica stays in
+    /// sync only through those acks: `heartbeat * 2 <= replica_lag_time_max` keeps a healthy
+    /// idle replica in sync (PROTOCOL.md §7.6).
+    pub(crate) fn check_heartbeat(&self, heartbeat: Duration) -> Result<()> {
+        let lag_max = self.limits.replica_lag_time_max;
+        if heartbeat.saturating_mul(2) > lag_max {
+            return Err(Error::Config(format!(
+                "heartbeat ({heartbeat:?}) must be at most half of serve.limits.replica_lag_time_max ({lag_max:?}): \
+                 replicas ack once per heartbeat, so idle replicas would drop out of sync"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         self.authenticator.validate()?;
         if self.allow_plaintext_token && self.tls.is_none() && !self.bind.is_loopback() {
@@ -276,7 +297,11 @@ impl ServeConfig {
         if l.bootstrap_chunk_bytes == 0 || l.bootstrap_chunk_bytes > MAX_BOOTSTRAP_CHUNK_BYTES {
             return Err(Error::Config(format!("bootstrap_chunk_bytes must be 1..={MAX_BOOTSTRAP_CHUNK_BYTES}")));
         }
-        if l.bootstrap_lease_ttl.is_zero() || l.verify_session_timeout.is_zero() || l.replica_lag_time_max.is_zero() {
+        if l.bootstrap_lease_ttl.is_zero()
+            || l.verify_session_timeout.is_zero()
+            || l.replica_lag_time_max.is_zero()
+            || l.auth_failure_window.is_zero()
+        {
             return Err(Error::Config("serve timeouts must be positive".into()));
         }
         Ok(())
@@ -324,6 +349,25 @@ mod serve_tests {
         let mut cfg = new();
         cfg.limits.verify_session_timeout = Duration::ZERO;
         assert!(cfg.validate().is_err());
+        let mut cfg = new();
+        cfg.limits.auth_failure_window = Duration::ZERO;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn heartbeat_must_be_at_most_half_the_in_sync_window() {
+        let mut m = MasterConfig::new("a", "/tmp/unused");
+        m.validate().unwrap();
+        m.serve = Some(ServeConfig::new(std::net::IpAddr::from([127, 0, 0, 1]), 0, Arc::new(AllowAll)));
+        m.heartbeat = Duration::from_secs(5);
+        m.validate().unwrap(); // 2 × 5 s = 10 s, the default window
+        m.heartbeat = Duration::from_millis(5_001);
+        assert!(matches!(m.validate(), Err(Error::Config(msg)) if msg.contains("replica_lag_time_max")));
+        m.serve.as_mut().unwrap().limits.replica_lag_time_max = Duration::from_secs(11);
+        m.validate().unwrap();
+        m.serve = None;
+        m.heartbeat = Duration::from_secs(60);
+        m.validate().unwrap(); // not serving: no constraint
     }
 
     #[test]

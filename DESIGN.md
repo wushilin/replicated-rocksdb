@@ -181,7 +181,7 @@ The same rules are in the rustdoc for `Master::put`, `Master::write` and `Master
 
 ### 5.2 Write concern (in-sync replicas)
 
-`MasterConfig::write_concern: WriteConcern { min_insync_replicas, ack_timeout }` (default `0` = asynchronous, `5 s`) applies to every write method; `Master::write_with(batch, concern)` and `Master::put_with(cf, key, value, concern)` override it per call. A direct replica of the master is **in sync** while its Tail stream is open, it follows the master's current identity, and its acknowledged seq reached the master's `last_seq` within `ServeLimits::replica_lag_time_max` (default 10 s; PROTOCOL.md §7.6). Replicas of replicas do not count.
+`MasterConfig::write_concern: WriteConcern { min_insync_replicas, ack_timeout }` (default `0` = asynchronous, `5 s`) applies to every write method; `Master::write_with(batch, concern)` and `Master::put_with(cf, key, value, concern)` override it per call. A direct replica of the master is **in sync** while its Tail stream is open, it follows the master's current identity, and its acknowledged seq reached the master's `last_seq` within `ServeLimits::replica_lag_time_max` (default 10 s; PROTOCOL.md §7.6). Replicas of replicas do not count. A node that serves must have `heartbeat * 2 <= replica_lag_time_max` (checked by `MasterConfig` and `SlaveConfig` validation, `Error::Config` otherwise): an idle replica acks once per heartbeat, so a longer heartbeat would drop healthy replicas out of sync.
 
 With `min_insync_replicas = N > 0`:
 1. Before taking the writer lock: if fewer than N replicas are in sync → `Error::NotEnoughReplicas { required, in_sync }`. Nothing is written and no seq is consumed.
@@ -383,7 +383,7 @@ Normative messages: PROTOCOL.md §9.
 
 **Repoint.** `Slave::repoint(upstream, RepointOptions) -> Result<RepointOutcome>` switches a running slave to another upstream; reads keep being served. It closes the current upstream stream (a bootstrap in progress is abandoned and starts from scratch against the new upstream), clears a halt (in memory: `node_state = ready` is persisted only once the new upstream is accepted, so a restart before that reopens the slave still halted and the operator repoints again), forgets the old upstream chain, and handshakes the new upstream under all the normal rules (loop detection, `STALE_EPOCH`, epoch continuity). It returns once that handshake settles: `Resumed`, `EpochAdvanced`, `Bootstrapped`, or `Retrying { last_error }` when the new upstream cannot be used yet (unreachable, `STALE_EPOCH`, `NOT_READY`; the slave keeps retrying it). The new upstream is not persisted: after a restart, open the slave with it. A repoint replaced by a later one, or by a shutdown, before it settles returns `Error::RepointSuperseded`. `SlaveStatus.upstream` is the current target.
 
-**Divergence is never resolved implicitly by a repoint.** The configured `on_divergence` is not used after a repoint; `RepointOptions::on_divergence` decides every `DIVERGED` answer (a handshake of any later session, or a Tail or Bootstrap ending `DIVERGED`) until the next repoint. A forced bootstrap requested before the repoint (a gap, an earlier `Rebootstrap`) is bound to the generation that requested it and never applies to a later repoint; only `clear_halt(Rebootstrap)` issued after the repoint applies:
+**Divergence is never resolved implicitly by a repoint.** The configured `on_divergence` is not used after a repoint; the repoint's mode decides every `DIVERGED` answer (a handshake of any later session, or a Tail or Bootstrap ending `DIVERGED`) until the next repoint. **Consent is single-use:** `Rebootstrap` and `Repair` apply only to their own repoint until it settles (`repoint` returns, with any outcome including `Retrying` or an error); from then on the mode is `Refuse`, so a later, unrelated `DIVERGED` halts the slave with its data intact instead of discarding data again. `Refuse` stays in force until the next repoint. A forced bootstrap requested before the repoint (a gap, an earlier `Rebootstrap`) is bound to the generation that requested it and never applies to a later repoint; only `clear_halt(Rebootstrap)` issued after the repoint applies:
 - `Refuse` (default): `Error::Diverged { fork_seq, local_last_seq, divergent_entries }`; the slave halts `Diverged` with its data intact and readable.
 - `Rebootstrap { accept_loss: AcceptDataLoss }`: discard all local data and bootstrap from the new upstream.
 - `Repair { accept_loss: AcceptDataLoss }`: roll back only the divergent entries (§22). Until verify sessions exist it returns `Error::Unsupported`, and the slave halts `Diverged` with its data intact.
@@ -431,7 +431,7 @@ Built-in implementations:
 - `AllowMethods::new(inner, &[Method])` restricts any authenticator to some methods (`PERMISSION_DENIED` otherwise); `NoCredentials` sends no token.
 - **Token auth without TLS is refused** unless `allow_plaintext_token: true` is set.
 - `method` lets deployments allow `Bootstrap` and `Verify` only to some peers. Those calls expose the whole database.
-- The server limits the rate of failed authentications per remote address (`ServeLimits::max_auth_failures_per_minute`, default 10; then `UNAUTHENTICATED` without checking the token).
+- The server limits the rate of failed authentications per remote address (`ServeLimits::max_auth_failures_per_minute`, default 10 within `auth_failure_window`, default 60 s). A throttled call gets `RESOURCE_EXHAUSTED` / `BUSY` without its credentials being checked: a retryable answer, so a correctly configured replica behind the same address backs off and retries instead of halting `AuthRejected`. Only a credential that was checked and failed gets `UNAUTHENTICATED`.
 
 ## 15. Listener
 
@@ -492,7 +492,8 @@ pub struct ServeConfig {
     pub limits: ServeLimits,   // { max_concurrent_bootstraps: 2, max_verify_sessions: 4,
                                //   bootstrap_chunk_bytes: 1 MiB (at most 16 MiB),
                                //   bootstrap_lease_ttl: 15 min, verify_session_timeout: 5 min,
-                               //   max_auth_failures_per_minute: 10, max_tail_batch_bytes: 4 MiB,
+                               //   max_auth_failures_per_minute: 10, auth_failure_window: 60 s,
+                               //   max_tail_batch_bytes: 4 MiB,
                                //   replica_lag_time_max: 10 s }
 }
 

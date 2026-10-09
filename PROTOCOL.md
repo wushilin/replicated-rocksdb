@@ -410,7 +410,7 @@ message Heartbeat   { uint64 upstream_last_seq = 1; uint64 origin_last_seq = 2; 
 ```
 
 - Entries are sent in `EntryBatch` messages. Across all batches of a stream, entries are in strictly consecutive seq order, starting at `from_seq`, with no gaps or duplicates. A batch is never empty. When batches are formed is governed by §7.5.
-- If `from_seq > server.last_seq + 1` (only possible when the server is a replica), the server sends heartbeats and no entries until its own `last_seq` reaches `from_seq − 1`, then continues normally.
+- If `from_seq > server.last_seq + 1` (only possible when the server is a replica), the server sends heartbeats and no entries until its own `last_seq` reaches `from_seq − 1`, then continues normally. The **junction** is checked first: if the client sent `prev_crc32c` and the server did not hold entry `from_seq − 1` at validation, the server compares that entry's `crc32c` with `prev_crc32c` as soon as it holds it, and ends the stream with `FAILED_PRECONDITION` / `DIVERGED` on a mismatch, before sending `from_seq`.
 - The server sends a `Heartbeat` whenever it has sent no message for `heartbeat_ms`. It SHOULD also send one at least every `heartbeat_ms` while it is streaming entries, so that `origin_last_seq` stays current.
 - `upstream_last_seq` is the server's `last_seq`. `origin_last_seq` is the master's `last_seq` as last known to the server. `ts_ms` is the server's wall clock and is informational only.
 - The stream does not end on its own. The server ends it:
@@ -418,6 +418,7 @@ message Heartbeat   { uint64 upstream_last_seq = 1; uint64 origin_last_seq = 2; 
   - with `UNAVAILABLE` / `UPSTREAM_RESET` if the server starts bootstrapping itself or its identity changes (for example an epoch bump on the master);
   - with `UNAVAILABLE` / `SHUTTING_DOWN` on a graceful shutdown;
   - with `DATA_LOSS` / `CORRUPT` if a stored entry fails its CRC;
+  - with `FAILED_PRECONDITION` / `DIVERGED` if the junction check above fails;
   - with `INVALID_ARGUMENT` if a client message breaks the rules of §7.6.
 - A stream that ends without a status (a clean end of stream) carries no decision. The client MUST treat it as transient: back off and handshake again (§11.4).
 - Flow control is HTTP/2 flow control. A server MUST NOT drop entries to keep up with a slow consumer. It applies back-pressure until retention forces `LOG_GAP`.
@@ -462,7 +463,7 @@ After `start`, the client sends `ack` messages on the same stream. `applied_seq`
 - Acks never change what the server sends: it does not resend or skip entries because of them. On a reconnect the client's position is still its own durable `last_seq` (§7).
 - Per open stream the server tracks the client's node id and address, whether the id was verified (mutual TLS), the epoch the client follows, when the stream opened, the last seq sent, the last seq acknowledged, the last time `applied_seq` reached the server's `last_seq`, and the stream's fetch settings.
 - A replica is **caught up** as of the moment the server sent it a batch that held everything the server had (the batch ended at the server's `last_seq` when it was sent), once an ack covers that batch; also when an ack reaches the server's `last_seq` directly. This is Kafka's "caught up to the end offset at fetch time": a replica that keeps acknowledging what it is sent stays caught up even while writes keep the server ahead of its latest ack.
-- A replica is **in sync** while its stream is open, it follows the server's current identity, and it was caught up within the last `replica_lag_time_max` (RECOMMENDED 10 s). A master MAY make a write wait until a number of in-sync replicas have acknowledged it.
+- A replica is **in sync** while its stream is open, it follows the server's current identity, and it was caught up within the last `replica_lag_time_max` (RECOMMENDED 10 s). A server MUST keep `heartbeat_ms` at most half of `replica_lag_time_max`, so that an idle replica acknowledging once per heartbeat stays in sync. A master MAY make a write wait until a number of in-sync replicas have acknowledged it.
 
 ## 8. Bootstrap
 
@@ -605,13 +606,13 @@ RPC failures use standard gRPC status codes. The status MUST carry a `google.rpc
 | `STALE_EPOCH` | `FAILED_PRECONDITION` | yes, with backoff | The server is behind the client's epoch: a replica that has not caught up yet, or a demoted master. |
 | `LOG_GAP` | `OUT_OF_RANGE` | after a new handshake | The requested entries are no longer retained. |
 | `LOOP_DETECTED` | `FAILED_PRECONDITION` | no | The client is upstream of the server. |
-| `BUSY` | `RESOURCE_EXHAUSTED` | yes, with backoff | Concurrency limit reached. |
+| `BUSY` | `RESOURCE_EXHAUSTED` | yes, with backoff | Concurrency limit reached, or the caller's address is throttled after too many failed authentications. |
 | `SESSION_NOT_FOUND` | `NOT_FOUND` | start a new session | Unknown or expired verify session. |
 | `UPSTREAM_RESET` | `UNAVAILABLE` | after a new handshake | The server's state was replaced. |
 | `SHUTTING_DOWN` | `UNAVAILABLE` | yes, with backoff | Graceful shutdown. |
 | `CORRUPT` | `DATA_LOSS` | client: yes, with backoff | Stored data failed an integrity check on the server. The client's own data is intact, so it backs off and retries; the server's operator must repair it. |
 
-Authentication failures use `UNAUTHENTICATED` or `PERMISSION_DENIED` without `ErrorInfo` (§3.3). A malformed request uses `INVALID_ARGUMENT`, and so does a Tail client that breaks the message order or the ack rules (§7.1, §7.6).
+Authentication failures use `UNAUTHENTICATED` or `PERMISSION_DENIED` without `ErrorInfo` (§3.3). A server that throttles an address after repeated authentication failures MUST answer the throttled calls with `RESOURCE_EXHAUSTED` / `BUSY`, not `UNAUTHENTICATED`: their credentials were not checked, and a client halts on `UNAUTHENTICATED`, so a flood of bad credentials from a shared address would otherwise stop the good replicas behind it. A malformed request uses `INVALID_ARGUMENT`, and so does a Tail client that breaks the message order or the ack rules (§7.1, §7.6).
 
 ## 11. Client behaviour
 
@@ -693,7 +694,7 @@ Only the master enforces `max_entry_bytes`, at write time. Replicas accept and f
 - **Tokens.** Tokens MUST be compared in constant time, and MUST NOT be logged or included in error details. Support at least two concurrently valid tokens so they can be rotated without downtime.
 - **Node ids are not credentials.** `client_id`, `server_id` and `upstream_chain` are self-asserted. They are used for loop detection and diagnostics only.
 - **Integrity.** CRC-32C protects against accidental corruption only. Against active tampering, rely on TLS. The BLAKE3 digests detect divergence between honest nodes. They do not authenticate the data.
-- **Denial of service.** Servers bound concurrent bootstraps and verify sessions, expire idle sessions and leases, and SHOULD limit the rate of failed authentication attempts per peer address.
+- **Denial of service.** Servers bound concurrent bootstraps and verify sessions, expire idle sessions and leases, and SHOULD limit the rate of failed authentication attempts per peer address. Throttled calls are answered `BUSY` (retryable, §10), so the limit cannot be used to halt good replicas that share the address.
 - **Divergence.** The epoch history, the `DIVERGED` and `STALE_EPOCH` checks and the master's fsync together keep different histories from mixing under the same seq. An operator who restores a master from a backup MUST bump its epoch before it serves replicas, and an operator who promotes a replica MUST stop the old master first.
 
 ## 14. Complete protobuf definition

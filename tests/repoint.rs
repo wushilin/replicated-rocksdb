@@ -298,3 +298,36 @@ async fn status_reports_the_current_upstream() {
     assert_eq!(b.status().upstream, uri);
     assert!(b.status().upstream_chain.is_empty());
 }
+
+/// I1: `Rebootstrap { AcceptDataLoss }` is consent for its own repoint only. After that repoint
+/// settles (`Bootstrapped`), the upstream is restored from an old backup without an epoch bump
+/// (D is now ahead of it: `DIVERGED`). D halts with its data intact instead of discarding it on
+/// the strength of the old consent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consent_to_lose_data_ends_when_its_repoint_settles() {
+    let c = Cluster::new();
+    let (b_cfg, d, _, ld) = diverged_pair(&c).await;
+    let b = Slave::open(b_cfg).await.unwrap();
+    let b = b.promote(c.master_config("b")).await.unwrap();
+    let rebootstrap = RepointOptions { on_divergence: RepointDivergence::Rebootstrap { accept_loss: AcceptDataLoss } };
+    assert_eq!(repoint(&d, up(b.serve_addr().unwrap()), rebootstrap).await.unwrap(), RepointOutcome::Bootstrapped);
+    assert_converged(&b, &[("d", &d)]).await;
+    assert_eq!(ld.bootstraps(), 2);
+
+    // Back up B, write past the backup (D follows), then restore B without an epoch bump.
+    let b = c.restart_master_after_backup(b, "b", "b-backup").await;
+    let port = b.serve_addr().unwrap().port();
+    b.put("c", b"after the backup", b"1").unwrap();
+    b.put("c", b"after the backup 2", b"2").unwrap();
+    assert_converged(&b, &[("d", &d)]).await;
+    b.shutdown().await.unwrap();
+    support::restore_dir(&c.path("b-backup"), &c.path("b"));
+    let mut cfg = c.master_config("b");
+    cfg.serve.as_mut().unwrap().port = port;
+    let b = Master::open(cfg).await.unwrap();
+
+    wait_state(&d, "Diverged halt", |s| *s == SlaveState::Halted(HaltReason::Diverged)).await;
+    assert_eq!(d.get("c", b"after the backup 2").unwrap(), Some(b"2".to_vec()), "data intact");
+    assert_eq!(ld.bootstraps(), 2, "the settled repoint's consent was not reused");
+    drop(b);
+}

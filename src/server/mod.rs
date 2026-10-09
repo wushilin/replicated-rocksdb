@@ -99,7 +99,10 @@ impl ServerState {
     async fn authorize(&self, call: &CallInfo, method: Method) -> Result<Arc<dyn LogSource>, Status> {
         let ip = call.peer.remote_addr.ip();
         if self.auth_failures.is_blocked(ip, Instant::now()) {
-            return Err(Status::unauthenticated("too many failed authentication attempts"));
+            // Throttled, not rejected: the credentials were not even checked. A retryable
+            // answer, so a good replica behind the same address backs off instead of halting
+            // `AuthRejected` (which would let anyone with network access stop it).
+            return Err(reason_status(pb::Reason::Busy, "too many failed authentication attempts from this address; retry later"));
         }
         match self.cfg.authenticator.authenticate(&call.peer, method, call.token.as_deref()).await {
             Ok(()) => self.source(),
@@ -329,7 +332,7 @@ pub(crate) async fn start(source: Weak<dyn LogSource>, cfg: ServeConfig, replica
     let state = Arc::new(ServerState {
         source,
         bootstraps: Arc::new(Semaphore::new(cfg.limits.max_concurrent_bootstraps)),
-        auth_failures: FailureLimiter::new(cfg.limits.max_auth_failures_per_minute),
+        auth_failures: FailureLimiter::new(cfg.limits.max_auth_failures_per_minute, cfg.limits.auth_failure_window),
         leases: Mutex::new(HashMap::new()),
         shutdown: shutdown_rx.clone(),
         cfg,

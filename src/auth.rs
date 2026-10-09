@@ -266,10 +266,11 @@ impl FailureLimiter {
     /// Hard cap on tracked addresses.
     pub(crate) const MAX_TRACKED: usize = 10_000;
 
-    pub(crate) fn new(max_per_minute: u32) -> Self {
+    /// At most `max` failures per address within `window`.
+    pub(crate) fn new(max: u32, window: Duration) -> Self {
         FailureLimiter {
-            max: max_per_minute as usize,
-            window: Duration::from_secs(60),
+            max: max as usize,
+            window,
             failures: Mutex::new(HashMap::new()),
         }
     }
@@ -452,7 +453,7 @@ mod tests {
 
     #[test]
     fn failure_limiter_blocks_after_max_within_a_minute() {
-        let l = FailureLimiter::new(3);
+        let l = FailureLimiter::new(3, Duration::from_secs(60));
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let other: IpAddr = "10.0.0.2".parse().unwrap();
         let t0 = Instant::now();
@@ -480,7 +481,7 @@ mod tests {
 
     #[test]
     fn failure_limiter_boundary_and_buckets() {
-        let l = FailureLimiter::new(3);
+        let l = FailureLimiter::new(3, Duration::from_secs(60));
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let t0 = Instant::now();
         l.record_failure(ip, t0);
@@ -503,7 +504,7 @@ mod tests {
 
     #[test]
     fn failure_limiter_memory_is_bounded() {
-        let l = FailureLimiter::new(3);
+        let l = FailureLimiter::new(3, Duration::from_secs(60));
         let t0 = Instant::now();
         for i in 0..50_000u32 {
             l.record_failure(IpAddr::from(i.to_be_bytes()), t0 + Duration::from_millis(u64::from(i)));

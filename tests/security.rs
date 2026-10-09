@@ -153,3 +153,43 @@ async fn a_wrong_ca_is_a_retried_transport_error() {
     let ok = tls_slave(&c, &m, "ok", pki.client(None), None).await;
     assert_converged(&m, &[("ok", &ok)]).await;
 }
+
+/// I2: a flood of bad tokens from 127.0.0.1 throttles the address, but a correctly configured
+/// replica behind the same address is answered `BUSY` (retryable), not `UNAUTHENTICATED`: it
+/// keeps retrying with backoff, never halts `AuthRejected`, and converges once the window passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_auth_failure_flood_throttles_but_never_halts_a_good_replica_on_the_same_address() {
+    let c = Cluster::new();
+    let mut cfg = c.master_config("a");
+    let serve = cfg.serve.as_mut().unwrap();
+    serve.authenticator = Arc::new(TokenAuthenticator::new(["good"]));
+    serve.allow_plaintext_token = true;
+    serve.limits.max_auth_failures_per_minute = 3;
+    serve.limits.auth_failure_window = std::time::Duration::from_secs(2);
+    let m = Master::open(cfg).await.unwrap();
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", b"k", b"v").unwrap();
+    let addr = m.serve_addr().unwrap();
+
+    let mut bad = replicated_rocksdb::UpstreamConfig::from_addr(addr);
+    bad.credentials = Arc::new(TokenCredentials::new("bad"));
+    for _ in 0..10 {
+        assert!(replicated_rocksdb::admin::node_status(&bad, "attacker").await.is_err());
+    }
+
+    let (mut cfg, listener) = c.slave_config("b", addr);
+    cfg.serve = None;
+    cfg.upstream.credentials = Arc::new(TokenCredentials::new("good"));
+    let b = Slave::open(cfg).await.unwrap();
+    wait_until("throttled with a retryable error", || {
+        b.status().last_error.as_deref().is_some_and(|e| e.contains("too many failed authentication"))
+    })
+    .await;
+    assert!(!matches!(b.status().state, SlaveState::Halted(_)));
+    assert_converged(&m, &[("b", &b)]).await;
+    assert!(
+        listener.states().iter().all(|s| !matches!(s, SlaveState::Halted(_))),
+        "never halted: {:?}",
+        listener.states()
+    );
+}

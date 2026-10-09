@@ -232,8 +232,11 @@ async fn failed_authentications_are_rate_limited_per_address() {
         assert_eq!(e.code(), Code::Unauthenticated);
         assert_eq!(reason_of(&e), None, "auth failures carry no ErrorInfo");
     }
+    // Throttled without checking the token, with a retryable BUSY: never UNAUTHENTICATED, which
+    // would halt a correctly configured replica behind the same address.
     let e = client_with(addr, meta("good")).handshake(hello("b")).await.unwrap_err();
-    assert_eq!(e.code(), Code::Unauthenticated, "blocked without checking the token");
+    assert_eq!(e.code(), Code::ResourceExhausted, "blocked without checking the token");
+    assert_eq!(reason_of(&e), Some(pb::Reason::Busy));
 }
 
 #[tokio::test]
@@ -494,7 +497,11 @@ async fn small_writes_wait_for_max_wait_and_arrive_together() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reaching_min_batch_bytes_sends_before_max_wait() {
     let dir = tempfile::tempdir().unwrap();
-    let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_secs(30)).await;
+    let (m, _) = serving_master(dir.path(), |cfg| {
+        cfg.heartbeat = Duration::from_secs(30);
+        cfg.serve.as_mut().unwrap().limits.replica_lag_time_max = Duration::from_secs(60);
+    })
+    .await;
     m.create_cf(CfSpec::new("c")).unwrap();
     m.put("c", &[0], &[7; 100]).unwrap();
     let one = m.entries_since(1).unwrap().next().unwrap().unwrap().encoded_len();
