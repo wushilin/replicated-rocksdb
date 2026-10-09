@@ -7,6 +7,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use super::meta::{self, key};
+use super::Store;
+use crate::error::Result;
 use crate::types::CfEntry;
 
 #[derive(Debug)]
@@ -58,5 +61,30 @@ impl CfRegistry {
 
     pub(crate) fn push_pending(&self, cf: Arc<PhysCf>) {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner).push(cf);
+    }
+}
+
+impl Store {
+    /// Physically drops pending CFs that nothing references any more. Returns how many.
+    pub(crate) fn drop_unreferenced_cfs(&self) -> Result<usize> {
+        let mut pending = self.cfs.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut dropped = 0;
+        let mut i = 0;
+        while i < pending.len() {
+            // Pending CFs are not in the live map, so no new references can appear;
+            // a count of 1 (ours) means no reader holds it.
+            if Arc::strong_count(&pending[i]) == 1 {
+                self.db().drop_cf(&pending[i].physical)?;
+                pending.swap_remove(i);
+                dropped += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if dropped > 0 {
+            let remaining: Vec<CfEntry> = pending.iter().map(|p| p.entry.clone()).collect();
+            self.write_meta(&[(key::PENDING_CF_DROPS, &meta::encode_cf_list(&remaining))], true)?;
+        }
+        Ok(dropped)
     }
 }

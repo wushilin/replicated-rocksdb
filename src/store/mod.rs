@@ -1,13 +1,16 @@
 //! Crate-private RocksDB wrapper shared by master and slave.
 
+pub(crate) mod apply;
 pub(crate) mod cfs;
 pub(crate) mod meta;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use rocksdb::{BoundColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB};
 
@@ -31,6 +34,9 @@ pub(crate) struct Store {
     pub(crate) cfs: CfRegistry,
     pos: RwLock<Position>,
     first_retained: AtomicU64,
+    /// Options of CFs created after open. `DB::create_cf` does not retain the options'
+    /// comparator, so they must outlive `db` (fields drop in order: keep this after `db`).
+    created_cf_opts: Mutex<Vec<Options>>,
 }
 
 impl Store {
@@ -70,6 +76,7 @@ impl Store {
             cfs: CfRegistry::default(),
             pos: RwLock::new(Position::default()),
             first_retained: AtomicU64::new(1),
+            created_cf_opts: Mutex::new(Vec::new()),
         };
         let meta = match prior {
             Some(m) => m,
@@ -98,8 +105,25 @@ impl Store {
         self.load_meta()?.ok_or_else(|| Error::corrupt("__meta missing right after initialisation"))
     }
 
-    /// Finishes CF operations interrupted by a crash (DESIGN.md §7). Extended in Task 6.
-    fn recover_cf_state(&self, meta: MetaSnapshot, _existing: &[String]) -> Result<MetaSnapshot> {
+    /// Finishes CF operations interrupted by a crash (DESIGN.md §7):
+    /// an unregistered CF named by the create intent is dropped (replay recreates it), and
+    /// pending drops whose physical CF is already gone are forgotten.
+    fn recover_cf_state(&self, mut meta: MetaSnapshot, existing: &[String]) -> Result<MetaSnapshot> {
+        if let Some(intent) = meta.cf_create_intent.take() {
+            let physical = intent.physical_name();
+            let registered = meta.cf_specs.contains(&intent);
+            if !registered && self.db.cf_handle(&physical).is_some() {
+                self.db.drop_cf(&physical)?;
+            }
+            let cf = self.cf(CF_META);
+            self.db.delete_cf(&cf, key::CF_CREATE_INTENT)?;
+            self.db.flush_wal(true)?;
+        }
+        let before = meta.pending_drops.len();
+        meta.pending_drops.retain(|e| existing.contains(&e.physical_name()));
+        if meta.pending_drops.len() != before {
+            self.write_meta(&[(key::PENDING_CF_DROPS, &meta::encode_cf_list(&meta.pending_drops))], true)?;
+        }
         Ok(meta)
     }
 
@@ -114,6 +138,10 @@ impl Store {
 
     pub(crate) fn tuning(&self) -> &RocksTuning {
         &self.tuning
+    }
+
+    pub(crate) fn retain_cf_options(&self, opts: Options) {
+        self.created_cf_opts.lock().unwrap_or_else(PoisonError::into_inner).push(opts);
     }
 
     pub(crate) fn db(&self) -> &Arc<DB> {

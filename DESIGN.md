@@ -65,6 +65,7 @@ Master(A) ──► Slave(B) ──► Slave(C)
 | `node_state` | slave | `Ready` / `Bootstrapping { target_seq }` / `Halted(reason)`, persisted (see §16.3) |
 | `cf_specs` | all | live user CFs: `Vec<CfSpec>` plus `create_seq`, sorted by name |
 | `pending_cf_drops` | all | physical CFs logically dropped, awaiting physical drop |
+| `cf_create_intent` | all | the `CfEntry` being created; written with fsync before the physical CF is created, cleared in the `CreateCf` commit batch |
 
 `last_seq` is the source of truth for position. The changelog can be completely empty after retention, for example on a quiet master.
 
@@ -204,7 +205,7 @@ for each LogEntry received (in order):
 
 `CreateCf` and `DropCf` are not part of a RocksDB `WriteBatch`, so they are made crash-safe this way:
 
-- **CreateCf (seq N):** create the physical CF `u:{name}:{N}` if it doesn't exist (idempotent). Then write one batch: add the spec to `__meta.cf_specs`, write `__changelog[N]`, and set `last_seq = N`. After a crash in between, the CF exists but isn't registered, and replay completes the operation. On open, a physical `u:*` CF that is neither in `cf_specs` nor in `pending_cf_drops`, and whose `create_seq > last_seq`, is such a leftover. It is reused by the replay, or dropped if the node bootstraps.
+- **CreateCf (seq N):** write `__meta.cf_create_intent = (name, comparator, N)` with fsync, create the physical CF `u:{name}:{N}` if it doesn't exist (idempotent), then write one batch: add the spec to `__meta.cf_specs`, clear the intent, write `__changelog[N]`, and set `last_seq = N`. On open, an unregistered CF named by the intent is dropped and the intent cleared; replay (slave) or a retried write (master) recreates it. The intent exists because RocksDB can only reopen a CF with its comparator, and an unregistered CF's comparator would otherwise be unknown. Opening is two-phase: `__meta` is read through a read-only open first, so every user CF is reopened with its registered comparator.
 - **DropCf:** logical. One batch removes the spec from `cf_specs`, adds the physical CF to `pending_cf_drops`, and writes the changelog entry and `last_seq`.
 - **Physical drop is deferred while anything still references the CF.** Every RocksDB snapshot handle the crate gives out (`ReadSnapshot`, iterators, bootstrap and verify sessions) holds a reference-counted handle to each physical CF in its `cf_specs`. A background task drops a pending CF once its count reaches zero. A `ReadSnapshot` taken before the drop therefore still sees the CF and its data, through `list_cfs` too, because `cf_specs` is read through the snapshot.
 - On the master, creating a CF that already exists returns `AlreadyExists` and logs nothing.
