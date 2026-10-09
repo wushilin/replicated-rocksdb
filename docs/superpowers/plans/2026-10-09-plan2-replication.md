@@ -66,6 +66,7 @@ Each owning task updates DESIGN.md or PROTOCOL.md with the exact text given ther
 - **Slave config and status additions** (Task 7, DESIGN.md §16): `SlaveConfig::{heartbeat, connect_timeout, clock, sync_writes}`, `SlaveStatus::listener_failed`. `VerifyConfig`, `lag_ms` and `last_verify` come with Plan 3.
 - **Bootstrap lease hand-over** (Task 5, PROTOCOL.md §7.2): the Tail that presents the lease takes it over and releases it once it has read the entries after the snapshot (or when it ends), instead of releasing it the moment the stream is established — otherwise `max_entries = 1` retention can trim `S + 1` before the producer's first read.
 - **Bidirectional Tail with acks, replica status, `Status` RPC** (Task 6, addendum §1 and §4; PROTOCOL.md §2, §3.3, §6.5, §7, §7.1, §7.3, §7.6, §10, §11.2, §11.4, §12, §14; DESIGN.md §11, §14, §16, §17, §18, §19). Decisions: `ReplicaStatus::lag_ms` is `Option<u64>` — `None` when the first unacknowledged entry is no longer retained on the serving node, so no timestamp is known; `in_sync` also requires the replica to follow the node's current identity; `ServeLimits::replica_lag_time_max` (default 10 s) lives with the other server limits; the replica registry is owned by the node (`Inner.replicas`) and handed to `server::start`, so a node can report and wait on it; `Status.role` is the text `"master"`/`"slave"`, `node_state` is `__meta`'s text form, and `upstream` is empty on the master.
+- **Pre-flight 2 rulings (amendment #3):** in-sync is Kafka-style — a replica is caught up as of a send that drained the node's log once an ack covers it (PROTOCOL.md §7.6, Task 6; concurrent-writer test in Task 12); the Tail `start` wait also ends on shutdown (Task 6); `Status` takes `probe_seq` and answers `probe_crc`, and `admin::compare` needs the longer node's CRC at the shorter node's `last_seq` (different → `Diverged`; not held → `Unverifiable`, and `promote_checked` refuses a reachable peer that is at least as far and unverifiable with `PromotionUnverifiable`, reporting proven-diverged peers in its refusals), filled by `admin::gather` and `check_promotion` (Task 6 wire, Task 11 logic); `admin::node_status` times out after 5 s (unreachable); the slave client validates its token with `auth::validate_token` (invalid → non-persisted `AuthRejected`, Task 8); a repoint's divergence mode applies to every later `DIVERGED` (handshake or `status_end`) until the next repoint (Task 13).
 - **Clean end of a Tail stream is transient** (Task 6, PROTOCOL.md §7.3, §11.2, §11.4): a stream that ends with no status is treated like a lost connection.
 - **Bootstrap jobs release their snapshot and slot before their final status** (Task 6 fix of Task 5's `server::bootstrap`): after a reset the job used to wait in `end_stream` for a stalled client while still holding its `ReadSnapshot` and permit.
 - **Listener ordering** (Task 8, DESIGN.md §15): seqs are strictly increasing *between bootstraps*; after `on_bootstrap_complete(S)` delivery continues at `S + 1`. The listener is called before the new seq is published to `wait_for_seq`/`subscribe`, so whoever waits for a seq also sees the listener's effects.
@@ -3946,9 +3947,9 @@ Tasks 1–5 are implemented (commit `7bdd8fc`); their code under `src/` is the s
 - Produces:
   - Wire: `rpc Tail(stream TailClientMessage) returns (stream TailMessage)`, `TailClientMessage { oneof kind { TailRequest start = 1; TailAck ack = 2; } }`, `TailAck { applied_seq }`; `rpc Status(StatusRequest) returns (StatusResponse)` with `StatusRequest { client_id }`, `ReplicaSummary { node_id, applied_seq, in_sync }`, `StatusResponse { node_id, role, identity, epoch_history, last_seq, last_entry_crc, last_ts_ms, node_state, upstream, replicas }`.
   - `pub struct FetchSettings { min_batch_bytes: u64, max_wait: Duration, max_batch_bytes: u64 }`, `pub struct ReplicaStatus { node_id, remote_addr, peer_verified, epoch, connected_since, sent_seq, applied_seq, lag_entries, lag_ms: Option<u64>, in_sync, fetch }` (both re-exported from the crate root).
-  - `server::replicas::{ReplicaRegistry (Default) { open(self: &Arc<Self>, NewReplica) -> ReplicaHandle, acks(&self, epoch, lag_max) -> Vec<(Seq, bool)>, wait_until(&self, timeout, impl FnMut(&Self) -> bool) -> bool, summary(&self, epoch, lag_max) -> Vec<(String, Seq, bool)>, status(&self, &dyn LogSource, now_ms, lag_max) -> Vec<ReplicaStatus> }, NewReplica { node_id, remote_addr, peer_verified, epoch, has_up_to, fetch }, ReplicaHandle::cell(&self) -> &Arc<ReplicaCell> (removes the stream on drop), ReplicaCell::{note_sent(seq), ack(applied_seq, node_last_seq) -> Result<(), String>}}`. `acks` and `wait_until` are first used by Task 12.
+  - `server::replicas::{ReplicaRegistry (Default) { open(self: &Arc<Self>, NewReplica) -> ReplicaHandle, acks(&self, epoch, lag_max) -> Vec<(Seq, bool)>, wait_until(&self, timeout, impl FnMut(&Self) -> bool) -> bool, summary(&self, epoch, lag_max) -> Vec<(String, Seq, bool)>, status(&self, &dyn LogSource, now_ms, lag_max) -> Vec<ReplicaStatus> }, NewReplica { node_id, remote_addr, peer_verified, epoch, has_up_to, fetch }, ReplicaHandle::cell(&self) -> &Arc<ReplicaCell> (removes the stream on drop), ReplicaCell::{note_sent(seq, node_last_seq), ack(applied_seq, node_last_seq) -> Result<(), String>}}`. **Caught up is Kafka-style:** `note_sent` records `(seq, now)` when the send reaches the node's `last_seq` at that moment (it drained the log); an `ack` covering such a send sets `caught_up_at` to that send's instant (an ack reaching the node's `last_seq` directly also counts), so a replica that keeps acknowledging stays in sync while concurrent writes keep the node ahead of its latest ack. One helper, `Progress::in_sync(cell_epoch, epoch, lag_max)`, decides in-sync for `acks`, `summary` and `status`. `acks` and `wait_until` are first used by Task 12.
   - `server::start(Weak<dyn LogSource>, ServeConfig, Arc<ReplicaRegistry>)`, `server::start_for(&Arc<S>, Option<ServeConfig>, Arc<ReplicaRegistry>)`, `ServerState.replicas`, `ServerHandle::replica_lag_time_max(&self) -> Duration`.
-  - `server::status::{node_info(&dyn LogSource, &ReplicaRegistry, lag_max) -> NodeInfo, to_pb(&NodeInfo) -> pb::StatusResponse}`; `pub mod admin` with `NodeInfo { node_id, role, identity, epoch_history, last_seq, last_entry_crc, last_ts_ms, node_state, upstream, replicas }` and `ReplicaSummary { node_id, applied_seq, in_sync }`.
+  - `StatusRequest.probe_seq` / `StatusResponse.probe_crc` (the CRC of the server's entry at `probe_seq`, if held — `Store::entry_crc`, which includes the node's own `last_entry_crc`). `server::status::{node_info(&dyn LogSource, &ReplicaRegistry, lag_max, probes: &[Seq]) -> NodeInfo, to_pb(&NodeInfo, probe_seq: Option<Seq>) -> pb::StatusResponse}`; `pub mod admin` with `NodeInfo { node_id, role, identity, epoch_history, last_seq, last_entry_crc, last_ts_ms, node_state, upstream, replicas, probes: BTreeMap<Seq, Option<u32>> }` and `ReplicaSummary { node_id, applied_seq, in_sync }`.
   - `LogSource::{node_state(&self) -> String (default "ready"), upstream(&self) -> Option<String> (default None)}`; `Method::Status` (included in `MtlsSubjectAllowList::allow_all_methods`); `ServeLimits::replica_lag_time_max: Duration` (default 10 s, must be positive).
   - `master::writer::Inner.replicas: Arc<ReplicaRegistry>`; `Master::replicas(&self) -> Vec<ReplicaStatus>` (empty without `serve`).
   - Test helpers: `test_client::{TailExt::{tail_start, tail_with_acks}, ack(seq) -> pb::TailClientMessage}`.
@@ -3983,7 +3984,7 @@ mod tests {
         let h = reg.open(new(5));
         h.cell().ack(5, 9).unwrap();
         assert!(h.cell().ack(6, 9).unwrap_err().contains("above the last sent"));
-        h.cell().note_sent(9);
+        h.cell().note_sent(9, 9);
         h.cell().ack(7, 9).unwrap();
         assert!(h.cell().ack(6, 9).unwrap_err().contains("below the previous"));
         assert_eq!(reg.acks(1, Duration::from_secs(10)), vec![(7, false)], "not caught up yet");
@@ -3992,6 +3993,20 @@ mod tests {
         assert_eq!(reg.acks(2, Duration::from_secs(10)), vec![(9, false)], "other epoch: not in sync");
         drop(h);
         assert!(reg.acks(1, Duration::from_secs(10)).is_empty(), "closed streams leave the registry");
+    }
+
+    /// Kafka-style: an ack covering a send that drained the log makes the replica caught up
+    /// as of that send, even if the node has moved on since.
+    #[test]
+    fn an_ack_of_a_draining_send_counts_as_caught_up_while_the_node_moves_on() {
+        let reg = registry();
+        let h = reg.open(new(0));
+        h.cell().note_sent(3, 5); // did not drain: the node had 5
+        h.cell().ack(3, 9).unwrap();
+        assert_eq!(reg.acks(1, Duration::from_secs(10)), vec![(3, false)]);
+        h.cell().note_sent(5, 5); // drained
+        h.cell().ack(5, 9).unwrap(); // the node is at 9 by the time the ack arrives
+        assert_eq!(reg.acks(1, Duration::from_secs(10)), vec![(5, true)]);
     }
 
     #[test]
@@ -4008,7 +4023,7 @@ mod tests {
     fn wait_until_wakes_on_acks_and_times_out() {
         let reg = registry();
         let h = reg.open(new(0));
-        h.cell().note_sent(4);
+        h.cell().note_sent(4, 4);
         let cell = h.cell().clone();
         let t = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
@@ -4038,7 +4053,7 @@ Expected: FAIL to compile: `cannot find type ReplicaRegistry in this scope`, `ca
 //! Per-stream state of the replicas a node serves (addendum §1): what was sent, what the
 //! replica acknowledged, and whether it is in sync.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -4076,7 +4091,8 @@ pub struct ReplicaStatus {
     /// entry is no longer retained here.
     pub lag_ms: Option<u64>,
     /// Follows this node's current identity and was fully caught up within
-    /// `ServeLimits::replica_lag_time_max`.
+    /// `ServeLimits::replica_lag_time_max`: it acknowledged a batch that held everything this
+    /// node had when the batch was sent (PROTOCOL.md §7.6).
     pub in_sync: bool,
     pub fetch: FetchSettings,
 }
@@ -4085,8 +4101,22 @@ pub struct ReplicaStatus {
 struct Progress {
     sent_seq: Seq,
     applied_seq: Seq,
-    /// The last time `applied_seq` reached this node's `last_seq`.
+    /// When the replica was last fully caught up: when a batch it has acknowledged was sent
+    /// while it held everything this node had (Kafka's "caught up to the end offset at fetch
+    /// time"), or when an ack reached this node's `last_seq` directly.
     caught_up_at: Option<Instant>,
+    /// Sends not yet acknowledged that drained this node's log: `(last seq sent, when)`.
+    drained: VecDeque<(Seq, Instant)>,
+}
+
+/// At most this many unacknowledged draining sends are remembered (oldest dropped first).
+const MAX_DRAINED: usize = 1024;
+
+impl Progress {
+    /// In sync: follows the current `epoch` and was caught up within `lag_max`.
+    fn in_sync(&self, cell_epoch: u64, epoch: u64, lag_max: Duration) -> bool {
+        cell_epoch == epoch && self.caught_up_at.is_some_and(|t| t.elapsed() <= lag_max)
+    }
 }
 
 /// One open Tail stream.
@@ -4107,10 +4137,18 @@ impl ReplicaCell {
         self.progress.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records that entries up to `seq` were handed to the stream.
-    pub(crate) fn note_sent(&self, seq: Seq) {
+    /// Records that entries up to `seq` were handed to the stream; `node_last_seq` is this
+    /// node's `last_seq` at that moment. A send that reaches it drained the log: the replica
+    /// is caught up as of now once it acknowledges `seq`.
+    pub(crate) fn note_sent(&self, seq: Seq, node_last_seq: Seq) {
         let mut p = self.progress();
         p.sent_seq = p.sent_seq.max(seq);
+        if seq >= node_last_seq {
+            if p.drained.len() == MAX_DRAINED {
+                p.drained.pop_front();
+            }
+            p.drained.push_back((seq, Instant::now()));
+        }
     }
 
     /// Records an ack. `node_last_seq` is this node's `last_seq` right now. An ack that goes
@@ -4125,8 +4163,13 @@ impl ReplicaCell {
                 return Err(format!("ack {applied_seq} is above the last sent seq {}", p.sent_seq));
             }
             p.applied_seq = applied_seq;
-            if applied_seq >= node_last_seq {
-                p.caught_up_at = Some(Instant::now());
+            let mut caught_up = (applied_seq >= node_last_seq).then(Instant::now);
+            while p.drained.front().is_some_and(|&(seq, _)| seq <= applied_seq) {
+                let (_, at) = p.drained.pop_front().expect("checked");
+                caught_up = caught_up.max(Some(at));
+            }
+            if caught_up > p.caught_up_at {
+                p.caught_up_at = caught_up;
             }
         }
         self.registry.notify();
@@ -4194,7 +4237,12 @@ impl ReplicaRegistry {
             epoch: r.epoch,
             connected_since: SystemTime::now(),
             fetch: r.fetch,
-            progress: Mutex::new(Progress { sent_seq: r.has_up_to, applied_seq: r.has_up_to, caught_up_at: None }),
+            progress: Mutex::new(Progress {
+                sent_seq: r.has_up_to,
+                applied_seq: r.has_up_to,
+                caught_up_at: None,
+                drained: VecDeque::new(),
+            }),
             registry: self.clone(),
         });
         self.streams().insert(id, cell.clone());
@@ -4209,8 +4257,7 @@ impl ReplicaRegistry {
             .values()
             .map(|c| {
                 let p = c.progress();
-                let in_sync = c.epoch == epoch && p.caught_up_at.is_some_and(|t| t.elapsed() <= lag_max);
-                (p.applied_seq, in_sync)
+                (p.applied_seq, p.in_sync(c.epoch, epoch, lag_max))
             })
             .collect()
     }
@@ -4247,7 +4294,7 @@ impl ReplicaRegistry {
             .values()
             .map(|c| {
                 let p = c.progress();
-                (c.node_id.clone(), p.applied_seq, c.epoch == epoch && p.caught_up_at.is_some_and(|t| t.elapsed() <= lag_max))
+                (c.node_id.clone(), p.applied_seq, p.in_sync(c.epoch, epoch, lag_max))
             })
             .collect();
         out.sort();
@@ -4282,7 +4329,7 @@ impl ReplicaRegistry {
                     applied_seq: p.applied_seq,
                     lag_entries,
                     lag_ms,
-                    in_sync: c.epoch == epoch && p.caught_up_at.is_some_and(|t| t.elapsed() <= lag_max),
+                    in_sync: p.in_sync(c.epoch, epoch, lag_max),
                     fetch: c.fetch,
                 }
             })
@@ -4296,7 +4343,7 @@ impl ReplicaRegistry {
 `acks` and `wait_until` carry `#[cfg_attr(not(test), allow(dead_code))]` until the write concern uses them (Task 12 removes the attribute).
 
 Run: `cargo test --lib server::replicas`
-Expected: PASS, 3 tests: `acks_must_be_monotonic_and_not_above_what_was_sent`, `in_sync_expires_after_lag_time_max`, `wait_until_wakes_on_acks_and_times_out`.
+Expected: PASS, 4 tests: `acks_must_be_monotonic_and_not_above_what_was_sent`, `an_ack_of_a_draining_send_counts_as_caught_up_while_the_node_moves_on`, `in_sync_expires_after_lag_time_max`, `wait_until_wakes_on_acks_and_times_out`.
 
 - [ ] **Step 3: Change the wire protocol and the server tests**
 
@@ -4492,7 +4539,8 @@ message VerifyEndResponse {}
 
 // ---------- status (operator tooling) ----------
 
-message StatusRequest  { string client_id = 1; }
+// probe_seq: also report the crc32c of the server's entry at this seq (probe_crc).
+message StatusRequest  { string client_id = 1; optional uint64 probe_seq = 2; }
 message ReplicaSummary { string node_id = 1; uint64 applied_seq = 2; bool in_sync = 3; }
 message StatusResponse {
   string   node_id                  = 1;
@@ -4505,6 +4553,7 @@ message StatusResponse {
   string   node_state               = 8;   // "ready", "bootstrapping" or "halted:<Reason>"
   string   upstream                 = 9;   // empty on the master
   repeated ReplicaSummary replicas  = 10;
+  optional fixed32 probe_crc        = 11;  // crc32c of the entry at probe_seq, if held
 }
 ```
 
@@ -4943,6 +4992,22 @@ async fn methods_can_be_denied_per_credential() {
     c.handshake(hello("b")).await.unwrap();
     let e = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap_err();
     assert_eq!(e.code(), Code::PermissionDenied);
+    let e = c.status(pb::StatusRequest { client_id: "b".into(), probe_seq: None }).await.unwrap_err();
+    assert_eq!(e.code(), Code::PermissionDenied, "Status is a method of its own");
+}
+
+#[tokio::test]
+async fn status_and_tail_reject_a_client_id_that_differs_from_the_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    let mut c = client(m.serve_addr().unwrap(), "b");
+    let e = c.status(pb::StatusRequest { client_id: "x".into(), probe_seq: None }).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument);
+    let mut req = tail_req(&m.identity(), 1);
+    req.client_id = "x".into();
+    let e = c.tail_start(req).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument);
+    assert_eq!(c.status(pb::StatusRequest { client_id: "b".into(), probe_seq: None }).await.unwrap().into_inner().node_id, "a");
 }
 
 #[tokio::test]
@@ -5106,7 +5171,15 @@ async fn shutdown_with_unread_streams_releases_the_database() {
     let mut boot = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
     let first = within("the bootstrap header", boot.message()).await.unwrap().unwrap();
     assert!(matches!(first.kind, Some(Chunk::Header(_))));
+    // A Tail that never sends `start`: its handler holds the source while it waits.
+    let base = Arc::strong_count(&m.log_source());
+    let (_silent_tx, silent_rx) = tokio::sync::mpsc::channel::<pb::TailClientMessage>(1);
+    let mut c2 = c.clone();
+    let silent = tokio::spawn(async move { c2.tail(tokio_stream::wrappers::ReceiverStream::new(silent_rx)).await });
+    eventually("the silent Tail holds the source", || Arc::strong_count(&m.log_source()) > base).await;
     tokio::time::timeout(Duration::from_secs(20), m.shutdown()).await.expect("shutdown hangs").unwrap();
+    let silent = within("the silent Tail's answer", silent).await.unwrap();
+    assert_eq!(silent.err().map(|s| reason_of(&s)), Some(Some(pb::Reason::ShuttingDown)));
     let (m, _) = serving_master(dir.path(), |_| {}).await;
     assert_eq!(m.last_seq(), 129);
 }
@@ -5308,7 +5381,7 @@ async fn batches_fit_max_batch_bytes_including_framing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acks_drive_replica_status_and_in_sync() {
     let dir = tempfile::tempdir().unwrap();
-    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    let (m, clock) = serving_master(dir.path(), |_| {}).await;
     m.create_cf(CfSpec::new("c")).unwrap();
     for i in 0..3u8 {
         m.put("c", &[i], b"v").unwrap();
@@ -5329,6 +5402,14 @@ async fn acks_drive_replica_status_and_in_sync() {
     eventually("the partial ack", || m.replicas()[0].applied_seq == 2).await;
     assert_eq!(m.replicas()[0].lag_entries, 2);
     assert!(!m.replicas()[0].in_sync);
+    // lag_ms is now − ts_ms of the first unacknowledged entry (3, written at T0)...
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(m.replicas()[0].lag_ms, Some(1000));
+    // ...and None once that entry is no longer retained here.
+    let keep_one = crate::config::Retention { max_age: None, max_entries: Some(1), check_interval: Duration::from_secs(1) };
+    m.log_source().store().trim_changelog(0, &keep_one).unwrap();
+    assert_eq!(m.first_retained_seq(), 4);
+    assert_eq!(m.replicas()[0].lag_ms, None);
     acks.send(ack(4)).await.unwrap();
     eventually("caught up and in sync", || m.replicas()[0].in_sync).await;
     let r = &m.replicas()[0];
@@ -5520,6 +5601,8 @@ Create `src/admin.rs` (Task 11 completes it with comparison and promotion toolin
 //! Operator tooling for failover (addendum §4). This task adds the node report served by the
 //! `Status` RPC; comparing nodes and choosing a promotion candidate follow with promotion.
 
+use std::collections::BTreeMap;
+
 use crate::types::{DbIdentity, EpochStart, Role, Seq};
 
 /// What a node reports about itself (`Status` RPC, `Slave::promotion_info`).
@@ -5539,6 +5622,10 @@ pub struct NodeInfo {
     /// The upstream address; `None` on the master.
     pub upstream: Option<String>,
     pub replicas: Vec<ReplicaSummary>,
+    /// CRCs of entries this node was asked about (`Status.probe_seq`): seq → `crc32c` of its
+    /// entry there, `None` if it does not hold that entry. [`compare`] uses the longer node's
+    /// probe at the shorter node's `last_seq`; [`gather`] and `Slave::check_promotion` fill it.
+    pub probes: BTreeMap<Seq, Option<u32>>,
 }
 
 /// One direct downstream replica, as reported by `Status`.
@@ -5562,10 +5649,11 @@ use crate::admin::{NodeInfo, ReplicaSummary};
 use crate::net::convert::{epochs_to_pb, identity_to_pb};
 use crate::pb;
 use crate::source::LogSource;
-use crate::types::Role;
+use crate::types::{Role, Seq};
 
 /// What this node reports about itself.
-pub(crate) fn node_info(src: &dyn LogSource, replicas: &ReplicaRegistry, lag_max: Duration) -> NodeInfo {
+/// `probes`: seqs whose entry CRC to report as well (`NodeInfo::probes`).
+pub(crate) fn node_info(src: &dyn LogSource, replicas: &ReplicaRegistry, lag_max: Duration, probes: &[Seq]) -> NodeInfo {
     let ident = src.identity();
     let pos = src.store().position();
     let last_ts_ms = src
@@ -5590,10 +5678,14 @@ pub(crate) fn node_info(src: &dyn LogSource, replicas: &ReplicaRegistry, lag_max
             .into_iter()
             .map(|(node_id, applied_seq, in_sync)| ReplicaSummary { node_id, applied_seq, in_sync })
             .collect(),
+        // `entry_crc` includes this node's own `last_entry_crc` at `last_seq`; a read error
+        // reports the entry as not held.
+        probes: probes.iter().map(|&seq| (seq, src.store().entry_crc(seq).ok().flatten())).collect(),
     }
 }
 
-pub(crate) fn to_pb(i: &NodeInfo) -> pb::StatusResponse {
+/// The response for a request that asked about `probe_seq`.
+pub(crate) fn to_pb(i: &NodeInfo, probe_seq: Option<Seq>) -> pb::StatusResponse {
     pb::StatusResponse {
         node_id: i.node_id.clone(),
         role: match i.role {
@@ -5612,6 +5704,7 @@ pub(crate) fn to_pb(i: &NodeInfo) -> pb::StatusResponse {
             .iter()
             .map(|r| pb::ReplicaSummary { node_id: r.node_id.clone(), applied_seq: r.applied_seq, in_sync: r.in_sync })
             .collect(),
+        probe_crc: probe_seq.and_then(|seq| i.probes.get(&seq).copied().flatten()),
     }
 }
 ```
@@ -5661,7 +5754,13 @@ pub(super) async fn tail(
     let call = call_info(&req, Method::Tail)?;
     let src = state.authorize(&call, Method::Tail).await?;
     let mut inbound = req.into_inner();
-    let r = match tokio::time::timeout(START_TIMEOUT, inbound.message()).await {
+    // The source is held while waiting, so the wait also ends on shutdown.
+    let mut shutdown = state.shutdown.clone();
+    let first = tokio::select! {
+        m = tokio::time::timeout(START_TIMEOUT, inbound.message()) => m,
+        _ = super::stopped(&mut shutdown) => return Err(shutting_down()),
+    };
+    let r = match first {
         Ok(Ok(Some(pb::TailClientMessage { kind: Some(ClientKind::Start(r)) }))) => r,
         Ok(Ok(_)) => return Err(invalid_argument("the first Tail message must be `start`")),
         Ok(Err(status)) => return Err(status),
@@ -5924,7 +6023,7 @@ async fn produce(
     macro_rules! send_pending {
         () => {{
             if let Some(last) = pending.entries.last() {
-                stream.replica.cell().note_sent(last.seq);
+                stream.replica.cell().note_sent(last.seq, src.store().position().last_seq);
             }
             send!(pending.take());
         }};
@@ -6103,7 +6202,7 @@ mod tests {
 }
 ```
 
-The first client message must be `start` (10 s); the stream then registers in the replica registry and a separate task reads acks (`read_acks`), checking each against the cell (`ReplicaCell::ack`). A violation is handed to the producer through a oneshot and ends the stream with `INVALID_ARGUMENT`; `send_pending!` records the last seq sent before it sends. `produce` takes the `Out` sender bundle (it had too many arguments for clippy otherwise).
+The first client message must be `start` (10 s); the wait also selects on the server's shutdown signal and answers `SHUTTING_DOWN`, because the handler already holds the source (a client that opens a Tail and sends nothing must not delay `shutdown()`). The stream then registers in the replica registry and a separate task reads acks (`read_acks`), checking each against the cell (`ReplicaCell::ack`). A violation is handed to the producer through a oneshot and ends the stream with `INVALID_ARGUMENT`; `send_pending!` records the last seq sent — and this node's `last_seq` at that moment, for the caught-up rule — before it sends. `produce` takes the `Out` sender bundle (it had too many arguments for clippy otherwise).
 
 - [ ] **Step 7: Release a bootstrap's snapshot and slot before its final status**
 
@@ -6569,9 +6668,11 @@ impl Replication for Svc {
     async fn status(&self, req: Request<pb::StatusRequest>) -> Result<Response<pb::StatusResponse>, Status> {
         let call = call_info(&req, Method::Status)?;
         let src = self.0.authorize(&call, Method::Status).await?;
-        call.check_client_id(&req.get_ref().client_id)?;
-        let info = status::node_info(&*src, &self.0.replicas, self.0.cfg.limits.replica_lag_time_max);
-        Ok(Response::new(status::to_pb(&info)))
+        let r = req.into_inner();
+        call.check_client_id(&r.client_id)?;
+        let probes: Vec<Seq> = r.probe_seq.into_iter().collect();
+        let info = status::node_info(&*src, &self.0.replicas, self.0.cfg.limits.replica_lag_time_max, &probes);
+        Ok(Response::new(status::to_pb(&info, r.probe_seq)))
     }
 
     async fn verify_end(&self, _: Request<pb::VerifyEndRequest>) -> Result<Response<pb::VerifyEndResponse>, Status> {
@@ -6793,7 +6894,7 @@ pub use server::replicas::{FetchSettings, ReplicaStatus};
 - [ ] **Step 9: Run the tests**
 
 Run: `cargo test --lib server && cargo test --lib master`
-Expected: PASS, including the 4 new server tests: `acks_drive_replica_status_and_in_sync` (sent/applied seqs, `lag_entries`, `lag_ms`, `in_sync` follow the acks; the replica leaves the registry when its stream ends), `ack_violations_end_the_stream_with_invalid_argument` (an ack above the last sent seq, and one going backwards), `the_first_tail_message_must_be_start`, `a_reset_releases_a_stalled_bootstraps_snapshot_and_slot` (a client that stops reading a bootstrap + an epoch bump: a second Bootstrap is not `BUSY` within 10 s and the database is released).
+Expected: PASS, including the 5 new server tests: `acks_drive_replica_status_and_in_sync` (sent/applied seqs, `lag_entries`, `in_sync` follow the acks; `lag_ms` is `Some(1000)` after the manual clock moves 1 s past the first unacknowledged entry and `None` once retention trims that entry; the replica leaves the registry when its stream ends), `status_and_tail_reject_a_client_id_that_differs_from_the_metadata` (`INVALID_ARGUMENT` for both), `ack_violations_end_the_stream_with_invalid_argument` (an ack above the last sent seq, and one going backwards), `the_first_tail_message_must_be_start`, `a_reset_releases_a_stalled_bootstraps_snapshot_and_slot` (a client that stops reading a bootstrap + an epoch bump: a second Bootstrap is not `BUSY` within 10 s and the database is released). Two existing tests gain assertions: `methods_can_be_denied_per_credential` also checks that `Status` is a method of its own (`PERMISSION_DENIED` when not allowed), and `shutdown_with_unread_streams_releases_the_database` adds a Tail that never sends `start`: shutdown still completes and that call ends with `SHUTTING_DOWN`.
 
 Run: `cargo test`
 Expected: PASS (every suite so far, including `tests/proto_sync.rs`).
@@ -6874,8 +6975,9 @@ A read-only unary RPC for operators and promotion tooling. It is authenticated a
 | `node_state` | `"ready"`, `"bootstrapping"` or `"halted:<Reason>"`. |
 | `upstream` | The address the node replicates from; empty on the master. |
 | `replicas` | One `ReplicaSummary { node_id, applied_seq, in_sync }` per open Tail stream (§7.6). |
+| `probe_crc` | Present only if the request set `probe_seq`: the `crc32c` of the server's entry at `probe_seq`, if it holds it (its own `last_entry_crc` counts for `probe_seq = last_seq`, as in §6.3). Absent when the entry is not held (trimmed, before the server's bootstrap, or past its `last_seq`). |
 
-Comparing the `Status` of several replicas shows which one holds the most of the log (newest epoch, then highest `last_seq`) and which ones have diverged from it (they hold seqs at or past a point where the two epoch histories differ, or a different `last_entry_crc` at the same seq). Nothing in the protocol acts on it automatically.
+Comparing the `Status` of several replicas shows which one holds the most of the log (newest epoch, then highest `last_seq`) and which ones have diverged from it. Two nodes are compatible only if no seq both hold lies at or past a point where their epoch histories differ, **and** the longer node holds the shorter node's last entry with the same `crc32c` — which a tool learns by asking the longer node with `probe_seq` = the shorter node's `last_seq`. Only a proven CRC mismatch shows divergence; when the longer node no longer holds that entry (no `probe_crc`), compatibility is *unverifiable*, and tools SHOULD NOT treat such a node as safe to ignore. Nothing in the protocol acts on it automatically.
 ````
 
 In PROTOCOL.md §7, replace:
@@ -6947,7 +7049,8 @@ After `start`, the client sends `ack` messages on the same stream. `applied_seq`
 - `applied_seq` MUST NOT decrease and MUST NOT exceed the last seq the server sent on this stream. A second `start` is not allowed either. The server ends a stream that breaks one of these rules with `INVALID_ARGUMENT`.
 - Acks never change what the server sends: it does not resend or skip entries because of them. On a reconnect the client's position is still its own durable `last_seq` (§7).
 - Per open stream the server tracks the client's node id and address, whether the id was verified (mutual TLS), the epoch the client follows, when the stream opened, the last seq sent, the last seq acknowledged, the last time `applied_seq` reached the server's `last_seq`, and the stream's fetch settings.
-- A replica is **in sync** while its stream is open, it follows the server's current identity, and its `applied_seq` reached the server's `last_seq` within the last `replica_lag_time_max` (RECOMMENDED 10 s). A master MAY make a write wait until a number of in-sync replicas have acknowledged it.
+- A replica is **caught up** as of the moment the server sent it a batch that held everything the server had (the batch ended at the server's `last_seq` when it was sent), once an ack covers that batch; also when an ack reaches the server's `last_seq` directly. This is Kafka's "caught up to the end offset at fetch time": a replica that keeps acknowledging what it is sent stays caught up even while writes keep the server ahead of its latest ack.
+- A replica is **in sync** while its stream is open, it follows the server's current identity, and it was caught up within the last `replica_lag_time_max` (RECOMMENDED 10 s). A master MAY make a write wait until a number of in-sync replicas have acknowledged it.
 ````
 
 In PROTOCOL.md §10, replace:
@@ -6997,6 +7100,34 @@ add:
 ```
 | Tail acks | client | after each batch, and at least every `heartbeat_ms` |
 | `replica_lag_time_max` (in-sync window, §7.6) | server | 10 000 ms |
+```
+
+In PROTOCOL.md §16 (first example), replace:
+
+```
+C → B  Tail{identity:(U,1), from_seq: 4211, bootstrap_lease: L}
+B → C  entry 4211 · entry 4212 · heartbeat · …           (B releases the guard for L)
+```
+
+with:
+
+```
+C → B  Tail start{identity:(U,1), from_seq: 4211, bootstrap_lease: L}
+B → C  batch[4211, 4212] · heartbeat · …                  (B releases the guard for L)
+C → B  ack{applied_seq: 4212}                             (after applying the batch; again
+                                                          at least once per heartbeat)
+```
+
+In PROTOCOL.md §16 (second example), replace:
+
+```
+C → B  Tail{from_seq: 901}
+```
+
+with:
+
+```
+C → B  Tail start{from_seq: 901} · ack{applied_seq: 900} …
 ```
 
 In DESIGN.md §11 (LogSource), after:
@@ -7061,9 +7192,11 @@ pub struct ReplicaStatus {          // one direct downstream replica (Master/Sla
     pub lag_entries: u64,           // this node's last_seq − applied_seq
     pub lag_ms: Option<u64>,        // now − ts_ms of the first unacknowledged entry; 0 when caught
                                     // up; None when that entry is no longer retained here
-    pub in_sync: bool,              // current identity, fully caught up within replica_lag_time_max
+    pub in_sync: bool,              // current identity, caught up within replica_lag_time_max
+                                    // (acked a batch that drained this node's log; PROTOCOL §7.6)
     pub fetch: FetchSettings,       // the stream's batching, as clamped by the server
 }
+pub struct FetchSettings { pub min_batch_bytes: u64, pub max_wait: Duration, pub max_batch_bytes: u64 }
 ```
 
 In DESIGN.md §17 (table), replace:
@@ -8263,7 +8396,7 @@ In the PROTOCOL.md §11.2 table, after the row `` | `REJECT` / `NOT_READY` | Bac
 | A call or stream fails with `CORRUPT` (the server's stored data) | Back off and retry. The client's data is not affected. |
 ```
 
-In §16 `SlaveConfig`, replace:
+In DESIGN.md §16 `SlaveConfig`, replace:
 
 ```
                                              // 0 = real-time push; larger = batch like Kafka fetch.min.bytes
@@ -8346,7 +8479,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - The Tail request stream is `start`, then `ack { applied_seq }` whenever a `watch::Sender<Seq>` changes: after each applied batch and on every heartbeat (`send_replace` of the current `last_seq`), so acks that back up coalesce to the latest. A stream that ends without a status is a `Retry` (back off, handshake again).
   - `pub struct Slave` with `async open(SlaveConfig) -> Result<Slave>`, `status() -> SlaveStatus`, `applied_seq() -> Seq`, `async wait_for_seq(seq, timeout) -> Result<()>` (`Err(Halted(r))`, `Err(Timeout)`), `watch_state() -> watch::Receiver<SlaveState>`, `snapshot() -> Result<ReadSnapshot>` (`Err(NotReady)` without data), `async shutdown(self) -> Result<()>`; `impl ReadApi for Slave` (all reads `Err(NotReady)` without data), `impl LogApi for Slave`.
   - `slave::inner::Inner` with `pub store, pub cfg, pub state_tx, pub seq_tx, pub reset_tx, pub shutdown_tx, pub origin_last_seq, pub upstream_last_seq, pub max_entry_bytes, pub force_bootstrap, pub halt_cleared` and `new(Store, SlaveConfig, &MetaSnapshot)`, `policies()`, `ident()`, `set_ident(..)`, `is_ready()`, `now_ms()`, `state()`, `set_state(SlaveState)`, `halt(HaltReason)` (a synced write: called through `background::blocking`), `reset_downstream()`, `upstream_chain()`, `note_upstream(&pb::HandshakeResponse) -> Option<u64>` (the changed `max_entry_bytes`, persisted by the driver on a blocking thread), `note_positions(upstream, origin)`, `note_contact()`, `set_last_error(Option<String>)`, `notify(impl FnOnce(&dyn ReplicationListener))`, `status()`.
-  - `slave::client::{Client, connect(&SlaveConfig) -> Result<Client>, connect_upstream(&UpstreamConfig, identifier, connect_timeout) -> Result<Client>}`; `slave::driver::{SessionEnd { Retry(String), Again, Halt(HaltReason) }, spawn(&Arc<Inner>) -> JoinHandle<()>, end_for, status_end}` (the driver holds `Weak<Inner>` while waiting; `Inner.halt_cleared` is an `Arc<Notify>` it shares); `slave::maintenance::spawn(&Arc<Inner>) -> JoinHandle<()>` (Weak, upgraded per tick); `slave::apply::{Applied, apply(&Arc<Inner>, LogEntry)}`; `slave::bootstrap::install(&Arc<Inner>, &Client, &pb::HandshakeResponse) -> Result<Vec<u8> /* lease */, SessionEnd>`.
+  - `slave::client::{Client, connect(&SlaveConfig) -> Result<Client>, connect_upstream(&UpstreamConfig, identifier, connect_timeout) -> Result<Client>}` (the interceptor checks the configured token with Task 4's `auth::validate_token` before building `authorization`; an invalid token is refused locally as `UNAUTHENTICATED`, which `after_status` turns into the non-persisted `AuthRejected` halt); `slave::driver::{SessionEnd { Retry(String), Again, Halt(HaltReason) }, spawn(&Arc<Inner>) -> JoinHandle<()>, end_for, status_end}` (the driver holds `Weak<Inner>` while waiting; `Inner.halt_cleared` is an `Arc<Notify>` it shares); `slave::maintenance::spawn(&Arc<Inner>) -> JoinHandle<()>` (Weak, upgraded per tick); `slave::apply::{Applied, apply(&Arc<Inner>, LogEntry)}`; `slave::bootstrap::install(&Arc<Inner>, &Client, &pb::HandshakeResponse) -> Result<Vec<u8> /* lease */, SessionEnd>`.
   - Harness (`tests/support/mod.rs`): `Cluster { clock } (new, path, serve, master_config, master, restart_master, restart_master_after_backup, slave_config, slave)`, `wait_until`, `wait_state`, `Node`, `Dump`, `dump`, `assert_same`, `assert_converged`, `edge_cases`, `write_edge_cases`, `check_edge_cases`, `copy_dir`, `restore_dir`, `RecordingListener`, constants `T0`, `HEARTBEAT`, `WAIT`.
 
 - [ ] **Step 1: Write the harness**
@@ -8881,6 +9014,23 @@ async fn a_panicking_listener_is_disabled_and_replication_goes_on() {
     assert_converged(&m, &[("b", &b)]).await;
     assert!(b.status().listener_failed);
 }
+
+/// A configured token that is not an RFC 6750 b64token is refused before it is sent: the
+/// slave halts `AuthRejected`, which is not persisted, so a fixed configuration resumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invalid_token_halts_auth_rejected_without_persisting() {
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    cfg.upstream.credentials = std::sync::Arc::new(replicated_rocksdb::TokenCredentials::new("not a token"));
+    let b = Slave::open(cfg).await.unwrap();
+    wait_state(&b, "AuthRejected", |s| *s == SlaveState::Halted(replicated_rocksdb::HaltReason::AuthRejected)).await;
+    b.shutdown().await.unwrap();
+    let (cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    let b = Slave::open(cfg).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+}
 ```
 
 - [ ] **Step 3: Run them to confirm they fail**
@@ -9209,21 +9359,15 @@ pub(crate) struct CallMeta {
     credentials: Arc<dyn CredentialsProvider>,
 }
 
-/// RFC 6750 `b64token`: `1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`.
-fn is_b64token(t: &[u8]) -> bool {
-    let body = t.iter().position(|&b| b == b'=').unwrap_or(t.len());
-    body > 0
-        && t[..body].iter().all(|b| b.is_ascii_alphanumeric() || b"-._~+/".contains(b))
-        && t[body..].iter().all(|&b| b == b'=')
-}
-
 impl Interceptor for CallMeta {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         let md = req.metadata_mut();
         md.insert(MD_PROTOCOL_VERSION, AsciiMetadataValue::from(PROTOCOL_VERSION));
         md.insert(MD_NODE_ID, self.node_id.clone());
         if let Some(token) = self.credentials.token() {
-            if !is_b64token(&token) {
+            // An invalid token is refused locally as UNAUTHENTICATED, which halts the slave
+            // with `AuthRejected` (not persisted).
+            if crate::auth::validate_token(&token).is_err() {
                 return Err(Status::unauthenticated("the configured token has characters outside RFC 6750 b64token"));
             }
             let mut v = b"Bearer ".to_vec();
@@ -9261,21 +9405,6 @@ pub(crate) fn connect_upstream(up: &UpstreamConfig, identifier: &str, connect_ti
         .map_err(|_| Error::Config("identifier is not valid header text".into()))?;
     let meta = CallMeta { node_id, credentials: up.credentials.clone() };
     Ok(ReplicationClient::with_interceptor(endpoint.connect_lazy(), meta))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn b64token_rules() {
-        for ok in [&b"abc"[..], b"A-Z._~+/09", b"abc==", b"x="] {
-            assert!(is_b64token(ok), "{ok:?}");
-        }
-        for bad in [&b""[..], b"=", b"a b", b"a=b", b"\xff", b"tok\n"] {
-            assert!(!is_b64token(bad), "{bad:?}");
-        }
-    }
 }
 ```
 
@@ -10096,15 +10225,15 @@ pub use slave::{
 
 - [ ] **Step 10: Run the tests**
 
-Run: `cargo test --lib slave::client && cargo test --test replication`
-Expected: PASS: `b64token_rules`, and 10 tests in `replication` (`slave_bootstraps_then_tails_every_kind_of_write`, `read_api_on_a_slave`, `ttl_values_replicate_and_the_reapers_delete_replicates`, `edge_case_data_through_tail_and_bootstrap`, `restart_resumes_without_bootstrap`, `status_and_wait_for_seq` (also: the master's `replicas()` shows the slave's acknowledged seq, zero lag and `in_sync`), `a_slave_without_data_is_not_ready_and_reports_the_connection_error`, `a_batching_slave_applies_every_entry_on_its_own` (fetch batching on; each entry still its own write and listener call; the master reports the clamped fetch settings), `a_sync_writes_slave_replicates_and_resumes`, `a_panicking_listener_is_disabled_and_replication_goes_on`). The edge-case test moves a ~16 MiB value through Tail and Bootstrap; allow it a few seconds in debug builds.
+Run: `cargo test --test replication`
+Expected: PASS, 11 tests (`an_invalid_token_halts_auth_rejected_without_persisting`, `slave_bootstraps_then_tails_every_kind_of_write`, `read_api_on_a_slave`, `ttl_values_replicate_and_the_reapers_delete_replicates`, `edge_case_data_through_tail_and_bootstrap`, `restart_resumes_without_bootstrap`, `status_and_wait_for_seq` (also: the master's `replicas()` shows the slave's acknowledged seq, zero lag and `in_sync`), `a_slave_without_data_is_not_ready_and_reports_the_connection_error`, `a_batching_slave_applies_every_entry_on_its_own` (fetch batching on; each entry still its own write and listener call; the master reports the clamped fetch settings), `a_sync_writes_slave_replicates_and_resumes`, `a_panicking_listener_is_disabled_and_replication_goes_on`). The edge-case test moves a ~16 MiB value through Tail and Bootstrap; allow it a few seconds in debug builds.
 
 Run: `cargo test`
 Expected: PASS (all unit and integration tests so far).
 
 - [ ] **Step 11: Update DESIGN.md §6 and §15, and PROTOCOL.md §11.2**
 
-Replace:
+In DESIGN.md §15, replace:
 
 ```
 - Strictly increasing `seq`, with no duplicates within a process.

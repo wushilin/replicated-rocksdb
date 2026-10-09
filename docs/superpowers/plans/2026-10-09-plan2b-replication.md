@@ -70,6 +70,7 @@ Each owning task updates DESIGN.md or PROTOCOL.md with the exact text given ther
 - **Slave config and status additions** (Task 7, DESIGN.md §16): `SlaveConfig::{heartbeat, connect_timeout, clock, sync_writes}`, `SlaveStatus::listener_failed`. `VerifyConfig`, `lag_ms` and `last_verify` come with Plan 3.
 - **Bootstrap lease hand-over** (Task 5, PROTOCOL.md §7.2): the Tail that presents the lease takes it over and releases it once it has read the entries after the snapshot (or when it ends), instead of releasing it the moment the stream is established — otherwise `max_entries = 1` retention can trim `S + 1` before the producer's first read.
 - **Bidirectional Tail with acks, replica status, `Status` RPC** (Task 6, addendum §1 and §4; PROTOCOL.md §2, §3.3, §6.5, §7, §7.1, §7.3, §7.6, §10, §11.2, §11.4, §12, §14; DESIGN.md §11, §14, §16, §17, §18, §19). Decisions: `ReplicaStatus::lag_ms` is `Option<u64>` — `None` when the first unacknowledged entry is no longer retained on the serving node, so no timestamp is known; `in_sync` also requires the replica to follow the node's current identity; `ServeLimits::replica_lag_time_max` (default 10 s) lives with the other server limits; the replica registry is owned by the node (`Inner.replicas`) and handed to `server::start`, so a node can report and wait on it; `Status.role` is the text `"master"`/`"slave"`, `node_state` is `__meta`'s text form, and `upstream` is empty on the master.
+- **Pre-flight 2 rulings (amendment #3):** in-sync is Kafka-style — a replica is caught up as of a send that drained the node's log once an ack covers it (PROTOCOL.md §7.6, Task 6; concurrent-writer test in Task 12); the Tail `start` wait also ends on shutdown (Task 6); `Status` takes `probe_seq` and answers `probe_crc`, and `admin::compare` needs the longer node's CRC at the shorter node's `last_seq` (different → `Diverged`; not held → `Unverifiable`, and `promote_checked` refuses a reachable peer that is at least as far and unverifiable with `PromotionUnverifiable`, reporting proven-diverged peers in its refusals), filled by `admin::gather` and `check_promotion` (Task 6 wire, Task 11 logic); `admin::node_status` times out after 5 s (unreachable); the slave client validates its token with `auth::validate_token` (invalid → non-persisted `AuthRejected`, Task 8); a repoint's divergence mode applies to every later `DIVERGED` (handshake or `status_end`) until the next repoint (Task 13).
 - **Clean end of a Tail stream is transient** (Task 6, PROTOCOL.md §7.3, §11.2, §11.4): a stream that ends with no status is treated like a lost connection.
 - **Bootstrap jobs release their snapshot and slot before their final status** (Task 6 fix of Task 5's `server::bootstrap`): after a reset the job used to wait in `end_stream` for a stalled client while still holding its `ReadSnapshot` and permit.
 - **Listener ordering** (Task 8, DESIGN.md §15): seqs are strictly increasing *between bootstraps*; after `on_bootstrap_complete(S)` delivery continues at `S + 1`. The listener is called before the new seq is published to `wait_for_seq`/`subscribe`, so whoever waits for a seq also sees the listener's effects.
@@ -809,11 +810,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Produces:
   - `Store::rebuild_ttl_index(&self) -> Result<u64>`, `Store::promote_to_master(&self) -> Result<DbIdentity>`, `Store::demote_to_slave(&self) -> Result<DbIdentity>` (refused with `Error::Config` while the newest epoch has entries or when there is no earlier epoch).
   - `Slave::promote(self, cfg: MasterConfig) -> Result<Master>` (async; `Err(Config)` naming the `ReadSnapshot` if one still holds the database after the slave shut down).
-  - `Slave::promotion_info(&self) -> NodeInfo`; `Slave::check_promotion(&self, peers: &[UpstreamConfig]) -> Result<PromotionCheck>` (async; `Err(NotMostAdvanced { leader, seq })` if a reachable peer is later); `pub struct PromotionCheck { unreachable: Vec<(String, String)>, diverged: Vec<(String, Seq)>, foreign: Vec<String> }`; `Slave::promote_checked(self, cfg, peers) -> Result<Master, PromoteRefused>` (async); `pub struct PromoteRefused { pub error: Error, pub slave: Option<Box<Slave>> }` (`Debug`, `Display`, `std::error::Error`, `into_slave() -> Option<Slave>`): every refusal (promote's own checks, `NotMostAdvanced`, a failed peer check) returns the untouched running slave; `None` only for a failure after the shutdown for the promotion began.
+  - `Slave::promotion_info(&self) -> NodeInfo`; `Slave::check_promotion(&self, peers: &[UpstreamConfig]) -> Result<PromotionCheck>` (async; refuses with `Err(NotMostAdvanced { .. })` / `Err(PromotionUnverifiable { .. })`, see below); `pub struct PromotionCheck { unreachable: Vec<(String, String)>, diverged: Vec<(String, Seq)>, foreign: Vec<String>, unverifiable: Vec<(String, Seq)> }`; `Slave::promote_checked(self, cfg, peers) -> Result<Master, PromoteRefused>` (async); `pub struct PromoteRefused { pub error: Error, pub slave: Option<Box<Slave>> }` (`Debug`, `Display`, `std::error::Error`, `into_slave() -> Option<Slave>`): every refusal (promote's own checks, `NotMostAdvanced`, a failed peer check) returns the untouched running slave; `None` only for a failure after the shutdown for the promotion began.
   - `Master::can_demote(&self) -> Result<()>`; `Master::demote(self, cfg: SlaveConfig) -> Result<Slave, DemoteRefused>` (async); `pub struct DemoteRefused { pub error: Error, pub master: Option<Box<Master>> }` (same traits, `into_master() -> Option<Master>`): a refusal (`can_demote` fails, wrong `cfg.path`) returns the untouched running master; `None` only for a failure after its shutdown began.
   - Private `Slave::{promote_refusal(&self, &MasterConfig) -> Option<String>, promote_now(self, MasterConfig)}`: `promote` = check (refusal shuts down, as before) + `promote_now`; `promote_checked` = check + peer check (refusals return the slave) + `promote_now`.
-  - `admin::{NodeInfo::from_pb (crate), Side { A, B }, Comparison { Later(Side), Equal, Diverged { fork }, DifferentDatabase }, compare(&NodeInfo, &NodeInfo) -> Comparison, Choice { candidate, compatible: Vec<String>, diverged: Vec<(String, Seq)>, foreign: Vec<String> }, choose_promotion_candidate(&[NodeInfo]) -> Result<Choice>, node_status(&UpstreamConfig, client_id) -> Result<NodeInfo> (async)}`.
-  - `Error::NotMostAdvanced { leader: String, seq: Seq }`; crate-root re-exports `PromotionCheck`, `PromoteRefused`, `DemoteRefused`.
+  - `admin::{NodeInfo::from_pb(pb::StatusResponse, probe_seq) (crate), Side { A, B }, Comparison { Later(Side), Equal, Diverged { fork }, DifferentDatabase }, compare(&NodeInfo, &NodeInfo) -> Comparison, Choice { candidate, compatible: Vec<String>, diverged: Vec<(String, Seq)>, foreign: Vec<String> }, choose_promotion_candidate(&[NodeInfo]) -> Result<Choice>, STATUS_TIMEOUT = 5 s, node_status(&UpstreamConfig, client_id) -> Result<NodeInfo> (async), node_status_probed(&UpstreamConfig, client_id, probe_seq: Option<Seq>) -> Result<NodeInfo> (async), Gathered { nodes, unreachable }, gather(&[UpstreamConfig], client_id) -> Gathered (async)}`. `compare` requires the longer node's CRC at the shorter node's `last_seq` (`NodeInfo::probes`, or equal `last_entry_crc` at equal positions); a proven mismatch is `Diverged`; a missing probe (the entry is no longer held) is `Unverifiable { later: Option<Side> }`, which keeps the order by position. `Choice::unverifiable: Vec<String>`. `node_status` gives up after `STATUS_TIMEOUT` (the peer is then unreachable). `check_promotion` probes each peer at this slave's `last_seq` and reads its own entry at the peer's `last_seq` (`Store::entry_crc`).
+  - `Error::NotMostAdvanced { leader: String, seq: Seq, diverged: Vec<(String, Seq)> }` (proven later peer), `Error::PromotionUnverifiable { peer: String, seq: Seq, diverged: Vec<(String, Seq)> }` (a peer at least as far by position whose history cannot be verified — refused by default, plain `promote` overrides); `PromotionCheck::unverifiable: Vec<(String, Seq)>` (peers behind, unverifiable); crate-root re-exports `PromotionCheck`, `PromoteRefused`, `DemoteRefused`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1113,20 +1114,32 @@ async fn promote_checked_refuses_when_a_reachable_peer_is_later() {
     let c = Cluster::new();
     let a = c.master("a").await;
     let a_addr = a.serve_addr().unwrap();
-    a.create_cf(CfSpec::new("c")).unwrap();
+    // B and C tail every entry, so C still holds B's last entry for the CRC probe. D joins
+    // later: it is bootstrapped past entry 1 and cannot prove it holds B's history.
     let (b, _) = c.slave("b", a_addr).await;
     let (cn, _) = c.slave("c", a_addr).await;
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
+    for (name, s) in [("b", &b), ("c", &cn)] {
+        wait_state(s, name, |st| *st == SlaveState::Streaming).await;
+    }
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (d, _) = c.slave("d", a_addr).await;
+    assert_converged(&a, &[("b", &b), ("c", &cn), ("d", &d)]).await;
     b.shutdown().await.unwrap(); // b falls behind
     a.put("c", b"only c has it", b"v").unwrap();
-    assert_converged(&a, &[("c", &cn)]).await;
+    assert_converged(&a, &[("c", &cn), ("d", &d)]).await;
     a.shutdown().await.unwrap();
 
     let (b, _) = reopen(&c, "b", a_addr, |_| {}).await;
     let c_addr = UpstreamConfig::from_addr(cn.serve_addr().unwrap());
     let refused = b.promote_checked(c.master_config("b"), std::slice::from_ref(&c_addr)).await.err().expect("c is later");
-    assert!(matches!(&refused.error, Error::NotMostAdvanced { leader, seq: 2 } if leader == "c"), "{refused}");
+    assert!(matches!(&refused.error, Error::NotMostAdvanced { leader, seq: 2, .. } if leader == "c"), "{refused}");
     // Refused by default: b comes back untouched and still running.
+    let b = refused.into_slave().expect("a refusal returns the slave");
+    // D is ahead too, but its history cannot be verified (bootstrapped past B's last entry):
+    // refused as well, not treated as diverged and ignored.
+    let d_addr = UpstreamConfig::from_addr(d.serve_addr().unwrap());
+    let refused = b.promote_checked(c.master_config("b"), std::slice::from_ref(&d_addr)).await.err().expect("d is unverifiable");
+    assert!(matches!(&refused.error, Error::PromotionUnverifiable { peer, seq: 2, .. } if peer == "d"), "{refused}");
     let b = refused.into_slave().expect("a refusal returns the slave");
     assert_eq!(b.get("c", b"only c has it").unwrap(), None, "b still serves its own data");
     assert_eq!(b.last_seq(), 1);
@@ -1138,7 +1151,7 @@ async fn promote_checked_refuses_when_a_reachable_peer_is_later() {
     // The most advanced node passes the check; the unreachable old master does not block it.
     let check = cn.check_promotion(&[UpstreamConfig::from_addr(b.serve_addr().unwrap()), UpstreamConfig::from_addr(a_addr)]).await.unwrap();
     assert_eq!(check.unreachable.len(), 1);
-    assert!(check.diverged.is_empty() && check.foreign.is_empty());
+    assert!(check.diverged.is_empty() && check.foreign.is_empty() && check.unverifiable.is_empty());
     let new_master = cn.promote_checked(c.master_config("c"), &[UpstreamConfig::from_addr(a_addr)]).await.unwrap();
     assert_eq!(new_master.get("c", b"only c has it").unwrap(), Some(b"v".to_vec()));
     // The returned slave is fully alive: it still serves a downstream replica.
@@ -1203,6 +1216,50 @@ async fn demote_is_refused_once_the_new_epoch_has_entries() {
     b_master.put("c", b"still writable", b"v").unwrap();
     assert_converged(&b_master, &[("d", &d)]).await;
 }
+
+/// Same-epoch divergence (a master restored from a backup without an epoch bump): epoch
+/// histories agree, so only the CRC probe shows that B's entry 4 is not C's entry 4.
+/// `gather` + the chooser flag B as diverged, and B's checked promotion is not refused by C
+/// (C does not hold B's history) but reports it as diverged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_epoch_divergence_is_found_by_the_crc_probe() {
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    let a_addr = a.serve_addr().unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    a.put("c", b"1", b"v").unwrap();
+    a.put("c", b"2", b"v").unwrap();
+    let (b, _) = c.slave("b", a_addr).await;
+    let (cn, _) = c.slave("c", a_addr).await;
+    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
+    let a = c.restart_master_after_backup(a, "a", "a-backup").await; // backup at seq 3
+    let b_cfg = c.slave_config("b", a_addr).0;
+    b.shutdown().await.unwrap();
+    a.put("c", b"original 4", b"v").unwrap();
+    a.put("c", b"original 5", b"v").unwrap();
+    assert_converged(&a, &[("c", &cn)]).await;
+    // The operator restores A from the backup and forgets the epoch bump.
+    a.shutdown().await.unwrap();
+    support::restore_dir(&c.path("a-backup"), &c.path("a"));
+    let mut a_cfg = c.master_config("a");
+    a_cfg.serve.as_mut().unwrap().port = a_addr.port();
+    let a = Master::open(a_cfg).await.unwrap();
+    a.put("c", b"different 4", b"v").unwrap();
+    let b = Slave::open(b_cfg).await.unwrap();
+    assert_converged(&a, &[("b", &b)]).await;
+    assert_eq!((b.last_seq(), cn.last_seq()), (4, 5));
+    a.shutdown().await.unwrap();
+
+    let peers = [UpstreamConfig::from_addr(b.serve_addr().unwrap()), UpstreamConfig::from_addr(cn.serve_addr().unwrap())];
+    let gathered = admin::gather(&peers, "operator").await;
+    assert!(gathered.unreachable.is_empty());
+    let choice = admin::choose_promotion_candidate(&gathered.nodes).unwrap();
+    assert_eq!(choice.candidate.node_id, "c");
+    assert_eq!(choice.diverged, vec![("b".to_string(), 4)], "same epoch, different entry 4");
+    assert!(choice.compatible.is_empty());
+    let check = b.check_promotion(&peers[1..]).await.unwrap();
+    assert_eq!(check.diverged, vec![("c".to_string(), 4)]);
+}
 ```
 
 In `src/admin.rs`, append the comparison tests (they fail until Step 5):
@@ -1225,21 +1282,36 @@ mod tests {
             node_state: "ready".into(),
             upstream: None,
             replicas: vec![],
+            probes: BTreeMap::new(),
         }
+    }
+
+    fn probed(mut n: NodeInfo, seq: Seq, crc: Option<u32>) -> NodeInfo {
+        n.probes.insert(seq, crc);
+        n
     }
 
     #[test]
     fn compare_orders_compatible_nodes_and_detects_divergence() {
-        let a = node("a", 1, &[(1, 1)], 10, Some(1));
+        // a holds b's last entry (8) with b's CRC: a is later.
+        let a = probed(node("a", 1, &[(1, 1)], 10, Some(1)), 8, Some(2));
         let b = node("b", 1, &[(1, 1)], 8, Some(2));
         assert_eq!(compare(&a, &b), Comparison::Later(Side::A));
         assert_eq!(compare(&b, &a), Comparison::Later(Side::B));
         assert_eq!(compare(&a, &a.clone()), Comparison::Equal);
         assert_eq!(compare(&a, &node("a2", 1, &[(1, 1)], 10, Some(9))), Comparison::Diverged { fork: 10 });
-        // Promoted at 11: the old-epoch node behind the fork is behind; past it, diverged.
-        let promoted = node("p", 1, &[(1, 1), (2, 11)], 12, Some(3));
-        assert_eq!(compare(&node("c", 1, &[(1, 1)], 10, None), &promoted), Comparison::Later(Side::B));
-        assert_eq!(compare(&node("d", 1, &[(1, 1)], 11, None), &promoted), Comparison::Diverged { fork: 11 });
+        // Same epoch, but entry 8 differs (a restore without an epoch bump, or two masters in
+        // one epoch): diverged. Without a probe it cannot be shown compatible: diverged too.
+        let other_8 = probed(node("a", 1, &[(1, 1)], 10, Some(1)), 8, Some(7));
+        assert_eq!(compare(&other_8, &b), Comparison::Diverged { fork: 8 });
+        // a no longer holds entry 8 (or was not probed): unverifiable, a still later by position.
+        assert_eq!(compare(&node("a", 1, &[(1, 1)], 10, Some(1)), &b), Comparison::Unverifiable { later: Some(Side::A) });
+        assert_eq!(compare(&b, &probed(node("a", 1, &[(1, 1)], 10, Some(1)), 8, None)), Comparison::Unverifiable { later: Some(Side::B) });
+        // Promoted at 11: the old-epoch node behind the fork is behind (its last entry matches);
+        // past the fork, diverged.
+        let promoted = probed(node("p", 1, &[(1, 1), (2, 11)], 12, Some(3)), 10, Some(4));
+        assert_eq!(compare(&node("c", 1, &[(1, 1)], 10, Some(4)), &promoted), Comparison::Later(Side::B));
+        assert_eq!(compare(&node("d", 1, &[(1, 1)], 11, Some(5)), &promoted), Comparison::Diverged { fork: 11 });
         // Two promotions of the same epoch at different points.
         let other = node("q", 1, &[(1, 1), (2, 15)], 16, None);
         assert_eq!(compare(&promoted, &other), Comparison::Diverged { fork: 11 });
@@ -1253,7 +1325,7 @@ mod tests {
         let nodes = vec![
             node("b", 1, &[(1, 1)], 10, Some(1)),
             node("c", 1, &[(1, 1)], 12, Some(2)),
-            node("d", 1, &[(1, 1), (2, 11)], 11, Some(3)),
+            probed(node("d", 1, &[(1, 1), (2, 11)], 11, Some(3)), 10, Some(1)),
             node("x", 9, &[(1, 1)], 50, None),
         ];
         // d has the newest epoch: it wins; c holds entries past d's fork (11, 12): diverged.
@@ -1263,8 +1335,16 @@ mod tests {
         assert_eq!(choice.diverged, vec![("c".to_string(), 11)]);
         assert_eq!(choice.foreign, vec!["x".to_string()]);
 
-        let same_epoch = vec![node("b", 1, &[(1, 1)], 10, None), node("c", 1, &[(1, 1)], 12, None)];
-        assert_eq!(choose_promotion_candidate(&same_epoch).unwrap().candidate.node_id, "c", "highest seq");
+        let same_epoch = vec![node("b", 1, &[(1, 1)], 10, Some(1)), probed(node("c", 1, &[(1, 1)], 12, None), 10, Some(1))];
+        let choice = choose_promotion_candidate(&same_epoch).unwrap();
+        assert_eq!((choice.candidate.node_id.as_str(), choice.compatible.clone()), ("c", vec!["b".to_string()]), "highest seq");
+        // Same epoch, b's entry 10 differs on c: b is diverged, not compatible.
+        let forked = vec![node("b", 1, &[(1, 1)], 10, Some(1)), probed(node("c", 1, &[(1, 1)], 12, None), 10, Some(9))];
+        assert_eq!(choose_promotion_candidate(&forked).unwrap().diverged, vec![("b".to_string(), 10)]);
+        // c no longer holds entry 10: b is listed as unverifiable, neither compatible nor diverged.
+        let trimmed = vec![node("b", 1, &[(1, 1)], 10, Some(1)), probed(node("c", 1, &[(1, 1)], 12, None), 10, None)];
+        let choice = choose_promotion_candidate(&trimmed).unwrap();
+        assert_eq!((choice.unverifiable, choice.compatible, choice.diverged), (vec!["b".to_string()], vec![], vec![]));
         let tie = vec![node("c", 1, &[(1, 1)], 12, Some(1)), node("b", 1, &[(1, 1)], 12, Some(1))];
         assert_eq!(choose_promotion_candidate(&tie).unwrap().candidate.node_id, "b", "lowest id on a tie");
         let empty = NodeInfo { identity: None, epoch_history: vec![], ..node("e", 1, &[(1, 1)], 0, None) };
@@ -1396,14 +1476,21 @@ impl Store {
 Run: `cargo test --lib store::promote`
 Expected: PASS, 3 tests: `promotion_rewrites_meta_and_rebuilds_the_ttl_index`, `demotion_undoes_an_unused_promotion_only`, `a_slave_without_data_cannot_be_promoted`.
 
-- [ ] **Step 4: Add `Error::NotMostAdvanced`**
+- [ ] **Step 4: Add `Error::NotMostAdvanced` and `Error::PromotionUnverifiable`**
 
 In `src/error.rs`, after the `Halted` variant add:
 
 ```rust
-    /// `promote_checked` found a reachable peer that holds more of the log.
-    #[error("{leader} is more advanced (last_seq {seq}); promote it instead")]
-    NotMostAdvanced { leader: String, seq: Seq },
+    /// `promote_checked` found a reachable peer that holds more of the log. `diverged` lists
+    /// the peers proven to hold different entries (`node_id`, fork), for the operator.
+    #[error("{leader} is more advanced (last_seq {seq}); promote it instead (diverged peers: {diverged:?})")]
+    NotMostAdvanced { leader: String, seq: Seq, diverged: Vec<(String, Seq)> },
+    /// `promote_checked` found a reachable peer that is at least as far by position (newest
+    /// epoch, then `last_seq`) but whose compatibility cannot be proven, because the entry that
+    /// would prove it is no longer held. Plain `promote` remains available as an explicit
+    /// operator decision. `diverged` as for `NotMostAdvanced`.
+    #[error("{peer} (last_seq {seq}) is at least as far and its history cannot be verified; promote explicitly if intended (diverged peers: {diverged:?})")]
+    PromotionUnverifiable { peer: String, seq: Seq, diverged: Vec<(String, Seq)> },
 ```
 
 - [ ] **Step 5: Implement the promotion tooling**
@@ -1417,8 +1504,8 @@ Replace `src/admin.rs` with (the module doc carries the failover runbook; the te
 //! # Failover runbook
 //!
 //! 1. Fence the old master (stop it, or cut it off from clients and replicas).
-//! 2. Gather the status of every replica: [`node_status`] over the network, or
-//!    [`Slave::promotion_info`](crate::Slave::promotion_info) in-process.
+//! 2. Gather the status of every replica with [`gather`], which also probes the entry CRCs
+//!    that [`compare`] needs ([`node_status`] reads one node).
 //! 3. Promote the most advanced compatible one: [`choose_promotion_candidate`], then
 //!    [`Slave::promote_checked`](crate::Slave::promote_checked), which refuses if a reachable
 //!    peer is later.
@@ -1427,6 +1514,7 @@ Replace `src/admin.rs` with (the module doc carries the failover runbook; the te
 //! With `WriteConcern::min_insync_replicas >= 1`, the most advanced in-sync replica holds
 //! every acknowledged write.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -1452,6 +1540,10 @@ pub struct NodeInfo {
     /// The upstream address; `None` on the master.
     pub upstream: Option<String>,
     pub replicas: Vec<ReplicaSummary>,
+    /// CRCs of entries this node was asked about (`Status.probe_seq`): seq → `crc32c` of its
+    /// entry there, `None` if it does not hold that entry. [`compare`] uses the longer node's
+    /// probe at the shorter node's `last_seq`; [`gather`] and `Slave::check_promotion` fill it.
+    pub probes: BTreeMap<Seq, Option<u32>>,
 }
 
 /// One direct downstream replica, as reported by `Status`.
@@ -1463,7 +1555,7 @@ pub struct ReplicaSummary {
 }
 
 impl NodeInfo {
-    pub(crate) fn from_pb(p: pb::StatusResponse) -> Result<NodeInfo> {
+    pub(crate) fn from_pb(p: pb::StatusResponse, probe_seq: Option<Seq>) -> Result<NodeInfo> {
         let role = match p.role.as_str() {
             "master" => Role::Master,
             "slave" => Role::Slave,
@@ -1484,6 +1576,7 @@ impl NodeInfo {
                 .into_iter()
                 .map(|r| ReplicaSummary { node_id: r.node_id, applied_seq: r.applied_seq, in_sync: r.in_sync })
                 .collect(),
+            probes: probe_seq.map(|seq| (seq, p.probe_crc)).into_iter().collect(),
         })
     }
 
@@ -1505,8 +1598,14 @@ pub enum Comparison {
     /// Compatible histories; this side holds everything the other holds, and more.
     Later(Side),
     Equal,
-    /// Both hold different entries from `fork` on.
+    /// Both hold different entries from `fork` on: a CRC mismatch was proven (or the epoch
+    /// histories fork below both positions).
     Diverged { fork: Seq },
+    /// Compatibility cannot be proven: the node that would have to hold the other's last
+    /// entry no longer does (trimmed, or bootstrapped past it), or no probe was taken.
+    /// `later` is the side that is later by position (newest epoch, then `last_seq`); `None`
+    /// when both positions are equal.
+    Unverifiable { later: Option<Side> },
     /// Different databases (different `db_uuid`).
     DifferentDatabase,
 }
@@ -1524,10 +1623,18 @@ fn fork_between(a: &[EpochStart], b: &[EpochStart]) -> Option<Seq> {
     None
 }
 
-/// Compares two nodes of a topology. A node without data is behind any node with data.
-/// Two histories are compatible when every seq both nodes hold carries the same epoch in
-/// both; then the later node is the one with the newer epoch, then the higher `last_seq`.
-/// Equal positions with different `last_entry_crc` are `Diverged`.
+/// Compares two nodes of a topology (addendum §4). A node without data is behind any node
+/// with data; different `db_uuid`s are `DifferentDatabase`.
+///
+/// Otherwise the nodes are compatible when no seq both hold lies at or past a point where
+/// their epoch histories differ, **and** the shorter node's last entry is present in the
+/// longer node with the same CRC: equal `last_entry_crc` at equal `last_seq`, or the longer
+/// node's probe at the shorter node's `last_seq` ([`NodeInfo::probes`]). The later of two
+/// compatible nodes has the newer epoch, then the higher `last_seq`. Anything that cannot be
+/// shown compatible because of a CRC mismatch is `Diverged`; when the
+/// histories agree, `fork` is then the shorter node's `last_seq` (the first seq known not to
+/// match may be earlier). A comparison that needs a CRC nobody can supply is `Unverifiable`,
+/// never `Compatible` or `Diverged`.
 pub fn compare(a: &NodeInfo, b: &NodeInfo) -> Comparison {
     let (ia, ib) = match (a.identity, b.identity) {
         (None, None) => return Comparison::Equal,
@@ -1543,14 +1650,29 @@ pub fn compare(a: &NodeInfo, b: &NodeInfo) -> Comparison {
             return Comparison::Diverged { fork };
         }
     }
-    match a.newest().cmp(&b.newest()) {
-        std::cmp::Ordering::Greater => Comparison::Later(Side::A),
-        std::cmp::Ordering::Less => Comparison::Later(Side::B),
-        std::cmp::Ordering::Equal => match (a.last_entry_crc, b.last_entry_crc) {
-            (Some(x), Some(y)) if x != y => Comparison::Diverged { fork: a.last_seq },
-            _ => Comparison::Equal,
-        },
+    let (short, long, long_side) = match a.last_seq.cmp(&b.last_seq) {
+        std::cmp::Ordering::Equal => {
+            return match (a.last_entry_crc, b.last_entry_crc) {
+                _ if a.last_seq == 0 => Comparison::Equal,
+                (Some(x), Some(y)) if x == y => Comparison::Equal,
+                (Some(_), Some(_)) => Comparison::Diverged { fork: a.last_seq },
+                _ => Comparison::Unverifiable { later: None },
+            };
+        }
+        std::cmp::Ordering::Less => (a, b, Side::B),
+        std::cmp::Ordering::Greater => (b, a, Side::A),
+    };
+    if short.last_seq > 0 {
+        let held = long.probes.get(&short.last_seq).copied().flatten();
+        match (short.last_entry_crc, held) {
+            (Some(x), Some(y)) if x == y => {}
+            (Some(_), Some(_)) => return Comparison::Diverged { fork: short.last_seq },
+            _ => return Comparison::Unverifiable { later: Some(long_side) },
+        }
     }
+    // Compatible: the longer node holds everything the shorter one holds. Its newest epoch is
+    // at least as new (a newer epoch on the shorter node would have forked above).
+    Comparison::Later(long_side)
 }
 
 /// The node to promote, and how the others relate to it.
@@ -1564,6 +1686,9 @@ pub struct Choice {
     pub diverged: Vec<(String, Seq)>,
     /// Nodes of another database.
     pub foreign: Vec<String>,
+    /// Nodes whose compatibility with the candidate cannot be proven (see
+    /// [`Comparison::Unverifiable`]). They are not known to be safe to follow it.
+    pub unverifiable: Vec<String>,
 }
 
 /// Picks the most advanced node holding data (newest epoch, then highest `last_seq`, then
@@ -1575,7 +1700,8 @@ pub fn choose_promotion_candidate(nodes: &[NodeInfo]) -> Result<Choice> {
         .max_by(|x, y| x.newest().cmp(&y.newest()).then_with(|| y.node_id.cmp(&x.node_id)))
         .ok_or_else(|| Error::Config("no node holds data".into()))?
         .clone();
-    let mut choice = Choice { candidate, compatible: Vec::new(), diverged: Vec::new(), foreign: Vec::new() };
+    let mut choice =
+        Choice { candidate, compatible: Vec::new(), diverged: Vec::new(), foreign: Vec::new(), unverifiable: Vec::new() };
     for n in nodes.iter().filter(|n| n.node_id != choice.candidate.node_id) {
         match compare(&choice.candidate, n) {
             Comparison::Later(Side::A) | Comparison::Equal => choice.compatible.push(n.node_id.clone()),
@@ -1583,20 +1709,69 @@ pub fn choose_promotion_candidate(nodes: &[NodeInfo]) -> Result<Choice> {
             Comparison::Later(Side::B) => choice.compatible.push(n.node_id.clone()),
             Comparison::Diverged { fork } => choice.diverged.push((n.node_id.clone(), fork)),
             Comparison::DifferentDatabase => choice.foreign.push(n.node_id.clone()),
+            Comparison::Unverifiable { .. } => choice.unverifiable.push(n.node_id.clone()),
         }
     }
     Ok(choice)
 }
 
-/// Queries a node's `Status` over the network. `client_id` identifies the caller (it must be
-/// a valid node identifier); `upstream` carries the address, TLS and credentials.
+/// How long [`node_status`] waits for a peer's answer; a peer that does not answer in time is
+/// unreachable.
+pub const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Queries a node's `Status` over the network (within [`STATUS_TIMEOUT`]). `client_id`
+/// identifies the caller (it must be a valid node identifier); `upstream` carries the
+/// address, TLS and credentials.
 pub async fn node_status(upstream: &UpstreamConfig, client_id: &str) -> Result<NodeInfo> {
-    let mut c = crate::slave::connect_upstream(upstream, client_id, Duration::from_secs(5))?;
-    let r = c
-        .status(pb::StatusRequest { client_id: client_id.to_string() })
+    node_status_probed(upstream, client_id, None).await
+}
+
+/// [`node_status`], also asking for the CRC of the node's entry at `probe_seq`.
+pub async fn node_status_probed(upstream: &UpstreamConfig, client_id: &str, probe_seq: Option<Seq>) -> Result<NodeInfo> {
+    let mut c = crate::slave::connect_upstream(upstream, client_id, STATUS_TIMEOUT)?;
+    let call = c.status(pb::StatusRequest { client_id: client_id.to_string(), probe_seq });
+    let r = tokio::time::timeout(STATUS_TIMEOUT, call)
         .await
+        .map_err(|_| Error::Config(format!("Status from {}: no answer within {STATUS_TIMEOUT:?}", upstream.uri())))?
         .map_err(|s| Error::Config(format!("Status from {}: {}: {}", upstream.uri(), s.code(), s.message())))?;
-    NodeInfo::from_pb(r.into_inner())
+    NodeInfo::from_pb(r.into_inner(), probe_seq)
+}
+
+/// What [`gather`] collected.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Gathered {
+    /// Every node that answered, with probes at the other nodes' `last_seq`s below its own.
+    pub nodes: Vec<NodeInfo>,
+    /// Nodes that did not answer (address, error).
+    pub unreachable: Vec<(String, String)>,
+}
+
+/// Step 2 of the failover runbook: reads every node's `Status`, then probes each node at the
+/// `last_seq` of every node that is behind it, so [`compare`] and
+/// [`choose_promotion_candidate`] can check that the shorter node's last entry is present.
+pub async fn gather(nodes: &[UpstreamConfig], client_id: &str) -> Gathered {
+    let mut out = Gathered::default();
+    let mut reached = Vec::new();
+    for up in nodes {
+        match node_status(up, client_id).await {
+            Ok(info) => reached.push((up, info)),
+            Err(e) => out.unreachable.push((up.uri(), e.to_string())),
+        }
+    }
+    let seqs: Vec<Seq> = reached.iter().map(|(_, i)| i.last_seq).collect();
+    for (up, mut info) in reached {
+        for &seq in seqs.iter().filter(|&&s| s > 0 && s < info.last_seq) {
+            if info.probes.contains_key(&seq) {
+                continue;
+            }
+            match node_status_probed(up, client_id, Some(seq)).await {
+                Ok(probed) => info.probes.extend(probed.probes),
+                Err(e) => tracing::warn!(node = %info.node_id, seq, error = %e, "probe failed"),
+            }
+        }
+        out.nodes.push(info);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1616,21 +1791,36 @@ mod tests {
             node_state: "ready".into(),
             upstream: None,
             replicas: vec![],
+            probes: BTreeMap::new(),
         }
+    }
+
+    fn probed(mut n: NodeInfo, seq: Seq, crc: Option<u32>) -> NodeInfo {
+        n.probes.insert(seq, crc);
+        n
     }
 
     #[test]
     fn compare_orders_compatible_nodes_and_detects_divergence() {
-        let a = node("a", 1, &[(1, 1)], 10, Some(1));
+        // a holds b's last entry (8) with b's CRC: a is later.
+        let a = probed(node("a", 1, &[(1, 1)], 10, Some(1)), 8, Some(2));
         let b = node("b", 1, &[(1, 1)], 8, Some(2));
         assert_eq!(compare(&a, &b), Comparison::Later(Side::A));
         assert_eq!(compare(&b, &a), Comparison::Later(Side::B));
         assert_eq!(compare(&a, &a.clone()), Comparison::Equal);
         assert_eq!(compare(&a, &node("a2", 1, &[(1, 1)], 10, Some(9))), Comparison::Diverged { fork: 10 });
-        // Promoted at 11: the old-epoch node behind the fork is behind; past it, diverged.
-        let promoted = node("p", 1, &[(1, 1), (2, 11)], 12, Some(3));
-        assert_eq!(compare(&node("c", 1, &[(1, 1)], 10, None), &promoted), Comparison::Later(Side::B));
-        assert_eq!(compare(&node("d", 1, &[(1, 1)], 11, None), &promoted), Comparison::Diverged { fork: 11 });
+        // Same epoch, but entry 8 differs (a restore without an epoch bump, or two masters in
+        // one epoch): diverged. Without a probe it cannot be shown compatible: diverged too.
+        let other_8 = probed(node("a", 1, &[(1, 1)], 10, Some(1)), 8, Some(7));
+        assert_eq!(compare(&other_8, &b), Comparison::Diverged { fork: 8 });
+        // a no longer holds entry 8 (or was not probed): unverifiable, a still later by position.
+        assert_eq!(compare(&node("a", 1, &[(1, 1)], 10, Some(1)), &b), Comparison::Unverifiable { later: Some(Side::A) });
+        assert_eq!(compare(&b, &probed(node("a", 1, &[(1, 1)], 10, Some(1)), 8, None)), Comparison::Unverifiable { later: Some(Side::B) });
+        // Promoted at 11: the old-epoch node behind the fork is behind (its last entry matches);
+        // past the fork, diverged.
+        let promoted = probed(node("p", 1, &[(1, 1), (2, 11)], 12, Some(3)), 10, Some(4));
+        assert_eq!(compare(&node("c", 1, &[(1, 1)], 10, Some(4)), &promoted), Comparison::Later(Side::B));
+        assert_eq!(compare(&node("d", 1, &[(1, 1)], 11, Some(5)), &promoted), Comparison::Diverged { fork: 11 });
         // Two promotions of the same epoch at different points.
         let other = node("q", 1, &[(1, 1), (2, 15)], 16, None);
         assert_eq!(compare(&promoted, &other), Comparison::Diverged { fork: 11 });
@@ -1644,7 +1834,7 @@ mod tests {
         let nodes = vec![
             node("b", 1, &[(1, 1)], 10, Some(1)),
             node("c", 1, &[(1, 1)], 12, Some(2)),
-            node("d", 1, &[(1, 1), (2, 11)], 11, Some(3)),
+            probed(node("d", 1, &[(1, 1), (2, 11)], 11, Some(3)), 10, Some(1)),
             node("x", 9, &[(1, 1)], 50, None),
         ];
         // d has the newest epoch: it wins; c holds entries past d's fork (11, 12): diverged.
@@ -1654,8 +1844,16 @@ mod tests {
         assert_eq!(choice.diverged, vec![("c".to_string(), 11)]);
         assert_eq!(choice.foreign, vec!["x".to_string()]);
 
-        let same_epoch = vec![node("b", 1, &[(1, 1)], 10, None), node("c", 1, &[(1, 1)], 12, None)];
-        assert_eq!(choose_promotion_candidate(&same_epoch).unwrap().candidate.node_id, "c", "highest seq");
+        let same_epoch = vec![node("b", 1, &[(1, 1)], 10, Some(1)), probed(node("c", 1, &[(1, 1)], 12, None), 10, Some(1))];
+        let choice = choose_promotion_candidate(&same_epoch).unwrap();
+        assert_eq!((choice.candidate.node_id.as_str(), choice.compatible.clone()), ("c", vec!["b".to_string()]), "highest seq");
+        // Same epoch, b's entry 10 differs on c: b is diverged, not compatible.
+        let forked = vec![node("b", 1, &[(1, 1)], 10, Some(1)), probed(node("c", 1, &[(1, 1)], 12, None), 10, Some(9))];
+        assert_eq!(choose_promotion_candidate(&forked).unwrap().diverged, vec![("b".to_string(), 10)]);
+        // c no longer holds entry 10: b is listed as unverifiable, neither compatible nor diverged.
+        let trimmed = vec![node("b", 1, &[(1, 1)], 10, Some(1)), probed(node("c", 1, &[(1, 1)], 12, None), 10, None)];
+        let choice = choose_promotion_candidate(&trimmed).unwrap();
+        assert_eq!((choice.unverifiable, choice.compatible, choice.diverged), (vec!["b".to_string()], vec![], vec![]));
         let tie = vec![node("c", 1, &[(1, 1)], 12, Some(1)), node("b", 1, &[(1, 1)], 12, Some(1))];
         assert_eq!(choose_promotion_candidate(&tie).unwrap().candidate.node_id, "b", "lowest id on a tie");
         let empty = NodeInfo { identity: None, epoch_history: vec![], ..node("e", 1, &[(1, 1)], 0, None) };
@@ -1754,23 +1952,34 @@ pub struct PromotionCheck {
     pub diverged: Vec<(String, Seq)>,
     /// Peers of another database.
     pub foreign: Vec<String>,
+    /// Peers behind this slave whose history cannot be verified against it (`node_id`,
+    /// `last_seq`): following it may discard entries they hold.
+    pub unverifiable: Vec<(String, Seq)>,
 }
 
 impl Slave {
     /// What this slave reports about itself; the same fields as the `Status` RPC.
     pub fn promotion_info(&self) -> NodeInfo {
         let lag_max = self.server.as_ref().map_or(Duration::from_secs(10), ServerHandle::replica_lag_time_max);
-        node_info(&*self.inner, &self.inner.replicas, lag_max)
+        node_info(&*self.inner, &self.inner.replicas, lag_max, &[])
     }
 
-    /// Asks every reachable peer for its `Status` and refuses with `Error::NotMostAdvanced`
-    /// if one holds more of the log than this slave (addendum §4). Unreachable, diverged and
-    /// foreign peers are reported, not refused: the operator decides.
+    /// Asks every reachable peer for its `Status` and **refuses by default** (addendum §4):
+    /// `Error::NotMostAdvanced` if a peer is proven to hold more of the log, and
+    /// `Error::PromotionUnverifiable` if a peer is at least as far by position but its history
+    /// cannot be verified (the entry that would prove it is trimmed or before its bootstrap).
+    /// Each peer is probed at this slave's `last_seq`, and this slave's entry at the peer's
+    /// `last_seq` is read locally, so [`admin::compare`] can check the shorter node's last
+    /// entry. Peers proven diverged are reported (in the result, and in a refusal's error),
+    /// not refused; unreachable peers (no answer within `admin::STATUS_TIMEOUT`), foreign
+    /// peers and unverifiable peers that are behind are reported too: the operator decides.
     pub async fn check_promotion(&self, peers: &[UpstreamConfig]) -> Result<PromotionCheck> {
-        let me = self.promotion_info();
+        let mut me = self.promotion_info();
         let mut check = PromotionCheck::default();
+        let (mut later, mut unverified_ahead) = (Vec::new(), Vec::new());
         for peer in peers {
-            let info = match admin::node_status(peer, &me.node_id).await {
+            let probe = Some(me.last_seq).filter(|&s| s > 0);
+            let info = match admin::node_status_probed(peer, &me.node_id, probe).await {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::warn!(peer = %peer.uri(), error = %e, "promotion check: peer unreachable");
@@ -1778,14 +1987,24 @@ impl Slave {
                     continue;
                 }
             };
+            if info.last_seq > 0 && info.last_seq < me.last_seq {
+                let crc = self.inner.store.entry_crc(info.last_seq)?;
+                me.probes.insert(info.last_seq, crc);
+            }
             match compare(&me, &info) {
-                Comparison::Later(Side::B) => {
-                    return Err(Error::NotMostAdvanced { leader: info.node_id, seq: info.last_seq });
-                }
+                Comparison::Later(Side::B) => later.push((info.node_id, info.last_seq)),
+                Comparison::Unverifiable { later: Some(Side::B) | None } => unverified_ahead.push((info.node_id, info.last_seq)),
+                Comparison::Unverifiable { later: Some(Side::A) } => check.unverifiable.push((info.node_id, info.last_seq)),
                 Comparison::Diverged { fork } => check.diverged.push((info.node_id, fork)),
                 Comparison::DifferentDatabase => check.foreign.push(info.node_id),
                 Comparison::Later(Side::A) | Comparison::Equal => {}
             }
+        }
+        if let Some((leader, seq)) = later.into_iter().next() {
+            return Err(Error::NotMostAdvanced { leader, seq, diverged: check.diverged });
+        }
+        if let Some((peer, seq)) = unverified_ahead.into_iter().next() {
+            return Err(Error::PromotionUnverifiable { peer, seq, diverged: check.diverged });
         }
         Ok(check)
     }
@@ -1794,7 +2013,8 @@ impl Slave {
     /// by default. **A refusal hands the slave back untouched and still running**
     /// ([`PromoteRefused::into_slave`]): the checks of `promote` (bootstrapping, no data,
     /// halted `Corrupt`/`SpecMismatch`, wrong `cfg.path`, invalid `cfg`), a later reachable peer
-    /// (`Error::NotMostAdvanced`), or a peer check that could not run.
+    /// (`Error::NotMostAdvanced`), a peer at least as far whose history cannot be verified
+    /// (`Error::PromotionUnverifiable`), or a peer check that could not run.
     ///
     /// Only a failure after the slave has started shutting down for the promotion loses the
     /// handle (`PromoteRefused::slave` is `None`): an I/O error during shutdown, a
@@ -1806,7 +2026,7 @@ impl Slave {
         }
         match self.check_promotion(peers).await {
             Ok(check) => {
-                if !check.unreachable.is_empty() || !check.diverged.is_empty() || !check.foreign.is_empty() {
+                if !check.unreachable.is_empty() || !check.diverged.is_empty() || !check.foreign.is_empty() || !check.unverifiable.is_empty() {
                     tracing::warn!(?check, "promoting despite unreachable, diverged or foreign peers");
                 }
                 self.promote_now(cfg).await.map_err(|error| PromoteRefused { error, slave: None })
@@ -1969,7 +2189,7 @@ impl std::error::Error for DemoteRefused {
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --lib admin && cargo test --test promotion`
-Expected: PASS: `admin::tests::{compare_orders_compatible_nodes_and_detects_divergence, the_chooser_picks_the_most_advanced_and_flags_the_rest}`, and 7 tests in `promotion`: `promotion_end_to_end` (including that the new master's reaper `Delete` reaches C through `entries_since`), `the_old_master_is_refused_with_stale_epoch_and_the_client_retries`, `promotion_is_refused_without_data_and_needs_released_snapshots` (`Error::Config` naming the open `ReadSnapshot`; the directory reopens as a slave afterwards), `the_status_rpc_and_promotion_info_report_positions` (the `Status` RPC and `promotion_info` agree; the master lists its in-sync replica), `promote_checked_refuses_when_a_reachable_peer_is_later` (the refusal returns B still running — it serves reads, a second refusal for a wrong path returns it too, and it then serves a new downstream replica to convergence; the most advanced node passes with an unreachable peer listed), `demote_undoes_a_wrong_promotion_with_zero_loss` (the old identity is back, data identical, a sibling promoted instead is followed without a bootstrap), `demote_is_refused_once_the_new_epoch_has_entries` (the refusal returns the master still running: its write is readable, it takes another write and a new replica converges).
+Expected: PASS: `admin::tests::{compare_orders_compatible_nodes_and_detects_divergence (including a same-epoch CRC mismatch → `Diverged` and a missing probe → `Unverifiable`, listed separately by the chooser), the_chooser_picks_the_most_advanced_and_flags_the_rest}`, and 8 tests in `promotion`: `same_epoch_divergence_is_found_by_the_crc_probe` (a master restored without an epoch bump: `gather` + the chooser list B as diverged at 4, and B's `check_promotion` reports C as diverged), `promotion_end_to_end` (including that the new master's reaper `Delete` reaches C through `entries_since`), `the_old_master_is_refused_with_stale_epoch_and_the_client_retries`, `promotion_is_refused_without_data_and_needs_released_snapshots` (`Error::Config` naming the open `ReadSnapshot`; the directory reopens as a slave afterwards), `the_status_rpc_and_promotion_info_report_positions` (the `Status` RPC and `promotion_info` agree; the master lists its in-sync replica), `promote_checked_refuses_when_a_reachable_peer_is_later` (C tails every entry and holds B's last entry: `NotMostAdvanced`; D joined after the first entry, so it is ahead but cannot verify B's history: `PromotionUnverifiable`; each refusal returns B still running — it serves reads, a second refusal for a wrong path returns it too, and it then serves a new downstream replica to convergence; the most advanced node passes with an unreachable peer listed), `demote_undoes_a_wrong_promotion_with_zero_loss` (the old identity is back, data identical, a sibling promoted instead is followed without a bootstrap), `demote_is_refused_once_the_new_epoch_has_entries` (the refusal returns the master still running: its write is readable, it takes another write and a new replica converges).
 
 Run: `cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features failpoints -- -D warnings`
 Expected: no warnings.
@@ -1993,9 +2213,10 @@ add:
 ```
 **Promotion tooling.**
 - `Slave::promotion_info()` returns the same `NodeInfo` as the `Status` RPC (PROTOCOL.md §6.5); `admin::node_status(upstream, client_id)` fetches it over the network.
-- `admin::compare(a, b)` → `Later(A | B)`, `Equal`, `Diverged { fork }` or `DifferentDatabase`. Two histories are compatible when every seq both nodes hold carries the same epoch in both; then the node with the newer epoch is later, then the one with the higher `last_seq`. Equal positions with different `last_entry_crc` have diverged. A node without data is behind every node with data.
-- `admin::choose_promotion_candidate(&[NodeInfo])` picks the most advanced node holding data (newest epoch, then highest `last_seq`, then lowest node id) and lists the others as compatible, diverged (`(node_id, fork)`) or foreign.
-- `Slave::promote_checked(cfg, peers)` reads every peer's `Status` first and refuses with `Error::NotMostAdvanced { leader, seq }` if a reachable peer is later. Unreachable, diverged and foreign peers are logged and do not block: that is the operator's call. `Slave::check_promotion(peers)` runs the same check without promoting.
+- `admin::compare(a, b)` → `Later(A | B)`, `Equal`, `Diverged { fork }` or `DifferentDatabase`. Two nodes are compatible when no seq both hold lies at or past a point where their epoch histories differ **and** the longer node holds the shorter node's last entry with the same CRC (`NodeInfo::probes`, filled by asking the longer node's `Status` with `probe_seq`; equal positions compare `last_entry_crc`). Then the node with the newer epoch is later, then the one with the higher `last_seq`. A proven CRC mismatch is `Diverged`, so same-epoch divergence (a restore without an epoch bump, two masters in one epoch) is caught. When the longer node no longer holds the probed entry (trimmed, or bootstrapped past it), the result is `Unverifiable { later }`: the order by position is still reported, compatibility is not. A node without data is behind every node with data.
+- `admin::gather(&[UpstreamConfig], client_id)` reads every node's `Status` and probes each node at the `last_seq` of every node behind it; `admin::node_status` waits at most `admin::STATUS_TIMEOUT` (5 s), after which a peer is unreachable.
+- `admin::choose_promotion_candidate(&[NodeInfo])` picks the most advanced node holding data (newest epoch, then highest `last_seq`, then lowest node id) and lists the others as compatible, diverged (`(node_id, fork)`), unverifiable or foreign.
+- `Slave::promote_checked(cfg, peers)` reads every peer's `Status` first (probing it at this slave's `last_seq`, and reading its own entry at the peer's `last_seq`) and **refuses by default**: `Error::NotMostAdvanced { leader, seq, diverged }` if a reachable peer is proven later, `Error::PromotionUnverifiable { peer, seq, diverged }` if a reachable peer is at least as far by position but its history cannot be verified. Both name the proven-diverged peers. Unreachable, diverged, foreign and behind-but-unverifiable peers are reported and do not block; plain `promote` remains the explicit way to override. `Slave::check_promotion(peers)` runs the same check without promoting.
 - `Master::demote(cfg: SlaveConfig)` undoes a promotion of the wrong node. It is allowed only while the newest epoch has no entries (`last_seq < its start_seq`), so nothing is lost: it removes that epoch record, restores the previous identity, persists `role = slave` and opens the directory as a slave. `Master::can_demote()` checks this without consuming the master.
 - `promote_checked` and `demote` refuse by default and **hand the untouched, still-running node back**: `Err(PromoteRefused { error, slave })` / `Err(DemoteRefused { error, master })`, with `into_slave()` / `into_master()`. Only a failure after the node has started shutting down for the change (an I/O error during shutdown, a `ReadSnapshot` that still holds the database, a failure while rewriting `__meta`) loses the handle (`None`); the directory is then reopened by the application. Plain `promote` keeps its behaviour: a refusal shuts the slave down with its directory unchanged.
 ```
@@ -2045,10 +2266,14 @@ pub struct NodeInfo {
     pub epoch_history: Vec<EpochStart>, pub last_seq: Seq, pub last_entry_crc: Option<u32>,
     pub last_ts_ms: u64, pub node_state: String, pub upstream: Option<String>,
     pub replicas: Vec<ReplicaSummary>,          // { node_id, applied_seq, in_sync }
+    pub probes: BTreeMap<Seq, Option<u32>>,     // CRCs at probed seqs (Status.probe_seq)
 }
 pub fn compare(a: &NodeInfo, b: &NodeInfo) -> Comparison;  // Later(Side) | Equal | Diverged { fork } | DifferentDatabase
-pub fn choose_promotion_candidate(nodes: &[NodeInfo]) -> Result<Choice>; // { candidate, compatible, diverged, foreign }
-pub async fn node_status(upstream: &UpstreamConfig, client_id: &str) -> Result<NodeInfo>;
+                                                            // | Unverifiable { later: Option<Side> }
+pub fn choose_promotion_candidate(nodes: &[NodeInfo]) -> Result<Choice>; // { candidate, compatible, diverged, foreign, unverifiable }
+pub async fn node_status(upstream: &UpstreamConfig, client_id: &str) -> Result<NodeInfo>;  // 5 s timeout
+pub async fn node_status_probed(upstream: &UpstreamConfig, client_id: &str, probe_seq: Option<Seq>) -> Result<NodeInfo>;
+pub async fn gather(nodes: &[UpstreamConfig], client_id: &str) -> Gathered;   // { nodes (probed), unreachable }
 ```
 
 In DESIGN.md §16.2, replace:
@@ -2060,7 +2285,7 @@ In DESIGN.md §16.2, replace:
 with:
 
 ```
-`Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq }` (`promote_checked`), `Io`, `RocksDb`.
+`Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }` and `PromotionUnverifiable { peer, seq, diverged }` (`promote_checked`), `Io`, `RocksDb`.
 ```
 
 In DESIGN.md §20, after:
@@ -2176,6 +2401,31 @@ mod tests {
         assert_eq!(write.await.unwrap().unwrap(), 2);
     }
 
+    /// Waiting for acks does not hold the writer lock: while one write waits for its ack,
+    /// another write commits and returns under its own (asynchronous) concern.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_commits_while_another_waits_for_acks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(dir.path(), |_| {}).await;
+        let m = Arc::new(m);
+        m.create_cf(CfSpec::new("c")).unwrap();
+        let mut c = client(m.serve_addr().unwrap(), "b");
+        let (mut s, acks) = c.tail_with_acks(tail_req(&m.identity(), 1)).await.unwrap();
+        next_batch(&mut s).await;
+        acks.send(ack(1)).await.unwrap();
+        eventually("in sync", || m.replicas().iter().any(|r| r.in_sync)).await;
+
+        let m2 = m.clone();
+        let waiting = tokio::task::spawn_blocking(move || m2.put_with("c", b"waits", b"v", concern(1, 10_000)));
+        assert_eq!(next_batch(&mut s).await[0].seq, 2, "the waiting write is committed and sent");
+        let m3 = m.clone();
+        let other = tokio::task::spawn_blocking(move || m3.put("c", b"proceeds", b"v")).await.unwrap().unwrap();
+        assert_eq!(other, 3, "committed while seq 2 waits for its ack");
+        assert!(!waiting.is_finished(), "seq 2 still waits");
+        acks.send(ack(2)).await.unwrap();
+        assert_eq!(waiting.await.unwrap().unwrap(), 2);
+    }
+
     /// A replica that stops being caught up leaves the ISR after `replica_lag_time_max`,
     /// then `NotEnoughReplicas` refuses writes without consuming a seq; catching up rejoins.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2195,7 +2445,9 @@ mod tests {
         m.put("c", b"unacked", b"v").unwrap();
         eventually("out of sync after 300 ms behind", || !m.replicas()[0].in_sync).await;
         let last = m.last_seq();
-        let r = m.put_with("c", b"refused", b"v", concern(1, 1_000));
+        let m = Arc::new(m);
+        let m2 = m.clone();
+        let r = tokio::task::spawn_blocking(move || m2.put_with("c", b"refused", b"v", concern(1, 1_000))).await.unwrap();
         assert!(matches!(r, Err(Error::NotEnoughReplicas { required: 1, in_sync: 0 })), "{r:?}");
         assert_eq!(m.last_seq(), last, "no seq consumed");
 
@@ -2299,6 +2551,42 @@ async fn the_configured_write_concern_applies_to_every_write() {
     let m = Arc::new(m);
     let m2 = m.clone();
     tokio::task::spawn_blocking(move || m2.create_cf(CfSpec::new("c"))).await.unwrap().unwrap();
+    assert_converged(&*m, &[("b", &b)]).await;
+}
+
+/// Kafka-style in-sync (PROTOCOL.md §7.6): under a steady stream of writes the master is
+/// almost always ahead of the replica's latest ack, yet the replica stays in sync, because an
+/// ack of a batch that drained the master's log counts as caught up as of that send. Two
+/// concurrent writers with N = 1 run for several in-sync windows and never get
+/// `NotEnoughReplicas`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writers_keep_the_replica_in_sync() {
+    let c = Cluster::new();
+    let mut cfg = c.master_config("a");
+    cfg.serve.as_mut().unwrap().limits.replica_lag_time_max = Duration::from_millis(200);
+    let m = Arc::new(Master::open(cfg).await.unwrap());
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
+    wait_until("b in sync", || m.replicas().iter().any(|r| r.in_sync)).await;
+    let until = std::time::Instant::now() + Duration::from_millis(1_000);
+    let writers: Vec<_> = (0..2u8)
+        .map(|w| {
+            let m = m.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut n = 0u32;
+                while std::time::Instant::now() < until {
+                    m.put_with("c", &[w, (n % 256) as u8], b"v", WriteConcern::in_sync(1)).unwrap();
+                    n += 1;
+                }
+                n
+            })
+        })
+        .collect();
+    let mut total = 0;
+    for w in writers {
+        total += w.await.unwrap();
+    }
+    assert!(total > 10, "{total} writes");
     assert_converged(&*m, &[("b", &b)]).await;
 }
 ```
@@ -2458,7 +2746,7 @@ In `src/master/mod.rs`, import `WriteConcern` (`use crate::config::{MasterConfig
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --lib master::write_concern && cargo test --test write_concern`
-Expected: PASS: 4 unit tests (`ack_timeout_leaves_the_write_committed`, `a_write_returns_after_the_in_sync_ack`, `a_lagging_replica_leaves_the_isr_and_rejoins` (a replica that stops being caught up leaves the ISR after `replica_lag_time_max` and `NotEnoughReplicas` consumes no seq; catching up rejoins), `without_replicas_a_write_concern_is_refused_and_consumes_no_seq`) and 3 end-to-end tests (`a_write_returns_after_a_real_slave_acknowledged_it`, `an_acknowledged_write_survives_losing_the_master` (`promote_checked` on an in-sync replica after the master is gone: the acknowledged write is there), `the_configured_write_concern_applies_to_every_write`). The failpoint test `a_replica_that_stops_acking_times_the_write_out` (a real slave that commits but never acknowledges → `AckTimeout`, entry committed) is added with the other failpoint tests in Task 15.
+Expected: PASS: 5 unit tests (`ack_timeout_leaves_the_write_committed`, `a_write_returns_after_the_in_sync_ack`, `a_write_commits_while_another_waits_for_acks` (while one `put_with(N = 1)` waits for its ack, a plain `put` commits seq + 1 and returns; then the ack releases the first), `a_lagging_replica_leaves_the_isr_and_rejoins` (a replica that stops being caught up leaves the ISR after `replica_lag_time_max` and `NotEnoughReplicas` consumes no seq; catching up rejoins), `without_replicas_a_write_concern_is_refused_and_consumes_no_seq`) and 4 end-to-end tests (`concurrent_writers_keep_the_replica_in_sync` (two writers with N = 1 for 1 s against `replica_lag_time_max = 200 ms`: no `NotEnoughReplicas`, thanks to Task 6's caught-up-at-send rule), `a_write_returns_after_a_real_slave_acknowledged_it`, `an_acknowledged_write_survives_losing_the_master` (`promote_checked` on an in-sync replica after the master is gone: the acknowledged write is there), `the_configured_write_concern_applies_to_every_write`). The failpoint test `a_replica_that_stops_acking_times_the_write_out` (a real slave that commits but never acknowledges → `AckTimeout`, entry committed) is added with the other failpoint tests in Task 15.
 
 Run: `cargo test && cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features failpoints -- -D warnings`
 Expected: PASS; no warnings.
@@ -2530,13 +2818,13 @@ add:
 In DESIGN.md §16.2, replace:
 
 ```
-`NotMostAdvanced { leader, seq }` (`promote_checked`), 
+`NotMostAdvanced { leader, seq, diverged }` and `PromotionUnverifiable { peer, seq, diverged }` (`promote_checked`), 
 ```
 
 with:
 
 ```
-`NotMostAdvanced { leader, seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), 
+`NotMostAdvanced { leader, seq, diverged }` and `PromotionUnverifiable { peer, seq, diverged }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), 
 ```
 
 In DESIGN.md §18 (table), after:
@@ -2603,16 +2891,16 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `pub struct AcceptDataLoss;` `pub enum RepointDivergence { Refuse (default), Repair { accept_loss: AcceptDataLoss }, Rebootstrap { accept_loss: AcceptDataLoss } }`, `pub struct RepointOptions { pub on_divergence: RepointDivergence }` (`Default`), `#[non_exhaustive] pub enum RepointOutcome { Resumed, EpochAdvanced, Bootstrapped, Repaired { discarded: RangeInclusive<Seq> }, Retrying { last_error: String } }` — all re-exported from the crate root.
   - `Slave::repoint(&self, upstream: UpstreamConfig, opts: RepointOptions) -> Result<RepointOutcome>` (async).
   - `Error::Diverged { fork_seq: Seq, local_last_seq: Seq, divergent_entries: u64 }`, `Error::Unsupported(String)`.
-  - `Inner::{upstream() -> UpstreamConfig, set_upstream(UpstreamConfig), upstream_uri() (now the current upstream), repoint_tx: watch::Sender<u64>, pending_repoint(), repoint_mode(generation), settle_repoint(generation, Result<RepointOutcome>), fail_repoint_on_halt(generation, Error), settle_repoint_end(generation, &SessionEnd)}`, `repoint::{PendingRepoint, divergence(local_epoch, local_last, &pb::HandshakeResponse) -> Error}`; `driver::unless_repointed(&Inner, generation, impl Future) -> Result<T, SessionEnd>`; `bootstrap::install(&Arc<Inner>, generation, &Client, &pb::HandshakeResponse)`; `client::connect(&Inner)`.
+  - `Inner::{upstream() -> UpstreamConfig, set_upstream(UpstreamConfig), upstream_uri() (now the current upstream), repoint_tx: watch::Sender<u64>, pending_repoint(), repoint_divergence, repoint_mode() -> Option<RepointDivergence>, settle_repoint(generation, Result<RepointOutcome>), fail_repoint_on_halt(generation, Error), settle_repoint_end(generation, &SessionEnd)}`, `repoint::{PendingRepoint, divergence(local_epoch, local_last, &pb::HandshakeResponse) -> Error}`; `driver::unless_repointed(&Inner, generation, impl Future) -> Result<T, SessionEnd>`; `bootstrap::install(&Arc<Inner>, generation, &Client, &pb::HandshakeResponse)`; `client::connect(&Inner)`.
 
-**How it works.** `repoint` validates the address, clears a halt (persisting `node_state = ready`), stores the new upstream and a pending reply tagged with a new *generation*, and bumps `Inner::repoint_tx`. The driver reads the generation at the start of each session and rebuilds its client when it changed; every network await of a session (handshake, opening Tail or Bootstrap, each stream message, and the mid-bootstrap failpoint freeze) goes through `unless_repointed`, which ends the session with `Again` as soon as the generation moves on. Store writes are never cancelled: the driver only stops between them. A bootstrap abandoned this way left the slave `bootstrapping` without identity, so the next session bootstraps from scratch. The session of the new generation settles the reply after its handshake: `Resumed`, `EpochAdvanced` (after adopting the epoch) or `Bootstrapped` (after the install), `Retrying` when the session ends in a retry, an error when it halts (sent only once the halt is persisted). A `DIVERGED` answer is decided by the pending `RepointDivergence`, not by `SlaveConfig::on_divergence`: `Rebootstrap` bootstraps; `Refuse` halts `Diverged` and reports `Error::Diverged` (fork from the server's epoch history, rule 8; from the master's `last_seq + 1`, rule 11; or the last entry, rule 12); `Repair` halts `Diverged` and reports `Error::Unsupported` until Plan 3 replaces that arm. Success resets downstream streams, so they learn the new upstream chain.
+**How it works.** `repoint` validates the address, clears a halt (persisting `node_state = ready`), stores the new upstream and a pending reply tagged with a new *generation*, and bumps `Inner::repoint_tx`. The driver reads the generation at the start of each session and rebuilds its client when it changed; every network await of a session (handshake, opening Tail or Bootstrap, each stream message, and the mid-bootstrap failpoint freeze) goes through `unless_repointed`, which ends the session with `Again` as soon as the generation moves on. Store writes are never cancelled: the driver only stops between them. A bootstrap abandoned this way left the slave `bootstrapping` without identity, so the next session bootstraps from scratch. The session of the new generation settles the reply after its handshake: `Resumed`, `EpochAdvanced` (after adopting the epoch) or `Bootstrapped` (after the install), `Retrying` when the session ends in a retry, an error when it halts (sent only once the halt is persisted). Every `DIVERGED` answer after a repoint — in a handshake of any later session, or a Tail/Bootstrap ending with `DIVERGED` (`status_end`) — is decided by the latest repoint's `RepointDivergence` (`Inner.repoint_divergence`, replaced only by the next repoint), never by `SlaveConfig::on_divergence`: `Rebootstrap` bootstraps; `Refuse` halts `Diverged` and reports `Error::Diverged` (fork from the server's epoch history, rule 8; from the master's `last_seq + 1`, rule 11; or the last entry, rule 12); `Repair` halts `Diverged` and reports `Error::Unsupported` until Plan 3 replaces that arm. Success resets downstream streams, so they learn the new upstream chain.
 
 - [ ] **Step 1: Write the failing tests**
 
 Create `tests/repoint.rs`:
 
 ```rust
-//! Switching upstream at runtime (DESIGN.md §13.1–§13.2, addendum §3).
+//! Switching upstream at runtime (DESIGN.md §13.1, addendum §3).
 
 mod support;
 
@@ -2778,6 +3066,43 @@ async fn repoint_to_a_stale_master_keeps_retrying() {
     assert_converged(&b, &[("c", &cn)]).await;
     assert_eq!(lc.bootstraps(), 1);
 }
+
+/// The repoint's mode lasts beyond its first handshake: D is configured with
+/// `on_divergence: Rebootstrap`, is repointed (Refuse) at an address where nothing listens
+/// yet (`Retrying`), and only then does a diverged new master start there. D halts
+/// `Diverged` with its data intact instead of re-bootstrapping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusing_repoint_still_refuses_after_retrying() {
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
+    let (mut d_cfg, ld) = c.slave_config("d", a.serve_addr().unwrap());
+    d_cfg.on_divergence = replicated_rocksdb::DivergencePolicy::Rebootstrap;
+    let d = Slave::open(d_cfg).await.unwrap();
+    wait_state(&b, "b streaming", |s| *s == SlaveState::Streaming).await;
+    a.put("c", b"k", b"1").unwrap();
+    assert_converged(&a, &[("b", &b), ("d", &d)]).await;
+    let b_cfg = c.slave_config("b", a.serve_addr().unwrap()).0;
+    b.shutdown().await.unwrap();
+    a.put("c", b"only on d", b"2").unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    a.shutdown().await.unwrap();
+
+    // A free port: nothing listens there until B is promoted onto it.
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let target = UpstreamConfig::new("127.0.0.1", port);
+    assert!(matches!(repoint(&d, target, RepointOptions::default()).await.unwrap(), RepointOutcome::Retrying { .. }));
+
+    let b = Slave::open(b_cfg).await.unwrap();
+    let mut mcfg = c.master_config("b");
+    mcfg.serve.as_mut().unwrap().port = port;
+    let b = b.promote(mcfg).await.unwrap();
+    wait_state(&d, "Diverged halt", |s| *s == SlaveState::Halted(HaltReason::Diverged)).await;
+    assert_eq!(d.get("c", b"only on d").unwrap(), Some(b"2".to_vec()), "data intact");
+    assert_eq!(ld.bootstraps(), 1, "the configured Rebootstrap policy was not applied");
+    drop(b);
+}
 ```
 
 The repoint-during-bootstrap test needs a failpoint, so it is added to `tests/failpoints.rs` in Task 15 (`repoint_during_bootstrap_restarts_it_against_the_new_upstream`).
@@ -2789,7 +3114,7 @@ Expected: FAIL to compile: `unresolved imports replicated_rocksdb::AcceptDataLos
 
 - [ ] **Step 3: Errors and public types**
 
-In `src/error.rs`, after the `NotMostAdvanced` variant add:
+In `src/error.rs`, after the `PromotionUnverifiable` variant add:
 
 ```rust
     /// The local log holds entries the upstream does not: `divergent_entries` entries from
@@ -2805,7 +3130,7 @@ In `src/error.rs`, after the `NotMostAdvanced` variant add:
 Create `src/slave/repoint.rs`:
 
 ```rust
-//! Switching upstream at runtime (DESIGN.md §13.2).
+//! Switching upstream at runtime (DESIGN.md §13.1).
 
 use std::ops::RangeInclusive;
 
@@ -2827,14 +3152,15 @@ use crate::types::{fork_after, EpochStart, Seq};
 pub struct AcceptDataLoss;
 
 /// What a repoint does when the new upstream answers `DIVERGED`. The slave's configured
-/// `on_divergence` policy is not used for the repoint's own handshake.
+/// `on_divergence` policy is not used after an explicit repoint: this mode decides every
+/// `DIVERGED` answer (handshake or Tail) until the next repoint or a restart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RepointDivergence {
     /// `repoint` returns `Error::Diverged`; the slave halts `Diverged` with its data intact
     /// and readable.
     #[default]
     Refuse,
-    /// Discard only the divergent suffix and resume (DESIGN.md §13.3). **Not available in
+    /// Discard only the divergent suffix and resume (DESIGN.md §22, Plan 3). **Not available in
     /// this version:** `repoint` returns `Error::Unsupported` and the slave halts
     /// `Diverged` with its data intact. It needs verify sessions (Plan 3).
     Repair { accept_loss: AcceptDataLoss },
@@ -2870,16 +3196,17 @@ pub enum RepointOutcome {
 
 pub(crate) struct PendingRepoint {
     pub generation: u64,
-    pub on_divergence: RepointDivergence,
     /// The error to report when the session ends in a halt, instead of `Halted(reason)`.
     pub halt_error: Option<Error>,
     pub reply: oneshot::Sender<Result<RepointOutcome>>,
 }
 
 impl Inner {
-    /// The divergence mode of the repoint that session `generation` settles, if any.
-    pub(crate) fn repoint_mode(&self, generation: u64) -> Option<RepointDivergence> {
-        self.pending_repoint().as_ref().filter(|p| p.generation == generation).map(|p| p.on_divergence)
+    /// The divergence mode of the latest repoint, if the slave was repointed since it
+    /// opened. It decides every `DIVERGED` answer from then on (handshake or Tail), so the
+    /// configured `on_divergence` never applies to an explicitly chosen upstream.
+    pub(crate) fn repoint_mode(&self) -> Option<RepointDivergence> {
+        *self.repoint_divergence.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Settles the repoint that session `generation` was started for (no-op if there is none).
@@ -2975,8 +3302,9 @@ impl Slave {
             let mut pending = self.inner.pending_repoint();
             tracing::info!(node = %self.inner.cfg.identifier, upstream = %upstream.uri(), "repointing");
             self.inner.set_upstream(upstream);
+            *self.inner.repoint_divergence.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(opts.on_divergence);
             let generation = *self.inner.repoint_tx.borrow() + 1;
-            *pending = Some(PendingRepoint { generation, on_divergence: opts.on_divergence, halt_error: None, reply });
+            *pending = Some(PendingRepoint { generation, halt_error: None, reply });
             self.inner.repoint_tx.send_replace(generation);
         }
         self.inner.set_last_error(None);
@@ -2990,7 +3318,7 @@ impl Slave {
 }
 ```
 
-In `src/slave/mod.rs`, add `mod repoint;` to the module list and, after `pub use promote::PromotionCheck;`:
+In `src/slave/mod.rs`, add `mod repoint;` to the module list and, after `pub use promote::{PromoteRefused, PromotionCheck};`:
 
 ```rust
 pub use repoint::{AcceptDataLoss, RepointDivergence, RepointOptions, RepointOutcome};
@@ -3059,6 +3387,9 @@ pub(crate) struct Inner {
     /// Bumped by every repoint; the driver ends its session and reconnects.
     pub repoint_tx: watch::Sender<u64>,
     pending_repoint: Mutex<Option<PendingRepoint>>,
+    /// The divergence mode of the latest repoint. It replaces `cfg.on_divergence` for every
+    /// session from then on (until the next repoint), not only for the first handshake.
+    pub(crate) repoint_divergence: Mutex<Option<super::repoint::RepointDivergence>>,
 }
 
 impl Inner {
@@ -3097,6 +3428,7 @@ impl Inner {
             cfg,
             repoint_tx: watch::channel(0).0,
             pending_repoint: Mutex::new(None),
+            repoint_divergence: Mutex::new(None),
         })
     }
 
@@ -3335,6 +3667,14 @@ pub(crate) async fn unless_repointed<T>(inner: &Inner, generation: u64, f: impl 
 }
 
 pub(crate) fn status_end(inner: &Inner, s: &Status) -> SessionEnd {
+    // After a repoint, a Tail or Bootstrap ending with DIVERGED follows the repoint's mode.
+    if crate::net::reason_of(s) == Some(pb::Reason::Diverged) {
+        match inner.repoint_mode() {
+            Some(RepointDivergence::Rebootstrap { .. }) => return end_for(inner, Action::Bootstrap),
+            Some(RepointDivergence::Refuse | RepointDivergence::Repair { .. }) => return SessionEnd::Halt(HaltReason::Diverged),
+            None => {}
+        }
+    }
     end_for(inner, policy::after_status(s, &inner.policies()))
 }
 
@@ -3459,7 +3799,7 @@ async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, 
     let force = inner.force_bootstrap.load(Ordering::SeqCst);
     let mut action = policy::after_handshake(&hs, &inner.policies(), force);
     // An explicit repoint never resolves divergence by the configured policy.
-    if let Some(mode) = inner.repoint_mode(generation) {
+    if let Some(mode) = inner.repoint_mode() {
         let diverged = hs.decision() == pb::Decision::Reject && hs.reason() == pb::Reason::Diverged;
         if diverged && !force {
             action = match mode {
@@ -3820,7 +4160,7 @@ pub(crate) async fn install(
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test --test repoint`
-Expected: PASS, 4 tests: `failover_runbook_end_to_end` (choose the candidate from `promotion_info`, `promote_checked`, repoint the sibling → `EpochAdvanced` with reads served throughout and no second bootstrap; the new master lists it in sync; repointing to the same upstream → `Resumed`), `divergence_is_refused_unless_data_loss_is_accepted` (`Err(Diverged { fork_seq, local_last_seq, divergent_entries: 2 })`, halted `Diverged` with its data readable; `Repair` → `Err(Unsupported)`, still halted with data; `Rebootstrap { accept_loss: AcceptDataLoss }` → `Bootstrapped`, converges, divergent keys gone), `repoint_refuses_loops` (itself and its own downstream → `Err(Halted(LoopDetected))` with data intact; a valid upstream then → `Resumed`), `repoint_to_a_stale_master_keeps_retrying` (restarted old master → `Retrying { last_error: "STALE_EPOCH: …" }`, not halted, split-brain write not applied; back to the new master → `Resumed`, no bootstrap).
+Expected: PASS, 5 tests: `a_refusing_repoint_still_refuses_after_retrying` (D configured with `on_divergence: Rebootstrap` is repointed (Refuse) at a free port → `Retrying`; a diverged new master then starts there: D halts `Diverged` with its data, no second bootstrap), `failover_runbook_end_to_end` (choose the candidate from `promotion_info`, `promote_checked`, repoint the sibling → `EpochAdvanced` with reads served throughout and no second bootstrap; the new master lists it in sync; repointing to the same upstream → `Resumed`), `divergence_is_refused_unless_data_loss_is_accepted` (`Err(Diverged { fork_seq, local_last_seq, divergent_entries: 2 })`, halted `Diverged` with its data readable; `Repair` → `Err(Unsupported)`, still halted with data; `Rebootstrap { accept_loss: AcceptDataLoss }` → `Bootstrapped`, converges, divergent keys gone), `repoint_refuses_loops` (itself and its own downstream → `Err(Halted(LoopDetected))` with data intact; a valid upstream then → `Resumed`), `repoint_to_a_stale_master_keeps_retrying` (restarted old master → `Retrying { last_error: "STALE_EPOCH: …" }`, not halted, split-brain write not applied; back to the new master → `Resumed`, no bootstrap).
 
 Run: `cargo test && cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features failpoints -- -D warnings`
 Expected: PASS; no warnings.
@@ -3847,7 +4187,7 @@ add:
 
 **Failover runbook.**
 1. Fence the old master: stop it, or cut it off from clients and replicas.
-2. Gather the status of every replica (`admin::node_status`, or `Slave::promotion_info` in-process).
+2. Gather the status of every replica with `admin::gather`, which also probes the CRCs `compare` needs.
 3. Promote the most advanced compatible one: `admin::choose_promotion_candidate`, then `Slave::promote_checked` with the others as peers. If the wrong node was promoted, `Master::demote` undoes it while it has no writes.
 4. `Slave::repoint` every other replica at the new master. Compatible replicas resume or advance their epoch; diverged ones are refused until the operator accepts the loss of their divergent entries.
 
@@ -4538,20 +4878,23 @@ async fn repoint_during_bootstrap_restarts_it_against_the_new_upstream() {
 }
 
 /// The only in-sync replica commits an entry but never acknowledges it: the write is
-/// committed on the master and returns `AckTimeout`.
+/// committed on the master and returns `AckTimeout`. After the replica comes back, the entry
+/// is replicated and acknowledged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replica_that_stops_acking_times_the_write_out() {
     let (_serial, scenario) = serial().await;
     let c = Cluster::new();
-    let m = c.master("a").await;
+    let m = std::sync::Arc::new(c.master("a").await);
     m.create_cf(CfSpec::new("c")).unwrap();
     let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
     wait_until("b in sync", || m.replicas().iter().any(|r| r.node_id == "b" && r.in_sync)).await;
     let wc = WriteConcern { min_insync_replicas: 1, ack_timeout: Duration::from_millis(300) };
-    m.put_with("c", b"acked", b"v", wc).unwrap();
+    let m2 = m.clone();
+    tokio::task::spawn_blocking(move || m2.put_with("c", b"acked", b"v", wc)).await.unwrap().unwrap();
 
     fail::cfg("slave-after-apply", "1*return").unwrap();
-    let err = m.put_with("c", b"never acked", b"v", wc).unwrap_err();
+    let m2 = m.clone();
+    let err = tokio::task::spawn_blocking(move || m2.put_with("c", b"never acked", b"v", wc)).await.unwrap().unwrap_err();
     let seq = m.last_seq();
     assert!(matches!(err, Error::AckTimeout { seq: s, acked: 0, required: 1 } if s == seq), "{err}");
     assert_eq!(m.get("c", b"never acked").unwrap(), Some(b"v".to_vec()), "committed on the master");
@@ -4559,6 +4902,11 @@ async fn a_replica_that_stops_acking_times_the_write_out() {
     assert!(m.replicas().iter().all(|r| r.applied_seq < seq));
     b.kill().await.unwrap();
     fail::remove("slave-after-apply");
+
+    // The replica returns: the entry is there and the master sees it acknowledged.
+    let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
+    assert_converged(&*m, &[("b", &b)]).await;
+    wait_until("the ack lands", || m.replicas().iter().any(|r| r.node_id == "b" && r.applied_seq == seq)).await;
     scenario.teardown();
 }
 ```
@@ -4647,7 +4995,7 @@ with:
 - [ ] **Step 6: Run the fault-injection tests**
 
 Run: `cargo test --features failpoints --test failpoints`
-Expected: PASS, 7 tests (run one at a time through the file-level mutex): `crash_mid_bootstrap_restarts_the_bootstrap` (also asserts the abandoned bootstrap's guard is released: retention passes its `S` again), `crash_after_apply_resumes_without_gap_or_duplicate`, `connection_drop_mid_tail_resumes`, `bootstrap_lease_survives_aggressive_retention` (the slave is held with the `pause` action — no sleeps as synchronisation, no blocked timing windows — and released with `fail::remove`), `a_failed_epoch_bump_fences_the_master_writer`, `repoint_during_bootstrap_restarts_it_against_the_new_upstream` (a slave frozen after its first bootstrap chunk is repointed at a converged sibling: `Bootstrapped`, one completed bootstrap, converged, chain `["b", "a"]`), `a_replica_that_stops_acking_times_the_write_out` (the only in-sync replica commits an entry and freezes before acknowledging: `AckTimeout { acked: 0, required: 1 }`, the entry is committed on the master and on the replica, and `replicas()` still shows the older ack).
+Expected: PASS, 7 tests (run one at a time through the file-level mutex): `crash_mid_bootstrap_restarts_the_bootstrap` (also asserts the abandoned bootstrap's guard is released: retention passes its `S` again), `crash_after_apply_resumes_without_gap_or_duplicate`, `connection_drop_mid_tail_resumes`, `bootstrap_lease_survives_aggressive_retention` (the slave is held with the `pause` action and released with `fail::remove`; one 100 ms absence window, no sleep as synchronisation), `a_failed_epoch_bump_fences_the_master_writer`, `repoint_during_bootstrap_restarts_it_against_the_new_upstream` (a slave frozen after its first bootstrap chunk is repointed at a converged sibling: `Bootstrapped`, one completed bootstrap, converged, chain `["b", "a"]`), `a_replica_that_stops_acking_times_the_write_out` (the only in-sync replica commits an entry and freezes before acknowledging; the blocking `put_with` runs on `spawn_blocking`: `AckTimeout { acked: 0, required: 1 }`, the entry is committed on the master and on the replica, `replicas()` still shows the older ack; after the replica is killed and reopened, it converges and the ack lands).
 
 - [ ] **Step 7: Remove Plan 1 placeholders Plan 2 does not use**
 
