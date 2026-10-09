@@ -6,8 +6,10 @@ use crate::error::{Error, Result};
 use crate::store::bootstrap::{NODE_BOOTSTRAPPING, NODE_READY};
 use crate::types::{DbIdentity, Seq};
 
-/// Why a slave stopped advancing. Reads keep working while halted.
+/// Why a slave stopped advancing. Reads keep working while halted. More reasons may be added,
+/// hence `non_exhaustive`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum HaltReason {
     // Data-related: persisted, survive restart, cleared only by `clear_halt`.
     IdentityChanged,
@@ -66,8 +68,10 @@ impl HaltReason {
     }
 }
 
-/// Runtime state of a slave.
+/// Runtime state of a slave. More states may be added (verification in Plan 3), hence
+/// `non_exhaustive`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SlaveState {
     Connecting,
     Bootstrapping { target_seq: Seq, records: u64 },
@@ -80,8 +84,10 @@ pub enum SlaveState {
 pub enum HaltAction {
     /// Handshake again with the current data (after fixing the cause).
     Retry,
-    /// Discard local data and bootstrap from the upstream.
-    Rebootstrap,
+    /// Discard local data and bootstrap from the upstream. Discarding data takes an explicit
+    /// [`AcceptDataLoss`](crate::AcceptDataLoss), written out by the caller:
+    /// `HaltAction::Rebootstrap { accept_loss: AcceptDataLoss }`.
+    Rebootstrap { accept_loss: crate::slave::AcceptDataLoss },
 }
 
 /// `__meta.node_state`: `ready`, `bootstrapping` or `halted:<Reason>`.

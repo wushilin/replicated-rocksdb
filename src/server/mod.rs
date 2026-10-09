@@ -7,6 +7,7 @@ pub(crate) mod handshake;
 pub(crate) mod replicas;
 pub(crate) mod status;
 mod tail;
+pub(crate) use tail::DEFAULT_MAX_BATCH_BYTES;
 #[cfg(test)]
 pub(crate) use tail::READ_BATCH;
 #[cfg(test)]

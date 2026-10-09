@@ -94,6 +94,11 @@ pub enum Error {
     /// the loss.
     #[error("{peer} holds entries {fork}..={peer_last_seq} that promoting this slave would discard; promote that node instead, or use plain promote to accept the loss")]
     PromotionWouldDiscard { peer: String, fork: Seq, peer_last_seq: Seq },
+    /// `admin::node_status` (and `node_status_probed`) could not get an answer from `peer`:
+    /// connect error, timeout, or a transport failure. A peer that answered with an error
+    /// status is reported as `Config` with the status text instead.
+    #[error("{peer} is unreachable: {reason}")]
+    PeerUnreachable { peer: String, reason: String },
     #[error(transparent)]
     RocksDb(#[from] rocksdb::Error),
     #[error(transparent)]
@@ -104,6 +109,30 @@ impl Error {
     pub(crate) fn corrupt(msg: impl Into<String>) -> Self {
         Error::Corrupt(msg.into())
     }
+
+    /// A storage I/O failure that may pass (disk full, a transient device error, RocksDB
+    /// busy or timed out), as opposed to an integrity failure (corruption, invalid input).
+    pub(crate) fn is_transient_io(&self) -> bool {
+        use rocksdb::ErrorKind as K;
+        match self {
+            Error::Io(_) => true,
+            Error::RocksDb(e) => matches!(e.kind(), K::IOError | K::Busy | K::TimedOut | K::TryAgain),
+            _ => false,
+        }
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_storage_io_failures_are_transient() {
+        assert!(Error::Io(std::io::Error::other("disk full")).is_transient_io());
+        assert!(!Error::corrupt("bad crc").is_transient_io());
+        assert!(!Error::NoSuchCf("c".into()).is_transient_io());
+        assert!(!Error::CfInUse { physical: "u:c:1".into() }.is_transient_io());
+    }
+}

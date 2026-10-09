@@ -203,8 +203,10 @@ impl TlsClientConfig {
     }
 }
 
-/// Server-side limits (PROTOCOL.md §12).
+/// Server-side limits (PROTOCOL.md §12). Limits may be added, hence `non_exhaustive`: start
+/// from `ServeLimits::default()` and set the fields.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ServeLimits {
     pub max_concurrent_bootstraps: usize,
     pub max_verify_sessions: usize,

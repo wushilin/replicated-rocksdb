@@ -77,6 +77,7 @@ pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) 
     let e = entry.clone();
     let result = tokio::task::spawn_blocking(move || {
         let prepared = i.store.prepare(&e, &ops).map_err(Failure::Prepare)?;
+        failpoint::io_error("slave-commit-io").map_err(Failure::Commit)?;
         i.store.commit(prepared, i.cfg.sync_writes).map_err(Failure::Commit)
     })
     .await;
@@ -96,8 +97,15 @@ pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) 
             tracing::warn!(node = %inner.cfg.identifier, seq, error = %e, "column family still in use by a snapshot; will retry");
             return Applied::End(SessionEnd::Retry(e.to_string()));
         }
-        // A failed commit is never retried in-process: its CF side effects (a created
-        // physical CF) must not be reused with another entry. Halt; restart re-evaluates.
+        // A storage I/O failure (disk full, a device error) says nothing about the data: back
+        // off and retry, reported in `last_error`. Nothing was committed (`last_seq` did not
+        // move). A physical CF it may have created is guarded by the persisted create intent:
+        // the store refuses to reuse it for an entry with another spec (`Corrupt`, below).
+        Ok(Err(Failure::Commit(e))) if e.is_transient_io() => {
+            tracing::warn!(node = %inner.cfg.identifier, seq, error = %e, "commit failed with an I/O error; will retry");
+            return Applied::End(SessionEnd::Retry(format!("could not commit entry {seq}: {e}")));
+        }
+        // Integrity failures (corruption, a commit that contradicts local state) halt.
         Ok(Err(Failure::Commit(e))) => {
             tracing::error!(node = %inner.cfg.identifier, seq, error = %e, "commit failed; halting");
             return Applied::End(SessionEnd::Halt(HaltReason::Corrupt));

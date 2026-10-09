@@ -6,7 +6,7 @@ mod support;
 use std::time::Duration;
 
 use replicated_rocksdb::{
-    CfSpec, DivergencePolicy, Error, HaltAction, HaltReason, IdentityPolicy, LogApi, Master, ReadApi, RocksTuning,
+    AcceptDataLoss, CfSpec, DivergencePolicy, Error, HaltAction, HaltReason, IdentityPolicy, LogApi, Master, ReadApi, RocksTuning,
     Slave, SlaveState,
 };
 use support::{assert_converged, restore_dir, wait_state, wait_until, Cluster, WAIT};
@@ -72,7 +72,7 @@ async fn identity_change_is_refused_persistently_until_clear_halt_rebootstraps()
     assert_eq!(b.status().state, SlaveState::Halted(HaltReason::IdentityChanged));
     assert_eq!(listener.bootstraps(), 0);
 
-    b.clear_halt(HaltAction::Rebootstrap).await.unwrap();
+    b.clear_halt(HaltAction::Rebootstrap { accept_loss: AcceptDataLoss }).await.unwrap();
     // Seqs of different databases can coincide: wait for the bootstrap before comparing.
     wait_until("the bootstrap from the new database", || listener.bootstraps() == 1).await;
     assert_converged(&m2, &[("b", &b)]).await;

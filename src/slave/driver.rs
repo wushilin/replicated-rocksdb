@@ -298,6 +298,16 @@ async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, 
     }
 }
 
+/// The Tail decode limit (PROTOCOL.md §11.4): `max(max_entry_bytes, max_batch_bytes)` plus
+/// framing slack, where `max_batch_bytes = 0` means the server's default of 1 MiB.
+fn tail_decode_limit(max_entry_bytes: u64, max_batch_bytes: u32) -> usize {
+    let batch = match max_batch_bytes {
+        0 => crate::server::DEFAULT_MAX_BATCH_BYTES as u64,
+        n => u64::from(n),
+    };
+    usize::try_from(max_entry_bytes.max(batch)).unwrap_or(usize::MAX).saturating_add(DECODE_SLACK)
+}
+
 const CONTRADICTION: &str = "upstream reported DIVERGED on the stream but not in the handshake";
 
 /// A handshake that answers RESUME right after the stream ended `DIVERGED` contradicts the
@@ -337,9 +347,7 @@ async fn tail(
     let Some((identity, _)) = inner.ident() else { return SessionEnd::Again };
     let pos = inner.store.position();
     let fetch = &inner.cfg.fetch;
-    let limit = usize::try_from(hs.max_entry_bytes.max(u64::from(fetch.max_batch_bytes)))
-        .unwrap_or(usize::MAX)
-        .saturating_add(DECODE_SLACK);
+    let limit = tail_decode_limit(hs.max_entry_bytes, fetch.max_batch_bytes);
     let req = pb::TailRequest {
         client_id: inner.cfg.identifier.clone(),
         identity: Some(identity_to_pb(&identity)),
@@ -427,5 +435,13 @@ mod tests {
         }
         assert!(contradicting_resume(true, &Action::Bootstrap).is_none());
         assert!(contradicting_resume(true, &Action::Again).is_none());
+    }
+
+    /// M6: `max_batch_bytes = 0` is the server default (1 MiB), not 0, in the decode limit.
+    #[test]
+    fn the_tail_decode_limit_maps_a_zero_batch_size_to_the_default() {
+        assert_eq!(tail_decode_limit(1000, 0), (1 << 20) + DECODE_SLACK);
+        assert_eq!(tail_decode_limit(1000, 2 << 20), (2 << 20) + DECODE_SLACK);
+        assert_eq!(tail_decode_limit(16 << 20, 0), (16 << 20) + DECODE_SLACK);
     }
 }

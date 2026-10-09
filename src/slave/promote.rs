@@ -85,7 +85,9 @@ impl Slave {
 }
 
 /// What `check_promotion` found among the peers (none of them is later than this slave).
+/// Fields may be added, hence `non_exhaustive` (`Default` builds an empty one).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PromotionCheck {
     /// Peers whose `Status` could not be read (address and error). They do not block.
     pub unreachable: Vec<(String, String)>,

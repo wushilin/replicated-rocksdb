@@ -123,6 +123,18 @@ impl Store {
                 }
                 // Note: `delete_all_keys` below runs under the registry write lock; reuse is rare
                 // (a snapshot-held CF re-created at the same seq) and reads stall meanwhile.
+                // A leftover intent (a commit that failed or crashed after create_cf) for this
+                // physical name but another spec: the existing physical CF was made for that
+                // spec (its comparator may differ) and must not be reused for this entry.
+                let leftover = self.db().get_cf(&self.cf(CF_META), key::CF_CREATE_INTENT)?;
+                if let Some(prev) = leftover.map(|v| meta::decode_cf_entry(&v)).transpose()? {
+                    if prev.physical_name() == physical && prev != entry && reuse.is_none() && self.db().cf_handle(&physical).is_some() {
+                        return Err(Error::corrupt(format!(
+                            "physical CF {physical} was created for {:?} by an unfinished commit; entry {} creates {:?}",
+                            prev.spec, p.seq, entry.spec
+                        )));
+                    }
+                }
                 // Record the intent durably first: a crash after create_cf leaves a CF whose
                 // comparator would otherwise be unknown at the next open.
                 self.write_meta(&[(key::CF_CREATE_INTENT, &meta::encode_cf_entry(&entry))], true)?;
@@ -426,5 +438,27 @@ mod tests {
         store.commit(a, false).unwrap();
         assert!(matches!(store.commit(b, false), Err(Error::Corrupt(_))));
         assert_eq!(store.position().last_seq, 1);
+    }
+
+    /// M3: a physical CF left by a commit that failed after `create_cf` is reused only by the
+    /// same create (a retry of that entry), never by an entry with another spec.
+    #[test]
+    fn a_leftover_physical_cf_is_reused_only_by_the_same_create() {
+        use crate::store::meta;
+        use crate::types::CfEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        // Seq 1 creates "c"; a failed commit of another spec left `u:c:1` and its intent.
+        let other = CfEntry { spec: CfSpec { name: "c".into(), comparator: Some("reverse".into()) }, create_seq: 1 };
+        store.db().create_cf(other.physical_name(), &rocksdb::Options::default()).unwrap();
+        store.write_meta(&[(key::CF_CREATE_INTENT, &meta::encode_cf_entry(&other))], true).unwrap();
+        assert!(matches!(apply(&store, vec![create("c")]), Err(Error::Corrupt(_))));
+        assert_eq!(store.position().last_seq, 0, "nothing committed");
+        // The same spec (a retry of the failed entry) reuses it.
+        let same = CfEntry { spec: CfSpec::new("c"), create_seq: 1 };
+        store.write_meta(&[(key::CF_CREATE_INTENT, &meta::encode_cf_entry(&same))], true).unwrap();
+        assert_eq!(apply(&store, vec![create("c")]).unwrap(), 1);
+        assert_eq!(apply(&store, vec![put("c", b"k", b"v")]).unwrap(), 2);
+        assert!(raw(&store, "c", b"k").is_some());
     }
 }

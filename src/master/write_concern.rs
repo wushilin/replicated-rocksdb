@@ -27,16 +27,22 @@ impl Inner {
     /// replicas are in sync; otherwise commits as usual (fsynced, writer lock released) and
     /// then waits for N in-sync replicas to acknowledge the seq, or fails with `AckTimeout`
     /// — the entry stays committed and keeps replicating.
+    ///
+    /// The in-sync check comes last, just before the commit and under the writer lock: a
+    /// fenced writer (`WriterFenced`) and invalid input (`NoSuchCf`, `EntryTooLarge`, an
+    /// invalid range, ...) report their own error, never `NotEnoughReplicas`.
     pub(crate) fn commit_with(&self, wc: &WriteConcern, build: impl FnOnce(u64) -> Result<Vec<Op>>) -> Result<Seq> {
         let required = wc.min_insync_replicas;
         if required == 0 {
             return self.commit_ops(build);
         }
-        let (in_sync, _) = self.in_sync(Seq::MAX);
-        if in_sync < required {
-            return Err(Error::NotEnoughReplicas { required, in_sync });
-        }
-        let seq = self.commit_ops(build)?;
+        let seq = {
+            let mut w = self.lock_writer()?;
+            self.commit_locked(&mut w, build, |_, _| {
+                let (in_sync, _) = self.in_sync(Seq::MAX);
+                if in_sync < required { Err(Error::NotEnoughReplicas { required, in_sync }) } else { Ok(()) }
+            })?
+        };
         if self.replicas.wait_until(wc.ack_timeout, |_| self.in_sync(seq).1 >= required) {
             Ok(seq)
         } else {
@@ -171,5 +177,21 @@ mod tests {
         embedded.create_cf(CfSpec::new("c")).unwrap();
         assert!(matches!(embedded.put_with("c", b"k", b"v", WriteConcern::in_sync(1)), Err(Error::NotEnoughReplicas { .. })));
         assert_eq!(embedded.put_with("c", b"k", b"v", WriteConcern::default()).unwrap(), 2, "N = 0 is asynchronous");
+    }
+
+    /// M4: invalid input reports its own error before the replica check.
+    #[tokio::test]
+    async fn invalid_input_is_reported_before_not_enough_replicas() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(dir.path(), |cfg| cfg.max_entry_bytes = 1 << 10).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        let wc = WriteConcern::in_sync(1);
+        assert!(matches!(m.put_with("nope", b"k", b"v", wc), Err(Error::NoSuchCf(_))));
+        assert!(matches!(m.put_with("c", b"k", &[0; 2 << 10], wc), Err(Error::EntryTooLarge { .. })));
+        let mut batch = crate::types::Batch::new();
+        batch.delete_range("c", b"z", b"a");
+        assert!(matches!(m.write_with(batch, wc), Err(Error::InvalidRange)));
+        assert!(matches!(m.put_with("c", b"k", b"v", wc), Err(Error::NotEnoughReplicas { required: 1, in_sync: 0 })));
+        assert_eq!(m.last_seq(), 1, "nothing written");
     }
 }

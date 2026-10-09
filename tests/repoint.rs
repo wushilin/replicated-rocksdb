@@ -246,7 +246,7 @@ async fn a_leftover_forced_bootstrap_does_not_override_a_refusing_repoint() {
     b.shutdown().await.unwrap();
 
     // The operator asks for a rebootstrap, but the upstream is gone: the flag stays set.
-    d.clear_halt(HaltAction::Rebootstrap).await.unwrap();
+    d.clear_halt(HaltAction::Rebootstrap { accept_loss: AcceptDataLoss }).await.unwrap();
     assert!(matches!(
         repoint(&d, UpstreamConfig::new("127.0.0.1", p2), RepointOptions::default()).await.unwrap(),
         RepointOutcome::Retrying { .. }

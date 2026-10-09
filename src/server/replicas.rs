@@ -18,8 +18,10 @@ pub struct FetchSettings {
     pub max_batch_bytes: u64,
 }
 
-/// A direct downstream replica, as its upstream sees it.
+/// A direct downstream replica, as its upstream sees it. Fields may be added, hence
+/// `non_exhaustive`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReplicaStatus {
     /// The replica's `x-rrdb-node-id` (or certificate CommonName under mutual TLS).
     pub node_id: String,
@@ -198,15 +200,19 @@ impl ReplicaRegistry {
         ReplicaHandle { id, cell }
     }
 
-    /// `(applied_seq, in_sync)` of every open stream, for the given current epoch.
+    /// `(applied_seq, in_sync)` per replica node, for the given current epoch. A node with
+    /// several open streams (a reconnect whose old stream has not closed yet, or two streams
+    /// under one id) counts once, by its best stream: in sync first, then the highest
+    /// `applied_seq`. Otherwise one replica could satisfy a write concern of N > 1 alone.
     pub(crate) fn acks(&self, epoch: u64, lag_max: Duration) -> Vec<(Seq, bool)> {
-        self.streams()
-            .values()
-            .map(|c| {
-                let p = c.progress();
-                (p.applied_seq, p.in_sync(c.epoch, epoch, lag_max))
-            })
-            .collect()
+        let mut best: std::collections::BTreeMap<String, (bool, Seq)> = std::collections::BTreeMap::new();
+        for c in self.streams().values() {
+            let p = c.progress();
+            let this = (p.in_sync(c.epoch, epoch, lag_max), p.applied_seq);
+            let e = best.entry(c.node_id.clone()).or_insert(this);
+            *e = (*e).max(this);
+        }
+        best.into_values().map(|(in_sync, applied)| (applied, in_sync)).collect()
     }
 
     /// Blocks until `done` holds for the current acks, or `timeout` passes. Returns whether
@@ -286,7 +292,6 @@ impl ReplicaRegistry {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -320,6 +325,21 @@ mod tests {
         assert_eq!(reg.acks(2, Duration::from_secs(10)), vec![(9, false)], "other epoch: not in sync");
         drop(h);
         assert!(reg.acks(1, Duration::from_secs(10)).is_empty(), "closed streams leave the registry");
+    }
+
+    /// M5: two streams of one node count once (its best stream); another node counts apart.
+    #[test]
+    fn a_node_with_several_streams_counts_once() {
+        let reg = registry();
+        let a = reg.open(new(5));
+        let b = reg.open(new(3));
+        a.cell().ack(5, 5).unwrap(); // caught up: in sync
+        let lag = Duration::from_secs(10);
+        assert_eq!(reg.acks(1, lag), vec![(5, true)], "node b: one entry, its in-sync stream");
+        let other = reg.open(NewReplica { node_id: "c".into(), ..new(2) });
+        assert_eq!(reg.acks(1, lag), vec![(5, true), (2, false)]);
+        drop((a, b, other));
+        assert!(reg.acks(1, lag).is_empty());
     }
 
     /// Kafka-style: an ack covering a send that drained the log makes the replica caught up

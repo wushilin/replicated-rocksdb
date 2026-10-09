@@ -168,6 +168,8 @@ async fn a_failed_epoch_bump_fences_the_master_writer() {
     assert!(m.bump_epoch().is_err());
     fail::remove("master-bump-epoch-write");
     assert!(matches!(m.put("c", b"k", b"v"), Err(replicated_rocksdb::Error::WriterFenced)));
+    // A write concern does not hide the fence behind NotEnoughReplicas (no replica is in sync).
+    assert!(matches!(m.put_with("c", b"k", b"v", WriteConcern::in_sync(1)), Err(replicated_rocksdb::Error::WriterFenced)));
     assert_eq!(m.identity().epoch, 1);
     m.shutdown().await.unwrap();
     let m = Master::open(c.master_config("a")).await.unwrap();
@@ -239,5 +241,31 @@ async fn a_replica_that_stops_acking_times_the_write_out() {
     let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
     assert_converged(&*m, &[("b", &b)]).await;
     wait_until("the ack lands", || m.replicas().iter().any(|r| r.node_id == "b" && r.applied_seq == seq)).await;
+    scenario.teardown();
+}
+
+/// M3: a commit that fails with an I/O error is retried with backoff (reported, never a
+/// persisted `Corrupt` halt); the entry is applied once the storage recovers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_io_error_on_commit_is_retried_not_a_corrupt_halt() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (b_cfg, listener) = c.slave_config("b", m.serve_addr().unwrap());
+    let b = Slave::open(b_cfg.clone()).await.unwrap();
+    support::wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
+    fail::cfg("slave-commit-io", "2*return").unwrap();
+    m.put("c", b"k", b"v").unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    fail::remove("slave-commit-io");
+    let states = listener.states();
+    assert!(states.iter().all(|s| !matches!(s, SlaveState::Halted(_))), "never halted: {states:?}");
+    assert!(states.iter().filter(|s| **s == SlaveState::Streaming).count() >= 2, "the session was retried: {states:?}");
+    // Nothing was persisted as halted: a restart resumes.
+    let b = c.restart_slave(b, b_cfg).await;
+    assert!(!matches!(b.status().state, SlaveState::Halted(_)));
+    m.put("c", b"k2", b"v").unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
     scenario.teardown();
 }

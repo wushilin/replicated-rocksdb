@@ -114,8 +114,10 @@ impl Slave {
 
     /// Operator action: leaves a halt. `Retry` handshakes again with the current data (after
     /// fixing the cause, for example registering a missing comparator and reopening);
-    /// `Rebootstrap` discards local data and bootstraps — the only way out of `Diverged`, or
-    /// of `IdentityChanged` under `IdentityPolicy::Refuse`. `Err(Config)` if not halted.
+    /// `Rebootstrap { accept_loss: AcceptDataLoss }` discards local data and bootstraps — the
+    /// only way out of `Diverged`, or of `IdentityChanged` under `IdentityPolicy::Refuse`, apart
+    /// from `repoint`. It carries the consent to lose data in its signature. `Err(Config)` if
+    /// not halted.
     pub async fn clear_halt(&self, action: HaltAction) -> Result<()> {
         // The repoint generation is read together with the halt check: a repoint landing during
         // the blocking write below leaves a forced bootstrap requested for the older generation
@@ -127,7 +129,7 @@ impl Slave {
         let i = self.inner.clone();
         crate::background::blocking(move || i.store.write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true))
             .await?;
-        if action == HaltAction::Rebootstrap {
+        if matches!(action, HaltAction::Rebootstrap { .. }) {
             self.inner.force_bootstrap.request(generation);
         }
         tracing::info!(node = %self.inner.cfg.identifier, reason = reason.name(), ?action, "halt cleared");

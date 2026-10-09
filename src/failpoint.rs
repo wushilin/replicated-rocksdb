@@ -5,6 +5,7 @@
 //! `slave-bootstrap-after-chunk` (after a bootstrap records message is written),
 //! `server-tail-after-entry` (the server ends the Tail stream after sending an entry),
 //! `master-bump-epoch-write` (the synced write of `bump_epoch` fails),
+//! `slave-commit-io` (a slave's commit of a received entry fails with an I/O error),
 //! `slave-before-halt` (a session ended in a halt, before it is persisted; use `cfg_callback`).
 //!
 //! Configure with `fail::cfg(name, "1*return")` to make the point fire once, or

@@ -166,7 +166,7 @@ impl Master {
     /// `NotEnoughReplicas` when fewer than N replicas are in sync (nothing written), and
     /// otherwise returns once N in-sync replicas acknowledged the entry. **On
     /// `Error::AckTimeout` the entry is committed and keeps replicating**; see
-    /// [`WriteConcern`](crate::WriteConcern).
+    /// [`WriteConcern`].
     ///
     /// The read-modify-write caveat of [`write`](Self::write) applies unchanged. Blocks while
     /// waiting for acknowledgements (without holding the writer lock); async callers should

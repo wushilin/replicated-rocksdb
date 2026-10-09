@@ -23,8 +23,10 @@ use crate::pb;
 use crate::slave::UpstreamConfig;
 use crate::types::{DbIdentity, EpochStart, Role, Seq};
 
-/// What a node reports about itself (`Status` RPC, `Slave::promotion_info`).
+/// What a node reports about itself (`Status` RPC, `Slave::promotion_info`). Fields may be
+/// added, hence `non_exhaustive`: build one with [`NodeInfo::new`] and set the fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NodeInfo {
     pub node_id: String,
     pub role: Role,
@@ -59,6 +61,26 @@ pub struct ReplicaSummary {
 }
 
 impl NodeInfo {
+    /// A node without data: no identity, empty history, `last_seq` 0, state `ready`, no
+    /// upstream, replicas, probes or burned epoch. Set the public fields to describe a node
+    /// (for example to call [`compare`] on information kept elsewhere).
+    pub fn new(node_id: impl Into<String>, role: Role) -> NodeInfo {
+        NodeInfo {
+            node_id: node_id.into(),
+            role,
+            identity: None,
+            epoch_history: Vec::new(),
+            last_seq: 0,
+            last_entry_crc: None,
+            last_ts_ms: 0,
+            node_state: "ready".into(),
+            upstream: None,
+            replicas: Vec::new(),
+            probes: BTreeMap::new(),
+            max_burned_epoch: 0,
+        }
+    }
+
     pub(crate) fn from_pb(p: pb::StatusResponse, probe_seq: Option<Seq>) -> Result<NodeInfo> {
         let role = match p.role.as_str() {
             "master" => Role::Master,
@@ -104,8 +126,9 @@ pub enum Side {
     B,
 }
 
-/// How two nodes' data relate.
+/// How two nodes' data relate. More outcomes may be added, hence `non_exhaustive`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Comparison {
     /// Compatible histories; this side holds everything the other holds, and more.
     Later(Side),
@@ -206,8 +229,10 @@ pub fn compare(a: &NodeInfo, b: &NodeInfo) -> Comparison {
     Comparison::Later(by_position.unwrap_or(long_side))
 }
 
-/// The node to promote, and how the others relate to it.
+/// The node to promote, and how the others relate to it. Fields may be added, hence
+/// `non_exhaustive`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Choice {
     pub candidate: NodeInfo,
     /// Compatible nodes: behind the candidate or equal to it. They can follow it.
@@ -257,15 +282,21 @@ pub const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Queries a node's `Status` over the network (within [`STATUS_TIMEOUT`]). `client_id`
 /// identifies the caller (it must be a valid node identifier); `upstream` carries the
-/// address, TLS and credentials.
+/// address, TLS and credentials. A peer that cannot be reached is
+/// `Err(Error::PeerUnreachable { peer, reason })`.
 pub async fn node_status(upstream: &UpstreamConfig, client_id: &str) -> Result<NodeInfo> {
     node_status_probed(upstream, client_id, None).await
 }
 
 /// [`node_status`], also asking for the CRC of the node's entry at `probe_seq`.
+///
+/// `Err(PeerUnreachable { peer, reason })` when no answer could be had (connect error, the
+/// [`STATUS_TIMEOUT`], a transport failure); `Err(Config)` with the status text when the peer
+/// answered with an error (permission denied, another protocol, ...) or an undecodable answer.
 pub async fn node_status_probed(upstream: &UpstreamConfig, client_id: &str, probe_seq: Option<Seq>) -> Result<NodeInfo> {
     status_classified(upstream, client_id, probe_seq).await.map_err(|f| match f {
-        StatusFailure::Unreachable(m) | StatusFailure::Answered(m) => Error::Config(m),
+        StatusFailure::Unreachable(reason) => Error::PeerUnreachable { peer: upstream.uri(), reason },
+        StatusFailure::Answered(m) => Error::Config(m),
     })
 }
 
@@ -371,6 +402,20 @@ mod tests {
     fn probed(mut n: NodeInfo, seq: Seq, crc: Option<u32>) -> NodeInfo {
         n.probes.insert(seq, crc);
         n
+    }
+
+    /// M8: an unreachable peer is reported as such, not as a configuration error.
+    #[tokio::test]
+    async fn an_unreachable_peer_is_peer_unreachable() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let up = UpstreamConfig::new("127.0.0.1", port);
+        match node_status(&up, "operator").await {
+            Err(Error::PeerUnreachable { peer, reason }) => {
+                assert_eq!(peer, up.uri());
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected PeerUnreachable, got {other:?}"),
+        }
     }
 
     #[test]

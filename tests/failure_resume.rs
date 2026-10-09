@@ -5,7 +5,7 @@ mod support;
 
 use std::time::Duration;
 
-use replicated_rocksdb::{CfSpec, GapPolicy, HaltAction, HaltReason, LogApi, Master, ReadApi, Slave, SlaveState};
+use replicated_rocksdb::{AcceptDataLoss, CfSpec, GapPolicy, HaltAction, HaltReason, LogApi, Master, ReadApi, Slave, SlaveState};
 use support::{assert_converged, copy_dir, restore_dir, wait_state, wait_until, Cluster};
 
 /// A → B → C with writes between every restart: master, mid-chain and leaf restarts all
@@ -135,7 +135,7 @@ async fn a_log_gap_halt_persists_across_restart_until_cleared() {
     cfg2.on_log_gap = GapPolicy::Halt;
     let b = Slave::open(cfg2).await.unwrap();
     assert_eq!(b.status().state, SlaveState::Halted(HaltReason::LogGap), "persisted across restart");
-    b.clear_halt(HaltAction::Rebootstrap).await.unwrap();
+    b.clear_halt(HaltAction::Rebootstrap { accept_loss: AcceptDataLoss }).await.unwrap();
     assert_converged(&m, &[("b", &b)]).await;
     assert_eq!(listener.bootstraps(), 1);
 }

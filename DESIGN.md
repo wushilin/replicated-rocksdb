@@ -181,10 +181,10 @@ The same rules are in the rustdoc for `Master::put`, `Master::write` and `Master
 
 ### 5.2 Write concern (in-sync replicas)
 
-`MasterConfig::write_concern: WriteConcern { min_insync_replicas, ack_timeout }` (default `0` = asynchronous, `5 s`) applies to every write method; `Master::write_with(batch, concern)` and `Master::put_with(cf, key, value, concern)` override it per call. A direct replica of the master is **in sync** while its Tail stream is open, it follows the master's current identity, and its acknowledged seq reached the master's `last_seq` within `ServeLimits::replica_lag_time_max` (default 10 s; PROTOCOL.md §7.6). Replicas of replicas do not count. A node that serves must have `heartbeat * 2 <= replica_lag_time_max` (checked by `MasterConfig` and `SlaveConfig` validation, `Error::Config` otherwise): an idle replica acks once per heartbeat, so a longer heartbeat would drop healthy replicas out of sync.
+`MasterConfig::write_concern: WriteConcern { min_insync_replicas, ack_timeout }` (default `0` = asynchronous, `5 s`) applies to every write method; `Master::write_with(batch, concern)` and `Master::put_with(cf, key, value, concern)` override it per call. A direct replica of the master is **in sync** while its Tail stream is open, it follows the master's current identity, and its acknowledged seq reached the master's `last_seq` within `ServeLimits::replica_lag_time_max` (default 10 s; PROTOCOL.md §7.6). Replicas of replicas do not count, and each replica node counts once (by its best open stream), however many streams it has open. A node that serves must have `heartbeat * 2 <= replica_lag_time_max` (checked by `MasterConfig` and `SlaveConfig` validation, `Error::Config` otherwise): an idle replica acks once per heartbeat, so a longer heartbeat would drop healthy replicas out of sync.
 
 With `min_insync_replicas = N > 0`:
-1. Before taking the writer lock: if fewer than N replicas are in sync → `Error::NotEnoughReplicas { required, in_sync }`. Nothing is written and no seq is consumed.
+1. Under the writer lock, after the entry is built and validated (a fenced writer, an unknown CF, an oversized entry or an invalid range report their own error first) and just before the commit: if fewer than N replicas are in sync → `Error::NotEnoughReplicas { required, in_sync }`. Nothing is written and no seq is consumed.
 2. Commit and fsync as usual (§5), then release the writer lock.
 3. Wait, without the writer lock, until N in-sync replicas have acknowledged `seq` → `Ok(seq)`.
 4. After `ack_timeout` → `Error::AckTimeout { seq, acked, required }`. **The entry is committed on the master and keeps replicating**; the error only says that N acknowledgements were not seen in time (Kafka semantics). Retrying the write would write it twice.
@@ -196,7 +196,8 @@ Write methods stay synchronous; async callers use `spawn_blocking`. Concurrent w
 ```
 for each LogEntry received (in order):
   verify crc                                          → Halted(Corrupt)
-  verify entry.epoch == epoch_for(entry.seq)            → end stream, handshake again
+  verify entry.epoch == epoch_for(entry.seq)            → end stream, back off, handshake again
+                                                       (last_error set: it contradicts the shared history)
   if entry.seq <= last_seq: skip                       (exactly-once)
   if entry.seq != last_seq + 1:                        → GapPolicy
   ops = decode + validate (PROTOCOL.md §5.2)           → Halted(Corrupt / SpecMismatch)
@@ -205,10 +206,14 @@ for each LogEntry received (in order):
          __changelog[seq] = entry (unchanged)
          __meta.last_seq = seq, last_entry_crc = entry.crc32c
   db.write(wb)          (sync = SlaveConfig::sync_writes, default false)
-                                                       failure → Halted(Corrupt), never retried in-process;
-                                                       except CfInUse (a reader's snapshot still holds a CF with that
-                                                       physical name and a different spec; nothing was written):
-                                                       back off, retry, report in SlaveStatus.last_error
+                                                       integrity failure → Halted(Corrupt);
+                                                       storage I/O failure (std::io, RocksDB IOError/Busy/TimedOut/
+                                                       TryAgain; nothing committed) → back off, retry, report in
+                                                       SlaveStatus.last_error; so does CfInUse (a reader's snapshot
+                                                       still holds a CF with that physical name and a different spec;
+                                                       nothing was written). A physical CF left by a failed create is
+                                                       reused only by the same create (persisted create intent);
+                                                       another spec at that name → Halted(Corrupt)
   if a verify capture is requested at this seq: take the snapshot now (§12)
   listener.on_entry(&entry)
   publish seq to wait_for_seq and downstream tail subscribers
@@ -489,7 +494,8 @@ pub struct ServeConfig {
     pub tls: Option<TlsServerConfig>,
     pub authenticator: Arc<dyn Authenticator>,
     pub allow_plaintext_token: bool,
-    pub limits: ServeLimits,   // { max_concurrent_bootstraps: 2, max_verify_sessions: 4,
+    pub limits: ServeLimits,   // #[non_exhaustive]; start from ServeLimits::default()
+                               // { max_concurrent_bootstraps: 2, max_verify_sessions: 4,
                                //   bootstrap_chunk_bytes: 1 MiB (at most 16 MiB),
                                //   bootstrap_lease_ttl: 15 min, verify_session_timeout: 5 min,
                                //   max_auth_failures_per_minute: 10, auth_failure_window: 60 s,
@@ -497,6 +503,7 @@ pub struct ServeConfig {
                                //   replica_lag_time_max: 10 s }
 }
 
+#[non_exhaustive]
 pub struct ReplicaStatus {          // one direct downstream replica (Master/Slave::replicas)
     pub node_id: String,            // x-rrdb-node-id, or the certificate CommonName under mTLS
     pub remote_addr: SocketAddr,
@@ -590,6 +597,7 @@ pub struct SlaveConfig {
     pub clock: Arc<dyn Clock>,               // TTL read filtering and retention
 }
 
+#[non_exhaustive]
 pub enum SlaveState {
     Connecting,
     Bootstrapping { target_seq: Seq, records: u64 },
@@ -597,6 +605,7 @@ pub enum SlaveState {
     Halted(HaltReason),
 }
 
+#[non_exhaustive]
 pub enum HaltReason {
     // Data-related: persisted, survive restart, cleared only by clear_halt.
     IdentityChanged, Diverged, LogGap, Corrupt, SpecMismatch,
@@ -604,7 +613,7 @@ pub enum HaltReason {
     ProtocolMismatch, EnvelopeMismatch, AuthRejected, LoopDetected,
 }
 
-pub enum HaltAction { Retry, Rebootstrap }
+pub enum HaltAction { Retry, Rebootstrap { accept_loss: AcceptDataLoss } }   // consent in the signature
 pub struct AcceptDataLoss;                   // written out by the caller to accept discarding data
 pub struct RepointOptions { pub on_divergence: RepointDivergence }   // Default: Refuse
 pub enum RepointDivergence { Refuse, Repair { accept_loss: AcceptDataLoss }, Rebootstrap { accept_loss: AcceptDataLoss } }
@@ -655,17 +664,35 @@ impl ReadApi for Slave {}  impl LogApi for Slave {}
 // A Slave has no write methods. Writing to it is a compile error.
 
 // ---------------- admin: failover tooling (§13.1) ----------------
-pub struct NodeInfo {
+#[non_exhaustive]
+pub struct NodeInfo {                           // NodeInfo::new(node_id, role), then set fields
     pub node_id: String, pub role: Role, pub identity: Option<DbIdentity>,
     pub epoch_history: Vec<EpochStart>, pub last_seq: Seq, pub last_entry_crc: Option<u32>,
     pub last_ts_ms: u64, pub node_state: String, pub upstream: Option<String>,
     pub replicas: Vec<ReplicaSummary>,          // { node_id, applied_seq, in_sync }
     pub probes: BTreeMap<Seq, Option<u32>>,     // CRCs at probed seqs (Status.probe_seq)
+    pub max_burned_epoch: u64,                  // epoch given up by Master::demote; never reused
 }
-pub fn compare(a: &NodeInfo, b: &NodeInfo) -> Comparison;  // Later(Side) | Equal | Diverged { fork } | DifferentDatabase
-                                                            // | Unverifiable { later: Option<Side> }
-pub fn choose_promotion_candidate(nodes: &[NodeInfo]) -> Result<Choice>; // { candidate, compatible, diverged, foreign, unverifiable }
-pub async fn node_status(upstream: &UpstreamConfig, client_id: &str) -> Result<NodeInfo>;  // 5 s timeout
+#[non_exhaustive]
+pub enum Comparison {
+    Later(Side),                                // compatible; that side holds more
+    Equal,
+    Diverged { fork: Seq },                     // proven: histories or a CRC differ
+    Unverifiable { later: Option<Side> },       // compatibility cannot be proven (entry not held)
+    DifferentDatabase,
+}
+pub fn compare(a: &NodeInfo, b: &NodeInfo) -> Comparison;
+#[non_exhaustive]
+pub struct Choice { pub candidate: NodeInfo, pub compatible: Vec<String>, pub diverged: Vec<(String, Seq)>,
+                    pub foreign: Vec<String>, pub unverifiable: Vec<String> }
+pub fn choose_promotion_candidate(nodes: &[NodeInfo]) -> Result<Choice>;
+#[non_exhaustive]
+pub struct PromotionCheck {                     // Slave::check_promotion; Default
+    pub unreachable: Vec<(String, String)>, pub diverged: Vec<(String, Seq)>, pub foreign: Vec<String>,
+    pub unverifiable: Vec<(String, Seq)>, pub max_peer_epoch: u64,
+}
+pub async fn node_status(upstream: &UpstreamConfig, client_id: &str) -> Result<NodeInfo>;  // 5 s timeout;
+                                                // unreachable → Error::PeerUnreachable { peer, reason }
 pub async fn node_status_probed(upstream: &UpstreamConfig, client_id: &str, probe_seq: Option<Seq>) -> Result<NodeInfo>;
 pub async fn gather(nodes: &[UpstreamConfig], client_id: &str) -> Gathered;   // { nodes (probed), unreachable }
 ```
@@ -676,7 +703,7 @@ See §5.1. `Master::get`, `Master::put`, `Master::write` and the crate-level doc
 
 ### 16.2 Errors
 
-`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }`, `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), `Diverged { fork_seq, local_last_seq, divergent_entries }` (a refused `repoint`), `RepointSuperseded`, `Unsupported`, `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
+`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }`, `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), `Diverged { fork_seq, local_last_seq, divergent_entries }` (a refused `repoint`), `RepointSuperseded`, `Unsupported`, `PeerUnreachable { peer, reason }` (`admin::node_status*` got no answer), `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
 
 ### 16.3 Persisted vs runtime slave state
 
@@ -686,7 +713,7 @@ See §5.1. `Master::get`, `Master::put`, `Master::write` and the crate-level doc
 | `bootstrapping` | `Bootstrapping { .. }`. After a restart, the bootstrap starts over. |
 | `halted:<Reason>`, data-related reasons only | `Halted(reason)`. The slave does not contact its upstream until `clear_halt`. |
 
-`clear_halt(Retry)` returns to `Connecting` (useful after fixing a missing comparator, or after `LogGap` with `GapPolicy::Halt` once the operator chooses to wait). `clear_halt(Rebootstrap)` starts a fresh bootstrap. It is the only way out of `Diverged` or `IdentityChanged` under `Refuse`, apart from `repoint`, which clears any halt before it handshakes the new upstream (§13.1).
+`clear_halt(Retry)` returns to `Connecting` (useful after fixing a missing comparator, or after `LogGap` with `GapPolicy::Halt` once the operator chooses to wait). `clear_halt(Rebootstrap { accept_loss: AcceptDataLoss })` starts a fresh bootstrap (discarding local data takes the explicit consent). It is the only way out of `Diverged` or `IdentityChanged` under `Refuse`, apart from `repoint`, which clears any halt before it handshakes the new upstream (§13.1).
 
 ## 17. Wire protocol
 
