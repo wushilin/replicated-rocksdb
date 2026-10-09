@@ -21,7 +21,6 @@ pub enum Role {
     Slave,
 }
 
-#[allow(dead_code)]
 impl Role {
     pub(crate) fn as_bytes(self) -> &'static [u8] {
         match self {
@@ -60,13 +59,11 @@ impl CfSpec {
 
 /// A registered user CF: its spec plus the seq of the `CreateCf` entry that created it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct CfEntry {
     pub spec: CfSpec,
     pub create_seq: Seq,
 }
 
-#[allow(dead_code)]
 impl CfEntry {
     /// Physical RocksDB CF name, `u:{name}:{create_seq}`. Never parsed back.
     pub fn physical_name(&self) -> String {

@@ -18,5 +18,7 @@ pub use error::{Error, Result};
 pub use types::{Batch, CfSpec, DbIdentity, Direction, EpochStart, IterMode, LogEntry, Op, Role, Seq, ValueMeta};
 
 pub mod codec;
+#[allow(dead_code)] // consumed by the master and slave in later tasks
+pub(crate) mod store;
 pub use codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 pub use tuning::{CfKind, ComparatorRegistry, Compression, RocksTuning, Tunable};

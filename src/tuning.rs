@@ -139,7 +139,6 @@ impl RocksTuning {
         self
     }
 
-    #[allow(dead_code)] // used by later tasks
     pub(crate) fn db_options(&self) -> Options {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -150,7 +149,6 @@ impl RocksTuning {
         opts
     }
 
-    #[allow(dead_code)] // used by later tasks
     pub(crate) fn cf_options(&self, kind: CfKind<'_>) -> Result<Options> {
         let mut opts = Options::default();
         if let CfKind::User(spec) = kind {

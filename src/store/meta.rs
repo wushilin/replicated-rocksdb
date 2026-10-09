@@ -1,0 +1,123 @@
+//! `__meta` keys and value encodings (DESIGN.md §3.2).
+
+use prost::Message;
+
+use crate::error::{Error, Result};
+use crate::pb;
+use crate::proto::local::v1 as local;
+use crate::types::{CfEntry, CfSpec, DbIdentity, EpochStart, Role, Seq};
+
+pub(crate) const CF_META: &str = "__meta";
+pub(crate) const CF_CHANGELOG: &str = "__changelog";
+pub(crate) const CF_TTL_INDEX: &str = "__ttl_index";
+
+pub(crate) mod key {
+    pub const ROLE: &[u8] = b"role";
+    pub const PROTOCOL_VERSION: &[u8] = b"protocol_version";
+    pub const ENVELOPE_VERSION: &[u8] = b"envelope_version";
+    pub const ORIGIN_IDENTITY: &[u8] = b"origin_identity";
+    pub const LAST_SEQ: &[u8] = b"last_seq";
+    pub const LAST_ENTRY_CRC: &[u8] = b"last_entry_crc";
+    pub const LAST_TS: &[u8] = b"last_ts";
+    pub const EPOCH_HISTORY: &[u8] = b"epoch_history";
+    pub const CF_SPECS: &[u8] = b"cf_specs";
+    pub const PENDING_CF_DROPS: &[u8] = b"pending_cf_drops";
+    pub const CF_CREATE_INTENT: &[u8] = b"cf_create_intent";
+}
+
+pub(crate) fn be64(b: &[u8]) -> Result<u64> {
+    let a: [u8; 8] = b.try_into().map_err(|_| Error::corrupt("expected an 8-byte integer in __meta"))?;
+    Ok(u64::from_be_bytes(a))
+}
+
+pub(crate) fn be32(b: &[u8]) -> Result<u32> {
+    let a: [u8; 4] = b.try_into().map_err(|_| Error::corrupt("expected a 4-byte integer in __meta"))?;
+    Ok(u32::from_be_bytes(a))
+}
+
+pub(crate) fn encode_identity(id: &DbIdentity) -> Vec<u8> {
+    pb::Identity { db_uuid: id.db_uuid.as_bytes().to_vec(), epoch: id.epoch }.encode_to_vec()
+}
+
+pub(crate) fn decode_identity(b: &[u8]) -> Result<DbIdentity> {
+    let p = pb::Identity::decode(b).map_err(|e| Error::corrupt(format!("bad identity in __meta: {e}")))?;
+    let db_uuid = uuid::Uuid::from_slice(&p.db_uuid).map_err(|e| Error::corrupt(format!("bad db_uuid: {e}")))?;
+    Ok(DbIdentity { db_uuid, epoch: p.epoch })
+}
+
+pub(crate) fn encode_epoch_history(h: &[EpochStart]) -> Vec<u8> {
+    let epochs = h.iter().map(|e| pb::EpochStart { epoch: e.epoch, start_seq: e.start_seq }).collect();
+    local::EpochHistory { epochs }.encode_to_vec()
+}
+
+pub(crate) fn decode_epoch_history(b: &[u8]) -> Result<Vec<EpochStart>> {
+    let p = local::EpochHistory::decode(b).map_err(|e| Error::corrupt(format!("bad epoch history in __meta: {e}")))?;
+    Ok(p.epochs.into_iter().map(|e| EpochStart { epoch: e.epoch, start_seq: e.start_seq }).collect())
+}
+
+fn entry_to_pb(e: &CfEntry) -> pb::CfSpec {
+    pb::CfSpec { name: e.spec.name.clone(), comparator: e.spec.comparator.clone(), create_seq: e.create_seq }
+}
+
+fn entry_from_pb(p: pb::CfSpec) -> CfEntry {
+    CfEntry { spec: CfSpec { name: p.name, comparator: p.comparator }, create_seq: p.create_seq }
+}
+
+pub(crate) fn encode_cf_list(list: &[CfEntry]) -> Vec<u8> {
+    local::CfEntryList { cfs: list.iter().map(entry_to_pb).collect() }.encode_to_vec()
+}
+
+pub(crate) fn decode_cf_list(b: &[u8]) -> Result<Vec<CfEntry>> {
+    let p = local::CfEntryList::decode(b).map_err(|e| Error::corrupt(format!("bad CF list in __meta: {e}")))?;
+    Ok(p.cfs.into_iter().map(entry_from_pb).collect())
+}
+
+pub(crate) fn encode_cf_entry(e: &CfEntry) -> Vec<u8> {
+    entry_to_pb(e).encode_to_vec()
+}
+
+pub(crate) fn decode_cf_entry(b: &[u8]) -> Result<CfEntry> {
+    let p = pb::CfSpec::decode(b).map_err(|e| Error::corrupt(format!("bad CF entry in __meta: {e}")))?;
+    Ok(entry_from_pb(p))
+}
+
+/// Everything in `__meta`, read in one go (live, read-only, or through a snapshot).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MetaSnapshot {
+    pub role: Role,
+    pub protocol_version: u64,
+    pub envelope_version: u64,
+    pub identity: Option<DbIdentity>,
+    /// Empty until an identity is assigned (fresh master, or slave after bootstrap).
+    pub epoch_history: Vec<EpochStart>,
+    pub last_seq: Seq,
+    pub last_entry_crc: Option<u32>,
+    pub last_ts: u64,
+    pub cf_specs: Vec<CfEntry>,
+    pub pending_drops: Vec<CfEntry>,
+    pub cf_create_intent: Option<CfEntry>,
+}
+
+impl MetaSnapshot {
+    /// `Ok(None)` if the store has never been initialised (no `role` key).
+    pub(crate) fn load(get: impl Fn(&[u8]) -> Result<Option<Vec<u8>>>) -> Result<Option<MetaSnapshot>> {
+        let Some(role) = get(key::ROLE)? else { return Ok(None) };
+        let role = Role::from_bytes(&role).ok_or_else(|| Error::corrupt("unknown role in __meta"))?;
+        let u64_or = |k: &[u8], default: u64| -> Result<u64> {
+            get(k)?.map(|v| be64(&v)).transpose().map(|v| v.unwrap_or(default))
+        };
+        Ok(Some(MetaSnapshot {
+            role,
+            protocol_version: u64_or(key::PROTOCOL_VERSION, 0)?,
+            envelope_version: u64_or(key::ENVELOPE_VERSION, 0)?,
+            identity: get(key::ORIGIN_IDENTITY)?.map(|v| decode_identity(&v)).transpose()?,
+            epoch_history: get(key::EPOCH_HISTORY)?.map(|v| decode_epoch_history(&v)).transpose()?.unwrap_or_default(),
+            last_seq: u64_or(key::LAST_SEQ, 0)?,
+            last_entry_crc: get(key::LAST_ENTRY_CRC)?.map(|v| be32(&v)).transpose()?,
+            last_ts: u64_or(key::LAST_TS, 0)?,
+            cf_specs: get(key::CF_SPECS)?.map(|v| decode_cf_list(&v)).transpose()?.unwrap_or_default(),
+            pending_drops: get(key::PENDING_CF_DROPS)?.map(|v| decode_cf_list(&v)).transpose()?.unwrap_or_default(),
+            cf_create_intent: get(key::CF_CREATE_INTENT)?.map(|v| decode_cf_entry(&v)).transpose()?,
+        }))
+    }
+}
