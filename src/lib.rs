@@ -15,3 +15,6 @@ pub mod types;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{Error, Result};
 pub use types::{Batch, CfSpec, DbIdentity, Direction, EpochStart, IterMode, LogEntry, Op, Role, Seq, ValueMeta};
+
+pub mod codec;
+pub use codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};

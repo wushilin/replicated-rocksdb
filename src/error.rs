@@ -40,7 +40,6 @@ pub enum Error {
 }
 
 impl Error {
-    #[allow(dead_code)]
     pub(crate) fn corrupt(msg: impl Into<String>) -> Self {
         Error::Corrupt(msg.into())
     }

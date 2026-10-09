@@ -177,7 +177,7 @@ Rules (a receiver that finds a violation MUST treat the entry as `CORRUPT`):
 
 1. `ops` is non-empty.
 2. An entry that contains `CreateCf` or `DropCf` contains **exactly one** op.
-3. `cf` and `name` are logical column family (CF) names. They are non-empty, valid UTF-8, and MUST NOT start with `__`.
+3. `cf` and `name` are logical column family (CF) names. They are 1–255 bytes of valid UTF-8 and MUST NOT start with `__`.
 4. `cf` names a CF that exists at this seq. For `CreateCf`, `name` does not exist; for `DropCf`, it does.
 5. For `DeleteRange`, `start` sorts strictly before `end` under the CF's comparator.
 
