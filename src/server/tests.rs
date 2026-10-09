@@ -424,17 +424,19 @@ async fn shutdown_with_unread_streams_releases_the_database() {
         m.put("c", &[i], &vec![i; 256 << 10]).unwrap();
     }
     let mut c = client(m.serve_addr().unwrap(), "b");
-    let mut tail = c.tail_start(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
-    assert!(within("the first tail message", tail.message()).await.unwrap().is_some());
-    let mut boot = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
-    let first = within("the bootstrap header", boot.message()).await.unwrap().unwrap();
-    assert!(matches!(first.kind, Some(Chunk::Header(_))));
-    // A Tail that never sends `start`: its handler holds the source while it waits.
+    // A Tail that never sends `start`: its handler holds the source while it waits. It is
+    // opened first, while nothing else holds the source: a Tail producer also clones the
+    // source for each blocking log read, so with streams open the count is not quiescent.
     let base = Arc::strong_count(&m.log_source());
     let (_silent_tx, silent_rx) = tokio::sync::mpsc::channel::<pb::TailClientMessage>(1);
     let mut c2 = c.clone();
     let silent = tokio::spawn(async move { c2.tail(tokio_stream::wrappers::ReceiverStream::new(silent_rx)).await });
     eventually("the silent Tail holds the source", || Arc::strong_count(&m.log_source()) > base).await;
+    let mut tail = c.tail_start(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
+    assert!(within("the first tail message", tail.message()).await.unwrap().is_some());
+    let mut boot = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
+    let first = within("the bootstrap header", boot.message()).await.unwrap().unwrap();
+    assert!(matches!(first.kind, Some(Chunk::Header(_))));
     tokio::time::timeout(Duration::from_secs(20), m.shutdown()).await.expect("shutdown hangs").unwrap();
     let silent = within("the silent Tail's answer", silent).await.unwrap();
     assert_eq!(silent.err().map(|s| reason_of(&s)), Some(Some(pb::Reason::ShuttingDown)));
