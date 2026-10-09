@@ -10,6 +10,7 @@ mod maintenance;
 mod policy;
 mod state;
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,10 +21,12 @@ use crate::error::{Error, Result};
 use crate::log::{EntryIter, LogApi};
 use crate::read::{ReadApi, ReadSnapshot};
 use crate::server::{await_sole_owner, ServerHandle};
+use crate::store::meta::key;
 use crate::store::read::DbIter;
 use crate::store::Store;
 use crate::types::{CfSpec, Direction, IterMode, Role, Seq, ValueMeta};
 use inner::Inner;
+use state::NodeState;
 
 pub use config::{Backoff, DivergencePolicy, FetchConfig, GapPolicy, IdentityPolicy, SlaveConfig, UpstreamConfig};
 pub use state::{HaltAction, HaltReason, SlaveState, SlaveStatus};
@@ -85,6 +88,27 @@ impl Slave {
 
     pub fn watch_state(&self) -> watch::Receiver<SlaveState> {
         self.inner.state_tx.subscribe()
+    }
+
+    /// Operator action: leaves a halt. `Retry` handshakes again with the current data (after
+    /// fixing the cause, for example registering a missing comparator and reopening);
+    /// `Rebootstrap` discards local data and bootstraps — the only way out of `Diverged`, or
+    /// of `IdentityChanged` under `IdentityPolicy::Refuse`. `Err(Config)` if not halted.
+    pub async fn clear_halt(&self, action: HaltAction) -> Result<()> {
+        let SlaveState::Halted(reason) = self.inner.state() else {
+            return Err(Error::Config("the slave is not halted".into()));
+        };
+        let i = self.inner.clone();
+        crate::background::blocking(move || i.store.write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true))
+            .await?;
+        if action == HaltAction::Rebootstrap {
+            self.inner.force_bootstrap.store(true, Ordering::SeqCst);
+        }
+        tracing::info!(node = %self.inner.cfg.identifier, reason = reason.name(), ?action, "halt cleared");
+        self.inner.set_last_error(None);
+        self.inner.set_state(SlaveState::Connecting);
+        self.inner.halt_cleared.notify_one();
+        Ok(())
     }
 
     /// A consistent view at the current applied seq. `Err(NotReady)` while bootstrapping.
