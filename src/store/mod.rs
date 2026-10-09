@@ -28,15 +28,30 @@ pub(crate) struct Position {
 }
 
 pub(crate) struct Store {
-    db: Arc<DB>,
+    db: Arc<DbCore>,
     role: Role,
     tuning: RocksTuning,
     pub(crate) cfs: CfRegistry,
     pos: RwLock<Position>,
     first_retained: AtomicU64,
+}
+
+/// The RocksDB handle plus state that must live exactly as long as it. Shared by `Arc`
+/// with snapshots, which may outlive the `Store`.
+pub(crate) struct DbCore {
+    /// Declared first, so it is dropped before `retained_cf_opts`.
+    db: DB,
     /// Options of CFs created after open. `DB::create_cf` does not retain the options'
-    /// comparator, so they must outlive `db` (fields drop in order: keep this after `db`).
-    created_cf_opts: Mutex<Vec<Options>>,
+    /// custom comparator, so it must outlive the DB. Grows by one entry per CF created
+    /// during the process lifetime.
+    retained_cf_opts: Mutex<Vec<Options>>,
+}
+
+impl std::ops::Deref for DbCore {
+    type Target = DB;
+    fn deref(&self) -> &DB {
+        &self.db
+    }
 }
 
 impl Store {
@@ -67,7 +82,10 @@ impl Store {
                 .ok_or_else(|| Error::corrupt(format!("physical column family {name} is not in __meta")))?;
             descriptors.push(ColumnFamilyDescriptor::new(name, tuning.cf_options(CfKind::User(&entry.spec))?));
         }
-        let db = Arc::new(DB::open_cf_descriptors(&db_opts, path, descriptors)?);
+        let db = Arc::new(DbCore {
+            db: DB::open_cf_descriptors(&db_opts, path, descriptors)?,
+            retained_cf_opts: Mutex::new(Vec::new()),
+        });
 
         let mut store = Store {
             db,
@@ -76,7 +94,6 @@ impl Store {
             cfs: CfRegistry::default(),
             pos: RwLock::new(Position::default()),
             first_retained: AtomicU64::new(1),
-            created_cf_opts: Mutex::new(Vec::new()),
         };
         let meta = match prior {
             Some(m) => m,
@@ -141,10 +158,10 @@ impl Store {
     }
 
     pub(crate) fn retain_cf_options(&self, opts: Options) {
-        self.created_cf_opts.lock().unwrap_or_else(PoisonError::into_inner).push(opts);
+        self.db.retained_cf_opts.lock().unwrap_or_else(PoisonError::into_inner).push(opts);
     }
 
-    pub(crate) fn db(&self) -> &Arc<DB> {
+    pub(crate) fn db(&self) -> &Arc<DbCore> {
         &self.db
     }
 

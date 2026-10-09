@@ -1,7 +1,7 @@
 //! Turning one `LogEntry` into one atomic `WriteBatch` (DESIGN.md §5, §6, §7).
 
 use std::cmp::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use rocksdb::{WriteBatch, WriteOptions};
 
@@ -79,10 +79,7 @@ impl Store {
                     let phys = lookup(name)?;
                     let specs: Vec<CfEntry> =
                         live.values().filter(|p| p.entry.spec.name != *name).map(|p| p.entry.clone()).collect();
-                    let mut pending = self.cfs.pending_entries();
-                    pending.push(phys.entry.clone());
                     batch.put_cf(&meta_cf, key::CF_SPECS, meta::encode_cf_list(&specs));
-                    batch.put_cf(&meta_cf, key::PENDING_CF_DROPS, meta::encode_cf_list(&pending));
                     cf_change = Some(CfChange::Drop(phys));
                 }
             }
@@ -98,9 +95,14 @@ impl Store {
     /// Writes a prepared entry. CF changes hold the registry write lock across the write,
     /// so snapshots always see a CF list that matches their data.
     pub(crate) fn commit(&self, p: Prepared, sync: bool) -> Result<()> {
+        let last = self.position().last_seq;
+        if p.seq != last + 1 {
+            return Err(Error::corrupt(format!("commit of entry {} does not follow last_seq {last}", p.seq)));
+        }
         let mut wo = WriteOptions::default();
         wo.set_sync(sync);
-        match p.cf_change {
+        let mut p = p;
+        match p.cf_change.take() {
             Some(CfChange::Create(entry)) => {
                 let mut live = self.cfs.write();
                 // Record the intent durably first: a crash after create_cf leaves a CF whose
@@ -117,10 +119,16 @@ impl Store {
                 live.insert(entry.spec.name.clone(), PhysCf::new(entry));
             }
             Some(CfChange::Drop(phys)) => {
+                // Lock order: registry write lock, then pending. The persisted pending list is
+                // computed under the lock so a concurrent physical drop cannot lose this entry.
                 let mut live = self.cfs.write();
+                let mut pending = self.cfs.pending.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut list: Vec<CfEntry> = pending.iter().map(|c| c.entry.clone()).collect();
+                list.push(phys.entry.clone());
+                p.batch.put_cf(&self.cf(CF_META), key::PENDING_CF_DROPS, meta::encode_cf_list(&list));
                 self.db().write_opt(p.batch, &wo)?;
                 live.remove(&phys.entry.spec.name);
-                self.cfs.push_pending(phys);
+                pending.push(phys);
             }
             None => self.db().write_opt(p.batch, &wo)?,
         }
@@ -332,5 +340,64 @@ mod tests {
         assert!(store.db().cf_handle("u:x:1").is_none());
         assert!(store.load_meta().unwrap().unwrap().cf_create_intent.is_none());
         assert_eq!(apply(&store, vec![create("x")]).unwrap(), 1);
+    }
+
+    #[test]
+    fn interrupted_create_with_custom_comparator_is_cleaned_up_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tuning = RocksTuning::new();
+        tuning.comparators.register("reverse", |a: &[u8], b: &[u8]| b.cmp(a));
+        {
+            let store = open_store_with(dir.path(), tuning.clone());
+            let spec = CfSpec::new("x").with_comparator("reverse");
+            let intent = crate::types::CfEntry { spec: spec.clone(), create_seq: 1 };
+            store
+                .write_meta(&[(key::CF_CREATE_INTENT, &crate::store::meta::encode_cf_entry(&intent))], true)
+                .unwrap();
+            let opts = tuning.cf_options(crate::tuning::CfKind::User(&spec)).unwrap();
+            store.db().create_cf("u:x:1", &opts).unwrap();
+            store.retain_cf_options(opts);
+        }
+        let store = open_store_with(dir.path(), tuning);
+        assert!(store.db().cf_handle("u:x:1").is_none());
+        assert!(store.load_meta().unwrap().unwrap().cf_create_intent.is_none());
+        assert_eq!(
+            apply(&store, vec![Op::CreateCf { spec: CfSpec::new("x").with_comparator("reverse") }]).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn db_clone_outlives_store_with_custom_comparator_cf() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tuning = RocksTuning::new();
+        tuning.comparators.register("reverse", |a: &[u8], b: &[u8]| b.cmp(a));
+        let store = open_store_with(dir.path(), tuning);
+        apply(&store, vec![Op::CreateCf { spec: CfSpec::new("r").with_comparator("reverse") }]).unwrap();
+        apply(&store, vec![put("r", b"a", b"1")]).unwrap();
+        apply(&store, vec![put("r", b"b", b"2")]).unwrap();
+        let phys = store.live_cf("r").unwrap();
+        let db = store.db().clone();
+        drop(store);
+        let cf = db.cf_handle(&phys.physical).unwrap();
+        let keys: Vec<Vec<u8>> =
+            db.iterator_cf(&cf, rocksdb::IteratorMode::Start).map(|i| i.unwrap().0.to_vec()).collect();
+        assert_eq!(keys, vec![b"b".to_vec(), b"a".to_vec()]);
+        assert!(db.get_cf(&cf, b"a").unwrap().is_some());
+        drop(cf);
+        drop(db);
+    }
+
+    #[test]
+    fn commit_rechecks_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        let ops = vec![create("c")];
+        let entry = LogEntry::new(1, 1, 0, crate::codec::encode_ops(&ops));
+        let a = store.prepare(&entry, &ops).unwrap();
+        let b = store.prepare(&entry, &ops).unwrap();
+        store.commit(a, false).unwrap();
+        assert!(matches!(store.commit(b, false), Err(Error::Corrupt(_))));
+        assert_eq!(store.position().last_seq, 1);
     }
 }
