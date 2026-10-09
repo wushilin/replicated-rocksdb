@@ -18,6 +18,8 @@ pub(crate) struct ServerView {
     pub last_seq: Seq,
     pub first_retained_seq: Seq,
     /// `crc32c` of the server's entry at the client's `last_seq`, if the server holds it.
+    /// Includes the server's own `last_entry_crc` when `seq == last_seq` (PROTOCOL §6.3 note);
+    /// `None` for `seq == 0`, `seq > last_seq`, or a trimmed entry.
     pub crc_at_client_last: Option<u32>,
 }
 
@@ -52,7 +54,7 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
         return verdict(Reject, R::LoopDetected, d);
     }
     // 4: no consistent state to serve.
-    let Some(server_id) = v.identity.filter(|_| v.ready) else {
+    let Some(ident) = v.identity.filter(|_| v.ready) else {
         return verdict(Reject, R::NotReady, format!("{} is bootstrapping", v.server_id));
     };
     // 5
@@ -60,26 +62,31 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
         return verdict(Bootstrap, R::NoLocalState, "client has no data");
     };
     // 6
-    if known.db_uuid.as_slice() != server_id.db_uuid.as_bytes() {
+    if known.db_uuid.as_slice() != ident.db_uuid.as_bytes() {
         return verdict(Bootstrap, R::IdentityChanged, "database uuid differs");
     }
     let client_crc_matches = r.last_crc32c.is_some() && r.last_crc32c == v.crc_at_client_last;
     // 7
-    if known.epoch > server_id.epoch {
-        let d = format!("client epoch {} is newer than server epoch {}", known.epoch, server_id.epoch);
+    if known.epoch > ident.epoch {
+        let d = format!("client epoch {} is newer than server epoch {}", known.epoch, ident.epoch);
         return verdict(Reject, R::StaleEpoch, d);
     }
-    if known.epoch < server_id.epoch {
+    if known.epoch < ident.epoch {
         // 8: the client holds entries at or past the fork point after its epoch.
-        if let Some(fork) = fork_after(&v.epoch_history, known.epoch) {
-            if r.last_seq >= fork {
+        match fork_after(&v.epoch_history, known.epoch) {
+            Some(fork) if r.last_seq >= fork => {
                 let d = format!("client last_seq {} is at or past fork point {fork} of epoch {}", r.last_seq, known.epoch);
+                return verdict(Reject, R::Diverged, d);
+            }
+            Some(_) => {}
+            None => {
+                let d = format!("epoch history is inconsistent: no epoch after {} although server is at {}", known.epoch, ident.epoch);
                 return verdict(Reject, R::Diverged, d);
             }
         }
         // 9: continuity proven by the CRC of the client's last entry.
         if client_crc_matches {
-            return verdict(Resume, R::EpochAdvanced, format!("epoch {} -> {}", known.epoch, server_id.epoch));
+            return verdict(Resume, R::EpochAdvanced, format!("epoch {} -> {}", known.epoch, ident.epoch));
         }
         // 10
         return verdict(Bootstrap, R::IdentityChanged, "continuity across the epoch change cannot be proven");
@@ -242,6 +249,18 @@ mod tests {
         check(&v, &r, Bootstrap, R::IdentityChanged);
         r.last_crc32c = None;
         check(&master(), &r, Bootstrap, R::IdentityChanged);
+        // None == None must not count as proof.
+        check(&v, &r, Bootstrap, R::IdentityChanged);
+    }
+
+    #[test]
+    fn rule_08_inconsistent_history_fails_closed() {
+        let mut v = master();
+        v.epoch_history = vec![EpochStart { epoch: 1, start_seq: 1 }];
+        let mut r = req();
+        r.known_identity.as_mut().unwrap().epoch = 1;
+        r.last_seq = 100;
+        check(&v, &r, Reject, R::Diverged);
     }
 
     #[test]
@@ -259,6 +278,9 @@ mod tests {
         r.last_crc32c = Some(0xBBBB);
         check(&master(), &r, Reject, R::Diverged);
         check(&replica(), &r, Reject, R::Diverged);
+        // Rule 12 needs the client CRC.
+        r.last_crc32c = None;
+        check(&master(), &r, Resume, R::Unspecified);
     }
 
     #[test]
@@ -288,5 +310,10 @@ mod tests {
         v.first_retained_seq = 1;
         v.crc_at_client_last = None;
         check(&v, &r, Resume, R::Unspecified);
+        // Rule 13 must not overflow.
+        let mut r = req();
+        r.last_seq = u64::MAX;
+        r.last_crc32c = None;
+        check(&replica(), &r, Resume, R::Unspecified);
     }
 }
