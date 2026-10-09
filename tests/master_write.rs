@@ -215,6 +215,26 @@ async fn subscribe_sees_each_commit() {
 }
 
 #[tokio::test]
+async fn bump_on_open_is_skipped_for_a_fresh_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = clock();
+    let mut cfg = config(dir.path(), &c);
+    cfg.bump_epoch_on_open = true;
+    let m = Master::open(cfg).await.unwrap();
+    assert_eq!(m.identity().epoch, 1);
+    assert_eq!(m.epoch_history(), vec![EpochStart { epoch: 1, start_seq: 1 }]);
+}
+
+#[tokio::test]
+async fn zero_heartbeat_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = clock();
+    let mut cfg = config(dir.path(), &c);
+    cfg.heartbeat = Duration::ZERO;
+    assert!(matches!(Master::open(cfg).await, Err(Error::Config(_))));
+}
+
+#[tokio::test]
 async fn invalid_identifier_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let c = clock();

@@ -8,7 +8,8 @@ use crate::error::{Error, Result};
 use crate::types::{LogEntry, Seq};
 
 /// Entries with seq greater than a cursor, in order. Yields `Err(Gap)` and stops if the
-/// next expected entry has been trimmed by retention.
+/// next expected entry has been trimmed by retention. For a mid-stream hole, the error's
+/// `first_retained` is the next seq actually present.
 pub struct EntryIter<'a> {
     inner: DBIteratorWithThreadMode<'a, DB>,
     next: Seq,

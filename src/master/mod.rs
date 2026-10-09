@@ -38,6 +38,7 @@ impl Master {
     pub async fn open(cfg: MasterConfig) -> Result<Self> {
         cfg.validate()?;
         let (store, meta) = Store::open(&cfg.path, Role::Master, cfg.rocksdb.clone())?;
+        let mut fresh = false;
         let (identity, history) = match meta.identity {
             Some(id) if !meta.epoch_history.is_empty() => (id, meta.epoch_history),
             Some(_) => return Err(crate::Error::corrupt("origin_identity without epoch_history in __meta")),
@@ -51,12 +52,13 @@ impl Master {
                     ],
                     true,
                 )?;
+                fresh = true;
                 (id, history)
             }
         };
         let bump = cfg.bump_epoch_on_open;
         let inner = Arc::new(Inner::new(store, cfg, meta.last_ts, identity, history));
-        if bump {
+        if bump && !fresh {
             inner.bump_epoch()?;
         }
         Ok(Master { inner, task: None })
@@ -199,17 +201,8 @@ impl LogApi for Master {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn assert_send_sync<T: Send + Sync>() {}
-    fn assert_static<T: 'static>() {}
-
-    #[test]
-    fn handles_are_thread_safe() {
-        assert_send_sync::<Master>();
-        assert_send_sync::<ReadSnapshot>();
-        assert_static::<ReadSnapshot>();
-    }
-}
+const _: () = {
+    fn assert<T: Send + Sync + 'static>() {}
+    let _ = assert::<Master>;
+    let _ = assert::<ReadSnapshot>;
+};

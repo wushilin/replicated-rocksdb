@@ -79,6 +79,9 @@ impl MasterConfig {
         if self.reaper.max_deletes_per_entry == 0 || self.reaper.max_deletes_per_round == 0 {
             return Err(Error::Config("reaper limits must be positive".into()));
         }
+        if self.heartbeat.is_zero() {
+            return Err(Error::Config("heartbeat must be positive".into()));
+        }
         if self.retention.check_interval.is_zero() || self.reaper.interval.is_zero() {
             return Err(Error::Config("maintenance intervals must be positive".into()));
         }

@@ -19,6 +19,7 @@ pub enum Error {
     EntryTooLarge { size: u64, max: u64 },
     #[error("unknown comparator: {0}")]
     UnknownComparator(String),
+    /// For a hole in the middle of the log, `first_retained` is the next seq actually present.
     #[error("log gap: seq {requested} requested, first retained is {first_retained}")]
     Gap { requested: Seq, first_retained: Seq },
     #[error("corrupt data: {0}")]

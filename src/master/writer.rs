@@ -84,11 +84,11 @@ impl Inner {
         let ops = build(ts)?;
         let seq = self.store.position().last_seq + 1;
         let entry = LogEntry::new(seq, self.identity().epoch, ts, encode_ops(&ops));
-        let mut prepared = self.store.prepare(&entry, &ops)?;
         let size = entry.encoded_len() as u64;
         if size > self.cfg.max_entry_bytes {
             return Err(Error::EntryTooLarge { size, max: self.cfg.max_entry_bytes });
         }
+        let mut prepared = self.store.prepare(&entry, &ops)?;
         self.store.add_ttl_index(&mut prepared.batch, &ops)?;
         extra(&mut prepared.batch, &self.store)?;
         prepared.batch.put_cf(&self.store.cf(CF_META), key::LAST_TS, ts.to_be_bytes());
@@ -105,19 +105,23 @@ impl Inner {
     /// New epoch, same db_uuid; seq numbering continues (DESIGN.md §13).
     /// Identity and history are written in one synced batch.
     pub(crate) fn bump_epoch(&self) -> Result<DbIdentity> {
-        let _w = self.lock_writer()?;
+        let mut w = self.lock_writer()?;
         let mut guard = self.identity.write().unwrap_or_else(PoisonError::into_inner);
         let (mut id, mut history) = guard.clone();
         id.epoch = history.iter().map(|e| e.epoch).max().unwrap_or(id.epoch).max(id.epoch) + 1;
         let start = self.store.position().last_seq + 1;
         history.push(EpochStart { epoch: id.epoch, start_seq: start });
-        self.store.write_meta(
+        if let Err(e) = self.store.write_meta(
             &[
                 (key::ORIGIN_IDENTITY, &meta::encode_identity(&id)),
                 (key::EPOCH_HISTORY, &meta::encode_epoch_history(&history)),
             ],
             true,
-        )?;
+        ) {
+            w.fenced = true;
+            tracing::error!(error = %e, "epoch bump failed; writer fenced until reopen");
+            return Err(e);
+        }
         *guard = (id, history);
         tracing::info!(epoch = id.epoch, start_seq = start, "epoch bumped");
         Ok(id)
