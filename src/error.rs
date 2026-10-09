@@ -68,6 +68,12 @@ pub enum Error {
     /// mistake and has taken no writes, then check again.
     #[error("{peer} is a reachable master; fence it, or demote it if it was promoted by mistake and has no writes, before promoting")]
     MasterReachable { peer: String },
+    /// `promote_checked` found a reachable peer whose history forks from this slave's at
+    /// `fork` while the peer holds entries at or past it (up to `peer_last_seq`): promoting this
+    /// slave would discard them. Promote that peer instead, or use plain `promote` to accept
+    /// the loss.
+    #[error("{peer} holds entries {fork}..={peer_last_seq} that promoting this slave would discard; promote that node instead, or use plain promote to accept the loss")]
+    PromotionWouldDiscard { peer: String, fork: Seq, peer_last_seq: Seq },
     #[error(transparent)]
     RocksDb(#[from] rocksdb::Error),
     #[error(transparent)]

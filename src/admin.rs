@@ -210,6 +210,10 @@ pub struct Choice {
     pub unverifiable: Vec<String>,
 }
 
+/// Compatibility is judged by entries. A node whose newest epoch is empty and differs from the
+/// candidate's (for example a wrongly promoted master with no writes) is not safe to follow the
+/// candidate as it is: `demote` it (or rebootstrap it) first.
+///
 /// Picks the most advanced node holding data (newest epoch, then highest `last_seq`, then
 /// lowest `node_id`) and classifies the others against it. `Err(Config)` if no node holds data.
 pub fn choose_promotion_candidate(nodes: &[NodeInfo]) -> Result<Choice> {
@@ -260,8 +264,8 @@ pub(crate) enum StatusFailure {
     Answered(String),
 }
 
-/// Transport failures, connect errors, `Unavailable` and the timeout are `Unreachable`; every
-/// other status (`PermissionDenied`, `Unimplemented`, `FailedPrecondition`, ...) is `Answered`.
+/// Unreachable: connect errors, the timeout, and statuses `Unavailable`, `DeadlineExceeded`,
+/// `Cancelled` and `Unknown` with a transport error as its source. Every other status (`PermissionDenied`, `Unimplemented`, `FailedPrecondition`, ...) is `Answered`.
 pub(crate) async fn status_classified(
     upstream: &UpstreamConfig,
     client_id: &str,
@@ -287,18 +291,18 @@ fn is_transport_failure(s: &tonic::Status) -> bool {
     // errors, `Unknown` with a transport error as the source.
     match s.code() {
         Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled => true,
-        Code::Unknown => std::error::Error::source(s).is_some() || s.message().contains("transport error"),
+        Code::Unknown => std::error::Error::source(s).is_some(),
         _ => false,
     }
 }
 
-/// What [`gather`] collected. `unreachable` also lists nodes that answered `Status` with an
-/// error (the text says which); `Slave::check_promotion` treats those as blocking instead.
+/// What [`gather`] collected.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Gathered {
     /// Every node that answered, with probes at the other nodes' `last_seq`s below its own.
     pub nodes: Vec<NodeInfo>,
-    /// Nodes that did not answer (address, error).
+    /// Nodes that did not answer, or answered with an error (address, error text);
+    /// `Slave::check_promotion` treats the latter as blocking instead.
     pub unreachable: Vec<(String, String)>,
 }
 

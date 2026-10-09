@@ -102,8 +102,11 @@ impl Slave {
     /// cannot be verified (the entry that would prove it is trimmed or before its bootstrap).
     /// Each peer is probed at this slave's `last_seq`, and this slave's entry at the peer's
     /// `last_seq` is read locally, so [`admin::compare`] can check the shorter node's last
-    /// entry. Peers proven diverged are reported (in the result, and in a refusal's error),
-    /// not refused; unreachable peers (no answer within `admin::STATUS_TIMEOUT`), foreign
+    /// entry. A peer whose history forks from this slave's at `fork` and that holds entries at
+    /// or past it blocks with `Error::PromotionWouldDiscard` (promoting this slave would
+    /// discard them; promote that node instead, or use plain `promote` to accept the loss).
+    /// A diverged peer with nothing at or past the fork is only reported (in the result, and
+    /// in a refusal's error); unreachable peers (no answer within `admin::STATUS_TIMEOUT`), foreign
     /// peers and unverifiable peers that are behind are reported too: the operator decides.
     /// A peer that is reachable but answered `Status` with an error (permission denied, another
     /// protocol, ...) blocks as `PromotionUnverifiable` (`seq` 0, the error in `peer`): its state
@@ -115,7 +118,7 @@ impl Slave {
     pub async fn check_promotion(&self, peers: &[UpstreamConfig]) -> Result<PromotionCheck> {
         let mut me = self.promotion_info();
         let mut check = PromotionCheck::default();
-        let (mut later, mut unverified_ahead) = (Vec::new(), Vec::new());
+        let (mut later, mut unverified_ahead, mut would_discard) = (Vec::new(), Vec::new(), Vec::new());
         for peer in peers {
             let probe = Some(me.last_seq).filter(|&s| s > 0);
             let info = match admin::status_classified(peer, &me.node_id, probe).await {
@@ -144,6 +147,8 @@ impl Slave {
                 Comparison::Later(Side::B) => later.push((info.node_id, info.last_seq)),
                 Comparison::Unverifiable { later: Some(Side::B) | None } => unverified_ahead.push((info.node_id, info.last_seq)),
                 Comparison::Unverifiable { later: Some(Side::A) } => check.unverifiable.push((info.node_id, info.last_seq)),
+                // The peer holds entries this slave would discard: refused by default.
+                Comparison::Diverged { fork } if info.last_seq >= fork => would_discard.push((info.node_id, fork, info.last_seq)),
                 Comparison::Diverged { fork } => check.diverged.push((info.node_id, fork)),
                 Comparison::DifferentDatabase => check.foreign.push(info.node_id),
                 Comparison::Later(Side::A) | Comparison::Equal => {}
@@ -154,6 +159,9 @@ impl Slave {
         }
         if let Some((peer, seq)) = unverified_ahead.into_iter().next() {
             return Err(Error::PromotionUnverifiable { peer, seq, diverged: check.diverged });
+        }
+        if let Some((peer, fork, peer_last_seq)) = would_discard.into_iter().next() {
+            return Err(Error::PromotionWouldDiscard { peer, fork, peer_last_seq });
         }
         Ok(check)
     }

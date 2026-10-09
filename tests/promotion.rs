@@ -308,8 +308,8 @@ async fn demote_is_refused_once_the_new_epoch_has_entries() {
 
 /// Same-epoch divergence (a master restored from a backup without an epoch bump): epoch
 /// histories agree, so only the CRC probe shows that B's entry 4 is not C's entry 4.
-/// `gather` + the chooser flag B as diverged, and B's checked promotion is not refused by C
-/// (C does not hold B's history) but reports it as diverged.
+/// `gather` + the chooser flag B as diverged, and B's checked promotion is refused: C holds entries 4..=5 that
+/// promoting B would discard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_epoch_divergence_is_found_by_the_crc_probe() {
     let c = Cluster::new();
@@ -346,8 +346,9 @@ async fn same_epoch_divergence_is_found_by_the_crc_probe() {
     assert_eq!(choice.candidate.node_id, "c");
     assert_eq!(choice.diverged, vec![("b".to_string(), 4)], "same epoch, different entry 4");
     assert!(choice.compatible.is_empty());
-    let check = b.check_promotion(&peers[1..]).await.unwrap();
-    assert_eq!(check.diverged, vec![("c".to_string(), 4)]);
+    // C holds entries 4..=5 that promoting B would discard: refused by default.
+    let err = b.check_promotion(&peers[1..]).await.expect_err("c holds entries b would discard");
+    assert!(matches!(err, Error::PromotionWouldDiscard { ref peer, fork: 4, peer_last_seq: 5 } if peer == "c"), "{err}");
 }
 
 /// A reachable peer that is itself a master (promoted by mistake) blocks `promote_checked`
@@ -417,4 +418,48 @@ async fn a_refused_slave_keeps_replicating_from_its_live_upstream() {
     a.put("c", b"after refusal", b"v").unwrap();
     assert_converged(&a, &[("b", &b)]).await;
     assert_eq!(b.get("c", b"after refusal").unwrap(), Some(b"v".to_vec()));
+}
+
+/// A slave whose newest epoch is empty (it follows a promotion that took no writes) against a
+/// slave of the old epoch that holds entries past that epoch's start: the empty one must not be
+/// promoted (it would discard those entries); the other one may be (the empty one has nothing
+/// at or past the fork), reporting it as diverged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promotion_that_would_discard_entries_is_refused() {
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    let a_addr = a.serve_addr().unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (b, _) = c.slave("b", a_addr).await;
+    let (cn, _) = c.slave("c", a_addr).await;
+    wait_state(&b, "b", |s| *s == SlaveState::Streaming).await;
+    wait_state(&cn, "c", |s| *s == SlaveState::Streaming).await;
+    a.put("c", b"1", b"v").unwrap();
+    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
+    b.shutdown().await.unwrap();
+    a.put("c", b"2", b"v").unwrap();
+    a.put("c", b"3", b"v").unwrap();
+    assert_converged(&a, &[("c", &cn)]).await;
+    a.shutdown().await.unwrap();
+
+    // B is promoted (epoch 2, empty); D follows it and has the empty epoch too.
+    let (b, _) = reopen(&c, "b", a_addr, |_| {}).await;
+    let fork = b.last_seq() + 1;
+    let b_master = b.promote(c.master_config("b")).await.unwrap();
+    let (d, _) = c.slave("d", b_master.serve_addr().unwrap()).await;
+    wait_state(&d, "d streaming", |s| *s == SlaveState::Streaming).await;
+    assert_converged(&b_master, &[("d", &d)]).await;
+    let c_peer = UpstreamConfig::from_addr(cn.serve_addr().unwrap());
+
+    let refused = d.promote_checked(c.master_config("d"), std::slice::from_ref(&c_peer)).await.err().expect("c holds entries");
+    assert!(
+        matches!(&refused.error, Error::PromotionWouldDiscard { peer, fork: f, peer_last_seq } if peer == "c" && *f == fork && *peer_last_seq == cn.last_seq()),
+        "{refused}"
+    );
+    let d = refused.into_slave().expect("the slave is returned");
+    let d_peer = UpstreamConfig::from_addr(d.serve_addr().unwrap());
+
+    // The other way round nothing is discarded: reported, not blocking.
+    let check = cn.check_promotion(std::slice::from_ref(&d_peer)).await.unwrap();
+    assert_eq!(check.diverged, vec![("d".to_string(), fork)]);
 }
