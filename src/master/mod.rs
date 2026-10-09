@@ -100,6 +100,10 @@ impl Master {
     /// [type-level docs](Self#read-modify-write).
     ///
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
+    ///
+    /// With a configured `MasterConfig::write_concern` it also waits for in-sync
+    /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
+    /// not undo the write; see [`write_with`](Self::write_with)).
     pub fn put(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<Seq> {
         let op = Op::Put { cf: cf.into(), key: key.into(), value: value.into(), expire_at_ms: None };
         self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
@@ -109,6 +113,10 @@ impl Master {
     /// hidden from reads at once and deleted by the reaper later.
     ///
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
+    ///
+    /// With a configured `MasterConfig::write_concern` it also waits for in-sync
+    /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
+    /// not undo the write; see [`write_with`](Self::write_with)).
     pub fn put_with_ttl(&self, cf: &str, key: &[u8], value: &[u8], ttl: Duration) -> Result<Seq> {
         let (cf, key, value) = (cf.to_string(), key.to_vec(), value.to_vec());
         self.inner.commit_with(&self.inner.cfg.write_concern, |ts| Ok(vec![Op::Put { cf, key, value, expire_at_ms: Some(expire_at(ts, ttl)) }]))
@@ -117,6 +125,10 @@ impl Master {
     /// Deletes `key`. A no-op delete is still logged as an entry.
     ///
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
+    ///
+    /// With a configured `MasterConfig::write_concern` it also waits for in-sync
+    /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
+    /// not undo the write; see [`write_with`](Self::write_with)).
     pub fn delete(&self, cf: &str, key: &[u8]) -> Result<Seq> {
         let op = Op::Delete { cf: cf.into(), key: key.into() };
         self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
@@ -125,6 +137,10 @@ impl Master {
     /// Deletes keys in `[start, end)` under the CF's comparator. `start` must sort before `end`.
     ///
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
+    ///
+    /// With a configured `MasterConfig::write_concern` it also waits for in-sync
+    /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
+    /// not undo the write; see [`write_with`](Self::write_with)).
     pub fn delete_range(&self, cf: &str, start: &[u8], end: &[u8]) -> Result<Seq> {
         let op = Op::DeleteRange { cf: cf.into(), start: start.into(), end: end.into() };
         self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
@@ -137,6 +153,10 @@ impl Master {
     /// the [type-level docs](Self#read-modify-write).
     ///
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
+    ///
+    /// With a configured `MasterConfig::write_concern` it also waits for in-sync
+    /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
+    /// not undo the write; see [`write_with`](Self::write_with)).
     pub fn write(&self, batch: Batch) -> Result<Seq> {
         self.inner.commit_with(&self.inner.cfg.write_concern, |ts| Ok(batch.into_ops(ts)))
     }
@@ -171,6 +191,10 @@ impl Master {
     /// `UnknownComparator`. Logged as its own entry.
     ///
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
+    ///
+    /// With a configured `MasterConfig::write_concern` it also waits for in-sync
+    /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
+    /// not undo the write; see [`write_with`](Self::write_with)).
     pub fn create_cf(&self, spec: CfSpec) -> Result<Seq> {
         validate_cf_name(&spec.name)?;
         self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![Op::CreateCf { spec }]))
@@ -180,6 +204,10 @@ impl Master {
     /// iterator still references it. Logged as its own entry.
     ///
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
+    ///
+    /// With a configured `MasterConfig::write_concern` it also waits for in-sync
+    /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
+    /// not undo the write; see [`write_with`](Self::write_with)).
     pub fn drop_cf(&self, name: &str) -> Result<Seq> {
         validate_cf_name(name)?;
         let op = Op::DropCf { name: name.into() };

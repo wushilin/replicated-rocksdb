@@ -10,6 +10,7 @@ mod inner;
 mod maintenance;
 mod policy;
 mod promote;
+mod repoint;
 mod source;
 mod state;
 
@@ -35,6 +36,7 @@ use state::NodeState;
 
 pub use config::{Backoff, DivergencePolicy, FetchConfig, GapPolicy, IdentityPolicy, SlaveConfig, UpstreamConfig};
 pub use promote::{PromoteRefused, PromotionCheck};
+pub use repoint::{AcceptDataLoss, RepointDivergence, RepointOptions, RepointOutcome};
 pub use state::{HaltAction, HaltReason, SlaveState, SlaveStatus};
 
 /// A read-only replica. It has no write methods: writing to a slave is a compile error.

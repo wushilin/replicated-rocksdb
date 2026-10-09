@@ -351,8 +351,8 @@ Normative messages: PROTOCOL.md §9.
 - **Epoch continuity.** A slave of an older epoch whose last entry lies before the fork point, and whose last entry's CRC matches the upstream's, continues without a bootstrap (`EPOCH_ADVANCED`). It persists the new identity and history before tailing. A slave with entries at or past the fork point is `DIVERGED`. Rules: PROTOCOL.md §6.3 rules 6–10.
 - **Policies on the slave:**
   - `on_identity_change: IdentityPolicy` — `Refuse` (default) halts with `IdentityChanged`; `Rebootstrap` bootstraps. Applies when `db_uuid` differs, or when continuity across an epoch change cannot be proven.
-  - `on_divergence: DivergencePolicy` — `Halt` (default) halts with `Diverged`; `Rebootstrap` bootstraps. Applies to `DIVERGED`.
-  - `STALE_EPOCH` (the upstream is behind the slave's epoch) is retried with backoff and reported in `SlaveStatus.last_error`. An upstream replica that has not yet learned the new epoch catches up; a demoted master never does, and the operator must re-point the slave.
+  - `on_divergence: DivergencePolicy` — `Halt` (default) halts with `Diverged`; `Rebootstrap` bootstraps. Applies to `DIVERGED` on reconnects; an explicit `Slave::repoint` uses `RepointOptions::on_divergence` instead (§13.1).
+  - `STALE_EPOCH` (the upstream is behind the slave's epoch) is retried with backoff and reported in `SlaveStatus.last_error`. An upstream replica that has not yet learned the new epoch catches up; a demoted master never does, and the operator must re-point the slave (`Slave::repoint`).
 - **Restoring a master from a backup** must change its epoch before any replica connects. Open it with `MasterConfig { bump_epoch_on_open: true, .. }`. That bumps the epoch before the replication port opens. Slaves at or behind the restored seq with matching entries continue; slaves past it get `DIVERGED`. If the bump is forgotten, the backstop still applies: a slave ahead of the master, or one whose last entry has a different CRC, gets `DIVERGED` instead of silently diverging.
 - **`PROTOCOL_VERSION: u32` must match exactly** in the handshake, and on every RPC through the `x-rrdb-protocol-version` metadata. The crate version is not compared. Upgrade procedure: stop all nodes, upgrade, start. `envelope_version` must also match exactly.
 
@@ -378,6 +378,23 @@ Normative messages: PROTOCOL.md §9.
 - Ordering is by position: newest epoch, then `last_seq`. A node whose newest epoch is still empty (a promotion that has taken no writes) is therefore the latest of the nodes that can be shown compatible, but it is `Diverged { fork: start_seq }` from a node that holds entries at or past that epoch's `start_seq`; demoting the empty-epoch node and promoting the other would lose nothing. `promote_checked` refuses with `Error::MasterReachable { peer }` when any reachable peer reports `role == Master` (fence it, or `demote` it first), and with `PromotionUnverifiable` (`seq` 0) when a peer is reachable but answered `Status` with an error (permission denied, unimplemented, protocol mismatch): only connect errors, the 5 s timeout and the statuses `Unavailable`, `DeadlineExceeded`, `Cancelled` and `Unknown` with a transport error as its source count as unreachable. The check samples this slave's `last_seq` while it may still replicate; the runbook requires the old master to be fenced first.
 - After `Master::demote`, replicas that had already followed the wrongly promoted master are refused by it with `STALE_EPOCH` until they are repointed at the real master.
 - `promote_checked` and `demote` refuse by default and **hand the untouched, still-running node back**: `Err(PromoteRefused { error, slave })` / `Err(DemoteRefused { error, master })`, with `into_slave()` / `into_master()`. Only a failure after the node has started shutting down for the change (an I/O error during shutdown, a `ReadSnapshot` that still holds the database, a failure while rewriting `__meta`) loses the handle (`None`); the directory is then reopened by the application. Plain `promote` keeps its behaviour: a refusal shuts the slave down with its directory unchanged.
+
+**Repoint.** `Slave::repoint(upstream, RepointOptions) -> Result<RepointOutcome>` switches a running slave to another upstream; reads keep being served. It closes the current upstream stream (a bootstrap in progress is abandoned and starts from scratch against the new upstream), clears a halt, and handshakes the new upstream under all the normal rules (loop detection, `STALE_EPOCH`, epoch continuity). It returns once that handshake settles: `Resumed`, `EpochAdvanced`, `Bootstrapped`, or `Retrying { last_error }` when the new upstream cannot be used yet (unreachable, `STALE_EPOCH`, `NOT_READY`; the slave keeps retrying it). The new upstream is not persisted: after a restart, open the slave with it.
+
+**Divergence is never resolved implicitly by a repoint.** The configured `on_divergence` is not used for the repoint's handshake; `RepointOptions::on_divergence` is:
+- `Refuse` (default): `Error::Diverged { fork_seq, local_last_seq, divergent_entries }`; the slave halts `Diverged` with its data intact and readable.
+- `Rebootstrap { accept_loss: AcceptDataLoss }`: discard all local data and bootstrap from the new upstream.
+- `Repair { accept_loss: AcceptDataLoss }`: roll back only the divergent entries (§22). Until verify sessions exist it returns `Error::Unsupported`, and the slave halts `Diverged` with its data intact.
+
+`AcceptDataLoss` is a unit struct the caller writes out; nothing supplies it by default. A repoint at the slave itself or at one of its own downstream nodes halts `LoopDetected` (`Err(Halted(LoopDetected))`) until it is repointed again.
+
+**Failover runbook.**
+1. Fence the old master: stop it, or cut it off from clients and replicas.
+2. Gather the status of every replica with `admin::gather`, which also probes the CRCs `compare` needs.
+3. Promote the most advanced compatible one: `admin::choose_promotion_candidate`, then `Slave::promote_checked` with the others as peers. If the wrong node was promoted, `Master::demote` undoes it while it has no writes.
+4. `Slave::repoint` every other replica at the new master. Compatible replicas resume or advance their epoch; diverged ones are refused until the operator accepts the loss of their divergent entries.
+
+With `min_insync_replicas ≥ 1`, the most advanced in-sync replica holds every acknowledged write, so step 3 loses none of them.
 
 After promotion:
 - Former siblings and downstream slaves re-pointed at the new master continue if they are at or behind its `last_seq` with matching entries. Those that received entries it never saw are `DIVERGED` and follow their divergence policy.
@@ -585,6 +602,11 @@ pub enum HaltReason {
 }
 
 pub enum HaltAction { Retry, Rebootstrap }
+pub struct AcceptDataLoss;                   // written out by the caller to accept discarding data
+pub struct RepointOptions { pub on_divergence: RepointDivergence }   // Default: Refuse
+pub enum RepointDivergence { Refuse, Repair { accept_loss: AcceptDataLoss }, Rebootstrap { accept_loss: AcceptDataLoss } }
+pub enum RepointOutcome { Resumed, EpochAdvanced, Bootstrapped, Repaired { discarded: RangeInclusive<Seq> },
+                          Retrying { last_error: String } }
 
 pub struct SlaveStatus {
     pub state: SlaveState,
@@ -611,6 +633,8 @@ impl Slave {
     pub fn watch_state(&self) -> watch::Receiver<SlaveState>;
     pub async fn verify_now(&self, mode: VerifyMode) -> Result<VerifyReport>;
     pub async fn clear_halt(&self, action: HaltAction) -> Result<()>;   // operator action
+    pub async fn repoint(&self, upstream: UpstreamConfig, opts: RepointOptions) -> Result<RepointOutcome>;
+                                             // switch upstream at runtime (§13.1)
     pub async fn promote(self, cfg: MasterConfig) -> Result<Master>;    // operator action (§13.1)
     pub async fn promote_checked(self, cfg: MasterConfig, peers: &[UpstreamConfig]) -> Result<Master, PromoteRefused>;
                                              // refuses if a reachable peer is later; a refusal returns
@@ -646,7 +670,7 @@ See §5.1. `Master::get`, `Master::put`, `Master::write` and the crate-level doc
 
 ### 16.2 Errors
 
-`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }`, `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
+`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }`, `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), `Diverged { fork_seq, local_last_seq, divergent_entries }` (a refused `repoint`), `Unsupported`, `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
 
 ### 16.3 Persisted vs runtime slave state
 
@@ -656,7 +680,7 @@ See §5.1. `Master::get`, `Master::put`, `Master::write` and the crate-level doc
 | `bootstrapping` | `Bootstrapping { .. }`. After a restart, the bootstrap starts over. |
 | `halted:<Reason>`, data-related reasons only | `Halted(reason)`. The slave does not contact its upstream until `clear_halt`. |
 
-`clear_halt(Retry)` returns to `Connecting` (useful after fixing a missing comparator, or after `LogGap` with `GapPolicy::Halt` once the operator chooses to wait). `clear_halt(Rebootstrap)` starts a fresh bootstrap. It is the only way out of `Diverged` or `IdentityChanged` under `Refuse`.
+`clear_halt(Retry)` returns to `Connecting` (useful after fixing a missing comparator, or after `LogGap` with `GapPolicy::Halt` once the operator chooses to wait). `clear_halt(Rebootstrap)` starts a fresh bootstrap. It is the only way out of `Diverged` or `IdentityChanged` under `Refuse`, apart from `repoint`, which clears any halt before it handshakes the new upstream (§13.1).
 
 ## 17. Wire protocol
 
@@ -766,7 +790,7 @@ Dependencies: `rocksdb`, `tokio`, `tonic` (tls), `prost`, `tonic-types` (ErrorIn
 **Decided**
 - No `update` or compare-and-set API. Read-modify-write is done by the application under its own lock (§5.1).
 - `LogEntry.ops` is opaque bytes, forwarded verbatim; the CRC covers the header fields and the ops.
-- Divergence is detected by CRC comparison on connect and by rejecting slaves ahead of the master. It is not repaired automatically.
+- Divergence is detected by CRC comparison on connect and by rejecting slaves ahead of the master. It is not repaired automatically: an explicit `repoint` refuses by default and discards entries only with `AcceptDataLoss`.
 - The bootstrap retention guard lasts until the follow-up Tail presents the lease, or the lease expires.
 - Verify ranges are half-open and contiguous; leaf mismatches are resolved by listing keys.
 - Data-related halts are persisted and need operator action; configuration halts are not persisted.

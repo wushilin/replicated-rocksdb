@@ -222,12 +222,12 @@ impl ReplicaRegistry {
                 return true;
             }
             changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
-            if *changes != seen {
-                continue;
-            }
             let now = Instant::now();
             if now >= deadline {
                 return false;
+            }
+            if *changes != seen {
+                continue;
             }
             changes = self.changed.wait_timeout(changes, deadline - now).unwrap_or_else(PoisonError::into_inner).0;
         }

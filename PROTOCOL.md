@@ -318,7 +318,7 @@ A replica is promoted to master by an operator, after the old master has been st
 Other replicas are then pointed at the new master, directly or through a chain. Under §6.3:
 
 - Replicas at or behind the promoted node's `last_seq`, with matching entries, continue at once (rule 9).
-- Replicas that had received entries the promoted node never saw are at or past the fork point and get `DIVERGED` (rule 8). Their divergence policy decides whether they halt or bootstrap.
+- Replicas that had received entries the promoted node never saw are at or past the fork point and get `DIVERGED` (rule 8). Their divergence policy decides whether they halt or bootstrap. When an operator explicitly re-points a replica, an implementation SHOULD NOT discard its divergent entries without an explicit confirmation.
 - The old master, if restarted and asked by a new-epoch replica, answers `STALE_EPOCH` (rule 7). It can rejoin only as a new replica with an empty directory.
 
 The protocol cannot stop an operator from running two masters at once. If two nodes both start the same epoch number with different histories, rule 12 detects the divergence wherever the conflicting entry is still retained.

@@ -71,6 +71,14 @@ pub enum Error {
     /// operator decision. `diverged` as for `NotMostAdvanced`.
     #[error("{peer} (last_seq {seq}) is at least as far and its history cannot be verified; promote explicitly if intended (diverged peers: {diverged:?})")]
     PromotionUnverifiable { peer: String, seq: Seq, diverged: Vec<(String, Seq)> },
+    /// The local log holds entries the upstream does not: `divergent_entries` entries from
+    /// `fork_seq` to `local_last_seq` (for a mismatch at the same epoch, `fork_seq` is the
+    /// last entry; earlier ones may differ too). Local data is intact.
+    #[error("local log diverged from the upstream at seq {fork_seq} ({divergent_entries} entries up to {local_last_seq})")]
+    Diverged { fork_seq: Seq, local_last_seq: Seq, divergent_entries: u64 },
+    /// The operation is not available in this version of the crate.
+    #[error("not supported by this version: {0}")]
+    Unsupported(String),
     /// `promote_checked` found a reachable peer that is itself a master. Promoting would give
     /// the database two masters: fence it (stop it), or `demote` it if it was promoted by
     /// mistake and has taken no writes, then check again.

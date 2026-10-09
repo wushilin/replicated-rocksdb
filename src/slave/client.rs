@@ -10,7 +10,8 @@ use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
-use super::config::{SlaveConfig, UpstreamConfig};
+use super::config::UpstreamConfig;
+use super::inner::Inner;
 use crate::auth::CredentialsProvider;
 use crate::codec::PROTOCOL_VERSION;
 use crate::error::{Error, Result};
@@ -46,9 +47,9 @@ impl Interceptor for CallMeta {
 
 pub(crate) type Client = ReplicationClient<InterceptedService<Channel, CallMeta>>;
 
-/// A client for the configured upstream. Connects on first use and reconnects by itself.
-pub(crate) fn connect(cfg: &SlaveConfig) -> Result<Client> {
-    connect_upstream(&cfg.upstream, &cfg.identifier, cfg.connect_timeout)
+/// A client for the slave's current upstream. Connects on first use and reconnects by itself.
+pub(crate) fn connect(inner: &Inner) -> Result<Client> {
+    connect_upstream(&inner.upstream(), &inner.cfg.identifier, inner.cfg.connect_timeout)
 }
 
 /// A client for `up`, identifying itself as `identifier`.

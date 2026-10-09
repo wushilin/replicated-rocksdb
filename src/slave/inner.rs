@@ -8,8 +8,9 @@ use std::time::SystemTime;
 
 use tokio::sync::{watch, Notify};
 
-use super::config::SlaveConfig;
+use super::config::{SlaveConfig, UpstreamConfig};
 use super::policy::Policies;
+use super::repoint::PendingRepoint;
 use super::state::{HaltReason, NodeState, SlaveState, SlaveStatus};
 use crate::error::{Error, Result};
 use crate::listener::ReplicationListener;
@@ -41,6 +42,14 @@ pub(crate) struct Inner {
     listener_failed: AtomicBool,
     /// Downstream replicas served by this slave.
     pub(crate) replicas: Arc<crate::server::replicas::ReplicaRegistry>,
+    /// The current upstream: `cfg.upstream` until `Slave::repoint` replaces it.
+    upstream: RwLock<UpstreamConfig>,
+    /// Bumped by every repoint; the driver ends its session and reconnects.
+    pub repoint_tx: watch::Sender<u64>,
+    pending_repoint: Mutex<Option<PendingRepoint>>,
+    /// The divergence mode of the latest repoint. It replaces `cfg.on_divergence` for every
+    /// session from then on (until the next repoint), not only for the first handshake.
+    pub(crate) repoint_divergence: Mutex<Option<super::repoint::RepointDivergence>>,
 }
 
 impl Inner {
@@ -60,6 +69,7 @@ impl Inner {
         let last_seq = store.position().last_seq;
         Ok(Inner {
             store,
+            upstream: RwLock::new(cfg.upstream.clone()),
             cfg,
             ident: RwLock::new(ident),
             state_tx: watch::channel(state).0,
@@ -76,12 +86,27 @@ impl Inner {
             halt_cleared: Arc::new(Notify::new()),
             listener_failed: AtomicBool::new(false),
             replicas: Arc::default(),
+            repoint_tx: watch::channel(0).0,
+            pending_repoint: Mutex::new(None),
+            repoint_divergence: Mutex::new(None),
         })
     }
 
-    /// The upstream's address.
+    /// The current upstream's address.
     pub(crate) fn upstream_uri(&self) -> String {
-        self.cfg.upstream.uri()
+        self.upstream().uri()
+    }
+
+    pub(crate) fn upstream(&self) -> UpstreamConfig {
+        self.upstream.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    pub(crate) fn set_upstream(&self, up: UpstreamConfig) {
+        *self.upstream.write().unwrap_or_else(PoisonError::into_inner) = up;
+    }
+
+    pub(crate) fn pending_repoint(&self) -> std::sync::MutexGuard<'_, Option<PendingRepoint>> {
+        self.pending_repoint.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn policies(&self) -> Policies {

@@ -74,8 +74,8 @@ mod slave;
 
 pub use listener::ReplicationListener;
 pub use slave::{
-    Backoff, DivergencePolicy, FetchConfig, GapPolicy, HaltAction, HaltReason, IdentityPolicy, PromoteRefused, PromotionCheck,
-    Slave, SlaveConfig, SlaveState, SlaveStatus, UpstreamConfig,
+    AcceptDataLoss, Backoff, DivergencePolicy, FetchConfig, GapPolicy, HaltAction, HaltReason, IdentityPolicy, PromoteRefused, PromotionCheck,
+    RepointDivergence, RepointOptions, RepointOutcome, Slave, SlaveConfig, SlaveState, SlaveStatus, UpstreamConfig,
 };
 pub(crate) mod server;
 pub(crate) mod failpoint;

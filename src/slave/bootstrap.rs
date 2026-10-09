@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tonic::Streaming;
 
 use super::client::Client;
-use super::driver::{status_end, SessionEnd};
+use super::driver::{status_end, unless_repointed, SessionEnd};
 use super::inner::Inner;
 use super::state::{HaltReason, SlaveState};
 use crate::codec::digest::Digest;
@@ -76,8 +76,8 @@ impl Plan {
     }
 }
 
-async fn next(inner: &Inner, s: &mut Streaming<pb::BootstrapChunk>) -> std::result::Result<Kind, SessionEnd> {
-    match s.message().await {
+async fn next(inner: &Inner, generation: u64, s: &mut Streaming<pb::BootstrapChunk>) -> std::result::Result<Kind, SessionEnd> {
+    match unless_repointed(inner, generation, s.message()).await? {
         Ok(Some(chunk)) => chunk.kind.ok_or_else(|| retry("empty bootstrap chunk")),
         Ok(None) => Err(retry("bootstrap stream ended before the footer")),
         Err(status) => Err(status_end(inner, &status)),
@@ -89,6 +89,7 @@ async fn next(inner: &Inner, s: &mut Streaming<pb::BootstrapChunk>) -> std::resu
 /// next session starts over.
 pub(crate) async fn install(
     inner: &Arc<Inner>,
+    generation: u64,
     c: &Client,
     hs: &pb::HandshakeResponse,
 ) -> std::result::Result<Vec<u8>, SessionEnd> {
@@ -106,11 +107,11 @@ pub(crate) async fn install(
         .max(MAX_BOOTSTRAP_CHUNK_BYTES)
         .saturating_add(DECODE_SLACK);
     let req = pb::BootstrapRequest { client_id: inner.cfg.identifier.clone() };
-    let mut stream = match c.clone().max_decoding_message_size(limit).bootstrap(req).await {
+    let mut stream = match unless_repointed(inner, generation, c.clone().max_decoding_message_size(limit).bootstrap(req)).await? {
         Ok(r) => r.into_inner(),
         Err(s) => return Err(status_end(inner, &s)),
     };
-    let Kind::Header(header) = next(inner, &mut stream).await? else {
+    let Kind::Header(header) = next(inner, generation, &mut stream).await? else {
         return Err(retry("bootstrap stream did not start with a header"));
     };
     let plan = Plan::from_header(header)?;
@@ -136,7 +137,7 @@ pub(crate) async fn install(
     let mut last_key: Option<Vec<u8>> = None;
     let mut count = 0u64;
     let footer = loop {
-        match next(inner, &mut stream).await? {
+        match next(inner, generation, &mut stream).await? {
             Kind::Records(r) => {
                 let j = plan.cfs.iter().position(|c| c.spec.name == r.cf).ok_or_else(|| retry(format!("records for unknown CF {}", r.cf)))?;
                 if j + 1 < marked {
@@ -172,8 +173,9 @@ pub(crate) async fn install(
                     .map_err(|e| retry(format!("could not write bootstrap records: {e}")))?;
                 inner.set_state(SlaveState::Bootstrapping { target_seq: s, records: count });
                 if failpoint::fire("slave-bootstrap-after-chunk") {
-                    // Emulated crash mid-bootstrap: freeze until the test kills the node.
-                    std::future::pending::<()>().await;
+                    // Emulated stall mid-bootstrap: freeze until the test kills the node or
+                    // repoints it.
+                    unless_repointed(inner, generation, std::future::pending::<()>()).await?;
                 }
             }
             Kind::Footer(f) => break f,

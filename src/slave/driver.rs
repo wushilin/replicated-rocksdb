@@ -1,6 +1,7 @@
 //! The replication driver: one task per slave that connects, handshakes and acts on the
 //! answer, forever (PROTOCOL.md §11.3).
 
+use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -18,8 +19,10 @@ use super::client::{self, Client};
 use super::config::BackoffState;
 use super::inner::Inner;
 use super::policy::{self, Action};
+use super::repoint::{self, RepointDivergence, RepointOutcome};
 use super::state::{HaltReason, SlaveState};
 use crate::background::blocking;
+use crate::error::Error;
 use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 use crate::net::convert::{checked_history, entry_from_pb, identity_from_pb, identity_to_pb};
 use crate::net::DECODE_SLACK;
@@ -56,7 +59,27 @@ pub(crate) fn end_for(inner: &Inner, action: Action) -> SessionEnd {
     }
 }
 
+/// Awaits `f` (a network call), or ends the session with `Again` once the slave is repointed
+/// away from the upstream of session `generation`. Store writes are never cancelled this way: the
+/// driver checks only between them.
+pub(crate) async fn unless_repointed<T>(inner: &Inner, generation: u64, f: impl Future<Output = T>) -> Result<T, SessionEnd> {
+    let mut repoints = inner.repoint_tx.subscribe();
+    tokio::select! {
+        biased;
+        _ = repoints.wait_for(|g| *g != generation) => Err(SessionEnd::Again),
+        v = f => Ok(v),
+    }
+}
+
 pub(crate) fn status_end(inner: &Inner, s: &Status) -> SessionEnd {
+    // After a repoint, a Tail or Bootstrap ending with DIVERGED follows the repoint's mode.
+    if crate::net::reason_of(s) == Some(pb::Reason::Diverged) {
+        match inner.repoint_mode() {
+            Some(RepointDivergence::Rebootstrap { .. }) => return end_for(inner, Action::Bootstrap),
+            Some(RepointDivergence::Refuse | RepointDivergence::Repair { .. }) => return SessionEnd::Halt(HaltReason::Diverged),
+            None => {}
+        }
+    }
     end_for(inner, policy::after_status(s, &inner.policies()))
 }
 
@@ -66,12 +89,20 @@ pub(crate) fn spawn(inner: &Arc<Inner>) -> JoinHandle<()> {
     let weak = Arc::downgrade(inner);
     let shutdown = inner.shutdown_tx.subscribe();
     let halt_cleared = inner.halt_cleared.clone();
+    let repoints = inner.repoint_tx.subscribe();
     let backoff = BackoffState::new(inner.cfg.reconnect.clone());
-    tokio::spawn(run(weak, shutdown, halt_cleared, backoff))
+    tokio::spawn(run(weak, shutdown, repoints, halt_cleared, backoff))
 }
 
-async fn run(weak: Weak<Inner>, mut shutdown: watch::Receiver<bool>, halt_cleared: Arc<Notify>, mut backoff: BackoffState) {
-    let mut client: Option<Client> = None;
+async fn run(
+    weak: Weak<Inner>,
+    mut shutdown: watch::Receiver<bool>,
+    mut repoints: watch::Receiver<u64>,
+    halt_cleared: Arc<Notify>,
+    mut backoff: BackoffState,
+) {
+    // The client of the upstream of repoint generation `.0`.
+    let mut client: Option<(u64, Client)> = None;
     loop {
         if *shutdown.borrow_and_update() {
             return;
@@ -85,8 +116,13 @@ async fn run(weak: Weak<Inner>, mut shutdown: watch::Receiver<bool>, halt_cleare
             }
             continue;
         }
+        let generation = *repoints.borrow_and_update();
+        if client.as_ref().is_some_and(|(g, _)| *g != generation) {
+            client = None;
+            backoff.reset();
+        }
         let end = tokio::select! {
-            end = session(&inner, &mut client, &mut backoff) => end,
+            end = session(&inner, generation, &mut client, &mut backoff) => end,
             r = shutdown.changed() => {
                 if r.is_err() {
                     return;
@@ -94,6 +130,9 @@ async fn run(weak: Weak<Inner>, mut shutdown: watch::Receiver<bool>, halt_cleare
                 continue;
             }
         };
+        if !matches!(end, SessionEnd::Halt(_)) {
+            inner.settle_repoint_end(generation, &end);
+        }
         let pause = match end {
             SessionEnd::Halt(reason) => {
                 let i = inner.clone();
@@ -102,11 +141,13 @@ async fn run(weak: Weak<Inner>, mut shutdown: watch::Receiver<bool>, halt_cleare
                     Ok(())
                 })
                 .await;
+                // A repoint waiting on this session sees the halt in place.
+                inner.settle_repoint_end(generation, &end);
                 continue;
             }
             SessionEnd::Again => AGAIN_PAUSE,
             SessionEnd::Retry(msg) => {
-                tracing::warn!(node = %inner.cfg.identifier, upstream = %inner.cfg.upstream.uri(), error = %msg, "replication retry");
+                tracing::warn!(node = %inner.cfg.identifier, upstream = %inner.upstream_uri(), error = %msg, "replication retry");
                 inner.set_last_error(Some(msg));
                 inner.set_state(SlaveState::Connecting);
                 backoff.next_delay()
@@ -115,6 +156,7 @@ async fn run(weak: Weak<Inner>, mut shutdown: watch::Receiver<bool>, halt_cleare
         drop(inner);
         tokio::select! {
             _ = tokio::time::sleep(pause) => {}
+            _ = repoints.changed() => {}
             r = shutdown.changed() => if r.is_err() { return },
         }
     }
@@ -133,19 +175,20 @@ fn handshake_request(inner: &Inner) -> pb::HandshakeRequest {
     }
 }
 
-/// One connect → handshake → act cycle.
-async fn session(inner: &Arc<Inner>, client: &mut Option<Client>, backoff: &mut BackoffState) -> SessionEnd {
+/// One connect → handshake → act cycle against the upstream of repoint `generation`.
+async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, Client)>, backoff: &mut BackoffState) -> SessionEnd {
     inner.set_state(SlaveState::Connecting);
     let c = match client {
-        Some(c) => c.clone(),
-        None => match client::connect(&inner.cfg) {
-            Ok(c) => client.insert(c).clone(),
+        Some((_, c)) => c.clone(),
+        None => match client::connect(inner) {
+            Ok(c) => client.insert((generation, c)).1.clone(),
             Err(e) => return SessionEnd::Retry(e.to_string()),
         },
     };
-    let hs = match c.clone().handshake(handshake_request(inner)).await {
-        Ok(r) => r.into_inner(),
-        Err(s) => return status_end(inner, &s),
+    let hs = match unless_repointed(inner, generation, c.clone().handshake(handshake_request(inner))).await {
+        Ok(Ok(r)) => r.into_inner(),
+        Ok(Err(s)) => return status_end(inner, &s),
+        Err(end) => return end,
     };
     if hs.decision() != pb::Decision::Reject {
         if let Some(max) = inner.note_upstream(&hs) {
@@ -159,14 +202,43 @@ async fn session(inner: &Arc<Inner>, client: &mut Option<Client>, backoff: &mut 
         inner.note_contact();
     }
     let force = inner.force_bootstrap.load(Ordering::SeqCst);
-    match policy::after_handshake(&hs, &inner.policies(), force) {
-        Action::Tail => tail(inner, &c, &hs, None, backoff).await,
+    let mut action = policy::after_handshake(&hs, &inner.policies(), force);
+    // An explicit repoint never resolves divergence by the configured policy.
+    if let Some(mode) = inner.repoint_mode() {
+        let diverged = hs.decision() == pb::Decision::Reject && hs.reason() == pb::Reason::Diverged;
+        if diverged && !force {
+            action = match mode {
+                RepointDivergence::Rebootstrap { .. } => Action::Bootstrap,
+                RepointDivergence::Refuse | RepointDivergence::Repair { .. } => {
+                    let local_epoch = inner.ident().map_or(0, |(id, _)| id.epoch);
+                    let err = match mode {
+                        RepointDivergence::Refuse => repoint::divergence(local_epoch, inner.store.position().last_seq, &hs),
+                        _ => Error::Unsupported("divergence repair needs verify sessions (Plan 3)".into()),
+                    };
+                    tracing::warn!(node = %inner.cfg.identifier, error = %err, "repoint refused: diverged");
+                    inner.fail_repoint_on_halt(generation, err);
+                    Action::Halt(HaltReason::Diverged)
+                }
+            };
+        }
+    }
+    match action {
+        Action::Tail => {
+            inner.settle_repoint(generation, Ok(RepointOutcome::Resumed));
+            tail(inner, generation, &c, &hs, None, backoff).await
+        }
         Action::AdoptEpochThenTail => match adopt_epoch(inner, &hs).await {
-            Ok(()) => tail(inner, &c, &hs, None, backoff).await,
+            Ok(()) => {
+                inner.settle_repoint(generation, Ok(RepointOutcome::EpochAdvanced));
+                tail(inner, generation, &c, &hs, None, backoff).await
+            }
             Err(end) => end,
         },
-        Action::Bootstrap => match bootstrap::install(inner, &c, &hs).await {
-            Ok(lease) => tail(inner, &c, &hs, Some(lease), backoff).await,
+        Action::Bootstrap => match bootstrap::install(inner, generation, &c, &hs).await {
+            Ok(lease) => {
+                inner.settle_repoint(generation, Ok(RepointOutcome::Bootstrapped));
+                tail(inner, generation, &c, &hs, Some(lease), backoff).await
+            }
             Err(end) => end,
         },
         Action::Halt(r) => SessionEnd::Halt(r),
@@ -195,6 +267,7 @@ async fn adopt_epoch(inner: &Arc<Inner>, hs: &pb::HandshakeResponse) -> Result<(
 /// Tails from `last_seq + 1` and applies entries until the stream ends.
 async fn tail(
     inner: &Arc<Inner>,
+    generation: u64,
     c: &Client,
     hs: &pb::HandshakeResponse,
     lease: Option<Vec<u8>>,
@@ -223,16 +296,21 @@ async fn tail(
     let ack_stream = WatchStream::from_changes(ack_rx)
         .map(|applied_seq| pb::TailClientMessage { kind: Some(ClientKind::Ack(pb::TailAck { applied_seq })) });
     let outbound = tokio_stream::iter([start]).chain(ack_stream);
-    let mut stream = match c.clone().max_decoding_message_size(limit).tail(outbound).await {
-        Ok(r) => r.into_inner(),
-        Err(s) => return status_end(inner, &s),
+    let mut stream = match unless_repointed(inner, generation, c.clone().max_decoding_message_size(limit).tail(outbound)).await {
+        Ok(Ok(r)) => r.into_inner(),
+        Ok(Err(s)) => return status_end(inner, &s),
+        Err(end) => return end,
     };
     inner.set_state(SlaveState::Streaming);
     let idle = (Duration::from_millis(u64::from(hs.heartbeat_ms)) * 3).max(inner.cfg.heartbeat);
     let mut cleared = false;
     let started = Instant::now();
     loop {
-        let msg = match tokio::time::timeout(idle, stream.message()).await {
+        let next = match unless_repointed(inner, generation, tokio::time::timeout(idle, stream.message())).await {
+            Ok(next) => next,
+            Err(end) => return end,
+        };
+        let msg = match next {
             Err(_) => return SessionEnd::Retry(format!("no message from upstream for {idle:?}")),
             Ok(Err(s)) => return status_end(inner, &s),
             Ok(Ok(None)) => return SessionEnd::Retry("upstream ended the tail stream".into()),
