@@ -117,6 +117,10 @@ impl Slave {
     /// `Rebootstrap` discards local data and bootstraps — the only way out of `Diverged`, or
     /// of `IdentityChanged` under `IdentityPolicy::Refuse`. `Err(Config)` if not halted.
     pub async fn clear_halt(&self, action: HaltAction) -> Result<()> {
+        // The repoint generation is read together with the halt check: a repoint landing during
+        // the blocking write below leaves a forced bootstrap requested for the older generation
+        // inert (DESIGN.md §13.1: only a `clear_halt` issued after the repoint applies).
+        let generation = *self.inner.repoint_tx.borrow();
         let SlaveState::Halted(reason) = self.inner.state() else {
             return Err(Error::Config("the slave is not halted".into()));
         };
@@ -124,7 +128,7 @@ impl Slave {
         crate::background::blocking(move || i.store.write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true))
             .await?;
         if action == HaltAction::Rebootstrap {
-            self.inner.force_bootstrap.request(*self.inner.repoint_tx.borrow());
+            self.inner.force_bootstrap.request(generation);
         }
         tracing::info!(node = %self.inner.cfg.identifier, reason = reason.name(), ?action, "halt cleared");
         self.inner.set_last_error(None);

@@ -78,7 +78,10 @@ pub(crate) fn status_end(inner: &Inner, generation: u64, s: &Status) -> SessionE
             Some(RepointDivergence::Rebootstrap { .. }) => return end_for(inner, generation, Action::Bootstrap),
             // No handshake here to compute the fork from: handshake again, which answers
             // `DIVERGED` under the same mode and halts with the exact `Error::Diverged`.
-            Some(RepointDivergence::Refuse | RepointDivergence::Repair { .. }) => return SessionEnd::Again,
+            Some(RepointDivergence::Refuse | RepointDivergence::Repair { .. }) => {
+                inner.diverged_on_stream.store(true, Ordering::SeqCst);
+                return SessionEnd::Again;
+            }
             None => {}
         }
     }
@@ -240,6 +243,7 @@ async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, 
         inner.note_contact();
     }
     let force = inner.force_bootstrap.is_requested_for(generation);
+    let after_stream_diverged = inner.diverged_on_stream.swap(false, Ordering::SeqCst);
     let mut action = policy::after_handshake(&hs, &inner.policies(), force);
     // An explicit repoint never resolves divergence by the configured policy.
     if let Some(mode) = inner.repoint_mode() {
@@ -258,6 +262,10 @@ async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, 
                 }
             };
         }
+    }
+    // The retry arm of the driver loop logs the warning and sets `last_error`.
+    if let Some(end) = contradicting_resume(after_stream_diverged, &action) {
+        return end;
     }
     match action {
         Action::Tail => {
@@ -286,6 +294,16 @@ async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, 
         Action::Retry(m) => SessionEnd::Retry(m),
         Action::Again => SessionEnd::Again,
     }
+}
+
+const CONTRADICTION: &str = "upstream reported DIVERGED on the stream but not in the handshake";
+
+/// A handshake that answers RESUME right after the stream ended `DIVERGED` contradicts the
+/// upstream's own report: retry with the normal reconnect backoff (and `last_error` set), not
+/// the fixed `AGAIN_PAUSE`, so a misbehaving upstream is not hammered.
+fn contradicting_resume(after_stream_diverged: bool, action: &Action) -> Option<SessionEnd> {
+    (after_stream_diverged && matches!(action, Action::Tail | Action::AdoptEpochThenTail))
+        .then(|| SessionEnd::Retry(CONTRADICTION.to_string()))
 }
 
 /// RESUME / EPOCH_ADVANCED: persist the new identity and history atomically, then tail.
@@ -392,5 +410,20 @@ async fn tail(
             }
             None => return SessionEnd::Retry("tail message without content".into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_after_a_stream_diverged_is_retried_with_backoff() {
+        for a in [Action::Tail, Action::AdoptEpochThenTail] {
+            assert!(matches!(contradicting_resume(true, &a), Some(SessionEnd::Retry(m)) if m == CONTRADICTION));
+            assert!(contradicting_resume(false, &a).is_none());
+        }
+        assert!(contradicting_resume(true, &Action::Bootstrap).is_none());
+        assert!(contradicting_resume(true, &Action::Again).is_none());
     }
 }

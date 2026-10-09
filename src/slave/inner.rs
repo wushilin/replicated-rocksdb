@@ -27,7 +27,8 @@ pub(crate) struct ForcedBootstrap(AtomicU64);
 impl ForcedBootstrap {
     /// 0 means none, so generation `g` is stored as `g + 1`.
     pub(crate) fn request(&self, generation: u64) {
-        self.0.store(generation + 1, Ordering::SeqCst);
+        // An older generation never overwrites a newer request.
+        self.0.fetch_max(generation + 1, Ordering::SeqCst);
     }
 
     pub(crate) fn is_requested_for(&self, generation: u64) -> bool {
@@ -76,6 +77,9 @@ pub(crate) struct Inner {
     /// A repoint cleared a halt in memory only: `node_state = ready` is persisted once the new
     /// upstream is accepted (so a restart before that reopens halted).
     pub halt_clear_pending: AtomicBool,
+    /// A stream ended `DIVERGED` under a repoint's mode and the session was restarted: the
+    /// next handshake must not answer RESUME (see `driver::contradicting_resume`).
+    pub diverged_on_stream: AtomicBool,
 }
 
 impl Inner {
@@ -116,6 +120,7 @@ impl Inner {
             pending_repoint: Mutex::new(None),
             repoint_divergence: Mutex::new(None),
             halt_clear_pending: AtomicBool::new(false),
+            diverged_on_stream: AtomicBool::new(false),
         })
     }
 
@@ -267,6 +272,14 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::ForcedBootstrap;
+
+    #[test]
+    fn an_older_request_never_overwrites_a_newer_one() {
+        let f = ForcedBootstrap::default();
+        f.request(2);
+        f.request(1);
+        assert!(f.is_requested_for(2) && !f.is_requested_for(1));
+    }
 
     #[test]
     fn a_forced_bootstrap_only_counts_for_the_generation_that_requested_it() {
