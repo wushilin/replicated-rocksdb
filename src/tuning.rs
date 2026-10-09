@@ -135,7 +135,10 @@ impl RocksTuning {
         Self::default()
     }
 
-    pub fn with_options(mut self, f: impl Fn(CfKind<'_>, &mut Tunable<'_>) + Send + Sync + 'static) -> Self {
+    pub fn with_options(
+        mut self,
+        f: impl Fn(CfKind<'_>, &mut Tunable<'_>) + Send + Sync + 'static,
+    ) -> Self {
         self.options = Some(Arc::new(f));
         self
     }
@@ -154,7 +157,10 @@ impl RocksTuning {
         let mut opts = Options::default();
         if let CfKind::User(spec) = kind {
             if let Some(name) = &spec.comparator {
-                let f = self.comparators.get(name).ok_or_else(|| Error::UnknownComparator(name.clone()))?;
+                let f = self
+                    .comparators
+                    .get(name)
+                    .ok_or_else(|| Error::UnknownComparator(name.clone()))?;
                 opts.set_comparator(name.as_str(), Box::new(move |a: &[u8], b: &[u8]| f(a, b)));
             }
         }
@@ -168,8 +174,8 @@ impl RocksTuning {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     #[test]
     fn compare_uses_registered_comparator_or_bytewise() {
@@ -185,7 +191,9 @@ mod tests {
     fn unknown_comparator_is_rejected() {
         let t = RocksTuning::new();
         let spec = CfSpec::new("c").with_comparator("missing");
-        assert!(matches!(t.cf_options(CfKind::User(&spec)), Err(Error::UnknownComparator(n)) if n == "missing"));
+        assert!(
+            matches!(t.cf_options(CfKind::User(&spec)), Err(Error::UnknownComparator(n)) if n == "missing")
+        );
         t.cf_options(CfKind::User(&CfSpec::new("plain"))).unwrap();
     }
 
@@ -199,7 +207,12 @@ mod tests {
             opts.set_compression(Compression::Lz4);
         });
         let _ = t.db_options();
-        for kind in [CfKind::Meta, CfKind::Changelog, CfKind::TtlIndex, CfKind::User(&CfSpec::new("u"))] {
+        for kind in [
+            CfKind::Meta,
+            CfKind::Changelog,
+            CfKind::TtlIndex,
+            CfKind::User(&CfSpec::new("u")),
+        ] {
             t.cf_options(kind).unwrap();
         }
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 5);

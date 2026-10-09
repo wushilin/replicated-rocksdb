@@ -9,7 +9,11 @@ const BASE_HEADER: usize = 10;
 const TTL_HEADER: usize = 18;
 
 pub fn encode(write_seq: Seq, expire_at_ms: Option<u64>, value: &[u8]) -> Vec<u8> {
-    let header = if expire_at_ms.is_some() { TTL_HEADER } else { BASE_HEADER };
+    let header = if expire_at_ms.is_some() {
+        TTL_HEADER
+    } else {
+        BASE_HEADER
+    };
     let mut out = Vec::with_capacity(header + value.len());
     out.push(ENVELOPE_VERSION);
     out.push(if expire_at_ms.is_some() { FLAG_TTL } else { 0 });
@@ -40,22 +44,36 @@ pub fn decode(raw: &[u8]) -> Result<Envelope<'_>> {
         return Err(Error::corrupt("value envelope is shorter than its header"));
     }
     if raw[0] != ENVELOPE_VERSION {
-        return Err(Error::corrupt(format!("unknown envelope version {}", raw[0])));
+        return Err(Error::corrupt(format!(
+            "unknown envelope version {}",
+            raw[0]
+        )));
     }
     let flags = raw[1];
     if flags & !FLAG_TTL != 0 {
-        return Err(Error::corrupt(format!("reserved envelope flag bits set: {flags:#04x}")));
+        return Err(Error::corrupt(format!(
+            "reserved envelope flag bits set: {flags:#04x}"
+        )));
     }
     let write_seq = be64(&raw[2..10]);
     let (expire_at_ms, header_len) = if flags & FLAG_TTL != 0 {
         if raw.len() < TTL_HEADER {
-            return Err(Error::corrupt("value envelope is shorter than its TTL header"));
+            return Err(Error::corrupt(
+                "value envelope is shorter than its TTL header",
+            ));
         }
         (Some(be64(&raw[10..18])), TTL_HEADER)
     } else {
         (None, BASE_HEADER)
     };
-    Ok(Envelope { meta: ValueMeta { write_seq, expire_at_ms }, header_len, value: &raw[header_len..] })
+    Ok(Envelope {
+        meta: ValueMeta {
+            write_seq,
+            expire_at_ms,
+        },
+        header_len,
+        value: &raw[header_len..],
+    })
 }
 
 fn be64(b: &[u8]) -> u64 {
@@ -71,7 +89,10 @@ mod tests {
 
     #[test]
     fn vector_v2_envelopes() {
-        assert_eq!(encode(1, None, b"v1"), hex("01 00 00 00 00 00 00 00 00 01 76 31"));
+        assert_eq!(
+            encode(1, None, b"v1"),
+            hex("01 00 00 00 00 00 00 00 00 01 76 31")
+        );
         assert_eq!(
             encode(1, Some(1_700_000_060_000), b"v1"),
             hex("01 01 00 00 00 00 00 00 00 01 00 00 01 8b cf e6 52 60 76 31")
@@ -82,7 +103,13 @@ mod tests {
     fn decode_round_trips() {
         let raw = encode(9, Some(50), b"");
         let env = decode(&raw).unwrap();
-        assert_eq!(env.meta, ValueMeta { write_seq: 9, expire_at_ms: Some(50) });
+        assert_eq!(
+            env.meta,
+            ValueMeta {
+                write_seq: 9,
+                expire_at_ms: Some(50)
+            }
+        );
         assert_eq!(env.header_len, 18);
         assert_eq!(env.value, b"");
         assert!(!env.is_expired(49));

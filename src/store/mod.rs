@@ -5,29 +5,30 @@ pub(crate) mod bootstrap;
 pub(crate) mod cfs;
 pub(crate) mod log;
 pub(crate) mod meta;
+pub(crate) mod promote;
 pub(crate) mod read;
 pub(crate) mod repl;
 pub(crate) mod retention;
 pub(crate) mod snapshot;
-pub(crate) mod promote;
-pub(crate) mod ttl;
 #[cfg(test)]
 pub(crate) mod test_support;
-
+pub(crate) mod ttl;
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
-use rocksdb::{BoundColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB};
+use rocksdb::{
+    BoundColumnFamily, ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch, WriteOptions,
+};
 
 use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 use crate::error::{Error, Result};
 use crate::tuning::{CfKind, RocksTuning};
 use crate::types::{CfEntry, Role, Seq};
 use cfs::{CfRegistry, PhysCf};
-use meta::{key, MetaSnapshot, CF_CHANGELOG, CF_META, CF_TTL_INDEX};
+use meta::{CF_CHANGELOG, CF_META, CF_TTL_INDEX, MetaSnapshot, key};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Position {
@@ -66,21 +67,35 @@ impl std::ops::Deref for DbCore {
 impl Store {
     /// Opens or creates a store. Two-phase: `__meta` is read through a read-only open first,
     /// so every user CF can be reopened with its registered comparator.
-    pub(crate) fn open(path: &Path, role: Role, tuning: RocksTuning) -> Result<(Store, MetaSnapshot)> {
+    pub(crate) fn open(
+        path: &Path,
+        role: Role,
+        tuning: RocksTuning,
+    ) -> Result<(Store, MetaSnapshot)> {
         let db_opts = tuning.db_options();
-        let existing: Vec<String> =
-            if path.join("CURRENT").exists() { DB::list_cf(&Options::default(), path)? } else { Vec::new() };
+        let existing: Vec<String> = if path.join("CURRENT").exists() {
+            DB::list_cf(&Options::default(), path)?
+        } else {
+            Vec::new()
+        };
         if !existing.iter().any(|n| n == CF_META) {
             // No `__meta`: either a fresh directory or a crash during first creation (which can
             // leave our reserved `__` CFs). Anything else is someone else's database.
-            if let Some(foreign) = existing.iter().find(|n| *n != "default" && !n.starts_with("__")) {
+            if let Some(foreign) = existing
+                .iter()
+                .find(|n| *n != "default" && !n.starts_with("__"))
+            {
                 return Err(Error::Config(format!(
                     "{} holds a RocksDB database not created by this crate (column family {foreign:?})",
                     path.display()
                 )));
             }
         }
-        let prior = if existing.iter().any(|n| n == CF_META) { read_meta_read_only(path)? } else { None };
+        let prior = if existing.iter().any(|n| n == CF_META) {
+            read_meta_read_only(path)?
+        } else {
+            None
+        };
         if let Some(m) = &prior {
             check_compatible(m, role)?;
         }
@@ -92,14 +107,23 @@ impl Store {
         ];
         let known: HashMap<String, CfEntry> = prior
             .iter()
-            .flat_map(|m| m.cf_specs.iter().chain(&m.pending_drops).chain(&m.cf_create_intent).chain(&m.bootstrap_cfs))
+            .flat_map(|m| {
+                m.cf_specs
+                    .iter()
+                    .chain(&m.pending_drops)
+                    .chain(&m.cf_create_intent)
+                    .chain(&m.bootstrap_cfs)
+            })
             .map(|e| (e.physical_name(), e.clone()))
             .collect();
         for name in existing.iter().filter(|n| n.starts_with("u:")) {
-            let entry = known
-                .get(name)
-                .ok_or_else(|| Error::corrupt(format!("physical column family {name} is not in __meta")))?;
-            descriptors.push(ColumnFamilyDescriptor::new(name, tuning.cf_options(CfKind::User(&entry.spec))?));
+            let entry = known.get(name).ok_or_else(|| {
+                Error::corrupt(format!("physical column family {name} is not in __meta"))
+            })?;
+            descriptors.push(ColumnFamilyDescriptor::new(
+                name,
+                tuning.cf_options(CfKind::User(&entry.spec))?,
+            ));
         }
         let db = Arc::new(DbCore {
             db: DB::open_cf_descriptors(&db_opts, path, descriptors)?,
@@ -121,7 +145,10 @@ impl Store {
         };
         let meta = store.recover_cf_state(meta, &existing)?;
         store.cfs = CfRegistry::load(&meta.cf_specs, &meta.pending_drops);
-        store.set_position(Position { last_seq: meta.last_seq, last_entry_crc: meta.last_entry_crc });
+        store.set_position(Position {
+            last_seq: meta.last_seq,
+            last_entry_crc: meta.last_entry_crc,
+        });
         let first = store.first_changelog_seq()?.unwrap_or(meta.last_seq + 1);
         store.set_first_retained_seq(first);
         Ok((store, meta))
@@ -131,21 +158,32 @@ impl Store {
         self.write_meta(
             &[
                 (key::ROLE, self.role.as_bytes()),
-                (key::PROTOCOL_VERSION, &u64::from(PROTOCOL_VERSION).to_be_bytes()),
-                (key::ENVELOPE_VERSION, &u64::from(ENVELOPE_VERSION).to_be_bytes()),
+                (
+                    key::PROTOCOL_VERSION,
+                    &u64::from(PROTOCOL_VERSION).to_be_bytes(),
+                ),
+                (
+                    key::ENVELOPE_VERSION,
+                    &u64::from(ENVELOPE_VERSION).to_be_bytes(),
+                ),
                 (key::LAST_SEQ, &0u64.to_be_bytes()),
                 (key::CF_SPECS, &meta::encode_cf_list(&[])),
                 (key::PENDING_CF_DROPS, &meta::encode_cf_list(&[])),
             ],
             true,
         )?;
-        self.load_meta()?.ok_or_else(|| Error::corrupt("__meta missing right after initialisation"))
+        self.load_meta()?
+            .ok_or_else(|| Error::corrupt("__meta missing right after initialisation"))
     }
 
     /// Finishes CF operations interrupted by a crash (DESIGN.md §7):
     /// an unregistered CF named by the create intent is dropped (replay recreates it), and
     /// pending drops whose physical CF is already gone are forgotten.
-    fn recover_cf_state(&self, mut meta: MetaSnapshot, existing: &[String]) -> Result<MetaSnapshot> {
+    fn recover_cf_state(
+        &self,
+        mut meta: MetaSnapshot,
+        existing: &[String],
+    ) -> Result<MetaSnapshot> {
         if let Some(intent) = meta.cf_create_intent.take() {
             let physical = intent.physical_name();
             let registered = meta.cf_specs.contains(&intent);
@@ -157,9 +195,16 @@ impl Store {
             self.db.flush_wal(true)?;
         }
         let before = meta.pending_drops.len();
-        meta.pending_drops.retain(|e| existing.contains(&e.physical_name()));
+        meta.pending_drops
+            .retain(|e| existing.contains(&e.physical_name()));
         if meta.pending_drops.len() != before {
-            self.write_meta(&[(key::PENDING_CF_DROPS, &meta::encode_cf_list(&meta.pending_drops))], true)?;
+            self.write_meta(
+                &[(
+                    key::PENDING_CF_DROPS,
+                    &meta::encode_cf_list(&meta.pending_drops),
+                )],
+                true,
+            )?;
         }
         Ok(meta)
     }
@@ -174,7 +219,11 @@ impl Store {
     }
 
     pub(crate) fn retain_cf_options(&self, opts: Options) {
-        self.db.retained_cf_opts.lock().unwrap_or_else(PoisonError::into_inner).push(opts);
+        self.db
+            .retained_cf_opts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(opts);
     }
 
     pub(crate) fn db(&self) -> &Arc<DbCore> {
@@ -199,17 +248,23 @@ impl Store {
 
     /// Handle of a reserved CF. These are always open, so a miss is a programming error.
     pub(crate) fn cf(&self, name: &'static str) -> Arc<BoundColumnFamily<'_>> {
-        self.db.cf_handle(name).unwrap_or_else(|| panic!("reserved column family {name} is not open"))
+        self.db
+            .cf_handle(name)
+            .unwrap_or_else(|| panic!("reserved column family {name} is not open"))
     }
 
     pub(crate) fn handle(&self, cf: &PhysCf) -> Result<Arc<BoundColumnFamily<'_>>> {
-        self.db
-            .cf_handle(&cf.physical)
-            .ok_or_else(|| Error::corrupt(format!("physical column family {} is missing", cf.physical)))
+        self.db.cf_handle(&cf.physical).ok_or_else(|| {
+            Error::corrupt(format!("physical column family {} is missing", cf.physical))
+        })
     }
 
     pub(crate) fn live_ctx(&self, now_ms: u64) -> read::ReadCtx<'_> {
-        read::ReadCtx { db: &self.db, snap: None, now_ms }
+        read::ReadCtx {
+            db: &self.db,
+            snap: None,
+            now_ms,
+        }
     }
 
     /// Takes a snapshot. The registry read lock is held while the RocksDB snapshot is taken;
@@ -225,11 +280,18 @@ impl Store {
             None => 0,
         };
         drop(meta_cf);
-        Ok(crate::read::ReadSnapshot { snap, cfs, seq, now_ms })
+        Ok(crate::read::ReadSnapshot {
+            snap,
+            cfs,
+            seq,
+            now_ms,
+        })
     }
 
     pub(crate) fn live_cf(&self, name: &str) -> Result<Arc<PhysCf>> {
-        self.cfs.get(name).ok_or_else(|| Error::NoSuchCf(name.to_string()))
+        self.cfs
+            .get(name)
+            .ok_or_else(|| Error::NoSuchCf(name.to_string()))
     }
 
     pub(crate) fn write_meta(&self, kvs: &[(&[u8], &[u8])], sync: bool) -> Result<()> {
@@ -259,13 +321,18 @@ fn read_meta_read_only(path: &Path) -> Result<Option<MetaSnapshot>> {
         [ColumnFamilyDescriptor::new(CF_META, Options::default())],
         false,
     )?;
-    let cf = db.cf_handle(CF_META).ok_or_else(|| Error::corrupt("__meta missing in read-only open"))?;
+    let cf = db
+        .cf_handle(CF_META)
+        .ok_or_else(|| Error::corrupt("__meta missing in read-only open"))?;
     MetaSnapshot::load(|k| Ok(db.get_cf(&cf, k)?))
 }
 
 fn check_compatible(m: &MetaSnapshot, role: Role) -> Result<()> {
     if m.role != role {
-        return Err(Error::WrongRole { expected: role, found: m.role });
+        return Err(Error::WrongRole {
+            expected: role,
+            found: m.role,
+        });
     }
     if m.protocol_version != u64::from(PROTOCOL_VERSION) {
         return Err(Error::VersionMismatch {
@@ -287,9 +354,9 @@ fn check_compatible(m: &MetaSnapshot, role: Role) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
     use crate::tuning::RocksTuning;
     use crate::types::{CfEntry, CfSpec, DbIdentity, EpochStart, Role};
-    use crate::error::Error;
 
     #[test]
     fn refuses_a_foreign_rocksdb_directory() {
@@ -316,7 +383,13 @@ mod tests {
         assert_eq!(meta.identity, None);
         assert!(meta.epoch_history.is_empty());
         assert!(meta.cf_specs.is_empty());
-        assert_eq!(store.position(), Position { last_seq: 0, last_entry_crc: None });
+        assert_eq!(
+            store.position(),
+            Position {
+                last_seq: 0,
+                last_entry_crc: None
+            }
+        );
         assert_eq!(store.first_retained_seq(), 1);
     }
 
@@ -325,15 +398,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let (store, _) = Store::open(dir.path(), Role::Master, RocksTuning::new()).unwrap();
-            store.write_meta(&[(meta::key::LAST_SEQ, &5u64.to_be_bytes())], true).unwrap();
+            store
+                .write_meta(&[(meta::key::LAST_SEQ, &5u64.to_be_bytes())], true)
+                .unwrap();
         }
         let (store, meta) = Store::open(dir.path(), Role::Master, RocksTuning::new()).unwrap();
         assert_eq!(meta.last_seq, 5);
         assert_eq!(store.position().last_seq, 5);
         assert_eq!(store.first_retained_seq(), 6);
         drop(store);
-        let err = Store::open(dir.path(), Role::Slave, RocksTuning::new()).err().unwrap();
-        assert!(matches!(err, Error::WrongRole { expected: Role::Slave, found: Role::Master }));
+        let err = Store::open(dir.path(), Role::Slave, RocksTuning::new())
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            Error::WrongRole {
+                expected: Role::Slave,
+                found: Role::Master
+            }
+        ));
     }
 
     #[test]
@@ -341,24 +424,65 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let (store, _) = Store::open(dir.path(), Role::Master, RocksTuning::new()).unwrap();
-            store.write_meta(&[(meta::key::PROTOCOL_VERSION, &99u64.to_be_bytes())], true).unwrap();
+            store
+                .write_meta(&[(meta::key::PROTOCOL_VERSION, &99u64.to_be_bytes())], true)
+                .unwrap();
         }
-        let err = Store::open(dir.path(), Role::Master, RocksTuning::new()).err().unwrap();
-        assert!(matches!(err, Error::VersionMismatch { what: "protocol_version", found: 99, expected: 1 }));
+        let err = Store::open(dir.path(), Role::Master, RocksTuning::new())
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            Error::VersionMismatch {
+                what: "protocol_version",
+                found: 99,
+                expected: 1
+            }
+        ));
     }
 
     #[test]
     fn meta_encodings_round_trip() {
-        let id = DbIdentity { db_uuid: uuid::Uuid::new_v4(), epoch: 3 };
-        assert_eq!(meta::decode_identity(&meta::encode_identity(&id)).unwrap(), id);
+        let id = DbIdentity {
+            db_uuid: uuid::Uuid::new_v4(),
+            epoch: 3,
+        };
+        assert_eq!(
+            meta::decode_identity(&meta::encode_identity(&id)).unwrap(),
+            id
+        );
         let list = vec![
-            CfEntry { spec: CfSpec::new("a"), create_seq: 1 },
-            CfEntry { spec: CfSpec::new("b").with_comparator("rev"), create_seq: 9 },
+            CfEntry {
+                spec: CfSpec::new("a"),
+                create_seq: 1,
+            },
+            CfEntry {
+                spec: CfSpec::new("b").with_comparator("rev"),
+                create_seq: 9,
+            },
         ];
-        assert_eq!(meta::decode_cf_list(&meta::encode_cf_list(&list)).unwrap(), list);
-        assert_eq!(meta::decode_cf_entry(&meta::encode_cf_entry(&list[1])).unwrap(), list[1]);
-        let h = vec![EpochStart { epoch: 1, start_seq: 1 }, EpochStart { epoch: 2, start_seq: 50 }];
-        assert_eq!(meta::decode_epoch_history(&meta::encode_epoch_history(&h)).unwrap(), h);
+        assert_eq!(
+            meta::decode_cf_list(&meta::encode_cf_list(&list)).unwrap(),
+            list
+        );
+        assert_eq!(
+            meta::decode_cf_entry(&meta::encode_cf_entry(&list[1])).unwrap(),
+            list[1]
+        );
+        let h = vec![
+            EpochStart {
+                epoch: 1,
+                start_seq: 1,
+            },
+            EpochStart {
+                epoch: 2,
+                start_seq: 50,
+            },
+        ];
+        assert_eq!(
+            meta::decode_epoch_history(&meta::encode_epoch_history(&h)).unwrap(),
+            h
+        );
         assert!(meta::be64(b"short").is_err());
     }
 }

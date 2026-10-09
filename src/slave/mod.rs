@@ -25,15 +25,17 @@ use crate::error::{Error, Result};
 use crate::log::{EntryIter, LogApi};
 use crate::read::{ReadApi, ReadSnapshot};
 use crate::server::replicas::ReplicaStatus;
-use crate::server::{await_sole_owner, ServerHandle};
+use crate::server::{ServerHandle, await_sole_owner};
+use crate::store::Store;
 use crate::store::meta::key;
 use crate::store::read::DbIter;
-use crate::store::Store;
 use crate::types::{CfSpec, Direction, IterMode, Role, Seq, ValueMeta};
 use inner::Inner;
 use state::NodeState;
 
-pub use config::{Backoff, DivergencePolicy, FetchConfig, GapPolicy, IdentityPolicy, SlaveConfig, UpstreamConfig};
+pub use config::{
+    Backoff, DivergencePolicy, FetchConfig, GapPolicy, IdentityPolicy, SlaveConfig, UpstreamConfig,
+};
 pub use promote::{PromoteRefused, PromotionCheck};
 pub use repoint::{AcceptDataLoss, RepointDivergence, RepointOptions, RepointOutcome};
 pub use state::{HaltAction, HaltReason, SlaveState, SlaveStatus};
@@ -57,17 +59,28 @@ impl Slave {
         cfg.validate()?;
         let (store, meta) = Store::open(&cfg.path, Role::Slave, cfg.rocksdb.clone())?;
         let inner = Arc::new(Inner::new(store, cfg, &meta)?);
-        let server = crate::server::start_for(&inner, inner.cfg.serve.clone(), inner.replicas.clone()).await?;
+        let server =
+            crate::server::start_for(&inner, inner.cfg.serve.clone(), inner.replicas.clone())
+                .await?;
         let driver = driver::spawn(&inner);
         let maintenance = maintenance::spawn(&inner);
-        Ok(Slave { inner, driver: Some(driver), maintenance: Some(maintenance), server })
+        Ok(Slave {
+            inner,
+            driver: Some(driver),
+            maintenance: Some(maintenance),
+            server,
+        })
     }
 
     /// Direct downstream replicas of this slave (see `Master::replicas`). Empty when it does
     /// not serve replication.
     pub fn replicas(&self) -> Vec<ReplicaStatus> {
         match &self.server {
-            Some(s) => self.inner.replicas.status(&*self.inner, self.inner.now_ms(), s.replica_lag_time_max()),
+            Some(s) => self.inner.replicas.status(
+                &*self.inner,
+                self.inner.now_ms(),
+                s.replica_lag_time_max(),
+            ),
             None => Vec::new(),
         }
     }
@@ -105,7 +118,9 @@ impl Slave {
                 }
             }
         };
-        tokio::time::timeout(timeout, wait).await.map_err(|_| Error::Timeout)?
+        tokio::time::timeout(timeout, wait)
+            .await
+            .map_err(|_| Error::Timeout)?
     }
 
     pub fn watch_state(&self) -> watch::Receiver<SlaveState> {
@@ -127,8 +142,11 @@ impl Slave {
             return Err(Error::Config("the slave is not halted".into()));
         };
         let i = self.inner.clone();
-        crate::background::blocking(move || i.store.write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true))
-            .await?;
+        crate::background::blocking(move || {
+            i.store
+                .write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true)
+        })
+        .await?;
         if matches!(action, HaltAction::Rebootstrap { .. }) {
             self.inner.force_bootstrap.request(generation);
         }
@@ -154,7 +172,11 @@ impl Slave {
     }
 
     fn check_ready(&self) -> Result<()> {
-        if self.inner.is_ready() { Ok(()) } else { Err(Error::NotReady) }
+        if self.inner.is_ready() {
+            Ok(())
+        } else {
+            Err(Error::NotReady)
+        }
     }
 
     /// Stops replication and serving and waits until every task has released the slave
@@ -165,10 +187,17 @@ impl Slave {
             server.shutdown().await;
         }
         self.inner.shutdown_tx.send_replace(true);
-        for task in [self.driver.take(), self.maintenance.take()].into_iter().flatten() {
+        for task in [self.driver.take(), self.maintenance.take()]
+            .into_iter()
+            .flatten()
+        {
             let _ = task.await;
         }
-        if await_sole_owner(&self.inner, Duration::from_secs(10)).await { Ok(()) } else { Err(Error::Timeout) }
+        if await_sole_owner(&self.inner, Duration::from_secs(10)).await {
+            Ok(())
+        } else {
+            Err(Error::Timeout)
+        }
     }
 }
 
@@ -181,11 +210,18 @@ impl Slave {
         if let Some(server) = self.server.take() {
             server.abort();
         }
-        for task in [self.driver.take(), self.maintenance.take()].into_iter().flatten() {
+        for task in [self.driver.take(), self.maintenance.take()]
+            .into_iter()
+            .flatten()
+        {
             task.abort();
             let _ = task.await;
         }
-        if await_sole_owner(&self.inner, Duration::from_secs(10)).await { Ok(()) } else { Err(Error::Timeout) }
+        if await_sole_owner(&self.inner, Duration::from_secs(10)).await {
+            Ok(())
+        } else {
+            Err(Error::Timeout)
+        }
     }
 }
 
@@ -205,18 +241,31 @@ impl ReadApi for Slave {
     fn iter(&self, cf: &str, mode: IterMode<'_>) -> Result<DbIter<'_>> {
         self.check_ready()?;
         let cf = self.live_cf(cf)?;
-        self.inner.store.live_ctx(self.inner.now_ms()).iter(cf, mode, None)
+        self.inner
+            .store
+            .live_ctx(self.inner.now_ms())
+            .iter(cf, mode, None)
     }
 
     fn prefix_iter(&self, cf: &str, prefix: &[u8]) -> Result<DbIter<'_>> {
         self.check_ready()?;
         let cf = self.live_cf(cf)?;
-        self.inner.store.live_ctx(self.inner.now_ms()).iter(cf, IterMode::From(prefix, Direction::Forward), Some(prefix))
+        self.inner.store.live_ctx(self.inner.now_ms()).iter(
+            cf,
+            IterMode::From(prefix, Direction::Forward),
+            Some(prefix),
+        )
     }
 
     /// Empty while bootstrapping.
     fn list_cfs(&self) -> Vec<CfSpec> {
-        self.inner.store.cfs.live_entries().into_iter().map(|e| e.spec).collect()
+        self.inner
+            .store
+            .cfs
+            .live_entries()
+            .into_iter()
+            .map(|e| e.spec)
+            .collect()
     }
 }
 

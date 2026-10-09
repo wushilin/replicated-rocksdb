@@ -53,7 +53,12 @@ pub enum AuthError {
 /// with that authenticator on a plaintext listener without the `allow_plaintext_token` guard.
 #[async_trait::async_trait]
 pub trait Authenticator: Send + Sync + 'static {
-    async fn authenticate(&self, peer: &PeerInfo, method: Method, token: Option<&[u8]>) -> Result<(), AuthError>;
+    async fn authenticate(
+        &self,
+        peer: &PeerInfo,
+        method: Method,
+        token: Option<&[u8]>,
+    ) -> Result<(), AuthError>;
 
     /// True if this authenticator relies on bearer tokens. A server refuses to start with
     /// such an authenticator on a plaintext listener unless `allow_plaintext_token` is set.
@@ -73,11 +78,15 @@ pub trait Authenticator: Send + Sync + 'static {
 pub fn validate_token(token: &[u8]) -> Result<()> {
     let body_len = token.iter().rposition(|&b| b != b'=').map_or(0, |i| i + 1);
     let ok = body_len > 0
-        && token[..body_len].iter().all(|&b| b.is_ascii_alphanumeric() || b"-._~+/".contains(&b));
+        && token[..body_len]
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b"-._~+/".contains(&b));
     if ok {
         Ok(())
     } else {
-        Err(Error::Config("token must be a non-empty RFC 6750 b64token ([A-Za-z0-9-._~+/]+=*)".into()))
+        Err(Error::Config(
+            "token must be a non-empty RFC 6750 b64token ([A-Za-z0-9-._~+/]+=*)".into(),
+        ))
     }
 }
 
@@ -92,7 +101,12 @@ pub struct AllowAll;
 
 #[async_trait::async_trait]
 impl Authenticator for AllowAll {
-    async fn authenticate(&self, _: &PeerInfo, _: Method, _: Option<&[u8]>) -> Result<(), AuthError> {
+    async fn authenticate(
+        &self,
+        _: &PeerInfo,
+        _: Method,
+        _: Option<&[u8]>,
+    ) -> Result<(), AuthError> {
         Ok(())
     }
 }
@@ -109,7 +123,10 @@ pub struct TokenAuthenticator {
 impl TokenAuthenticator {
     pub fn new(secrets: impl IntoIterator<Item = impl Into<Vec<u8>>>) -> Self {
         let secrets: Vec<Vec<u8>> = secrets.into_iter().map(Into::into).collect();
-        let digests = secrets.iter().map(|s| *blake3::hash(s).as_bytes()).collect();
+        let digests = secrets
+            .iter()
+            .map(|s| *blake3::hash(s).as_bytes())
+            .collect();
         TokenAuthenticator { secrets, digests }
     }
 }
@@ -122,15 +139,26 @@ impl fmt::Debug for TokenAuthenticator {
 
 #[async_trait::async_trait]
 impl Authenticator for TokenAuthenticator {
-    async fn authenticate(&self, _: &PeerInfo, _: Method, token: Option<&[u8]>) -> Result<(), AuthError> {
-        let Some(token) = token else { return Err(AuthError::Unauthenticated) };
+    async fn authenticate(
+        &self,
+        _: &PeerInfo,
+        _: Method,
+        token: Option<&[u8]>,
+    ) -> Result<(), AuthError> {
+        let Some(token) = token else {
+            return Err(AuthError::Unauthenticated);
+        };
         // Compare digests against every secret without early exit.
         let given = *blake3::hash(token).as_bytes();
         let mut ok = subtle::Choice::from(0);
         for d in &self.digests {
             ok |= d.as_slice().ct_eq(given.as_slice());
         }
-        if bool::from(ok) { Ok(()) } else { Err(AuthError::Unauthenticated) }
+        if bool::from(ok) {
+            Ok(())
+        } else {
+            Err(AuthError::Unauthenticated)
+        }
     }
 
     fn uses_tokens(&self) -> bool {
@@ -139,7 +167,9 @@ impl Authenticator for TokenAuthenticator {
 
     fn validate(&self) -> Result<()> {
         if self.secrets.is_empty() {
-            return Err(Error::Config("TokenAuthenticator needs at least one secret".into()));
+            return Err(Error::Config(
+                "TokenAuthenticator needs at least one secret".into(),
+            ));
         }
         self.secrets.iter().try_for_each(|s| validate_token(s))
     }
@@ -153,7 +183,9 @@ pub struct TokenCredentials {
 impl TokenCredentials {
     /// `secret` must consist of RFC 6750 `b64token` characters.
     pub fn new(secret: impl Into<Vec<u8>>) -> Self {
-        TokenCredentials { secret: secret.into() }
+        TokenCredentials {
+            secret: secret.into(),
+        }
     }
 }
 
@@ -199,13 +231,27 @@ impl MtlsSubjectAllowList {
 
     /// Allows `subject` to call every method.
     pub fn allow_all_methods(self, subject: impl Into<String>) -> Self {
-        self.allow(subject, &[Method::Handshake, Method::Tail, Method::Bootstrap, Method::Verify, Method::Status])
+        self.allow(
+            subject,
+            &[
+                Method::Handshake,
+                Method::Tail,
+                Method::Bootstrap,
+                Method::Verify,
+                Method::Status,
+            ],
+        )
     }
 }
 
 #[async_trait::async_trait]
 impl Authenticator for MtlsSubjectAllowList {
-    async fn authenticate(&self, peer: &PeerInfo, method: Method, _: Option<&[u8]>) -> Result<(), AuthError> {
+    async fn authenticate(
+        &self,
+        peer: &PeerInfo,
+        method: Method,
+        _: Option<&[u8]>,
+    ) -> Result<(), AuthError> {
         if !peer.peer_id_verified {
             return Err(AuthError::Unauthenticated);
         }
@@ -225,15 +271,27 @@ pub struct AllowMethods {
 
 impl AllowMethods {
     pub fn new(inner: Arc<dyn Authenticator>, methods: &[Method]) -> Self {
-        AllowMethods { inner, methods: methods.to_vec() }
+        AllowMethods {
+            inner,
+            methods: methods.to_vec(),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl Authenticator for AllowMethods {
-    async fn authenticate(&self, peer: &PeerInfo, method: Method, token: Option<&[u8]>) -> Result<(), AuthError> {
+    async fn authenticate(
+        &self,
+        peer: &PeerInfo,
+        method: Method,
+        token: Option<&[u8]>,
+    ) -> Result<(), AuthError> {
         self.inner.authenticate(peer, method, token).await?;
-        if self.methods.contains(&method) { Ok(()) } else { Err(AuthError::PermissionDenied) }
+        if self.methods.contains(&method) {
+            Ok(())
+        } else {
+            Err(AuthError::PermissionDenied)
+        }
     }
 
     fn uses_tokens(&self) -> bool {
@@ -289,8 +347,13 @@ impl FailureLimiter {
     pub(crate) fn is_blocked(&self, ip: IpAddr, now: Instant) -> bool {
         let ip = Self::bucket(ip);
         let mut map = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(q) = map.get_mut(&ip) else { return false };
-        while q.front().is_some_and(|t| now.saturating_duration_since(*t) >= self.window) {
+        let Some(q) = map.get_mut(&ip) else {
+            return false;
+        };
+        while q
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= self.window)
+        {
             q.pop_front();
         }
         if q.is_empty() {
@@ -304,7 +367,10 @@ impl FailureLimiter {
         let ip = Self::bucket(ip);
         let mut map = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
         let q = map.entry(ip).or_default();
-        while q.front().is_some_and(|t| now.saturating_duration_since(*t) >= self.window) {
+        while q
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= self.window)
+        {
             q.pop_front();
         }
         q.push_back(now);
@@ -313,11 +379,16 @@ impl FailureLimiter {
         }
         if map.len() > Self::MAX_TRACKED {
             let window = self.window;
-            map.retain(|_, q| q.back().is_some_and(|t| now.saturating_duration_since(*t) < window));
+            map.retain(|_, q| {
+                q.back()
+                    .is_some_and(|t| now.saturating_duration_since(*t) < window)
+            });
             if map.len() > Self::MAX_TRACKED {
                 // Still too many live entries: evict those with the oldest latest failure.
-                let mut by_age: Vec<(Instant, IpAddr)> =
-                    map.iter().filter_map(|(k, q)| q.back().map(|t| (*t, *k))).collect();
+                let mut by_age: Vec<(Instant, IpAddr)> = map
+                    .iter()
+                    .filter_map(|(k, q)| q.back().map(|t| (*t, *k)))
+                    .collect();
                 by_age.sort();
                 // Evict down to 3/4 of the cap so this O(n log n) pass is amortised.
                 let excess = map.len() - Self::MAX_TRACKED * 3 / 4;
@@ -348,7 +419,11 @@ pub(crate) fn subject_common_name(cert_der: &[u8]) -> Option<String> {
     }
     // [0] version (optional), serialNumber, signature, issuer, validity, subject
     let (tag, _, after) = der_tlv(tbs)?;
-    let mut rest = if tag == CONTEXT_0 { der_tlv(after)?.2 } else { after };
+    let mut rest = if tag == CONTEXT_0 {
+        der_tlv(after)?.2
+    } else {
+        after
+    };
     for _ in 0..3 {
         rest = der_tlv(rest)?.2;
     }
@@ -389,7 +464,12 @@ fn der_tlv(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         if n == 0 || n > 4 || b.len() < n {
             return None;
         }
-        (b[..n].iter().fold(0usize, |acc, &x| (acc << 8) | usize::from(x)), &b[n..])
+        (
+            b[..n]
+                .iter()
+                .fold(0usize, |acc, &x| (acc << 8) | usize::from(x)),
+            &b[n..],
+        )
     };
     if b.len() < len {
         return None;
@@ -415,40 +495,85 @@ mod tests {
         let a = TokenAuthenticator::new([b"old-secret".to_vec(), b"new-secret".to_vec()]);
         let p = peer("b", false);
         assert!(a.uses_tokens());
-        a.authenticate(&p, Method::Tail, Some(b"old-secret")).await.unwrap();
-        a.authenticate(&p, Method::Tail, Some(b"new-secret")).await.unwrap();
-        for bad in [Some(&b"new-secre"[..]), Some(b"new-secret!"), Some(b""), None] {
-            assert_eq!(a.authenticate(&p, Method::Tail, bad).await, Err(AuthError::Unauthenticated));
+        a.authenticate(&p, Method::Tail, Some(b"old-secret"))
+            .await
+            .unwrap();
+        a.authenticate(&p, Method::Tail, Some(b"new-secret"))
+            .await
+            .unwrap();
+        for bad in [
+            Some(&b"new-secre"[..]),
+            Some(b"new-secret!"),
+            Some(b""),
+            None,
+        ] {
+            assert_eq!(
+                a.authenticate(&p, Method::Tail, bad).await,
+                Err(AuthError::Unauthenticated)
+            );
         }
     }
 
     #[tokio::test]
     async fn allow_methods_restricts_after_authenticating() {
-        let a = AllowMethods::new(Arc::new(TokenAuthenticator::new(["t"])), &[Method::Handshake, Method::Tail]);
+        let a = AllowMethods::new(
+            Arc::new(TokenAuthenticator::new(["t"])),
+            &[Method::Handshake, Method::Tail],
+        );
         let p = peer("b", false);
         assert!(a.uses_tokens());
         a.authenticate(&p, Method::Tail, Some(b"t")).await.unwrap();
-        assert_eq!(a.authenticate(&p, Method::Bootstrap, Some(b"t")).await, Err(AuthError::PermissionDenied));
-        assert_eq!(a.authenticate(&p, Method::Bootstrap, Some(b"x")).await, Err(AuthError::Unauthenticated));
+        assert_eq!(
+            a.authenticate(&p, Method::Bootstrap, Some(b"t")).await,
+            Err(AuthError::PermissionDenied)
+        );
+        assert_eq!(
+            a.authenticate(&p, Method::Bootstrap, Some(b"x")).await,
+            Err(AuthError::Unauthenticated)
+        );
     }
 
     #[tokio::test]
     async fn mtls_allow_list_needs_a_verified_listed_subject() {
-        let a = MtlsSubjectAllowList::new().allow_all_methods("node-b").allow("node-c", &[Method::Handshake]);
+        let a = MtlsSubjectAllowList::new()
+            .allow_all_methods("node-b")
+            .allow("node-c", &[Method::Handshake]);
         assert!(!a.uses_tokens());
-        a.authenticate(&peer("node-b", true), Method::Bootstrap, None).await.unwrap();
-        a.authenticate(&peer("node-c", true), Method::Handshake, None).await.unwrap();
-        assert_eq!(a.authenticate(&peer("node-c", true), Method::Tail, None).await, Err(AuthError::PermissionDenied));
-        assert_eq!(a.authenticate(&peer("node-x", true), Method::Tail, None).await, Err(AuthError::PermissionDenied));
-        assert_eq!(a.authenticate(&peer("node-b", false), Method::Tail, None).await, Err(AuthError::Unauthenticated));
+        a.authenticate(&peer("node-b", true), Method::Bootstrap, None)
+            .await
+            .unwrap();
+        a.authenticate(&peer("node-c", true), Method::Handshake, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.authenticate(&peer("node-c", true), Method::Tail, None)
+                .await,
+            Err(AuthError::PermissionDenied)
+        );
+        assert_eq!(
+            a.authenticate(&peer("node-x", true), Method::Tail, None)
+                .await,
+            Err(AuthError::PermissionDenied)
+        );
+        assert_eq!(
+            a.authenticate(&peer("node-b", false), Method::Tail, None)
+                .await,
+            Err(AuthError::Unauthenticated)
+        );
     }
 
     #[tokio::test]
     async fn allow_all_and_credentials() {
-        AllowAll.authenticate(&peer("x", false), Method::Verify, None).await.unwrap();
+        AllowAll
+            .authenticate(&peer("x", false), Method::Verify, None)
+            .await
+            .unwrap();
         assert_eq!(TokenCredentials::new("abc").token(), Some(b"abc".to_vec()));
         assert_eq!(NoCredentials.token(), None);
-        assert!(!format!("{:?}", TokenCredentials::new("abc")).contains("abc"), "tokens are never printed");
+        assert!(
+            !format!("{:?}", TokenCredentials::new("abc")).contains("abc"),
+            "tokens are never printed"
+        );
     }
 
     #[test]
@@ -463,7 +588,10 @@ mod tests {
         }
         assert!(l.is_blocked(ip, t0 + Duration::from_secs(10)));
         assert!(!l.is_blocked(other, t0 + Duration::from_secs(10)));
-        assert!(!l.is_blocked(ip, t0 + Duration::from_secs(61)), "the oldest failure left the window");
+        assert!(
+            !l.is_blocked(ip, t0 + Duration::from_secs(61)),
+            "the oldest failure left the window"
+        );
         assert!(!l.is_blocked(ip, t0 + Duration::from_secs(120)));
     }
 
@@ -471,8 +599,12 @@ mod tests {
     fn common_name_is_read_from_a_real_certificate() {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.distinguished_name.push(rcgen::DnType::OrganizationName, "rrdb");
-        params.distinguished_name.push(rcgen::DnType::CommonName, "node-b");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, "rrdb");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "node-b");
         let cert = params.self_signed(&key).unwrap();
         assert_eq!(subject_common_name(cert.der()).as_deref(), Some("node-b"));
         assert_eq!(subject_common_name(&[0x30, 0x82, 0xFF]), None);
@@ -499,7 +631,10 @@ mod tests {
         }
         assert!(l.is_blocked(b, t0));
         assert!(!l.is_blocked(c, t0));
-        assert!(!l.is_blocked(ip, t0 + Duration::from_secs(60)), "window expiry unblocks");
+        assert!(
+            !l.is_blocked(ip, t0 + Duration::from_secs(60)),
+            "window expiry unblocks"
+        );
     }
 
     #[test]
@@ -507,14 +642,20 @@ mod tests {
         let l = FailureLimiter::new(3, Duration::from_secs(60));
         let t0 = Instant::now();
         for i in 0..50_000u32 {
-            l.record_failure(IpAddr::from(i.to_be_bytes()), t0 + Duration::from_millis(u64::from(i)));
+            l.record_failure(
+                IpAddr::from(i.to_be_bytes()),
+                t0 + Duration::from_millis(u64::from(i)),
+            );
         }
         assert!(l.failures.lock().unwrap().len() <= FailureLimiter::MAX_TRACKED);
         let hot: IpAddr = "10.9.9.9".parse().unwrap();
         for _ in 0..100 {
             l.record_failure(hot, t0 + Duration::from_secs(1000));
         }
-        assert!(l.failures.lock().unwrap()[&hot].len() <= 3, "per-address queue is capped at max");
+        assert!(
+            l.failures.lock().unwrap()[&hot].len() <= 3,
+            "per-address queue is capped at max"
+        );
     }
 
     #[test]
@@ -522,14 +663,34 @@ mod tests {
         for ok in [&b"abc"[..], b"A-z9_", b"a.b-c~d+e/f", b"abc=="] {
             validate_token(ok).unwrap();
         }
-        for bad in [&b""[..], b"=", b"a b", b"a\nb", b"a\r", "tökén".as_bytes(), b"ab=c", b"a\"b"] {
+        for bad in [
+            &b""[..],
+            b"=",
+            b"a b",
+            b"a\nb",
+            b"a\r",
+            "tökén".as_bytes(),
+            b"ab=c",
+            b"a\"b",
+        ] {
             assert!(validate_token(bad).is_err(), "{bad:?}");
         }
-        assert!(TokenAuthenticator::new(["good", "bad token"]).validate().is_err());
-        assert!(TokenAuthenticator::new(Vec::<Vec<u8>>::new()).validate().is_err());
+        assert!(
+            TokenAuthenticator::new(["good", "bad token"])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            TokenAuthenticator::new(Vec::<Vec<u8>>::new())
+                .validate()
+                .is_err()
+        );
         assert!(TokenAuthenticator::new([""]).validate().is_err());
         TokenAuthenticator::new(["good"]).validate().unwrap();
-        let wrapped = AllowMethods::new(Arc::new(TokenAuthenticator::new(["bad token"])), &[Method::Tail]);
+        let wrapped = AllowMethods::new(
+            Arc::new(TokenAuthenticator::new(["bad token"])),
+            &[Method::Tail],
+        );
         assert!(wrapped.validate().is_err());
         AllowAll.validate().unwrap();
     }
@@ -538,7 +699,9 @@ mod tests {
     fn common_name_never_panics_on_truncated_certificates() {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.distinguished_name.push(rcgen::DnType::CommonName, "node-b");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "node-b");
         let cert = params.self_signed(&key).unwrap();
         let der = cert.der().to_vec();
         for n in 0..der.len() {

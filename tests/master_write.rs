@@ -3,7 +3,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{clock, config, log, T0};
+use common::{T0, clock, config, log};
 use replicated_rocksdb::{Batch, CfSpec, EpochStart, Error, IterMode, LogApi, Master, Op, ReadApi};
 
 #[tokio::test]
@@ -13,7 +13,13 @@ async fn first_open_creates_identity_and_reopen_keeps_it() {
     let m = Master::open(config(dir.path(), &c)).await.unwrap();
     let id = m.identity();
     assert_eq!(id.epoch, 1);
-    assert_eq!(m.epoch_history(), vec![EpochStart { epoch: 1, start_seq: 1 }]);
+    assert_eq!(
+        m.epoch_history(),
+        vec![EpochStart {
+            epoch: 1,
+            start_seq: 1
+        }]
+    );
     m.create_cf(CfSpec::new("users")).unwrap();
     m.put("users", b"k", b"v").unwrap();
     m.shutdown().await.unwrap();
@@ -32,7 +38,11 @@ async fn every_write_is_one_logged_entry() {
     let m = Master::open(config(dir.path(), &c)).await.unwrap();
     assert_eq!(m.create_cf(CfSpec::new("c")).unwrap(), 1);
     assert_eq!(m.put("c", b"a", b"1").unwrap(), 2);
-    assert_eq!(m.put_with_ttl("c", b"b", b"2", Duration::from_secs(1)).unwrap(), 3);
+    assert_eq!(
+        m.put_with_ttl("c", b"b", b"2", Duration::from_secs(1))
+            .unwrap(),
+        3
+    );
     assert_eq!(m.delete("c", b"a").unwrap(), 4);
     assert_eq!(m.delete_range("c", b"a", b"z").unwrap(), 5);
     let mut b = Batch::new();
@@ -41,7 +51,10 @@ async fn every_write_is_one_logged_entry() {
     assert_eq!(m.drop_cf("c").unwrap(), 7);
 
     let entries = log(&m);
-    assert_eq!(entries.iter().map(|e| e.seq).collect::<Vec<_>>(), (1..=7).collect::<Vec<_>>());
+    assert_eq!(
+        entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        (1..=7).collect::<Vec<_>>()
+    );
     for e in &entries {
         e.verify_crc().unwrap();
         assert_eq!(e.epoch, 1);
@@ -49,7 +62,12 @@ async fn every_write_is_one_logged_entry() {
     }
     assert_eq!(
         entries[2].decode_ops().unwrap(),
-        vec![Op::Put { cf: "c".into(), key: b"b".to_vec(), value: b"2".to_vec(), expire_at_ms: Some(T0 + 1_000) }]
+        vec![Op::Put {
+            cf: "c".into(),
+            key: b"b".to_vec(),
+            value: b"2".to_vec(),
+            expire_at_ms: Some(T0 + 1_000)
+        }]
     );
     assert_eq!(entries[5].decode_ops().unwrap().len(), 2);
 }
@@ -62,9 +80,18 @@ async fn failed_validation_consumes_no_seq() {
     m.create_cf(CfSpec::new("c")).unwrap();
     assert!(matches!(m.put("nope", b"k", b"v"), Err(Error::NoSuchCf(_))));
     assert!(matches!(m.write(Batch::new()), Err(Error::EmptyBatch)));
-    assert!(matches!(m.create_cf(CfSpec::new("c")), Err(Error::AlreadyExists(_))));
-    assert!(matches!(m.create_cf(CfSpec::new("__x")), Err(Error::InvalidCfName(_))));
-    assert!(matches!(m.delete_range("c", b"b", b"a"), Err(Error::InvalidRange)));
+    assert!(matches!(
+        m.create_cf(CfSpec::new("c")),
+        Err(Error::AlreadyExists(_))
+    ));
+    assert!(matches!(
+        m.create_cf(CfSpec::new("__x")),
+        Err(Error::InvalidCfName(_))
+    ));
+    assert!(matches!(
+        m.delete_range("c", b"b", b"a"),
+        Err(Error::InvalidRange)
+    ));
     assert_eq!(m.put("c", b"k", b"v").unwrap(), 2);
 }
 
@@ -78,12 +105,22 @@ async fn max_entry_bytes_is_enforced_at_the_boundary() {
     m.create_cf(CfSpec::new("c")).unwrap();
     // Find the value size whose encoded entry is exactly 200 bytes.
     let size_for = |n: usize| {
-        let ops = vec![Op::Put { cf: "c".into(), key: b"k".to_vec(), value: vec![0; n], expire_at_ms: None }];
+        let ops = vec![Op::Put {
+            cf: "c".into(),
+            key: b"k".to_vec(),
+            value: vec![0; n],
+            expire_at_ms: None,
+        }];
         replicated_rocksdb::codec::entry::encoded_entry_len(2, 1, T0, &ops)
     };
-    let n = (0..200).find(|&n| size_for(n) == 200).expect("some value size encodes to exactly 200 bytes");
+    let n = (0..200)
+        .find(|&n| size_for(n) == 200)
+        .expect("some value size encodes to exactly 200 bytes");
     let err = m.put("c", b"k", &vec![0; n + 1]).unwrap_err();
-    assert!(matches!(err, Error::EntryTooLarge { max: 200, .. }), "{err:?}");
+    assert!(
+        matches!(err, Error::EntryTooLarge { max: 200, .. }),
+        "{err:?}"
+    );
     assert_eq!(m.put("c", b"k", &vec![0; n]).unwrap(), 2);
 }
 
@@ -109,11 +146,16 @@ async fn concurrent_writers_get_unique_gap_free_seqs() {
         .map(|t| {
             let m = m.clone();
             std::thread::spawn(move || {
-                (0..50).map(|i| m.put("c", format!("{t}-{i}").as_bytes(), b"v").unwrap()).collect::<Vec<_>>()
+                (0..50)
+                    .map(|i| m.put("c", format!("{t}-{i}").as_bytes(), b"v").unwrap())
+                    .collect::<Vec<_>>()
             })
         })
         .collect();
-    let mut seqs: Vec<u64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+    let mut seqs: Vec<u64> = handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
     seqs.sort_unstable();
     assert_eq!(seqs, (2..=401).collect::<Vec<_>>());
     let ts: Vec<u64> = log(&*m).iter().map(|e| e.ts_ms).collect();
@@ -135,7 +177,16 @@ async fn bump_epoch_continues_seq_and_tags_new_entries() {
     assert_eq!((entries[0].epoch, entries[1].epoch), (1, 2));
     assert_eq!(
         m.epoch_history(),
-        vec![EpochStart { epoch: 1, start_seq: 1 }, EpochStart { epoch: 2, start_seq: 2 }]
+        vec![
+            EpochStart {
+                epoch: 1,
+                start_seq: 1
+            },
+            EpochStart {
+                epoch: 2,
+                start_seq: 2
+            }
+        ]
     );
     m.shutdown().await.unwrap();
 
@@ -143,7 +194,13 @@ async fn bump_epoch_continues_seq_and_tags_new_entries() {
     cfg.bump_epoch_on_open = true;
     let m = Master::open(cfg).await.unwrap();
     assert_eq!(m.identity().epoch, 3);
-    assert_eq!(m.epoch_history().last(), Some(&EpochStart { epoch: 3, start_seq: 3 }));
+    assert_eq!(
+        m.epoch_history().last(),
+        Some(&EpochStart {
+            epoch: 3,
+            start_seq: 3
+        })
+    );
 }
 
 #[tokio::test]
@@ -164,12 +221,20 @@ async fn edge_case_keys_and_values_through_the_master() {
     for (k, v) in &cases {
         m.put("e", k, v).unwrap();
     }
-    assert!(matches!(m.put("e", b"too-big", &vec![0; 16 << 20]), Err(Error::EntryTooLarge { .. })));
+    assert!(matches!(
+        m.put("e", b"too-big", &vec![0; 16 << 20]),
+        Err(Error::EntryTooLarge { .. })
+    ));
     m.shutdown().await.unwrap();
 
     let m = Master::open(config(dir.path(), &c)).await.unwrap();
     for (k, v) in &cases {
-        assert_eq!(m.get("e", k).unwrap().as_deref(), Some(v.as_slice()), "key of length {}", k.len());
+        assert_eq!(
+            m.get("e", k).unwrap().as_deref(),
+            Some(v.as_slice()),
+            "key of length {}",
+            k.len()
+        );
     }
     // An empty value is a value, not an absence.
     assert_eq!(m.get("e", b"").unwrap(), Some(vec![]));
@@ -180,7 +245,8 @@ async fn edge_case_keys_and_values_through_the_master() {
     assert_eq!(m.get("e", b"\0").unwrap(), None);
     assert_eq!(m.get("e", b"\0k\0").unwrap(), None);
     assert!(m.get("e", &big_key).unwrap().is_some());
-    m.put_with_ttl("e", b"", b"", Duration::from_secs(1)).unwrap();
+    m.put_with_ttl("e", b"", b"", Duration::from_secs(1))
+        .unwrap();
     assert_eq!(m.get("e", b"").unwrap(), Some(vec![]));
     c.advance(Duration::from_secs(1));
     assert_eq!(m.get("e", b"").unwrap(), None);
@@ -222,7 +288,13 @@ async fn bump_on_open_is_skipped_for_a_fresh_database() {
     cfg.bump_epoch_on_open = true;
     let m = Master::open(cfg).await.unwrap();
     assert_eq!(m.identity().epoch, 1);
-    assert_eq!(m.epoch_history(), vec![EpochStart { epoch: 1, start_seq: 1 }]);
+    assert_eq!(
+        m.epoch_history(),
+        vec![EpochStart {
+            epoch: 1,
+            start_seq: 1
+        }]
+    );
 }
 
 #[tokio::test]

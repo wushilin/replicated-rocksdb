@@ -2,9 +2,9 @@
 
 use rocksdb::{IteratorMode, WriteBatch, WriteOptions};
 
-use super::meta::{self, key, CF_CHANGELOG, CF_META, CF_TTL_INDEX};
-use super::ttl::index_key;
 use super::Store;
+use super::meta::{self, CF_CHANGELOG, CF_META, CF_TTL_INDEX, key};
+use super::ttl::index_key;
 use crate::codec::envelope;
 use crate::error::{Error, Result};
 use crate::types::{DbIdentity, EpochStart, LogEntry, Role};
@@ -46,22 +46,48 @@ impl Store {
     /// it never reuses a number this node gave up by demoting, nor one at or below `floor`
     /// (the highest epoch the caller saw on its peers, 0 for none).
     pub(crate) fn promote_to_master(&self, floor: u64) -> Result<DbIdentity> {
-        let m = self.load_meta()?.ok_or_else(|| Error::corrupt("__meta is empty"))?;
-        let old = m.identity.ok_or_else(|| Error::Config("this slave has no data to promote".into()))?;
+        let m = self
+            .load_meta()?
+            .ok_or_else(|| Error::corrupt("__meta is empty"))?;
+        let old = m
+            .identity
+            .ok_or_else(|| Error::Config("this slave has no data to promote".into()))?;
         let mut history = m.epoch_history;
-        let own = history.iter().map(|e| e.epoch).max().unwrap_or(old.epoch).max(old.epoch);
+        let own = history
+            .iter()
+            .map(|e| e.epoch)
+            .max()
+            .unwrap_or(old.epoch)
+            .max(old.epoch);
         let epoch = own.max(m.max_burned_epoch).max(floor) + 1;
-        history.push(EpochStart { epoch, start_seq: m.last_seq + 1 });
-        let identity = DbIdentity { db_uuid: old.db_uuid, epoch };
-        let last_ts = match self.db().get_cf(&self.cf(CF_CHANGELOG), m.last_seq.to_be_bytes())? {
+        history.push(EpochStart {
+            epoch,
+            start_seq: m.last_seq + 1,
+        });
+        let identity = DbIdentity {
+            db_uuid: old.db_uuid,
+            epoch,
+        };
+        let last_ts = match self
+            .db()
+            .get_cf(&self.cf(CF_CHANGELOG), m.last_seq.to_be_bytes())?
+        {
             Some(v) => LogEntry::decode(&v)?.ts_ms,
             None => 0,
         };
         let meta_cf = self.cf(CF_META);
         let mut batch = WriteBatch::default();
         batch.put_cf(&meta_cf, key::ROLE, Role::Master.as_bytes());
-        batch.put_cf(&meta_cf, key::ORIGIN_IDENTITY, meta::encode_identity(&identity));
-        batch.put_cf(&meta_cf, key::EPOCH_HISTORY, meta::encode_epoch_history(&history));
+        batch.put_cf(
+            &meta_cf,
+            key::ORIGIN_IDENTITY,
+            meta::encode_identity(&identity),
+        );
+        batch.put_cf(
+            &meta_cf,
+            key::EPOCH_HISTORY,
+            meta::encode_epoch_history(&history),
+        );
         batch.put_cf(&meta_cf, key::LAST_TS, last_ts.to_be_bytes());
         for k in [key::NODE_STATE, key::MAX_ENTRY_BYTES, key::BOOTSTRAP_CFS] {
             batch.delete_cf(&meta_cf, k);
@@ -91,12 +117,20 @@ impl Store {
     /// Refused (`Error::Config`, nothing written) if the newest epoch
     /// already has entries, or if there is no earlier epoch to return to.
     pub(crate) fn demote_to_slave(&self) -> Result<DbIdentity> {
-        let m = self.load_meta()?.ok_or_else(|| Error::corrupt("__meta is empty"))?;
-        let id = m.identity.ok_or_else(|| Error::corrupt("a master without identity"))?;
+        let m = self
+            .load_meta()?
+            .ok_or_else(|| Error::corrupt("__meta is empty"))?;
+        let id = m
+            .identity
+            .ok_or_else(|| Error::corrupt("a master without identity"))?;
         let mut history = m.epoch_history;
-        let newest = *history.last().ok_or_else(|| Error::corrupt("a master without epoch history"))?;
+        let newest = *history
+            .last()
+            .ok_or_else(|| Error::corrupt("a master without epoch history"))?;
         if history.len() < 2 {
-            return Err(Error::Config("nothing to undo: this is the database's first epoch".into()));
+            return Err(Error::Config(
+                "nothing to undo: this is the database's first epoch".into(),
+            ));
         }
         if m.last_seq >= newest.start_seq {
             return Err(Error::Config(format!(
@@ -105,14 +139,33 @@ impl Store {
             )));
         }
         history.pop();
-        let previous = DbIdentity { db_uuid: id.db_uuid, epoch: history.last().map_or(1, |e| e.epoch) };
+        let previous = DbIdentity {
+            db_uuid: id.db_uuid,
+            epoch: history.last().map_or(1, |e| e.epoch),
+        };
         let meta_cf = self.cf(CF_META);
         let mut batch = WriteBatch::default();
         batch.put_cf(&meta_cf, key::ROLE, Role::Slave.as_bytes());
-        batch.put_cf(&meta_cf, key::ORIGIN_IDENTITY, meta::encode_identity(&previous));
-        batch.put_cf(&meta_cf, key::EPOCH_HISTORY, meta::encode_epoch_history(&history));
-        batch.put_cf(&meta_cf, key::NODE_STATE, crate::store::bootstrap::NODE_READY);
-        batch.put_cf(&meta_cf, key::MAX_BURNED_EPOCH, m.max_burned_epoch.max(newest.epoch).to_be_bytes());
+        batch.put_cf(
+            &meta_cf,
+            key::ORIGIN_IDENTITY,
+            meta::encode_identity(&previous),
+        );
+        batch.put_cf(
+            &meta_cf,
+            key::EPOCH_HISTORY,
+            meta::encode_epoch_history(&history),
+        );
+        batch.put_cf(
+            &meta_cf,
+            key::NODE_STATE,
+            crate::store::bootstrap::NODE_READY,
+        );
+        batch.put_cf(
+            &meta_cf,
+            key::MAX_BURNED_EPOCH,
+            m.max_burned_epoch.max(newest.epoch).to_be_bytes(),
+        );
         batch.delete_cf(&meta_cf, key::LAST_TS);
         let mut wo = WriteOptions::default();
         wo.set_sync(true);
@@ -135,9 +188,23 @@ mod tests {
     fn promotion_rewrites_meta_and_rebuilds_the_ttl_index() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let store = Store::open(dir.path(), Role::Slave, Default::default()).unwrap().0;
-            let id = DbIdentity { db_uuid: uuid::Uuid::from_u128(5), epoch: 2 };
-            let history = vec![EpochStart { epoch: 1, start_seq: 1 }, EpochStart { epoch: 2, start_seq: 1 }];
+            let store = Store::open(dir.path(), Role::Slave, Default::default())
+                .unwrap()
+                .0;
+            let id = DbIdentity {
+                db_uuid: uuid::Uuid::from_u128(5),
+                epoch: 2,
+            };
+            let history = vec![
+                EpochStart {
+                    epoch: 1,
+                    start_seq: 1,
+                },
+                EpochStart {
+                    epoch: 2,
+                    start_seq: 1,
+                },
+            ];
             store
                 .finish_bootstrap(&BootstrapFinish {
                     identity: id,
@@ -148,24 +215,63 @@ mod tests {
                     max_entry_bytes: 1 << 20,
                 })
                 .unwrap();
-            apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
-            let put = |k: &[u8], at| Op::Put { cf: "c".into(), key: k.to_vec(), value: vec![], expire_at_ms: at };
-            apply(&store, vec![put(b"a", Some(50)), put(b"", None), put(b"\0", Some(70))]).unwrap();
+            apply(
+                &store,
+                vec![Op::CreateCf {
+                    spec: CfSpec::new("c"),
+                }],
+            )
+            .unwrap();
+            let put = |k: &[u8], at| Op::Put {
+                cf: "c".into(),
+                key: k.to_vec(),
+                value: vec![],
+                expire_at_ms: at,
+            };
+            apply(
+                &store,
+                vec![put(b"a", Some(50)), put(b"", None), put(b"\0", Some(70))],
+            )
+            .unwrap();
             assert_eq!(store.rebuild_ttl_index().unwrap(), 2);
             assert_eq!(store.rebuild_ttl_index().unwrap(), 2, "idempotent");
             let due = store.ttl_due(60, 10, None).unwrap();
-            assert_eq!(due.iter().map(|e| e.key.clone()).collect::<Vec<_>>(), vec![b"a".to_vec()]);
-            let c = CfEntry { spec: CfSpec::new("c"), create_seq: 1 };
-            assert!(due.iter().all(|e| e.cf_name == c.spec.name && e.create_seq == c.create_seq));
+            assert_eq!(
+                due.iter().map(|e| e.key.clone()).collect::<Vec<_>>(),
+                vec![b"a".to_vec()]
+            );
+            let c = CfEntry {
+                spec: CfSpec::new("c"),
+                create_seq: 1,
+            };
+            assert!(
+                due.iter()
+                    .all(|e| e.cf_name == c.spec.name && e.create_seq == c.create_seq)
+            );
 
             let promoted = store.promote_to_master(0).unwrap();
-            assert_eq!(promoted, DbIdentity { db_uuid: id.db_uuid, epoch: 3 });
+            assert_eq!(
+                promoted,
+                DbIdentity {
+                    db_uuid: id.db_uuid,
+                    epoch: 3
+                }
+            );
         }
         let (_, m) = Store::open(dir.path(), Role::Master, Default::default()).unwrap();
         assert_eq!(m.role, Role::Master);
         assert_eq!(m.identity.unwrap().epoch, 3);
-        assert_eq!(m.epoch_history.last(), Some(&EpochStart { epoch: 3, start_seq: 3 }));
-        assert_eq!(m.last_ts, 2_000, "ts of entry 2 (test_support stamps 1000 × seq)");
+        assert_eq!(
+            m.epoch_history.last(),
+            Some(&EpochStart {
+                epoch: 3,
+                start_seq: 3
+            })
+        );
+        assert_eq!(
+            m.last_ts, 2_000,
+            "ts of entry 2 (test_support stamps 1000 × seq)"
+        );
         assert_eq!((m.node_state, m.max_entry_bytes), (None, None));
     }
 
@@ -173,30 +279,61 @@ mod tests {
     fn demotion_undoes_an_unused_promotion_only() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let store = Store::open(dir.path(), Role::Slave, Default::default()).unwrap().0;
-            let id = DbIdentity { db_uuid: uuid::Uuid::from_u128(5), epoch: 1 };
+            let store = Store::open(dir.path(), Role::Slave, Default::default())
+                .unwrap()
+                .0;
+            let id = DbIdentity {
+                db_uuid: uuid::Uuid::from_u128(5),
+                epoch: 1,
+            };
             store
                 .finish_bootstrap(&BootstrapFinish {
                     identity: id,
-                    epoch_history: vec![EpochStart { epoch: 1, start_seq: 1 }],
+                    epoch_history: vec![EpochStart {
+                        epoch: 1,
+                        start_seq: 1,
+                    }],
                     cf_specs: vec![],
                     snapshot_seq: 0,
                     snapshot_crc: None,
                     max_entry_bytes: 1 << 20,
                 })
                 .unwrap();
-            apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
+            apply(
+                &store,
+                vec![Op::CreateCf {
+                    spec: CfSpec::new("c"),
+                }],
+            )
+            .unwrap();
             store.promote_to_master(0).unwrap();
         }
         {
-            let store = Store::open(dir.path(), Role::Master, Default::default()).unwrap().0;
-            assert_eq!(store.demote_to_slave().unwrap(), DbIdentity { db_uuid: uuid::Uuid::from_u128(5), epoch: 1 });
+            let store = Store::open(dir.path(), Role::Master, Default::default())
+                .unwrap()
+                .0;
+            assert_eq!(
+                store.demote_to_slave().unwrap(),
+                DbIdentity {
+                    db_uuid: uuid::Uuid::from_u128(5),
+                    epoch: 1
+                }
+            );
         }
         let (store, m) = Store::open(dir.path(), Role::Slave, Default::default()).unwrap();
-        assert_eq!(m.epoch_history, vec![EpochStart { epoch: 1, start_seq: 1 }]);
+        assert_eq!(
+            m.epoch_history,
+            vec![EpochStart {
+                epoch: 1,
+                start_seq: 1
+            }]
+        );
         assert_eq!(m.last_seq, 1);
         assert_eq!(m.max_burned_epoch, 2, "the undone epoch number is burned");
-        assert!(matches!(store.demote_to_slave(), Err(Error::Config(_))), "first epoch: nothing to undo");
+        assert!(
+            matches!(store.demote_to_slave(), Err(Error::Config(_))),
+            "first epoch: nothing to undo"
+        );
     }
 
     /// Epoch numbers are never reused: a promotion after a demotion skips the burned number,
@@ -205,32 +342,56 @@ mod tests {
     fn a_burned_epoch_and_the_peer_floor_are_never_reused() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let store = Store::open(dir.path(), Role::Slave, Default::default()).unwrap().0;
-            let id = DbIdentity { db_uuid: uuid::Uuid::from_u128(5), epoch: 1 };
+            let store = Store::open(dir.path(), Role::Slave, Default::default())
+                .unwrap()
+                .0;
+            let id = DbIdentity {
+                db_uuid: uuid::Uuid::from_u128(5),
+                epoch: 1,
+            };
             store
                 .finish_bootstrap(&BootstrapFinish {
                     identity: id,
-                    epoch_history: vec![EpochStart { epoch: 1, start_seq: 1 }],
+                    epoch_history: vec![EpochStart {
+                        epoch: 1,
+                        start_seq: 1,
+                    }],
                     cf_specs: vec![],
                     snapshot_seq: 0,
                     snapshot_crc: None,
                     max_entry_bytes: 1 << 20,
                 })
                 .unwrap();
-            apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
+            apply(
+                &store,
+                vec![Op::CreateCf {
+                    spec: CfSpec::new("c"),
+                }],
+            )
+            .unwrap();
             assert_eq!(store.promote_to_master(0).unwrap().epoch, 2);
             assert_eq!(store.demote_to_slave().unwrap().epoch, 1);
-            assert_eq!(store.promote_to_master(0).unwrap().epoch, 3, "epoch 2 is burned");
+            assert_eq!(
+                store.promote_to_master(0).unwrap().epoch,
+                3,
+                "epoch 2 is burned"
+            );
             assert_eq!(store.demote_to_slave().unwrap().epoch, 1);
             assert_eq!(store.load_meta().unwrap().unwrap().max_burned_epoch, 3);
-            assert_eq!(store.promote_to_master(7).unwrap().epoch, 8, "above every epoch a peer reported");
+            assert_eq!(
+                store.promote_to_master(7).unwrap().epoch,
+                8,
+                "above every epoch a peer reported"
+            );
         }
     }
 
     #[test]
     fn a_slave_without_data_cannot_be_promoted() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), Role::Slave, Default::default()).unwrap().0;
+        let store = Store::open(dir.path(), Role::Slave, Default::default())
+            .unwrap()
+            .0;
         assert!(matches!(store.promote_to_master(0), Err(Error::Config(_))));
     }
 }

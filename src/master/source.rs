@@ -66,7 +66,9 @@ mod tests {
     use crate::net::reason_of;
     use crate::pb;
     use crate::pb::tail_message::Kind;
-    use crate::server::test_client::{client, next_batch, serving_master, tail_req, within, TailExt};
+    use crate::server::test_client::{
+        TailExt, client, next_batch, serving_master, tail_req, within,
+    };
     use crate::types::CfSpec;
 
     /// Retention overtakes a reader that stopped consuming: the stream ends with LOG_GAP
@@ -81,18 +83,28 @@ mod tests {
             m.put("c", &[i], &vec![i; 256 << 10]).unwrap();
         }
         let req = tail_req(&m.identity(), 1);
-        let mut s = client(m.serve_addr().unwrap(), "b").tail_start(req).await.unwrap().into_inner();
+        let mut s = client(m.serve_addr().unwrap(), "b")
+            .tail_start(req)
+            .await
+            .unwrap()
+            .into_inner();
         // The producer has read ahead once the first batch arrives.
         let first = next_batch(&mut s).await;
         let mut last = first.last().unwrap().seq;
         assert_eq!(first[0].seq, 1);
-        let keep_one = Retention { max_age: None, max_entries: Some(1), check_interval: Duration::from_secs(1) };
+        let keep_one = Retention {
+            max_age: None,
+            max_entries: Some(1),
+            check_interval: Duration::from_secs(1),
+        };
         m.inner.store.trim_changelog(0, &keep_one).unwrap();
 
         let err = within("the slow reader's LOG_GAP", async {
             loop {
                 match s.message().await {
-                    Ok(Some(pb::TailMessage { kind: Some(Kind::Batch(b)) })) => {
+                    Ok(Some(pb::TailMessage {
+                        kind: Some(Kind::Batch(b)),
+                    })) => {
                         for e in b.entries {
                             assert_eq!(e.seq, last + 1);
                             last = e.seq;
@@ -108,9 +120,16 @@ mod tests {
         // Entries the producer had already read are delivered; the next read hits the gap.
         // Reads stop at 64 entries or at the default 1 MiB batch size, whichever comes first;
         // the first read also holds the small CreateCf entry 1, so reads end at 1 + k * per_read.
-        let per_read = ((1usize << 20).div_ceil(first.last().unwrap().encoded_len())).min(crate::server::READ_BATCH) as u64;
-        assert!(last < 200 && (last - 1) % per_read == 0, "last delivered: {last} (reads of {per_read})");
-        assert_eq!((err.code(), reason_of(&err)), (Code::OutOfRange, Some(pb::Reason::LogGap)));
+        let per_read = ((1usize << 20).div_ceil(first.last().unwrap().encoded_len()))
+            .min(crate::server::READ_BATCH) as u64;
+        assert!(
+            last < 200 && (last - 1) % per_read == 0,
+            "last delivered: {last} (reads of {per_read})"
+        );
+        assert_eq!(
+            (err.code(), reason_of(&err)),
+            (Code::OutOfRange, Some(pb::Reason::LogGap))
+        );
     }
 
     /// The lease protects `S + 1` until the stream has actually read it, even when the Tail
@@ -126,7 +145,13 @@ mod tests {
             m.put("c", &[i], &vec![i; 256 << 10]).unwrap();
         }
         let mut c = client(m.serve_addr().unwrap(), "b");
-        let mut boot = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
+        let mut boot = c
+            .bootstrap(pb::BootstrapRequest {
+                client_id: "b".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
         let (mut lease, mut s_seq) = (Vec::new(), 0);
         within("the bootstrap", async {
             loop {
@@ -143,11 +168,23 @@ mod tests {
         }
         let mut req = tail_req(&m.identity(), 1);
         req.bootstrap_lease = Some(lease);
-        let mut s = client(m.serve_addr().unwrap(), "b").tail_start(req).await.unwrap().into_inner();
+        let mut s = client(m.serve_addr().unwrap(), "b")
+            .tail_start(req)
+            .await
+            .unwrap()
+            .into_inner();
         next_batch(&mut s).await; // the first block is read; entry S + 1 is not
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let keep_one = Retention { max_age: None, max_entries: Some(1), check_interval: Duration::from_secs(1) };
+        let keep_one = Retention {
+            max_age: None,
+            max_entries: Some(1),
+            check_interval: Duration::from_secs(1),
+        };
         m.inner.store.trim_changelog(0, &keep_one).unwrap();
-        assert_eq!(m.first_retained_seq(), s_seq + 1, "the lease still holds S + 1");
+        assert_eq!(
+            m.first_retained_seq(),
+            s_seq + 1,
+            "the lease still holds S + 1"
+        );
     }
 }

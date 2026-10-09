@@ -8,9 +8,10 @@ use std::time::Duration;
 use tokio::sync::{Mutex, MutexGuard};
 
 use replicated_rocksdb::{
-    CfSpec, Error, LogApi, Master, ReadApi, RepointOptions, RepointOutcome, Slave, SlaveState, UpstreamConfig, WriteConcern,
+    CfSpec, Error, LogApi, Master, ReadApi, RepointOptions, RepointOutcome, Slave, SlaveState,
+    UpstreamConfig, WriteConcern,
 };
-use support::{assert_converged, wait_until, Cluster};
+use support::{Cluster, assert_converged, wait_until};
 
 static SERIAL: Mutex<()> = Mutex::const_new(());
 
@@ -40,9 +41,10 @@ async fn crash_mid_bootstrap_restarts_the_bootstrap() {
     fail::cfg("slave-bootstrap-after-chunk", "1*return").unwrap();
     let (cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
     let b = Slave::open(cfg).await.unwrap();
-    wait_until("frozen after the first chunk", || {
-        matches!(b.status().state, SlaveState::Bootstrapping { records, .. } if records > 0)
-    })
+    wait_until(
+        "frozen after the first chunk",
+        || matches!(b.status().state, SlaveState::Bootstrapping { records, .. } if records > 0),
+    )
     .await;
     b.kill().await.unwrap();
     fail::remove("slave-bootstrap-after-chunk");
@@ -51,14 +53,21 @@ async fn crash_mid_bootstrap_restarts_the_bootstrap() {
     for i in 0..3u8 {
         m.put("c", &[b'x', i], b"v").unwrap();
     }
-    wait_until("the abandoned guard is released", || m.first_retained_seq() == m.last_seq()).await;
+    wait_until("the abandoned guard is released", || {
+        m.first_retained_seq() == m.last_seq()
+    })
+    .await;
 
     let (cfg, listener) = c.slave_config("b", m.serve_addr().unwrap());
     let b = Slave::open(cfg).await.unwrap();
     // The interrupted bootstrap left no readable state: reads are not ready until it is redone.
     match b.get("c", &[0]) {
         Err(replicated_rocksdb::Error::NotReady) => {}
-        Ok(v) => assert_eq!(v, Some(vec![0; 100]), "only a completed bootstrap is readable"),
+        Ok(v) => assert_eq!(
+            v,
+            Some(vec![0; 100]),
+            "only a completed bootstrap is readable"
+        ),
         Err(e) => panic!("unexpected error {e}"),
     }
     assert_converged(&m, &[("b", &b)]).await;
@@ -84,14 +93,21 @@ async fn crash_after_apply_resumes_without_gap_or_duplicate() {
     wait_until("entry committed", || b.last_seq() == crashed).await;
     b.kill().await.unwrap();
     fail::remove("slave-after-apply");
-    assert!(!first.entries().contains(&crashed), "the listener never saw the crashed entry");
+    assert!(
+        !first.entries().contains(&crashed),
+        "the listener never saw the crashed entry"
+    );
 
     for k in [&b"3"[..], b"4"] {
         m.put("c", k, b"v").unwrap();
     }
     let (cfg, second) = c.slave_config("b", m.serve_addr().unwrap());
     let b = Slave::open(cfg).await.unwrap();
-    assert_eq!(b.get("c", b"2").unwrap(), Some(b"v".to_vec()), "durable before the crash");
+    assert_eq!(
+        b.get("c", b"2").unwrap(),
+        Some(b"v".to_vec()),
+        "durable before the crash"
+    );
     assert_converged(&m, &[("b", &b)]).await;
     assert_eq!(second.entries(), vec![crashed + 1, crashed + 2]);
     assert_eq!(second.bootstraps(), 0);
@@ -115,10 +131,21 @@ async fn connection_drop_mid_tail_resumes() {
     }
     assert_converged(&m, &[("b", &b)]).await;
     fail::remove("server-tail-after-entry");
-    assert_eq!(listener.entries(), ((start + 1)..=m.last_seq()).collect::<Vec<_>>());
+    assert_eq!(
+        listener.entries(),
+        ((start + 1)..=m.last_seq()).collect::<Vec<_>>()
+    );
     assert_eq!(listener.bootstraps(), 1, "only the initial bootstrap");
-    let reconnects = listener.states().iter().filter(|s| **s == SlaveState::Streaming).count();
-    assert!(reconnects >= 4, "three drops, three reconnects: {:?}", listener.states());
+    let reconnects = listener
+        .states()
+        .iter()
+        .filter(|s| **s == SlaveState::Streaming)
+        .count();
+    assert!(
+        reconnects >= 4,
+        "three drops, three reconnects: {:?}",
+        listener.states()
+    );
     scenario.teardown();
 }
 
@@ -142,17 +169,35 @@ async fn bootstrap_lease_survives_aggressive_retention() {
     // writes on and retention runs.
     fail::cfg("slave-bootstrap-after-chunk", "pause").unwrap();
     let (b, listener) = c.slave("b", m.serve_addr().unwrap()).await;
-    wait_until("bootstrap paused", || matches!(b.status().state, SlaveState::Bootstrapping { records, .. } if records > 0)).await;
+    wait_until(
+        "bootstrap paused",
+        || matches!(b.status().state, SlaveState::Bootstrapping { records, .. } if records > 0),
+    )
+    .await;
     for i in 0..10u8 {
         m.put("c", &[b'x', i], b"v").unwrap();
     }
-    wait_until("retention trims up to the bootstrap guard", || m.first_retained_seq() == s + 1).await;
+    wait_until("retention trims up to the bootstrap guard", || {
+        m.first_retained_seq() == s + 1
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(100)).await; // ten more retention rounds
-    assert_eq!(m.first_retained_seq(), s + 1, "the bootstrap guard keeps S + 1");
+    assert_eq!(
+        m.first_retained_seq(),
+        s + 1,
+        "the bootstrap guard keeps S + 1"
+    );
     fail::remove("slave-bootstrap-after-chunk"); // unpauses the slave
     assert_converged(&m, &[("b", &b)]).await;
-    assert_eq!(listener.bootstraps(), 1, "tailed from S + 1 with the lease: no second bootstrap");
-    wait_until("retention resumes after the lease", || m.first_retained_seq() == m.last_seq()).await;
+    assert_eq!(
+        listener.bootstraps(),
+        1,
+        "tailed from S + 1 with the lease: no second bootstrap"
+    );
+    wait_until("retention resumes after the lease", || {
+        m.first_retained_seq() == m.last_seq()
+    })
+    .await;
     scenario.teardown();
 }
 
@@ -167,9 +212,15 @@ async fn a_failed_epoch_bump_fences_the_master_writer() {
     fail::cfg("master-bump-epoch-write", "1*return").unwrap();
     assert!(m.bump_epoch().is_err());
     fail::remove("master-bump-epoch-write");
-    assert!(matches!(m.put("c", b"k", b"v"), Err(replicated_rocksdb::Error::WriterFenced)));
+    assert!(matches!(
+        m.put("c", b"k", b"v"),
+        Err(replicated_rocksdb::Error::WriterFenced)
+    ));
     // A write concern does not hide the fence behind NotEnoughReplicas (no replica is in sync).
-    assert!(matches!(m.put_with("c", b"k", b"v", WriteConcern::in_sync(1)), Err(replicated_rocksdb::Error::WriterFenced)));
+    assert!(matches!(
+        m.put_with("c", b"k", b"v", WriteConcern::in_sync(1)),
+        Err(replicated_rocksdb::Error::WriterFenced)
+    ));
     assert_eq!(m.identity().epoch, 1);
     m.shutdown().await.unwrap();
     let m = Master::open(c.master_config("a")).await.unwrap();
@@ -196,18 +247,28 @@ async fn repoint_during_bootstrap_restarts_it_against_the_new_upstream() {
 
     fail::cfg("slave-bootstrap-after-chunk", "1*return").unwrap();
     let (cn, listener) = c.slave("c", m.serve_addr().unwrap()).await;
-    wait_until("frozen after the first chunk", || {
-        matches!(cn.status().state, SlaveState::Bootstrapping { records, .. } if records > 0)
-    })
+    wait_until(
+        "frozen after the first chunk",
+        || matches!(cn.status().state, SlaveState::Bootstrapping { records, .. } if records > 0),
+    )
     .await;
     fail::remove("slave-bootstrap-after-chunk");
-    let repoint = cn.repoint(UpstreamConfig::from_addr(b.serve_addr().unwrap()), RepointOptions::default());
-    let outcome = tokio::time::timeout(support::WAIT, repoint).await.expect("repoint settles").unwrap();
+    let repoint = cn.repoint(
+        UpstreamConfig::from_addr(b.serve_addr().unwrap()),
+        RepointOptions::default(),
+    );
+    let outcome = tokio::time::timeout(support::WAIT, repoint)
+        .await
+        .expect("repoint settles")
+        .unwrap();
     assert_eq!(outcome, RepointOutcome::Bootstrapped);
     m.put("c", b"after", b"v").unwrap();
     assert_converged(&m, &[("b", &b), ("c", &cn)]).await;
     assert_eq!(listener.bootstraps(), 1, "one completed bootstrap");
-    assert_eq!(cn.status().upstream_chain, vec!["b".to_string(), "a".to_string()]);
+    assert_eq!(
+        cn.status().upstream_chain,
+        vec!["b".to_string(), "a".to_string()]
+    );
     scenario.teardown();
 }
 
@@ -221,17 +282,36 @@ async fn a_replica_that_stops_acking_times_the_write_out() {
     let m = std::sync::Arc::new(c.master("a").await);
     m.create_cf(CfSpec::new("c")).unwrap();
     let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
-    wait_until("b in sync", || m.replicas().iter().any(|r| r.node_id == "b" && r.in_sync)).await;
-    let wc = WriteConcern { min_insync_replicas: 1, ack_timeout: Duration::from_millis(300) };
+    wait_until("b in sync", || {
+        m.replicas().iter().any(|r| r.node_id == "b" && r.in_sync)
+    })
+    .await;
+    let wc = WriteConcern {
+        min_insync_replicas: 1,
+        ack_timeout: Duration::from_millis(300),
+    };
     let m2 = m.clone();
-    tokio::task::spawn_blocking(move || m2.put_with("c", b"acked", b"v", wc)).await.unwrap().unwrap();
+    tokio::task::spawn_blocking(move || m2.put_with("c", b"acked", b"v", wc))
+        .await
+        .unwrap()
+        .unwrap();
 
     fail::cfg("slave-after-apply", "1*return").unwrap();
     let m2 = m.clone();
-    let err = tokio::task::spawn_blocking(move || m2.put_with("c", b"never acked", b"v", wc)).await.unwrap().unwrap_err();
+    let err = tokio::task::spawn_blocking(move || m2.put_with("c", b"never acked", b"v", wc))
+        .await
+        .unwrap()
+        .unwrap_err();
     let seq = m.last_seq();
-    assert!(matches!(err, Error::AckTimeout { seq: s, acked: 0, required: 1 } if s == seq), "{err}");
-    assert_eq!(m.get("c", b"never acked").unwrap(), Some(b"v".to_vec()), "committed on the master");
+    assert!(
+        matches!(err, Error::AckTimeout { seq: s, acked: 0, required: 1 } if s == seq),
+        "{err}"
+    );
+    assert_eq!(
+        m.get("c", b"never acked").unwrap(),
+        Some(b"v".to_vec()),
+        "committed on the master"
+    );
     wait_until("committed on b, not acknowledged", || b.last_seq() == seq).await;
     assert!(m.replicas().iter().all(|r| r.applied_seq < seq));
     b.kill().await.unwrap();
@@ -240,7 +320,12 @@ async fn a_replica_that_stops_acking_times_the_write_out() {
     // The replica returns: the entry is there and the master sees it acknowledged.
     let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
     assert_converged(&*m, &[("b", &b)]).await;
-    wait_until("the ack lands", || m.replicas().iter().any(|r| r.node_id == "b" && r.applied_seq == seq)).await;
+    wait_until("the ack lands", || {
+        m.replicas()
+            .iter()
+            .any(|r| r.node_id == "b" && r.applied_seq == seq)
+    })
+    .await;
     scenario.teardown();
 }
 
@@ -260,8 +345,18 @@ async fn an_io_error_on_commit_is_retried_not_a_corrupt_halt() {
     assert_converged(&m, &[("b", &b)]).await;
     fail::remove("slave-commit-io");
     let states = listener.states();
-    assert!(states.iter().all(|s| !matches!(s, SlaveState::Halted(_))), "never halted: {states:?}");
-    assert!(states.iter().filter(|s| **s == SlaveState::Streaming).count() >= 2, "the session was retried: {states:?}");
+    assert!(
+        states.iter().all(|s| !matches!(s, SlaveState::Halted(_))),
+        "never halted: {states:?}"
+    );
+    assert!(
+        states
+            .iter()
+            .filter(|s| **s == SlaveState::Streaming)
+            .count()
+            >= 2,
+        "the session was retried: {states:?}"
+    );
     // Nothing was persisted as halted: a restart resumes.
     let b = c.restart_slave(b, b_cfg).await;
     assert!(!matches!(b.status().state, SlaveState::Halted(_)));

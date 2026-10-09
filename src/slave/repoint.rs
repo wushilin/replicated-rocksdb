@@ -12,7 +12,7 @@ use super::state::SlaveState;
 use super::{Slave, UpstreamConfig};
 use crate::error::{Error, Result};
 use crate::pb;
-use crate::types::{fork_after, EpochStart, Seq};
+use crate::types::{EpochStart, Seq, fork_after};
 
 /// Acknowledges that an operation discards data. A caller constructs it explicitly
 /// (`AcceptDataLoss`) to opt in; nothing in the crate supplies one by default.
@@ -81,7 +81,10 @@ impl Inner {
     /// opened. It decides every `DIVERGED` answer from then on (handshake or Tail), so the
     /// configured `on_divergence` never applies to an explicitly chosen upstream.
     pub(crate) fn repoint_mode(&self) -> Option<RepointDivergence> {
-        *self.repoint_divergence.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self
+            .repoint_divergence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Settles the repoint that session `generation` was started for (no-op if there is none).
@@ -93,8 +96,14 @@ impl Inner {
             let p = pending.take().expect("checked");
             // Under the `pending` lock, so a newer repoint's mode (set under it too) is never
             // overwritten.
-            let mut mode = self.repoint_divergence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if matches!(*mode, Some(RepointDivergence::Rebootstrap { .. } | RepointDivergence::Repair { .. })) {
+            let mut mode = self
+                .repoint_divergence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(
+                *mode,
+                Some(RepointDivergence::Rebootstrap { .. } | RepointDivergence::Repair { .. })
+            ) {
                 tracing::info!(node = %self.cfg.identifier, "repoint settled; its consent to discard data has ended");
                 *mode = Some(RepointDivergence::Refuse);
             }
@@ -110,7 +119,11 @@ impl Inner {
     /// Makes the repoint of session `generation` fail with `e` once the session's halt is in
     /// place.
     pub(crate) fn fail_repoint_on_halt(&self, generation: u64, e: Error) {
-        if let Some(p) = self.pending_repoint().as_mut().filter(|p| p.generation == generation) {
+        if let Some(p) = self
+            .pending_repoint()
+            .as_mut()
+            .filter(|p| p.generation == generation)
+        {
             p.halt_error = Some(e);
         }
     }
@@ -120,10 +133,18 @@ impl Inner {
     pub(crate) fn settle_repoint_end(&self, generation: u64, end: &SessionEnd) {
         match end {
             SessionEnd::Halt(r) => {
-                let e = self.pending_repoint().as_mut().and_then(|p| p.halt_error.take());
+                let e = self
+                    .pending_repoint()
+                    .as_mut()
+                    .and_then(|p| p.halt_error.take());
                 self.settle_repoint(generation, Err(e.unwrap_or(Error::Halted(*r))));
             }
-            SessionEnd::Retry(m) => self.settle_repoint(generation, Ok(RepointOutcome::Retrying { last_error: m.clone() })),
+            SessionEnd::Retry(m) => self.settle_repoint(
+                generation,
+                Ok(RepointOutcome::Retrying {
+                    last_error: m.clone(),
+                }),
+            ),
             SessionEnd::Again => {}
         }
     }
@@ -131,8 +152,14 @@ impl Inner {
 
 /// `Error::Diverged` for a `DIVERGED` answer: where the local log leaves the upstream's.
 pub(crate) fn divergence(local_epoch: u64, local_last: Seq, hs: &pb::HandshakeResponse) -> Error {
-    let history: Vec<EpochStart> =
-        hs.epoch_history.iter().map(|e| EpochStart { epoch: e.epoch, start_seq: e.start_seq }).collect();
+    let history: Vec<EpochStart> = hs
+        .epoch_history
+        .iter()
+        .map(|e| EpochStart {
+            epoch: e.epoch,
+            start_seq: e.start_seq,
+        })
+        .collect();
     let fork_seq = match fork_after(&history, local_epoch) {
         // Rule 8: everything from the next epoch's start is not on the upstream's history.
         Some(fork) if fork <= local_last => fork,
@@ -141,14 +168,20 @@ pub(crate) fn divergence(local_epoch: u64, local_last: Seq, hs: &pb::HandshakeRe
         // Rule 12: the last entry differs; earlier ones may too (repair finds out).
         _ => local_last,
     };
-    Error::Diverged { fork_seq, local_last_seq: local_last, divergent_entries: local_last + 1 - fork_seq.min(local_last + 1) }
+    Error::Diverged {
+        fork_seq,
+        local_last_seq: local_last,
+        divergent_entries: local_last + 1 - fork_seq.min(local_last + 1),
+    }
 }
 
 /// The error a repoint reports when `mode` halts on divergence: `diverged` for `Refuse`,
 /// `Unsupported` for `Repair`.
 pub(crate) fn mode_error(mode: RepointDivergence, diverged: impl FnOnce() -> Error) -> Error {
     match mode {
-        RepointDivergence::Repair { .. } => Error::Unsupported("divergence repair needs verify sessions (Plan 3)".into()),
+        RepointDivergence::Repair { .. } => {
+            Error::Unsupported("divergence repair needs verify sessions (Plan 3)".into())
+        }
         _ => diverged(),
     }
 }
@@ -186,20 +219,38 @@ impl Slave {
     /// The wait includes a whole bootstrap when one is needed. To bound it, wrap the call in
     /// `tokio::time::timeout`: dropping the future does not undo the repoint, the slave keeps
     /// following the new upstream.
-    pub async fn repoint(&self, upstream: UpstreamConfig, opts: RepointOptions) -> Result<RepointOutcome> {
+    pub async fn repoint(
+        &self,
+        upstream: UpstreamConfig,
+        opts: RepointOptions,
+    ) -> Result<RepointOutcome> {
         if upstream.server.is_empty() || upstream.port == 0 {
-            return Err(Error::Config("upstream server and port are required".into()));
+            return Err(Error::Config(
+                "upstream server and port are required".into(),
+            ));
         }
-        connect_upstream(&upstream, &self.inner.cfg.identifier, self.inner.cfg.connect_timeout)?;
+        connect_upstream(
+            &upstream,
+            &self.inner.cfg.identifier,
+            self.inner.cfg.connect_timeout,
+        )?;
         let (reply, settled) = oneshot::channel();
         {
             let mut pending = self.inner.pending_repoint();
             tracing::info!(node = %self.inner.cfg.identifier, upstream = %upstream.uri(), "repointing");
             self.inner.set_upstream(upstream);
             self.inner.clear_upstream_chain();
-            *self.inner.repoint_divergence.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(opts.on_divergence);
+            *self
+                .inner
+                .repoint_divergence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(opts.on_divergence);
             let generation = *self.inner.repoint_tx.borrow() + 1;
-            *pending = Some(PendingRepoint { generation, halt_error: None, reply });
+            *pending = Some(PendingRepoint {
+                generation,
+                halt_error: None,
+                reply,
+            });
             self.inner.repoint_tx.send_replace(generation);
         }
         self.inner.set_last_error(None);

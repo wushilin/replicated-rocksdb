@@ -4,6 +4,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .bytes(".rrdb.replication.v1.LogEntry.ops")
-        .compile_protos(&["proto/replication.proto", "proto/local.proto"], &["proto"])?;
+        .compile_protos(
+            &["proto/replication.proto", "proto/local.proto"],
+            &["proto"],
+        )?;
     Ok(())
 }

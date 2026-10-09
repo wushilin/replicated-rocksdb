@@ -36,7 +36,11 @@ pub enum Error {
     WrongRole { expected: Role, found: Role },
     /// A protocol, envelope or storage version differs from this build.
     #[error("{what} is {found}, this build supports {expected}")]
-    VersionMismatch { what: &'static str, found: u64, expected: u64 },
+    VersionMismatch {
+        what: &'static str,
+        found: u64,
+        expected: u64,
+    },
     /// A write failed with unknown durability, so further writes are refused to avoid reusing seqs.
     #[error("the writer is fenced after a failed write; reopen the database")]
     WriterFenced,
@@ -54,28 +58,54 @@ pub enum Error {
     #[error("replication is halted: {0:?}")]
     Halted(crate::slave::HaltReason),
     /// Fewer replicas are in sync than the write concern requires; nothing was written.
-    #[error("{in_sync} replicas in sync, the write concern requires {required}; nothing was written")]
+    #[error(
+        "{in_sync} replicas in sync, the write concern requires {required}; nothing was written"
+    )]
     NotEnoughReplicas { required: usize, in_sync: usize },
     /// The write is committed on the master (and keeps replicating), but `required` in-sync
     /// acknowledgements were not seen within the write concern's `ack_timeout`. Retrying the
     /// write would apply it a second time.
-    #[error("entry {seq} is committed but only {acked} of {required} in-sync replicas acknowledged it in time")]
-    AckTimeout { seq: Seq, acked: usize, required: usize },
+    #[error(
+        "entry {seq} is committed but only {acked} of {required} in-sync replicas acknowledged it in time"
+    )]
+    AckTimeout {
+        seq: Seq,
+        acked: usize,
+        required: usize,
+    },
     /// `promote_checked` found a reachable peer that holds more of the log. `diverged` lists
     /// the peers proven to hold different entries (`node_id`, fork), for the operator.
-    #[error("{leader} is more advanced (last_seq {seq}); promote it instead (diverged peers: {diverged:?})")]
-    NotMostAdvanced { leader: String, seq: Seq, diverged: Vec<(String, Seq)> },
+    #[error(
+        "{leader} is more advanced (last_seq {seq}); promote it instead (diverged peers: {diverged:?})"
+    )]
+    NotMostAdvanced {
+        leader: String,
+        seq: Seq,
+        diverged: Vec<(String, Seq)>,
+    },
     /// `promote_checked` found a reachable peer that is at least as far by position (newest
     /// epoch, then `last_seq`) but whose compatibility cannot be proven, because the entry that
     /// would prove it is no longer held. Plain `promote` remains available as an explicit
     /// operator decision. `diverged` as for `NotMostAdvanced`.
-    #[error("{peer} (last_seq {seq}) is at least as far and its history cannot be verified; promote explicitly if intended (diverged peers: {diverged:?})")]
-    PromotionUnverifiable { peer: String, seq: Seq, diverged: Vec<(String, Seq)> },
+    #[error(
+        "{peer} (last_seq {seq}) is at least as far and its history cannot be verified; promote explicitly if intended (diverged peers: {diverged:?})"
+    )]
+    PromotionUnverifiable {
+        peer: String,
+        seq: Seq,
+        diverged: Vec<(String, Seq)>,
+    },
     /// The local log holds entries the upstream does not: `divergent_entries` entries from
     /// `fork_seq` to `local_last_seq` (for a mismatch at the same epoch, `fork_seq` is the
     /// last entry; earlier ones may differ too). Local data is intact.
-    #[error("local log diverged from the upstream at seq {fork_seq} ({divergent_entries} entries up to {local_last_seq})")]
-    Diverged { fork_seq: Seq, local_last_seq: Seq, divergent_entries: u64 },
+    #[error(
+        "local log diverged from the upstream at seq {fork_seq} ({divergent_entries} entries up to {local_last_seq})"
+    )]
+    Diverged {
+        fork_seq: Seq,
+        local_last_seq: Seq,
+        divergent_entries: u64,
+    },
     /// A `Slave::repoint` was replaced by a later repoint, or the slave shut down, before the
     /// first handshake with its upstream settled. The later repoint (if any) is in force.
     #[error("the repoint was superseded by a later repoint or the slave shut down")]
@@ -86,14 +116,22 @@ pub enum Error {
     /// `promote_checked` found a reachable peer that is itself a master. Promoting would give
     /// the database two masters: fence it (stop it), or `demote` it if it was promoted by
     /// mistake and has taken no writes, then check again.
-    #[error("{peer} is a reachable master; fence it, or demote it if it was promoted by mistake and has no writes, before promoting")]
+    #[error(
+        "{peer} is a reachable master; fence it, or demote it if it was promoted by mistake and has no writes, before promoting"
+    )]
     MasterReachable { peer: String },
     /// `promote_checked` found a reachable peer whose history forks from this slave's at
     /// `fork` while the peer holds entries at or past it (up to `peer_last_seq`): promoting this
     /// slave would discard them. Promote that peer instead, or use plain `promote` to accept
     /// the loss.
-    #[error("{peer} holds entries {fork}..={peer_last_seq} that promoting this slave would discard; promote that node instead, or use plain promote to accept the loss")]
-    PromotionWouldDiscard { peer: String, fork: Seq, peer_last_seq: Seq },
+    #[error(
+        "{peer} holds entries {fork}..={peer_last_seq} that promoting this slave would discard; promote that node instead, or use plain promote to accept the loss"
+    )]
+    PromotionWouldDiscard {
+        peer: String,
+        fork: Seq,
+        peer_last_seq: Seq,
+    },
     /// `admin::node_status` (and `node_status_probed`) could not get an answer from `peer`:
     /// connect error, timeout, or a transport failure. A peer that answered with an error
     /// status is reported as `Config` with the status text instead.
@@ -116,7 +154,9 @@ impl Error {
         use rocksdb::ErrorKind as K;
         match self {
             Error::Io(_) => true,
-            Error::RocksDb(e) => matches!(e.kind(), K::IOError | K::Busy | K::TimedOut | K::TryAgain),
+            Error::RocksDb(e) => {
+                matches!(e.kind(), K::IOError | K::Busy | K::TimedOut | K::TryAgain)
+            }
             _ => false,
         }
     }
@@ -133,6 +173,11 @@ mod tests {
         assert!(Error::Io(std::io::Error::other("disk full")).is_transient_io());
         assert!(!Error::corrupt("bad crc").is_transient_io());
         assert!(!Error::NoSuchCf("c".into()).is_transient_io());
-        assert!(!Error::CfInUse { physical: "u:c:1".into() }.is_transient_io());
+        assert!(
+            !Error::CfInUse {
+                physical: "u:c:1".into()
+            }
+            .is_transient_io()
+        );
     }
 }

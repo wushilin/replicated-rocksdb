@@ -3,8 +3,8 @@
 
 use rocksdb::{IteratorMode, WriteBatch};
 
-use super::meta::CF_TTL_INDEX;
 use super::Store;
+use super::meta::CF_TTL_INDEX;
 use crate::codec::envelope;
 use crate::error::{Error, Result};
 use crate::types::{CfEntry, Op, Seq};
@@ -42,14 +42,26 @@ pub(crate) fn parse_index_key(raw: &[u8]) -> Result<IndexEntry> {
         return Err(bad());
     }
     let cf_name = String::from_utf8(raw[18..name_end].to_vec()).map_err(|_| bad())?;
-    Ok(IndexEntry { raw_key: raw.to_vec(), expire_at, cf_name, create_seq, key: raw[name_end..].to_vec() })
+    Ok(IndexEntry {
+        raw_key: raw.to_vec(),
+        expire_at,
+        cf_name,
+        create_seq,
+        key: raw[name_end..].to_vec(),
+    })
 }
 
 impl Store {
     pub(crate) fn add_ttl_index(&self, batch: &mut WriteBatch, ops: &[Op]) -> Result<()> {
         let cf = self.cf(CF_TTL_INDEX);
         for op in ops {
-            if let Op::Put { cf: name, key, expire_at_ms: Some(at), .. } = op {
+            if let Op::Put {
+                cf: name,
+                key,
+                expire_at_ms: Some(at),
+                ..
+            } = op
+            {
                 let phys = self.live_cf(name)?;
                 batch.put_cf(&cf, index_key(*at, &phys.entry, key), []);
             }
@@ -60,7 +72,12 @@ impl Store {
     /// Up to `limit` index entries with `expire_at <= now_ms`, oldest first. With `after`, the
     /// scan starts strictly after that raw index key, so a caller that has already processed
     /// earlier entries does not rescan them (or their tombstones).
-    pub(crate) fn ttl_due(&self, now_ms: u64, limit: usize, after: Option<&[u8]>) -> Result<Vec<IndexEntry>> {
+    pub(crate) fn ttl_due(
+        &self,
+        now_ms: u64,
+        limit: usize,
+        after: Option<&[u8]>,
+    ) -> Result<Vec<IndexEntry>> {
         let cf = self.cf(CF_TTL_INDEX);
         let mode = match after {
             Some(k) => IteratorMode::From(k, rocksdb::Direction::Forward),
@@ -86,11 +103,15 @@ impl Store {
 
     /// True if the key still holds the value this index entry was written for.
     pub(crate) fn ttl_entry_is_live(&self, e: &IndexEntry) -> Result<bool> {
-        let Some(phys) = self.cfs.get(&e.cf_name) else { return Ok(false) };
+        let Some(phys) = self.cfs.get(&e.cf_name) else {
+            return Ok(false);
+        };
         if phys.entry.create_seq != e.create_seq {
             return Ok(false);
         }
-        let Some(raw) = self.live_ctx(0).get_raw(&phys, &e.key)? else { return Ok(false) };
+        let Some(raw) = self.live_ctx(0).get_raw(&phys, &e.key)? else {
+            return Ok(false);
+        };
         Ok(envelope::decode(&raw)?.meta.expire_at_ms == Some(e.expire_at))
     }
 
@@ -109,12 +130,23 @@ mod tests {
 
     #[test]
     fn index_key_round_trips_and_sorts_by_expiry() {
-        let cf = CfEntry { spec: CfSpec::new("a:b"), create_seq: 7 };
+        let cf = CfEntry {
+            spec: CfSpec::new("a:b"),
+            create_seq: 7,
+        };
         let k1 = index_key(5, &cf, b"");
         let k2 = index_key(6, &cf, b"\x00");
         assert!(k1 < k2);
         let e = parse_index_key(&k2).unwrap();
-        assert_eq!((e.expire_at, e.create_seq, e.cf_name.as_str(), e.key.as_slice()), (6, 7, "a:b", &b"\x00"[..]));
+        assert_eq!(
+            (
+                e.expire_at,
+                e.create_seq,
+                e.cf_name.as_str(),
+                e.key.as_slice()
+            ),
+            (6, 7, "a:b", &b"\x00"[..])
+        );
         assert!(parse_index_key(&k2[..17]).is_err());
     }
 }

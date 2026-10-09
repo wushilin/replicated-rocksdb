@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use super::state::{HaltReason, SlaveState};
 use super::{Slave, UpstreamConfig};
-use crate::admin::{self, compare, Comparison, NodeInfo, Side};
+use crate::admin::{self, Comparison, NodeInfo, Side, compare};
 use crate::config::MasterConfig;
 use crate::error::{Error, Result};
 use crate::master::Master;
-use crate::server::status::node_info;
 use crate::server::ServerHandle;
+use crate::server::status::node_info;
 use crate::store::Store;
 use crate::types::{Role, Seq};
 
@@ -47,12 +47,18 @@ impl Slave {
     /// Why `promote(cfg)` would be refused before it changes anything, if it would.
     fn promote_refusal(&self, cfg: &MasterConfig) -> Option<String> {
         match self.inner.state() {
-            SlaveState::Bootstrapping { .. } => Some("cannot promote while bootstrapping".to_string()),
+            SlaveState::Bootstrapping { .. } => {
+                Some("cannot promote while bootstrapping".to_string())
+            }
             SlaveState::Halted(r @ (HaltReason::Corrupt | HaltReason::SpecMismatch)) => {
                 Some(format!("cannot promote a slave halted with {r:?}"))
             }
-            _ if !self.inner.is_ready() => Some("this slave has no consistent data to promote".to_string()),
-            _ if cfg.path != self.inner.cfg.path => Some("MasterConfig.path must be the slave's path".to_string()),
+            _ if !self.inner.is_ready() => {
+                Some("this slave has no consistent data to promote".to_string())
+            }
+            _ if cfg.path != self.inner.cfg.path => {
+                Some("MasterConfig.path must be the slave's path".to_string())
+            }
             _ => cfg.validate().err().map(|e| e.to_string()),
         }
     }
@@ -76,7 +82,11 @@ impl Slave {
             let (store, _) = Store::open(&path, Role::Slave, tuning)?;
             let indexed = store.rebuild_ttl_index()?;
             let identity = store.promote_to_master(epoch_floor)?;
-            tracing::info!(epoch = identity.epoch, ttl_entries = indexed, "slave promoted to master");
+            tracing::info!(
+                epoch = identity.epoch,
+                ttl_entries = indexed,
+                "slave promoted to master"
+            );
             Ok(())
         })
         .await?;
@@ -107,7 +117,10 @@ pub struct PromotionCheck {
 impl Slave {
     /// What this slave reports about itself; the same fields as the `Status` RPC.
     pub fn promotion_info(&self) -> NodeInfo {
-        let lag_max = self.server.as_ref().map_or(Duration::from_secs(10), ServerHandle::replica_lag_time_max);
+        let lag_max = self
+            .server
+            .as_ref()
+            .map_or(Duration::from_secs(10), ServerHandle::replica_lag_time_max);
         node_info(&*self.inner, &self.inner.replicas, lag_max, &[])
     }
 
@@ -135,7 +148,8 @@ impl Slave {
     pub async fn check_promotion(&self, peers: &[UpstreamConfig]) -> Result<PromotionCheck> {
         let mut me = self.promotion_info();
         let mut check = PromotionCheck::default();
-        let (mut later, mut unverified_ahead, mut would_discard) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut later, mut unverified_ahead, mut would_discard) =
+            (Vec::new(), Vec::new(), Vec::new());
         for peer in peers {
             let probe = Some(me.last_seq).filter(|&s| s > 0);
             let info = match admin::status_classified(peer, &me.node_id, probe).await {
@@ -156,7 +170,9 @@ impl Slave {
             if info.role == Role::Master {
                 return Err(Error::MasterReachable { peer: info.node_id });
             }
-            let same_db = info.identity.is_some_and(|id| me.identity.is_some_and(|mine| mine.db_uuid == id.db_uuid));
+            let same_db = info
+                .identity
+                .is_some_and(|id| me.identity.is_some_and(|mine| mine.db_uuid == id.db_uuid));
             if same_db || info.identity.is_none() {
                 check.max_peer_epoch = check.max_peer_epoch.max(info.max_epoch_seen());
             }
@@ -166,23 +182,41 @@ impl Slave {
             }
             match compare(&me, &info) {
                 Comparison::Later(Side::B) => later.push((info.node_id, info.last_seq)),
-                Comparison::Unverifiable { later: Some(Side::B) | None } => unverified_ahead.push((info.node_id, info.last_seq)),
-                Comparison::Unverifiable { later: Some(Side::A) } => check.unverifiable.push((info.node_id, info.last_seq)),
+                Comparison::Unverifiable {
+                    later: Some(Side::B) | None,
+                } => unverified_ahead.push((info.node_id, info.last_seq)),
+                Comparison::Unverifiable {
+                    later: Some(Side::A),
+                } => check.unverifiable.push((info.node_id, info.last_seq)),
                 // The peer holds entries this slave would discard: refused by default.
-                Comparison::Diverged { fork } if info.last_seq >= fork => would_discard.push((info.node_id, fork, info.last_seq)),
+                Comparison::Diverged { fork } if info.last_seq >= fork => {
+                    would_discard.push((info.node_id, fork, info.last_seq))
+                }
                 Comparison::Diverged { fork } => check.diverged.push((info.node_id, fork)),
                 Comparison::DifferentDatabase => check.foreign.push(info.node_id),
                 Comparison::Later(Side::A) | Comparison::Equal => {}
             }
         }
         if let Some((leader, seq)) = later.into_iter().next() {
-            return Err(Error::NotMostAdvanced { leader, seq, diverged: check.diverged });
+            return Err(Error::NotMostAdvanced {
+                leader,
+                seq,
+                diverged: check.diverged,
+            });
         }
         if let Some((peer, seq)) = unverified_ahead.into_iter().next() {
-            return Err(Error::PromotionUnverifiable { peer, seq, diverged: check.diverged });
+            return Err(Error::PromotionUnverifiable {
+                peer,
+                seq,
+                diverged: check.diverged,
+            });
         }
         if let Some((peer, fork, peer_last_seq)) = would_discard.into_iter().next() {
-            return Err(Error::PromotionWouldDiscard { peer, fork, peer_last_seq });
+            return Err(Error::PromotionWouldDiscard {
+                peer,
+                fork,
+                peer_last_seq,
+            });
         }
         Ok(check)
     }
@@ -202,18 +236,37 @@ impl Slave {
     /// handle (`PromoteRefused::slave` is `None`): an I/O error during shutdown, a
     /// `ReadSnapshot` that still holds the database (`Error::Config`; drop it and reopen the
     /// directory as a slave, which is unchanged), or a failure while rewriting it.
-    pub async fn promote_checked(self, cfg: MasterConfig, peers: &[UpstreamConfig]) -> Result<Master, PromoteRefused> {
+    pub async fn promote_checked(
+        self,
+        cfg: MasterConfig,
+        peers: &[UpstreamConfig],
+    ) -> Result<Master, PromoteRefused> {
         if let Some(msg) = self.promote_refusal(&cfg) {
-            return Err(PromoteRefused { error: Error::Config(msg), slave: Some(Box::new(self)) });
+            return Err(PromoteRefused {
+                error: Error::Config(msg),
+                slave: Some(Box::new(self)),
+            });
         }
         match self.check_promotion(peers).await {
             Ok(check) => {
-                if !check.unreachable.is_empty() || !check.diverged.is_empty() || !check.foreign.is_empty() || !check.unverifiable.is_empty() {
-                    tracing::warn!(?check, "promoting despite unreachable, diverged or foreign peers");
+                if !check.unreachable.is_empty()
+                    || !check.diverged.is_empty()
+                    || !check.foreign.is_empty()
+                    || !check.unverifiable.is_empty()
+                {
+                    tracing::warn!(
+                        ?check,
+                        "promoting despite unreachable, diverged or foreign peers"
+                    );
                 }
-                self.promote_now(cfg, check.max_peer_epoch).await.map_err(|error| PromoteRefused { error, slave: None })
+                self.promote_now(cfg, check.max_peer_epoch)
+                    .await
+                    .map_err(|error| PromoteRefused { error, slave: None })
             }
-            Err(error) => Err(PromoteRefused { error, slave: Some(Box::new(self)) }),
+            Err(error) => Err(PromoteRefused {
+                error,
+                slave: Some(Box::new(self)),
+            }),
         }
     }
 }
@@ -236,7 +289,10 @@ impl PromoteRefused {
 
 impl std::fmt::Debug for PromoteRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PromoteRefused").field("error", &self.error).field("slave_returned", &self.slave.is_some()).finish()
+        f.debug_struct("PromoteRefused")
+            .field("error", &self.error)
+            .field("slave_returned", &self.slave.is_some())
+            .finish()
     }
 }
 

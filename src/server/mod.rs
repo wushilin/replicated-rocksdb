@@ -21,15 +21,15 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-use crate::auth::{subject_common_name, AuthError, FailureLimiter, Method, PeerInfo};
+use crate::auth::{AuthError, FailureLimiter, Method, PeerInfo, subject_common_name};
 use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
-use crate::config::{validate_identifier, ServeConfig};
+use crate::config::{ServeConfig, validate_identifier};
 use crate::error::{Error, Result};
 use crate::net::convert::{cf_to_pb, epochs_to_pb, identity_to_pb};
 use crate::net::{self, reason_status};
@@ -37,8 +37,8 @@ use crate::pb;
 use crate::pb::replication_server::{Replication, ReplicationServer};
 use crate::source::LogSource;
 use crate::store::retention::RetentionGuard;
-use replicas::ReplicaRegistry;
 use crate::types::{Role, Seq};
+use replicas::ReplicaRegistry;
 
 /// A bootstrap's retention guard, kept after the footer until the client's Tail presents
 /// the lease or the lease expires (PROTOCOL.md §8.4).
@@ -62,7 +62,9 @@ pub(crate) struct ServerState {
 
 impl ServerState {
     fn source(&self) -> Result<Arc<dyn LogSource>, Status> {
-        self.source.upgrade().ok_or_else(|| reason_status(pb::Reason::ShuttingDown, "node is shutting down"))
+        self.source
+            .upgrade()
+            .ok_or_else(|| reason_status(pb::Reason::ShuttingDown, "node is shutting down"))
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
@@ -73,9 +75,23 @@ impl ServerState {
         self.leases.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn insert_lease(&self, id: [u8; 16], client_id: String, snapshot_seq: Seq, guard: RetentionGuard) {
+    pub(crate) fn insert_lease(
+        &self,
+        id: [u8; 16],
+        client_id: String,
+        snapshot_seq: Seq,
+        guard: RetentionGuard,
+    ) {
         let expires_at = Instant::now() + self.cfg.limits.bootstrap_lease_ttl;
-        self.leases().insert(id, Lease { client_id, snapshot_seq, expires_at, _guard: guard });
+        self.leases().insert(
+            id,
+            Lease {
+                client_id,
+                snapshot_seq,
+                expires_at,
+                _guard: guard,
+            },
+        );
     }
 
     pub(crate) fn remove_lease(&self, id: &[u8; 16]) {
@@ -85,10 +101,17 @@ impl ServerState {
     /// Takes the lease presented by `client_id`'s Tail from `from_seq` (PROTOCOL.md §7.2),
     /// if it matches. The Tail producer keeps it until it has read the entries after the
     /// snapshot, so aggressive retention cannot trim `S + 1` in between.
-    pub(crate) fn take_lease(&self, lease_id: &[u8], client_id: &str, from_seq: Seq) -> Option<Lease> {
+    pub(crate) fn take_lease(
+        &self,
+        lease_id: &[u8],
+        client_id: &str,
+        from_seq: Seq,
+    ) -> Option<Lease> {
         let id = <[u8; 16]>::try_from(lease_id).ok()?;
         let mut leases = self.leases();
-        let matches = leases.get(&id).is_some_and(|l| l.client_id == client_id && from_seq <= l.snapshot_seq + 1);
+        let matches = leases
+            .get(&id)
+            .is_some_and(|l| l.client_id == client_id && from_seq <= l.snapshot_seq + 1);
         if matches { leases.remove(&id) } else { None }
     }
 
@@ -97,21 +120,35 @@ impl ServerState {
     }
 
     /// Authenticates one call (PROTOCOL.md §3.3) and returns the node it may read.
-    async fn authorize(&self, call: &CallInfo, method: Method) -> Result<Arc<dyn LogSource>, Status> {
+    async fn authorize(
+        &self,
+        call: &CallInfo,
+        method: Method,
+    ) -> Result<Arc<dyn LogSource>, Status> {
         let ip = call.peer.remote_addr.ip();
         if self.auth_failures.is_blocked(ip, Instant::now()) {
             // Throttled, not rejected: the credentials were not even checked. A retryable
             // answer, so a good replica behind the same address backs off instead of halting
             // `AuthRejected` (which would let anyone with network access stop it).
-            return Err(reason_status(pb::Reason::Busy, "too many failed authentication attempts from this address; retry later"));
+            return Err(reason_status(
+                pb::Reason::Busy,
+                "too many failed authentication attempts from this address; retry later",
+            ));
         }
-        match self.cfg.authenticator.authenticate(&call.peer, method, call.token.as_deref()).await {
+        match self
+            .cfg
+            .authenticator
+            .authenticate(&call.peer, method, call.token.as_deref())
+            .await
+        {
             Ok(()) => self.source(),
             Err(AuthError::Unauthenticated) => {
                 self.auth_failures.record_failure(ip, Instant::now());
                 Err(Status::unauthenticated("authentication failed"))
             }
-            Err(AuthError::PermissionDenied) => Err(Status::permission_denied(format!("{method:?} is not allowed"))),
+            Err(AuthError::PermissionDenied) => Err(Status::permission_denied(format!(
+                "{method:?} is not allowed"
+            ))),
         }
     }
 }
@@ -127,9 +164,12 @@ pub(crate) struct CallInfo {
 impl CallInfo {
     /// The request's `client_id` must be a valid id and equal the `x-rrdb-node-id` metadata.
     pub(crate) fn check_client_id(&self, client_id: &str) -> Result<(), Status> {
-        validate_identifier(client_id).map_err(|e| net::invalid_argument(format!("client_id: {e}")))?;
+        validate_identifier(client_id)
+            .map_err(|e| net::invalid_argument(format!("client_id: {e}")))?;
         if client_id != self.node_id {
-            return Err(net::invalid_argument("client_id must equal the x-rrdb-node-id metadata"));
+            return Err(net::invalid_argument(
+                "client_id must equal the x-rrdb-node-id metadata",
+            ));
         }
         Ok(())
     }
@@ -141,15 +181,35 @@ pub(crate) fn call_info<T>(req: &Request<T>, method: Method) -> Result<CallInfo,
     if method != Method::Handshake {
         net::check_protocol_version(req.metadata())?;
     }
-    let node_id = net::node_id(req.metadata()).ok_or_else(|| net::invalid_argument("x-rrdb-node-id is required"))?;
-    validate_identifier(&node_id).map_err(|e| net::invalid_argument(format!("x-rrdb-node-id: {e}")))?;
-    let remote_addr = req.remote_addr().unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-    let client_cert = req.peer_certs().and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()));
+    let node_id = net::node_id(req.metadata())
+        .ok_or_else(|| net::invalid_argument("x-rrdb-node-id is required"))?;
+    validate_identifier(&node_id)
+        .map_err(|e| net::invalid_argument(format!("x-rrdb-node-id: {e}")))?;
+    let remote_addr = req
+        .remote_addr()
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+    let client_cert = req
+        .peer_certs()
+        .and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()));
     let peer = match client_cert.as_deref().and_then(subject_common_name) {
-        Some(cn) => PeerInfo { peer_id: cn, peer_id_verified: true, remote_addr, client_cert },
-        None => PeerInfo { peer_id: node_id.clone(), peer_id_verified: false, remote_addr, client_cert },
+        Some(cn) => PeerInfo {
+            peer_id: cn,
+            peer_id_verified: true,
+            remote_addr,
+            client_cert,
+        },
+        None => PeerInfo {
+            peer_id: node_id.clone(),
+            peer_id_verified: false,
+            remote_addr,
+            client_cert,
+        },
     };
-    Ok(CallInfo { peer, token: net::bearer_token(req.metadata()), node_id })
+    Ok(CallInfo {
+        peer,
+        token: net::bearer_token(req.metadata()),
+        node_id,
+    })
 }
 
 /// Maps a store error to a status. Corruption and gaps keep their protocol reasons.
@@ -169,7 +229,10 @@ pub(crate) type VerifyRangeStream = ReceiverStream<Result<pb::VerifyRangeRespons
 
 #[tonic::async_trait]
 impl Replication for Svc {
-    async fn handshake(&self, req: Request<pb::HandshakeRequest>) -> Result<Response<pb::HandshakeResponse>, Status> {
+    async fn handshake(
+        &self,
+        req: Request<pb::HandshakeRequest>,
+    ) -> Result<Response<pb::HandshakeResponse>, Status> {
         let call = call_info(&req, Method::Handshake)?;
         let src = self.0.authorize(&call, Method::Handshake).await?;
         let r = req.into_inner();
@@ -195,7 +258,13 @@ impl Replication for Svc {
             detail: v.detail,
             upstream_chain: view.upstream_chain,
             identity: identity.as_ref().map(identity_to_pb),
-            cf_specs: src.store().cfs.live_entries().iter().map(cf_to_pb).collect(),
+            cf_specs: src
+                .store()
+                .cfs
+                .live_entries()
+                .iter()
+                .map(cf_to_pb)
+                .collect(),
             first_retained_seq: view.first_retained_seq,
             last_seq: view.last_seq,
             origin_last_seq: src.origin_last_seq(),
@@ -207,18 +276,29 @@ impl Replication for Svc {
 
     type TailStream = TailStream;
 
-    async fn tail(&self, req: Request<tonic::Streaming<pb::TailClientMessage>>) -> Result<Response<TailStream>, Status> {
+    async fn tail(
+        &self,
+        req: Request<tonic::Streaming<pb::TailClientMessage>>,
+    ) -> Result<Response<TailStream>, Status> {
         tail::tail(&self.0, req).await
     }
 
     type BootstrapStream = BootstrapStream;
 
-    async fn bootstrap(&self, req: Request<pb::BootstrapRequest>) -> Result<Response<BootstrapStream>, Status> {
+    async fn bootstrap(
+        &self,
+        req: Request<pb::BootstrapRequest>,
+    ) -> Result<Response<BootstrapStream>, Status> {
         bootstrap::bootstrap(&self.0, req).await
     }
 
-    async fn verify_begin(&self, _: Request<pb::VerifyBeginRequest>) -> Result<Response<pb::VerifyBeginResponse>, Status> {
-        Err(net::unimplemented("Verify is not implemented by this version"))
+    async fn verify_begin(
+        &self,
+        _: Request<pb::VerifyBeginRequest>,
+    ) -> Result<Response<pb::VerifyBeginResponse>, Status> {
+        Err(net::unimplemented(
+            "Verify is not implemented by this version",
+        ))
     }
 
     type VerifyRangeStream = VerifyRangeStream;
@@ -227,21 +307,36 @@ impl Replication for Svc {
         &self,
         _: Request<tonic::Streaming<pb::VerifyRangeRequest>>,
     ) -> Result<Response<VerifyRangeStream>, Status> {
-        Err(net::unimplemented("Verify is not implemented by this version"))
+        Err(net::unimplemented(
+            "Verify is not implemented by this version",
+        ))
     }
 
-    async fn status(&self, req: Request<pb::StatusRequest>) -> Result<Response<pb::StatusResponse>, Status> {
+    async fn status(
+        &self,
+        req: Request<pb::StatusRequest>,
+    ) -> Result<Response<pb::StatusResponse>, Status> {
         let call = call_info(&req, Method::Status)?;
         let src = self.0.authorize(&call, Method::Status).await?;
         let r = req.into_inner();
         call.check_client_id(&r.client_id)?;
         let probes: Vec<Seq> = r.probe_seq.into_iter().collect();
-        let info = status::node_info(&*src, &self.0.replicas, self.0.cfg.limits.replica_lag_time_max, &probes);
+        let info = status::node_info(
+            &*src,
+            &self.0.replicas,
+            self.0.cfg.limits.replica_lag_time_max,
+            &probes,
+        );
         Ok(Response::new(status::to_pb(&info, r.probe_seq)))
     }
 
-    async fn verify_end(&self, _: Request<pb::VerifyEndRequest>) -> Result<Response<pb::VerifyEndResponse>, Status> {
-        Err(net::unimplemented("Verify is not implemented by this version"))
+    async fn verify_end(
+        &self,
+        _: Request<pb::VerifyEndRequest>,
+    ) -> Result<Response<pb::VerifyEndResponse>, Status> {
+        Err(net::unimplemented(
+            "Verify is not implemented by this version",
+        ))
     }
 }
 
@@ -285,8 +380,15 @@ impl ServerHandle {
     /// and the server task has finished.
     pub(crate) async fn shutdown(mut self) {
         self.shutdown_tx.send_replace(true);
-        let all = u32::try_from(self.state.cfg.limits.max_concurrent_bootstraps).unwrap_or(u32::MAX);
-        if tokio::time::timeout(Duration::from_secs(5), self.state.bootstraps.acquire_many(all)).await.is_err() {
+        let all =
+            u32::try_from(self.state.cfg.limits.max_concurrent_bootstraps).unwrap_or(u32::MAX);
+        if tokio::time::timeout(
+            Duration::from_secs(5),
+            self.state.bootstraps.acquire_many(all),
+        )
+        .await
+        .is_err()
+        {
             tracing::warn!(addr = %self.addr, "bootstrap jobs did not stop in 5 s");
         }
         // A Bootstrap that arrives later on an existing connection is refused.
@@ -296,7 +398,10 @@ impl ServerHandle {
             let _ = sweep.await;
         }
         if let Some(mut task) = self.task.take() {
-            if tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_err() {
+            if tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .is_err()
+            {
                 tracing::warn!(addr = %self.addr, "replication server did not stop in 5 s; aborting it");
                 task.abort();
             }
@@ -325,7 +430,11 @@ impl Drop for ServerHandle {
 
 /// Binds `cfg.bind:cfg.port` (0 picks a free port) and serves `source`. Its Tail streams
 /// register in `replicas`.
-pub(crate) async fn start(source: Weak<dyn LogSource>, cfg: ServeConfig, replicas: Arc<ReplicaRegistry>) -> Result<ServerHandle> {
+pub(crate) async fn start(
+    source: Weak<dyn LogSource>,
+    cfg: ServeConfig,
+    replicas: Arc<ReplicaRegistry>,
+) -> Result<ServerHandle> {
     cfg.validate()?;
     let listener = TcpListener::bind((cfg.bind, cfg.port)).await?;
     let addr = listener.local_addr()?;
@@ -333,7 +442,10 @@ pub(crate) async fn start(source: Weak<dyn LogSource>, cfg: ServeConfig, replica
     let state = Arc::new(ServerState {
         source,
         bootstraps: Arc::new(Semaphore::new(cfg.limits.max_concurrent_bootstraps)),
-        auth_failures: FailureLimiter::new(cfg.limits.max_auth_failures_per_minute, cfg.limits.auth_failure_window),
+        auth_failures: FailureLimiter::new(
+            cfg.limits.max_auth_failures_per_minute,
+            cfg.limits.auth_failure_window,
+        ),
         leases: Mutex::new(HashMap::new()),
         shutdown: shutdown_rx.clone(),
         cfg,
@@ -343,17 +455,29 @@ pub(crate) async fn start(source: Weak<dyn LogSource>, cfg: ServeConfig, replica
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)));
     if let Some(tls) = &state.cfg.tls {
-        builder = builder.tls_config(tls.to_tonic()).map_err(|e| Error::Config(format!("server TLS: {e}")))?;
+        builder = builder
+            .tls_config(tls.to_tonic())
+            .map_err(|e| Error::Config(format!("server TLS: {e}")))?;
     }
-    let service = ReplicationServer::new(Svc(state.clone())).max_decoding_message_size(net::MAX_REQUEST_BYTES);
+    let service = ReplicationServer::new(Svc(state.clone()))
+        .max_decoding_message_size(net::MAX_REQUEST_BYTES);
     let mut signal = shutdown_rx.clone();
-    let task = tokio::spawn(builder.add_service(service).serve_with_incoming_shutdown(
-        TcpListenerStream::new(listener),
-        async move { stopped(&mut signal).await },
-    ));
+    let task = tokio::spawn(
+        builder
+            .add_service(service)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                stopped(&mut signal).await
+            }),
+    );
     let sweep = tokio::spawn(sweep_leases(state.clone(), shutdown_rx));
     tracing::info!(%addr, "replication server listening");
-    Ok(ServerHandle { addr, state, shutdown_tx, task: Some(task), sweep: Some(sweep) })
+    Ok(ServerHandle {
+        addr,
+        state,
+        shutdown_tx,
+        task: Some(task),
+        sweep: Some(sweep),
+    })
 }
 
 async fn sweep_leases(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>) {

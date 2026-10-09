@@ -37,7 +37,12 @@ impl ManualClock {
         let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
         let mut cur = self.0.load(Ordering::SeqCst);
         loop {
-            match self.0.compare_exchange_weak(cur, cur.saturating_add(by), Ordering::SeqCst, Ordering::SeqCst) {
+            match self.0.compare_exchange_weak(
+                cur,
+                cur.saturating_add(by),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
                 Ok(_) => break,
                 Err(actual) => cur = actual,
             }

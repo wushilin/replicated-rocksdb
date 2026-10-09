@@ -27,55 +27,58 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub(crate) mod net;
 #[allow(dead_code)] // generated types are unused until later tasks
 pub(crate) mod proto;
-pub(crate) mod net;
 
 pub(crate) use proto::replication::v1 as pb;
 
-pub(crate) mod background;
 pub mod admin;
 pub mod auth;
+pub(crate) mod background;
 pub mod clock;
 pub mod config;
+pub mod error;
 pub mod log;
 mod master;
-pub mod error;
-pub mod tuning;
 pub mod read;
+pub mod tuning;
 pub mod types;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{Error, Result};
-pub use types::{Batch, CfSpec, DbIdentity, Direction, EpochStart, IterMode, LogEntry, Op, Role, Seq, ValueMeta};
+pub use types::{
+    Batch, CfSpec, DbIdentity, Direction, EpochStart, IterMode, LogEntry, Op, Role, Seq, ValueMeta,
+};
 
 #[doc(hidden)]
 pub mod codec;
-pub(crate) mod store;
 pub(crate) mod source;
+pub(crate) mod store;
 pub use codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
-pub use tuning::{CfKind, ComparatorRegistry, Compression, RocksTuning, Tunable};
 pub use read::{ReadApi, ReadSnapshot};
 pub use store::read::DbIter;
+pub use tuning::{CfKind, ComparatorRegistry, Compression, RocksTuning, Tunable};
 
 pub use auth::{
-    AllowAll, AllowMethods, AuthError, Authenticator, CredentialsProvider, Method, MtlsSubjectAllowList, NoCredentials,
-    PeerInfo, TokenAuthenticator, TokenCredentials,
+    AllowAll, AllowMethods, AuthError, Authenticator, CredentialsProvider, Method,
+    MtlsSubjectAllowList, NoCredentials, PeerInfo, TokenAuthenticator, TokenCredentials,
 };
 pub use config::{
-    MasterConfig, ReaperConfig, Retention, ServeConfig, ServeLimits, TlsClientConfig, TlsIdentity, TlsServerConfig,
-    WriteConcern, MAX_BOOTSTRAP_CHUNK_BYTES,
+    MAX_BOOTSTRAP_CHUNK_BYTES, MasterConfig, ReaperConfig, Retention, ServeConfig, ServeLimits,
+    TlsClientConfig, TlsIdentity, TlsServerConfig, WriteConcern,
 };
 pub use log::{EntryIter, LogApi};
-pub use server::replicas::{FetchSettings, ReplicaStatus};
 pub use master::{DemoteRefused, Master, ReapStats};
+pub use server::replicas::{FetchSettings, ReplicaStatus};
 pub mod listener;
 mod slave;
 
 pub use listener::ReplicationListener;
 pub use slave::{
-    AcceptDataLoss, Backoff, DivergencePolicy, FetchConfig, GapPolicy, HaltAction, HaltReason, IdentityPolicy, PromoteRefused, PromotionCheck,
-    RepointDivergence, RepointOptions, RepointOutcome, Slave, SlaveConfig, SlaveState, SlaveStatus, UpstreamConfig,
+    AcceptDataLoss, Backoff, DivergencePolicy, FetchConfig, GapPolicy, HaltAction, HaltReason,
+    IdentityPolicy, PromoteRefused, PromotionCheck, RepointDivergence, RepointOptions,
+    RepointOutcome, Slave, SlaveConfig, SlaveState, SlaveStatus, UpstreamConfig,
 };
-pub(crate) mod server;
 pub(crate) mod failpoint;
+pub(crate) mod server;

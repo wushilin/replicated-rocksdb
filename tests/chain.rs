@@ -4,8 +4,12 @@ mod support;
 
 use std::time::Duration;
 
-use replicated_rocksdb::{CfSpec, HaltReason, IdentityPolicy, LogApi, Master, ReadApi, Slave, SlaveState};
-use support::{assert_converged, check_edge_cases, wait_state, wait_until, write_edge_cases, Cluster};
+use replicated_rocksdb::{
+    CfSpec, HaltReason, IdentityPolicy, LogApi, Master, ReadApi, Slave, SlaveState,
+};
+use support::{
+    Cluster, assert_converged, check_edge_cases, wait_state, wait_until, write_edge_cases,
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_chain_replicates_everything_and_bootstraps_from_the_middle() {
@@ -33,7 +37,8 @@ async fn a_chain_replicates_everything_and_bootstraps_from_the_middle() {
     assert_eq!(lc.bootstraps(), 1);
 
     a.create_cf(CfSpec::new("tmp")).unwrap();
-    a.put_with_ttl("tmp", b"t", b"v", Duration::from_secs(5)).unwrap();
+    a.put_with_ttl("tmp", b"t", b"v", Duration::from_secs(5))
+        .unwrap();
     a.drop_cf("c").unwrap();
     write_edge_cases(&a, "edge");
     assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
@@ -43,15 +48,33 @@ async fn a_chain_replicates_everything_and_bootstraps_from_the_middle() {
     let s = cn.status();
     assert_eq!(s.upstream_chain, vec!["b".to_string(), "a".to_string()]);
     assert_eq!(s.origin_identity, Some(a.identity()));
-    wait_until("origin position reaches the leaf", || cn.status().origin_last_seq == a.last_seq()).await;
+    wait_until("origin position reaches the leaf", || {
+        cn.status().origin_last_seq == a.last_seq()
+    })
+    .await;
     // C's log is A's log, byte for byte.
     let from = cn.first_retained_seq() - 1;
-    let ours: Vec<_> = cn.entries_since(from).unwrap().map(Result::unwrap).collect();
+    let ours: Vec<_> = cn
+        .entries_since(from)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
     let origin: Vec<_> = a.entries_since(from).unwrap().map(Result::unwrap).collect();
     assert_eq!(ours, origin);
     // Each node reports only its direct replicas.
-    wait_until("c acknowledged on b", || b.replicas().iter().any(|r| r.node_id == "c" && r.applied_seq == a.last_seq())).await;
-    assert_eq!(a.replicas().iter().map(|r| r.node_id.clone()).collect::<Vec<_>>(), vec!["b".to_string()]);
+    wait_until("c acknowledged on b", || {
+        b.replicas()
+            .iter()
+            .any(|r| r.node_id == "c" && r.applied_seq == a.last_seq())
+    })
+    .await;
+    assert_eq!(
+        a.replicas()
+            .iter()
+            .map(|r| r.node_id.clone())
+            .collect::<Vec<_>>(),
+        vec!["b".to_string()]
+    );
     assert_eq!(b.replicas().len(), 1);
     assert!(cn.replicas().is_empty());
 }
@@ -70,7 +93,10 @@ async fn a_loop_is_detected_and_the_halt_is_not_persisted() {
     let mut looped = b_cfg.clone();
     looped.upstream = replicated_rocksdb::UpstreamConfig::from_addr(cn.serve_addr().unwrap());
     let b = c.restart_slave(b, looped).await;
-    wait_state(&b, "LoopDetected halt", |s| *s == SlaveState::Halted(HaltReason::LoopDetected)).await;
+    wait_state(&b, "LoopDetected halt", |s| {
+        *s == SlaveState::Halted(HaltReason::LoopDetected)
+    })
+    .await;
 
     // Configuration halts are re-evaluated on restart: pointed back at A, B resumes.
     let b = c.restart_slave(b, b_cfg).await;
@@ -90,8 +116,15 @@ async fn a_slave_pointed_at_itself_halts_loop_detected() {
     let mut own = b_cfg;
     own.upstream = replicated_rocksdb::UpstreamConfig::from_addr(b.serve_addr().unwrap());
     let b = c.restart_slave(b, own).await;
-    wait_state(&b, "LoopDetected halt", |s| *s == SlaveState::Halted(HaltReason::LoopDetected)).await;
-    assert_eq!(b.get("c", b"k").unwrap(), None, "still readable while halted");
+    wait_state(&b, "LoopDetected halt", |s| {
+        *s == SlaveState::Halted(HaltReason::LoopDetected)
+    })
+    .await;
+    assert_eq!(
+        b.get("c", b"k").unwrap(),
+        None,
+        "still readable while halted"
+    );
 }
 
 /// When B re-bootstraps, it ends C's streams with UPSTREAM_RESET; C reconnects and follows.
@@ -109,7 +142,12 @@ async fn an_upstream_rebootstrap_resets_downstream_streams() {
     let cn = Slave::open(c_cfg).await.unwrap();
     assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
     wait_state(&cn, "C streaming", |s| *s == SlaveState::Streaming).await;
-    let streaming = || lc.states().iter().filter(|s| **s == SlaveState::Streaming).count();
+    let streaming = || {
+        lc.states()
+            .iter()
+            .filter(|s| **s == SlaveState::Streaming)
+            .count()
+    };
     let streams_before = streaming();
 
     // B's upstream is replaced by a different database: B re-bootstraps while serving C.
@@ -123,5 +161,8 @@ async fn an_upstream_rebootstrap_resets_downstream_streams() {
     assert_converged(&a2, &[("b", &b), ("c", &cn)]).await;
     assert_eq!(lb.bootstraps(), 2);
     assert_eq!(lc.bootstraps(), 2, "C followed B's new identity");
-    wait_until("C's stream reset and re-established", || streaming() > streams_before).await;
+    wait_until("C's stream reset and re-established", || {
+        streaming() > streams_before
+    })
+    .await;
 }

@@ -3,7 +3,7 @@
 
 use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 use crate::pb;
-use crate::types::{fork_after, DbIdentity, EpochStart, Seq};
+use crate::types::{DbIdentity, EpochStart, Seq, fork_after};
 
 /// What the server knows about itself when answering one handshake.
 #[derive(Clone, Debug)]
@@ -31,7 +31,11 @@ pub(crate) struct Verdict {
 }
 
 fn verdict(decision: pb::Decision, reason: pb::Reason, detail: impl Into<String>) -> Verdict {
-    Verdict { decision, reason, detail: detail.into() }
+    Verdict {
+        decision,
+        reason,
+        detail: detail.into(),
+    }
 }
 
 /// Evaluates PROTOCOL.md §6.3 rules 1–14 (with 10a/10b) in order; the first match wins.
@@ -41,21 +45,34 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
 
     // 1, 2: exact version match.
     if r.protocol_version != PROTOCOL_VERSION {
-        let d = format!("client protocol {} != server protocol {PROTOCOL_VERSION}", r.protocol_version);
+        let d = format!(
+            "client protocol {} != server protocol {PROTOCOL_VERSION}",
+            r.protocol_version
+        );
         return verdict(Reject, R::ProtocolMismatch, d);
     }
     if r.envelope_version != u32::from(ENVELOPE_VERSION) {
-        let d = format!("client envelope {} != server envelope {ENVELOPE_VERSION}", r.envelope_version);
+        let d = format!(
+            "client envelope {} != server envelope {ENVELOPE_VERSION}",
+            r.envelope_version
+        );
         return verdict(Reject, R::EnvelopeMismatch, d);
     }
     // 3: the client is this server or one of its upstreams.
     if r.client_id == v.server_id || v.upstream_chain.contains(&r.client_id) {
-        let d = format!("{} is upstream of {} (chain {:?})", r.client_id, v.server_id, v.upstream_chain);
+        let d = format!(
+            "{} is upstream of {} (chain {:?})",
+            r.client_id, v.server_id, v.upstream_chain
+        );
         return verdict(Reject, R::LoopDetected, d);
     }
     // 4: no consistent state to serve.
     let Some(ident) = v.identity.filter(|_| v.ready) else {
-        return verdict(Reject, R::NotReady, format!("{} is bootstrapping", v.server_id));
+        return verdict(
+            Reject,
+            R::NotReady,
+            format!("{} is bootstrapping", v.server_id),
+        );
     };
     // 5
     let Some(known) = &r.known_identity else {
@@ -68,36 +85,56 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
     let client_crc_matches = r.last_crc32c.is_some() && r.last_crc32c == v.crc_at_client_last;
     // 7
     if known.epoch > ident.epoch {
-        let d = format!("client epoch {} is newer than server epoch {}", known.epoch, ident.epoch);
+        let d = format!(
+            "client epoch {} is newer than server epoch {}",
+            known.epoch, ident.epoch
+        );
         return verdict(Reject, R::StaleEpoch, d);
     }
     if let Some(cfork) = changed_epoch_fork(v, known.epoch, ident.epoch, r.known_epoch_start) {
         // 8: the client holds entries at or past the point where its history leaves the server's.
         match cfork {
             Some(fork) if r.last_seq >= fork => {
-                let d = format!("client last_seq {} is at or past fork point {fork} of epoch {}", r.last_seq, known.epoch);
+                let d = format!(
+                    "client last_seq {} is at or past fork point {fork} of epoch {}",
+                    r.last_seq, known.epoch
+                );
                 return verdict(Reject, R::Diverged, d);
             }
             Some(_) => {}
             None => {
-                let d = format!("epoch history is inconsistent: no epoch after {} although server is at {}", known.epoch, ident.epoch);
+                let d = format!(
+                    "epoch history is inconsistent: no epoch after {} although server is at {}",
+                    known.epoch, ident.epoch
+                );
                 return verdict(Reject, R::Diverged, d);
             }
         }
         // 9: continuity proven by the CRC of the client's last entry.
         if client_crc_matches {
-            return verdict(Resume, R::EpochAdvanced, format!("epoch {} -> {}", known.epoch, ident.epoch));
+            return verdict(
+                Resume,
+                R::EpochAdvanced,
+                format!("epoch {} -> {}", known.epoch, ident.epoch),
+            );
         }
         // 10a: a proven mismatch below the fork.
         if r.last_crc32c.is_some() && v.crc_at_client_last.is_some() {
             return verdict(Reject, R::Diverged, format!("entry {} differs", r.last_seq));
         }
         // 10b
-        return verdict(Bootstrap, R::IdentityChanged, "continuity across the epoch change cannot be proven");
+        return verdict(
+            Bootstrap,
+            R::IdentityChanged,
+            "continuity across the epoch change cannot be proven",
+        );
     }
     // 11: nobody can be ahead of the fsyncing master.
     if v.is_master && r.last_seq > v.last_seq {
-        let d = format!("client last_seq {} is ahead of master last_seq {}", r.last_seq, v.last_seq);
+        let d = format!(
+            "client last_seq {} is ahead of master last_seq {}",
+            r.last_seq, v.last_seq
+        );
         return verdict(Reject, R::Diverged, d);
     }
     // 12
@@ -106,7 +143,11 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
     }
     // 13
     if r.last_seq.saturating_add(1) < v.first_retained_seq {
-        let d = format!("client needs {} but first retained is {}", r.last_seq + 1, v.first_retained_seq);
+        let d = format!(
+            "client needs {} but first retained is {}",
+            r.last_seq + 1,
+            v.first_retained_seq
+        );
         return verdict(Bootstrap, R::LogGap, d);
     }
     // 14
@@ -117,11 +158,22 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
 /// or the same number with another start seq (`known_epoch_start`) than the server's record of
 /// it. `cfork` is where the client's history leaves the server's (`None`: inconsistent).
 /// `None` when the client follows the server's epoch.
-fn changed_epoch_fork(v: &ServerView, known_epoch: u64, server_epoch: u64, known_start: Option<Seq>) -> Option<Option<Seq>> {
-    let server_start = v.epoch_history.iter().find(|e| e.epoch == known_epoch).map(|e| e.start_seq);
+fn changed_epoch_fork(
+    v: &ServerView,
+    known_epoch: u64,
+    server_epoch: u64,
+    known_start: Option<Seq>,
+) -> Option<Option<Seq>> {
+    let server_start = v
+        .epoch_history
+        .iter()
+        .find(|e| e.epoch == known_epoch)
+        .map(|e| e.start_seq);
     // The client's epoch began at another seq than the server's epoch of the same number (or
     // the server never had that epoch): the histories differ from the lower start on.
-    let start_fork = known_start.filter(|&k| server_start != Some(k)).map(|k| server_start.map_or(k, |s| s.min(k)));
+    let start_fork = known_start
+        .filter(|&k| server_start != Some(k))
+        .map(|k| server_start.map_or(k, |s| s.min(k)));
     if known_epoch == server_epoch && start_fork.is_none() {
         return None;
     }
@@ -148,8 +200,20 @@ mod tests {
             server_id: "a".into(),
             is_master: true,
             ready: true,
-            identity: Some(DbIdentity { db_uuid: uuid(), epoch: 2 }),
-            epoch_history: vec![EpochStart { epoch: 1, start_seq: 1 }, EpochStart { epoch: 2, start_seq: 101 }],
+            identity: Some(DbIdentity {
+                db_uuid: uuid(),
+                epoch: 2,
+            }),
+            epoch_history: vec![
+                EpochStart {
+                    epoch: 1,
+                    start_seq: 1,
+                },
+                EpochStart {
+                    epoch: 2,
+                    start_seq: 101,
+                },
+            ],
             upstream_chain: vec![],
             last_seq: 200,
             first_retained_seq: 50,
@@ -158,7 +222,12 @@ mod tests {
     }
 
     fn replica() -> ServerView {
-        ServerView { server_id: "b".into(), is_master: false, upstream_chain: vec!["a".into()], ..master() }
+        ServerView {
+            server_id: "b".into(),
+            is_master: false,
+            upstream_chain: vec!["a".into()],
+            ..master()
+        }
     }
 
     /// A client of epoch 2 at seq 150 whose last entry matches.
@@ -167,7 +236,10 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             envelope_version: u32::from(ENVELOPE_VERSION),
             client_id: "c".into(),
-            known_identity: Some(pb::Identity { db_uuid: uuid().as_bytes().to_vec(), epoch: 2 }),
+            known_identity: Some(pb::Identity {
+                db_uuid: uuid().as_bytes().to_vec(),
+                epoch: 2,
+            }),
             last_seq: 150,
             last_crc32c: Some(0xAAAA),
             known_epoch_start: Some(101),
@@ -185,7 +257,12 @@ mod tests {
 
     fn check(v: &ServerView, r: &pb::HandshakeRequest, decision: pb::Decision, reason: pb::Reason) {
         let got = decide(v, r);
-        assert_eq!((got.decision, got.reason), (decision, reason), "detail: {}", got.detail);
+        assert_eq!(
+            (got.decision, got.reason),
+            (decision, reason),
+            "detail: {}",
+            got.detail
+        );
     }
 
     #[test]
@@ -239,7 +316,10 @@ mod tests {
     #[test]
     fn rule_06_identity_changed_uuid() {
         let mut r = req();
-        r.known_identity = Some(pb::Identity { db_uuid: uuid::Uuid::from_u128(9).as_bytes().to_vec(), epoch: 5 });
+        r.known_identity = Some(pb::Identity {
+            db_uuid: uuid::Uuid::from_u128(9).as_bytes().to_vec(),
+            epoch: 5,
+        });
         check(&master(), &r, Bootstrap, R::IdentityChanged);
     }
 
@@ -294,7 +374,10 @@ mod tests {
     #[test]
     fn rule_08_inconsistent_history_fails_closed() {
         let mut v = master();
-        v.epoch_history = vec![EpochStart { epoch: 1, start_seq: 1 }];
+        v.epoch_history = vec![EpochStart {
+            epoch: 1,
+            start_seq: 1,
+        }];
         let r = epoch_1(100);
         check(&v, &r, Reject, R::Diverged);
     }
@@ -337,8 +420,20 @@ mod tests {
     #[test]
     fn an_epoch_the_server_never_had_forks_at_the_clients_start() {
         let mut v = master();
-        v.identity = Some(DbIdentity { db_uuid: uuid(), epoch: 3 });
-        v.epoch_history = vec![EpochStart { epoch: 1, start_seq: 1 }, EpochStart { epoch: 3, start_seq: 101 }];
+        v.identity = Some(DbIdentity {
+            db_uuid: uuid(),
+            epoch: 3,
+        });
+        v.epoch_history = vec![
+            EpochStart {
+                epoch: 1,
+                start_seq: 1,
+            },
+            EpochStart {
+                epoch: 3,
+                start_seq: 101,
+            },
+        ];
         let mut r = req(); // epoch 2 from 81
         r.known_epoch_start = Some(81);
         r.last_seq = 90;

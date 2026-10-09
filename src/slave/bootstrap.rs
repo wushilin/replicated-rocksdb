@@ -1,29 +1,32 @@
 //! Installing a bootstrap from the upstream (PROTOCOL.md §8.3, DESIGN.md §10).
 
 use std::cmp::Ordering as KeyOrdering;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tonic::Streaming;
 
 use super::client::Client;
-use super::driver::{status_end, unless_repointed, SessionEnd};
+use super::driver::{SessionEnd, status_end, unless_repointed};
 use super::inner::Inner;
 use super::state::{HaltReason, SlaveState};
 use crate::codec::digest::Digest;
-use crate::codec::{envelope, validate_cf_name, ENVELOPE_VERSION};
+use crate::codec::{ENVELOPE_VERSION, envelope, validate_cf_name};
 use crate::config::MAX_BOOTSTRAP_CHUNK_BYTES;
 use crate::error::{Error, Result};
 use crate::failpoint;
-use crate::net::convert::{cf_from_pb, checked_history, identity_from_pb};
 use crate::net::DECODE_SLACK;
+use crate::net::convert::{cf_from_pb, checked_history, identity_from_pb};
 use crate::pb;
 use crate::pb::bootstrap_chunk::Kind;
 use crate::store::bootstrap::BootstrapFinish;
 use crate::types::{CfEntry, DbIdentity, EpochStart, Seq};
 
 /// Runs `f` with the slave's state on a blocking thread.
-async fn blocking<T: Send + 'static>(inner: &Arc<Inner>, f: impl FnOnce(&Inner) -> Result<T> + Send + 'static) -> Result<T> {
+async fn blocking<T: Send + 'static>(
+    inner: &Arc<Inner>,
+    f: impl FnOnce(&Inner) -> Result<T> + Send + 'static,
+) -> Result<T> {
     let i = inner.clone();
     crate::background::blocking(move || f(&i)).await
 }
@@ -48,20 +51,29 @@ impl Plan {
     /// an inconsistent one (versions, CF list) is retried.
     fn from_header(h: pb::BootstrapHeader) -> std::result::Result<Plan, SessionEnd> {
         if h.envelope_version != u32::from(ENVELOPE_VERSION) {
-            return Err(retry(format!("bootstrap envelope version {} != {ENVELOPE_VERSION}", h.envelope_version)));
+            return Err(retry(format!(
+                "bootstrap envelope version {} != {ENVELOPE_VERSION}",
+                h.envelope_version
+            )));
         }
         let corrupt = |e: Error| {
             tracing::error!(error = %e, "invalid bootstrap header");
             SessionEnd::Halt(HaltReason::Corrupt)
         };
-        let identity = h.identity.as_ref().ok_or_else(|| Error::corrupt("bootstrap header without identity"));
+        let identity = h
+            .identity
+            .as_ref()
+            .ok_or_else(|| Error::corrupt("bootstrap header without identity"));
         let identity = identity.and_then(identity_from_pb).map_err(corrupt)?;
         let history = checked_history(&identity, &h.epoch_history).map_err(corrupt)?;
         let cfs: Vec<CfEntry> = h.cf_specs.iter().map(cf_from_pb).collect();
         for c in &cfs {
             validate_cf_name(&c.spec.name).map_err(|e| retry(e.to_string()))?;
         }
-        if !cfs.windows(2).all(|w| w[0].spec.name.as_bytes() < w[1].spec.name.as_bytes()) {
+        if !cfs
+            .windows(2)
+            .all(|w| w[0].spec.name.as_bytes() < w[1].spec.name.as_bytes())
+        {
             return Err(retry("bootstrap cf_specs are not sorted by name"));
         }
         Ok(Plan {
@@ -76,7 +88,11 @@ impl Plan {
     }
 }
 
-async fn next(inner: &Inner, generation: u64, s: &mut Streaming<pb::BootstrapChunk>) -> std::result::Result<Kind, SessionEnd> {
+async fn next(
+    inner: &Inner,
+    generation: u64,
+    s: &mut Streaming<pb::BootstrapChunk>,
+) -> std::result::Result<Kind, SessionEnd> {
     match unless_repointed(inner, generation, s.message()).await? {
         Ok(Some(chunk)) => chunk.kind.ok_or_else(|| retry("empty bootstrap chunk")),
         Ok(None) => Err(retry("bootstrap stream ended before the footer")),
@@ -97,7 +113,10 @@ pub(crate) async fn install(
     inner.set_ident(None);
     inner.reset_downstream();
     inner.seq_tx.send_replace(0);
-    inner.set_state(SlaveState::Bootstrapping { target_seq: 0, records: 0 });
+    inner.set_state(SlaveState::Bootstrapping {
+        target_seq: 0,
+        records: 0,
+    });
     blocking(inner, |i| i.store.reset_for_bootstrap())
         .await
         .map_err(|e| retry(format!("could not reset for bootstrap: {e}")))?;
@@ -106,8 +125,16 @@ pub(crate) async fn install(
         .unwrap_or(usize::MAX)
         .max(MAX_BOOTSTRAP_CHUNK_BYTES)
         .saturating_add(DECODE_SLACK);
-    let req = pb::BootstrapRequest { client_id: inner.cfg.identifier.clone() };
-    let mut stream = match unless_repointed(inner, generation, c.clone().max_decoding_message_size(limit).bootstrap(req)).await? {
+    let req = pb::BootstrapRequest {
+        client_id: inner.cfg.identifier.clone(),
+    };
+    let mut stream = match unless_repointed(
+        inner,
+        generation,
+        c.clone().max_decoding_message_size(limit).bootstrap(req),
+    )
+    .await?
+    {
         Ok(r) => r.into_inner(),
         Err(s) => return Err(status_end(inner, generation, &s)),
     };
@@ -118,7 +145,10 @@ pub(crate) async fn install(
     let s = plan.snapshot_seq;
     tracing::info!(node = %inner.cfg.identifier, snapshot_seq = s, cfs = plan.cfs.len(), "bootstrapping");
     inner.notify(|l| l.on_bootstrap_begin(s));
-    inner.set_state(SlaveState::Bootstrapping { target_seq: s, records: 0 });
+    inner.set_state(SlaveState::Bootstrapping {
+        target_seq: s,
+        records: 0,
+    });
 
     for cf in &plan.cfs {
         let cf = cf.clone();
@@ -128,7 +158,11 @@ pub(crate) async fn install(
                 tracing::error!(node = %inner.cfg.identifier, comparator = %name, "bootstrap needs an unregistered comparator");
                 return Err(SessionEnd::Halt(HaltReason::SpecMismatch));
             }
-            Err(e) => return Err(retry(format!("could not create bootstrap column family: {e}"))),
+            Err(e) => {
+                return Err(retry(format!(
+                    "could not create bootstrap column family: {e}"
+                )));
+            }
         }
     }
 
@@ -139,9 +173,16 @@ pub(crate) async fn install(
     let footer = loop {
         match next(inner, generation, &mut stream).await? {
             Kind::Records(r) => {
-                let j = plan.cfs.iter().position(|c| c.spec.name == r.cf).ok_or_else(|| retry(format!("records for unknown CF {}", r.cf)))?;
+                let j = plan
+                    .cfs
+                    .iter()
+                    .position(|c| c.spec.name == r.cf)
+                    .ok_or_else(|| retry(format!("records for unknown CF {}", r.cf)))?;
                 if j + 1 < marked {
-                    return Err(retry(format!("records for CF {} arrived out of order", r.cf)));
+                    return Err(retry(format!(
+                        "records for CF {} arrived out of order",
+                        r.cf
+                    )));
                 }
                 if j + 1 > marked {
                     for cf in &plan.cfs[marked..=j] {
@@ -157,11 +198,21 @@ pub(crate) async fn install(
                 let mut batch = Vec::with_capacity(r.records.len());
                 for rec in r.records {
                     if let Some(prev) = &last_key {
-                        if inner.store.tuning().comparators.compare(comparator, prev, &rec.key) != KeyOrdering::Less {
-                            return Err(retry(format!("bootstrap keys of CF {} are not strictly ascending", r.cf)));
+                        if inner
+                            .store
+                            .tuning()
+                            .comparators
+                            .compare(comparator, prev, &rec.key)
+                            != KeyOrdering::Less
+                        {
+                            return Err(retry(format!(
+                                "bootstrap keys of CF {} are not strictly ascending",
+                                r.cf
+                            )));
                         }
                     }
-                    envelope::decode(&rec.envelope).map_err(|e| retry(format!("bad envelope from upstream: {e}")))?;
+                    envelope::decode(&rec.envelope)
+                        .map_err(|e| retry(format!("bad envelope from upstream: {e}")))?;
                     digest.record(&rec.key, &rec.envelope);
                     last_key = Some(rec.key.clone());
                     batch.push((rec.key, rec.envelope));
@@ -171,7 +222,10 @@ pub(crate) async fn install(
                 blocking(inner, move |i| i.store.write_bootstrap_records(&cf, &batch))
                     .await
                     .map_err(|e| retry(format!("could not write bootstrap records: {e}")))?;
-                inner.set_state(SlaveState::Bootstrapping { target_seq: s, records: count });
+                inner.set_state(SlaveState::Bootstrapping {
+                    target_seq: s,
+                    records: count,
+                });
                 if failpoint::fire("slave-bootstrap-after-chunk") {
                     // Emulated stall mid-bootstrap: freeze until the test kills the node or
                     // repoints it.
@@ -203,7 +257,9 @@ pub(crate) async fn install(
     blocking(inner, move |i| i.store.finish_bootstrap(&finish))
         .await
         .map_err(|e| retry(format!("could not commit the bootstrap: {e}")))?;
-    inner.max_entry_bytes.store(plan.max_entry_bytes, Ordering::SeqCst);
+    inner
+        .max_entry_bytes
+        .store(plan.max_entry_bytes, Ordering::SeqCst);
     inner.set_ident(Some((plan.identity, plan.history)));
     tracing::info!(node = %inner.cfg.identifier, snapshot_seq = s, records = count, "bootstrap complete");
     inner.notify(|l| l.on_bootstrap_complete(s));

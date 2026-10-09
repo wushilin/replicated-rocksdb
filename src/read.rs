@@ -52,11 +52,18 @@ impl ReadSnapshot {
     }
 
     fn ctx(&self) -> ReadCtx<'_> {
-        ReadCtx { db: self.snap.db(), snap: Some(&self.snap), now_ms: self.now_ms }
+        ReadCtx {
+            db: self.snap.db(),
+            snap: Some(&self.snap),
+            now_ms: self.now_ms,
+        }
     }
 
     fn cf(&self, name: &str) -> Result<Arc<PhysCf>> {
-        self.cfs.get(name).cloned().ok_or_else(|| Error::NoSuchCf(name.to_string()))
+        self.cfs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Error::NoSuchCf(name.to_string()))
     }
 }
 
@@ -70,7 +77,11 @@ impl ReadApi for ReadSnapshot {
     }
 
     fn prefix_iter(&self, cf: &str, prefix: &[u8]) -> Result<DbIter<'_>> {
-        self.ctx().iter(self.cf(cf)?, IterMode::From(prefix, Direction::Forward), Some(prefix))
+        self.ctx().iter(
+            self.cf(cf)?,
+            IterMode::From(prefix, Direction::Forward),
+            Some(prefix),
+        )
     }
 
     fn list_cfs(&self) -> Vec<CfSpec> {

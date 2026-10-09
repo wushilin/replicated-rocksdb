@@ -87,7 +87,9 @@ pub enum HaltAction {
     /// Discard local data and bootstrap from the upstream. Discarding data takes an explicit
     /// [`AcceptDataLoss`](crate::AcceptDataLoss), written out by the caller:
     /// `HaltAction::Rebootstrap { accept_loss: AcceptDataLoss }`.
-    Rebootstrap { accept_loss: crate::slave::AcceptDataLoss },
+    Rebootstrap {
+        accept_loss: crate::slave::AcceptDataLoss,
+    },
 }
 
 /// `__meta.node_state`: `ready`, `bootstrapping` or `halted:<Reason>`.
@@ -112,7 +114,9 @@ impl NodeState {
 
     /// `None` (key absent) is `Ready`.
     pub(crate) fn decode(raw: Option<&[u8]>) -> Result<NodeState> {
-        let Some(raw) = raw else { return Ok(NodeState::Ready) };
+        let Some(raw) = raw else {
+            return Ok(NodeState::Ready);
+        };
         if raw == NODE_READY {
             return Ok(NodeState::Ready);
         }
@@ -125,7 +129,12 @@ impl NodeState {
             .and_then(HaltReason::from_name)
             .filter(|r| r.is_persisted())
             .map(NodeState::Halted)
-            .ok_or_else(|| Error::corrupt(format!("unknown node_state {:?}", String::from_utf8_lossy(raw))))
+            .ok_or_else(|| {
+                Error::corrupt(format!(
+                    "unknown node_state {:?}",
+                    String::from_utf8_lossy(raw)
+                ))
+            })
     }
 }
 
@@ -163,15 +172,24 @@ mod tests {
         for r in ALL {
             if r.is_persisted() {
                 let encoded = NodeState::Halted(r).encode();
-                assert_eq!(NodeState::decode(Some(&encoded)).unwrap(), NodeState::Halted(r));
+                assert_eq!(
+                    NodeState::decode(Some(&encoded)).unwrap(),
+                    NodeState::Halted(r)
+                );
             } else {
                 // encode() debug-asserts on these; a hand-written value must not decode.
                 let raw = format!("halted:{}", r.name());
-                assert!(NodeState::decode(Some(raw.as_bytes())).is_err(), "{r:?} is never persisted");
+                assert!(
+                    NodeState::decode(Some(raw.as_bytes())).is_err(),
+                    "{r:?} is never persisted"
+                );
             }
         }
         assert_eq!(NodeState::decode(None).unwrap(), NodeState::Ready);
-        assert_eq!(NodeState::Halted(HaltReason::LogGap).encode(), b"halted:LogGap");
+        assert_eq!(
+            NodeState::Halted(HaltReason::LogGap).encode(),
+            b"halted:LogGap"
+        );
         assert!(NodeState::decode(Some(b"halted:Nope")).is_err());
     }
 

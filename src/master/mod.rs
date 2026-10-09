@@ -3,8 +3,8 @@
 mod maintenance;
 mod reaper;
 mod source;
-pub(crate) mod writer;
 mod write_concern;
+pub(crate) mod writer;
 
 pub use reaper::ReapStats;
 
@@ -20,12 +20,14 @@ use crate::config::{MasterConfig, WriteConcern};
 use crate::error::Result;
 use crate::log::{EntryIter, LogApi};
 use crate::read::{ReadApi, ReadSnapshot};
-use crate::server::replicas::ReplicaStatus;
 use crate::server::ServerHandle;
+use crate::server::replicas::ReplicaStatus;
+use crate::store::Store;
 use crate::store::meta::{self, key};
 use crate::store::read::DbIter;
-use crate::store::Store;
-use crate::types::{expire_at, Batch, CfSpec, DbIdentity, Direction, EpochStart, IterMode, Op, Role, Seq, ValueMeta};
+use crate::types::{
+    Batch, CfSpec, DbIdentity, Direction, EpochStart, IterMode, Op, Role, Seq, ValueMeta, expire_at,
+};
 use writer::Inner;
 
 /// The single writable node. Every write is one fsynced log entry.
@@ -57,10 +59,20 @@ impl Master {
         let mut fresh = false;
         let (identity, history) = match meta.identity {
             Some(id) if !meta.epoch_history.is_empty() => (id, meta.epoch_history),
-            Some(_) => return Err(crate::Error::corrupt("origin_identity without epoch_history in __meta")),
+            Some(_) => {
+                return Err(crate::Error::corrupt(
+                    "origin_identity without epoch_history in __meta",
+                ));
+            }
             None => {
-                let id = DbIdentity { db_uuid: uuid::Uuid::new_v4(), epoch: 1 };
-                let history = vec![EpochStart { epoch: 1, start_seq: 1 }];
+                let id = DbIdentity {
+                    db_uuid: uuid::Uuid::new_v4(),
+                    epoch: 1,
+                };
+                let history = vec![EpochStart {
+                    epoch: 1,
+                    start_seq: 1,
+                }];
                 store.write_meta(
                     &[
                         (key::ORIGIN_IDENTITY, &meta::encode_identity(&id)),
@@ -78,9 +90,15 @@ impl Master {
             inner.bump_epoch()?;
         }
         // The epoch bump above happens before the replication port opens (DESIGN.md §13).
-        let server = crate::server::start_for(&inner, inner.cfg.serve.clone(), inner.replicas.clone()).await?;
+        let server =
+            crate::server::start_for(&inner, inner.cfg.serve.clone(), inner.replicas.clone())
+                .await?;
         let task = maintenance::spawn(&inner);
-        Ok(Master { inner, task: Some(task), server })
+        Ok(Master {
+            inner,
+            task: Some(task),
+            server,
+        })
     }
 
     /// The origin identity (`db_uuid` and current epoch) stamped on every entry.
@@ -105,8 +123,14 @@ impl Master {
     /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
     /// not undo the write; see [`write_with`](Self::write_with)).
     pub fn put(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<Seq> {
-        let op = Op::Put { cf: cf.into(), key: key.into(), value: value.into(), expire_at_ms: None };
-        self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
+        let op = Op::Put {
+            cf: cf.into(),
+            key: key.into(),
+            value: value.into(),
+            expire_at_ms: None,
+        };
+        self.inner
+            .commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
     }
 
     /// Like [`put`](Self::put), with an expiry of commit time + `ttl`. Expired values are
@@ -119,7 +143,14 @@ impl Master {
     /// not undo the write; see [`write_with`](Self::write_with)).
     pub fn put_with_ttl(&self, cf: &str, key: &[u8], value: &[u8], ttl: Duration) -> Result<Seq> {
         let (cf, key, value) = (cf.to_string(), key.to_vec(), value.to_vec());
-        self.inner.commit_with(&self.inner.cfg.write_concern, |ts| Ok(vec![Op::Put { cf, key, value, expire_at_ms: Some(expire_at(ts, ttl)) }]))
+        self.inner.commit_with(&self.inner.cfg.write_concern, |ts| {
+            Ok(vec![Op::Put {
+                cf,
+                key,
+                value,
+                expire_at_ms: Some(expire_at(ts, ttl)),
+            }])
+        })
     }
 
     /// Deletes `key`. A no-op delete is still logged as an entry.
@@ -130,8 +161,12 @@ impl Master {
     /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
     /// not undo the write; see [`write_with`](Self::write_with)).
     pub fn delete(&self, cf: &str, key: &[u8]) -> Result<Seq> {
-        let op = Op::Delete { cf: cf.into(), key: key.into() };
-        self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
+        let op = Op::Delete {
+            cf: cf.into(),
+            key: key.into(),
+        };
+        self.inner
+            .commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
     }
 
     /// Deletes keys in `[start, end)` under the CF's comparator. `start` must sort before `end`.
@@ -142,8 +177,13 @@ impl Master {
     /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
     /// not undo the write; see [`write_with`](Self::write_with)).
     pub fn delete_range(&self, cf: &str, start: &[u8], end: &[u8]) -> Result<Seq> {
-        let op = Op::DeleteRange { cf: cf.into(), start: start.into(), end: end.into() };
-        self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
+        let op = Op::DeleteRange {
+            cf: cf.into(),
+            start: start.into(),
+            end: end.into(),
+        };
+        self.inner
+            .commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
     }
 
     /// Commits all operations in `batch` atomically, as one log entry.
@@ -158,7 +198,8 @@ impl Master {
     /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
     /// not undo the write; see [`write_with`](Self::write_with)).
     pub fn write(&self, batch: Batch) -> Result<Seq> {
-        self.inner.commit_with(&self.inner.cfg.write_concern, |ts| Ok(batch.into_ops(ts)))
+        self.inner
+            .commit_with(&self.inner.cfg.write_concern, |ts| Ok(batch.into_ops(ts)))
     }
 
     /// Like [`write`](Self::write), with an explicit write concern instead of
@@ -172,12 +213,24 @@ impl Master {
     /// waiting for acknowledgements (without holding the writer lock); async callers should
     /// use `spawn_blocking`.
     pub fn write_with(&self, batch: Batch, concern: WriteConcern) -> Result<Seq> {
-        self.inner.commit_with(&concern, |ts| Ok(batch.into_ops(ts)))
+        self.inner
+            .commit_with(&concern, |ts| Ok(batch.into_ops(ts)))
     }
 
     /// Like [`put`](Self::put), with an explicit write concern; see [`write_with`](Self::write_with).
-    pub fn put_with(&self, cf: &str, key: &[u8], value: &[u8], concern: WriteConcern) -> Result<Seq> {
-        let op = Op::Put { cf: cf.into(), key: key.into(), value: value.into(), expire_at_ms: None };
+    pub fn put_with(
+        &self,
+        cf: &str,
+        key: &[u8],
+        value: &[u8],
+        concern: WriteConcern,
+    ) -> Result<Seq> {
+        let op = Op::Put {
+            cf: cf.into(),
+            key: key.into(),
+            value: value.into(),
+            expire_at_ms: None,
+        };
         self.inner.commit_with(&concern, |_| Ok(vec![op]))
     }
 
@@ -197,7 +250,9 @@ impl Master {
     /// not undo the write; see [`write_with`](Self::write_with)).
     pub fn create_cf(&self, spec: CfSpec) -> Result<Seq> {
         validate_cf_name(&spec.name)?;
-        self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![Op::CreateCf { spec }]))
+        self.inner.commit_with(&self.inner.cfg.write_concern, |_| {
+            Ok(vec![Op::CreateCf { spec }])
+        })
     }
 
     /// Logically drops a column family. The physical drop is deferred while any snapshot or
@@ -211,7 +266,8 @@ impl Master {
     pub fn drop_cf(&self, name: &str) -> Result<Seq> {
         validate_cf_name(name)?;
         let op = Op::DropCf { name: name.into() };
-        self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
+        self.inner
+            .commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
     }
 
     /// Reads the current value of `key`, or `None` if absent or expired.
@@ -244,7 +300,11 @@ impl Master {
     /// it is in sync. Empty when the master does not serve replication.
     pub fn replicas(&self) -> Vec<ReplicaStatus> {
         match &self.server {
-            Some(s) => self.inner.replicas.status(&*self.inner, self.inner.now_ms(), s.replica_lag_time_max()),
+            Some(s) => self.inner.replicas.status(
+                &*self.inner,
+                self.inner.now_ms(),
+                s.replica_lag_time_max(),
+            ),
             None => Vec::new(),
         }
     }
@@ -261,7 +321,9 @@ impl Master {
         let history = self.epoch_history();
         let last = self.last_seq();
         match history.last() {
-            _ if history.len() < 2 => Err(crate::Error::Config("nothing to undo: this is the database's first epoch".into())),
+            _ if history.len() < 2 => Err(crate::Error::Config(
+                "nothing to undo: this is the database's first epoch".into(),
+            )),
             Some(newest) if last >= newest.start_seq => Err(crate::Error::Config(format!(
                 "epoch {} already has entries ({}..={last}); demoting would discard them",
                 newest.epoch, newest.start_seq
@@ -286,18 +348,27 @@ impl Master {
     /// error during shutdown, a `ReadSnapshot` that still holds the database (`Error::Config`;
     /// drop it and reopen the directory, which is unchanged, as the master), or a failure
     /// while rewriting it or opening the slave.
-    pub async fn demote(self, cfg: crate::slave::SlaveConfig) -> Result<crate::slave::Slave, DemoteRefused> {
+    pub async fn demote(
+        self,
+        cfg: crate::slave::SlaveConfig,
+    ) -> Result<crate::slave::Slave, DemoteRefused> {
         let refusal = match self.can_demote() {
             Err(e) => Some(e),
-            Ok(()) if cfg.path != self.inner.cfg.path => {
-                Some(crate::Error::Config("SlaveConfig.path must be the master's path".into()))
-            }
+            Ok(()) if cfg.path != self.inner.cfg.path => Some(crate::Error::Config(
+                "SlaveConfig.path must be the master's path".into(),
+            )),
             Ok(()) => None,
         };
         if let Some(error) = refusal {
-            return Err(DemoteRefused { error, master: Some(Box::new(self)) });
+            return Err(DemoteRefused {
+                error,
+                master: Some(Box::new(self)),
+            });
         }
-        let lost = |error| DemoteRefused { error, master: None };
+        let lost = |error| DemoteRefused {
+            error,
+            master: None,
+        };
         let (path, tuning) = (cfg.path.clone(), cfg.rocksdb.clone());
         let db = Arc::downgrade(self.inner.store.db());
         self.shutdown().await.map_err(lost)?;
@@ -364,7 +435,10 @@ impl DemoteRefused {
 
 impl std::fmt::Debug for DemoteRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DemoteRefused").field("error", &self.error).field("master_returned", &self.master.is_some()).finish()
+        f.debug_struct("DemoteRefused")
+            .field("error", &self.error)
+            .field("master_returned", &self.master.is_some())
+            .finish()
     }
 }
 
@@ -390,21 +464,36 @@ impl ReadApi for Master {
         // One CF lookup and one clock read for the whole call.
         let cf = self.inner.store.live_cf(cf)?;
         let ctx = self.inner.store.live_ctx(self.inner.now_ms());
-        keys.iter().map(|k| Ok(ctx.get(&cf, k)?.map(|(v, _)| v))).collect()
+        keys.iter()
+            .map(|k| Ok(ctx.get(&cf, k)?.map(|(v, _)| v)))
+            .collect()
     }
 
     fn iter(&self, cf: &str, mode: IterMode<'_>) -> Result<DbIter<'_>> {
         let cf = self.inner.store.live_cf(cf)?;
-        self.inner.store.live_ctx(self.inner.now_ms()).iter(cf, mode, None)
+        self.inner
+            .store
+            .live_ctx(self.inner.now_ms())
+            .iter(cf, mode, None)
     }
 
     fn prefix_iter(&self, cf: &str, prefix: &[u8]) -> Result<DbIter<'_>> {
         let cf = self.inner.store.live_cf(cf)?;
-        self.inner.store.live_ctx(self.inner.now_ms()).iter(cf, IterMode::From(prefix, Direction::Forward), Some(prefix))
+        self.inner.store.live_ctx(self.inner.now_ms()).iter(
+            cf,
+            IterMode::From(prefix, Direction::Forward),
+            Some(prefix),
+        )
     }
 
     fn list_cfs(&self) -> Vec<CfSpec> {
-        self.inner.store.cfs.live_entries().into_iter().map(|e| e.spec).collect()
+        self.inner
+            .store
+            .cfs
+            .live_entries()
+            .into_iter()
+            .map(|e| e.spec)
+            .collect()
     }
 }
 

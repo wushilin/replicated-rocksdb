@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use super::meta::{self, key};
 use super::Store;
+use super::meta::{self, key};
 use crate::error::Result;
 use crate::types::CfEntry;
 
@@ -36,9 +36,16 @@ pub(crate) struct CfRegistry {
 
 impl CfRegistry {
     pub(crate) fn load(live: &[CfEntry], pending: &[CfEntry]) -> Self {
-        let live = live.iter().map(|e| (e.spec.name.clone(), PhysCf::new(e.clone()))).collect();
+        let live = live
+            .iter()
+            .map(|e| (e.spec.name.clone(), PhysCf::new(e.clone())))
+            .collect();
         let pending = pending.iter().cloned().map(PhysCf::new).collect();
-        CfRegistry { live: RwLock::new(live), pending: Mutex::new(pending), held: Mutex::default() }
+        CfRegistry {
+            live: RwLock::new(live),
+            pending: Mutex::new(pending),
+            held: Mutex::default(),
+        }
     }
 
     pub(crate) fn read(&self) -> RwLockReadGuard<'_, BTreeMap<String, Arc<PhysCf>>> {
@@ -62,7 +69,11 @@ impl CfRegistry {
 impl Store {
     /// Physically drops pending CFs that nothing references any more. Returns how many.
     pub(crate) fn drop_unreferenced_cfs(&self) -> Result<usize> {
-        let mut pending = self.cfs.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut pending = self
+            .cfs
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut dropped = 0;
         let mut i = 0;
         while i < pending.len() {
@@ -82,7 +93,10 @@ impl Store {
         }
         if dropped > 0 {
             let remaining: Vec<CfEntry> = pending.iter().map(|p| p.entry.clone()).collect();
-            self.write_meta(&[(key::PENDING_CF_DROPS, &meta::encode_cf_list(&remaining))], true)?;
+            self.write_meta(
+                &[(key::PENDING_CF_DROPS, &meta::encode_cf_list(&remaining))],
+                true,
+            )?;
         }
         Ok(dropped)
     }

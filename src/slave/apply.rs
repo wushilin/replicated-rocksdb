@@ -1,7 +1,7 @@
 //! Applying one received entry (PROTOCOL.md §7.4, DESIGN.md §6).
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::config::GapPolicy;
 use super::driver::SessionEnd;
@@ -9,7 +9,7 @@ use super::inner::Inner;
 use super::state::HaltReason;
 use crate::error::Error;
 use crate::failpoint;
-use crate::types::{epoch_for, LogEntry};
+use crate::types::{LogEntry, epoch_for};
 
 pub(crate) enum Applied {
     Committed,
@@ -25,13 +25,18 @@ enum Failure {
 
 /// `last_error` when an upstream sends an entry whose epoch disagrees with the history the
 /// session started with.
-pub(crate) const EPOCH_CONTRADICTION: &str = "upstream sent an entry whose epoch contradicts the shared history";
+pub(crate) const EPOCH_CONTRADICTION: &str =
+    "upstream sent an entry whose epoch contradicts the shared history";
 
 /// PROTOCOL.md §7.4 check 2: `Some(Retry)` (normal backoff, `last_error` set) when `entry.epoch`
 /// is not the epoch of `entry.seq` in `history`.
 fn epoch_mismatch(history: &[crate::types::EpochStart], entry: &LogEntry) -> Option<SessionEnd> {
-    (epoch_for(history, entry.seq) != Some(entry.epoch))
-        .then(|| SessionEnd::Retry(format!("{EPOCH_CONTRADICTION} (entry {} has epoch {})", entry.seq, entry.epoch)))
+    (epoch_for(history, entry.seq) != Some(entry.epoch)).then(|| {
+        SessionEnd::Retry(format!(
+            "{EPOCH_CONTRADICTION} (entry {} has epoch {})",
+            entry.seq, entry.epoch
+        ))
+    })
 }
 
 pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) -> Applied {
@@ -78,7 +83,9 @@ pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) 
     let result = tokio::task::spawn_blocking(move || {
         let prepared = i.store.prepare(&e, &ops).map_err(Failure::Prepare)?;
         failpoint::io_error("slave-commit-io").map_err(Failure::Commit)?;
-        i.store.commit(prepared, i.cfg.sync_writes).map_err(Failure::Commit)
+        i.store
+            .commit(prepared, i.cfg.sync_writes)
+            .map_err(Failure::Commit)
     })
     .await;
     match result {
@@ -103,7 +110,9 @@ pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) 
         // the store refuses to reuse it for an entry with another spec (`Corrupt`, below).
         Ok(Err(Failure::Commit(e))) if e.is_transient_io() => {
             tracing::warn!(node = %inner.cfg.identifier, seq, error = %e, "commit failed with an I/O error; will retry");
-            return Applied::End(SessionEnd::Retry(format!("could not commit entry {seq}: {e}")));
+            return Applied::End(SessionEnd::Retry(format!(
+                "could not commit entry {seq}: {e}"
+            )));
         }
         // Integrity failures (corruption, a commit that contradicts local state) halt.
         Ok(Err(Failure::Commit(e))) => {
@@ -138,7 +147,16 @@ mod tests {
     /// looped every 50 ms against an upstream that sends the same entry again).
     #[test]
     fn an_epoch_contradiction_is_retried_with_backoff() {
-        let history = [EpochStart { epoch: 1, start_seq: 1 }, EpochStart { epoch: 2, start_seq: 11 }];
+        let history = [
+            EpochStart {
+                epoch: 1,
+                start_seq: 1,
+            },
+            EpochStart {
+                epoch: 2,
+                start_seq: 11,
+            },
+        ];
         let entry = |seq, epoch| LogEntry::new(seq, epoch, 0, bytes::Bytes::new());
         assert!(epoch_mismatch(&history, &entry(10, 1)).is_none());
         assert!(epoch_mismatch(&history, &entry(11, 2)).is_none());
@@ -148,6 +166,12 @@ mod tests {
                 other => panic!("entry {seq}@{epoch}: expected Retry, got {other:?}"),
             }
         }
-        assert!(matches!(epoch_mismatch(&[], &entry(1, 1)), Some(SessionEnd::Retry(_))), "no history");
+        assert!(
+            matches!(
+                epoch_mismatch(&[], &entry(1, 1)),
+                Some(SessionEnd::Retry(_))
+            ),
+            "no history"
+        );
     }
 }

@@ -15,7 +15,10 @@ const CF_DROP_INTERVAL: Duration = Duration::from_secs(5);
 /// `Master` releases the database (and its LOCK) without waiting for the task.
 pub(crate) fn spawn(inner: &Arc<Inner>) -> JoinHandle<()> {
     let mut shutdown = inner.shutdown_tx.subscribe();
-    let (retention_every, reaper_every) = (inner.cfg.retention.check_interval, inner.cfg.reaper.interval);
+    let (retention_every, reaper_every) = (
+        inner.cfg.retention.check_interval,
+        inner.cfg.reaper.interval,
+    );
     let weak = Arc::downgrade(inner);
     tokio::spawn(async move {
         let mut retention = every(retention_every);

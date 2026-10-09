@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use rocksdb::{AsColumnFamilyRef, DBIteratorWithThreadMode, IteratorMode, ReadOptions, SnapshotWithThreadMode, DB};
+use rocksdb::{
+    AsColumnFamilyRef, DB, DBIteratorWithThreadMode, IteratorMode, ReadOptions,
+    SnapshotWithThreadMode,
+};
 
 use super::DbCore;
 use crate::error::Result;
@@ -23,7 +26,9 @@ impl OwnedSnapshot {
         // and every `ReadOptions` or iterator built from it is created inside a method whose
         // result is tied to `&self` (`get_cf`, `iterator_cf`), so none can outlive `Self`.
         let snap = unsafe {
-            std::mem::transmute::<SnapshotWithThreadMode<'_, DB>, SnapshotWithThreadMode<'static, DB>>(snap)
+            std::mem::transmute::<SnapshotWithThreadMode<'_, DB>, SnapshotWithThreadMode<'static, DB>>(
+                snap,
+            )
         };
         OwnedSnapshot { snap, db }
     }
@@ -39,7 +44,11 @@ impl OwnedSnapshot {
     }
 
     /// Point read as of the snapshot.
-    pub(crate) fn get_cf(&self, cf: &impl AsColumnFamilyRef, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn get_cf(
+        &self,
+        cf: &impl AsColumnFamilyRef,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
         Ok(self.db.get_cf_opt(cf, key, &self.read_opts())?)
     }
 

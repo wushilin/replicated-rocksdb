@@ -5,8 +5,11 @@ mod support;
 
 use std::time::Duration;
 
-use replicated_rocksdb::{AcceptDataLoss, CfSpec, GapPolicy, HaltAction, HaltReason, LogApi, Master, ReadApi, Slave, SlaveState};
-use support::{assert_converged, copy_dir, restore_dir, wait_state, wait_until, Cluster};
+use replicated_rocksdb::{
+    AcceptDataLoss, CfSpec, GapPolicy, HaltAction, HaltReason, LogApi, Master, ReadApi, Slave,
+    SlaveState,
+};
+use support::{Cluster, assert_converged, copy_dir, restore_dir, wait_state, wait_until};
 
 /// A → B → C with writes between every restart: master, mid-chain and leaf restarts all
 /// resume from the durable position, with no bootstrap, gap or duplicate.
@@ -41,7 +44,11 @@ async fn restarts_of_master_mid_chain_and_leaf_resume_without_bootstrap() {
     write(&a, 10);
     assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
 
-    assert_eq!((lb.bootstraps(), lc.bootstraps()), (1, 1), "only the initial bootstraps");
+    assert_eq!(
+        (lb.bootstraps(), lc.bootstraps()),
+        (1, 1),
+        "only the initial bootstraps"
+    );
     lb.assert_no_violations();
     lc.assert_no_violations();
 }
@@ -126,7 +133,10 @@ async fn a_log_gap_halt_persists_across_restart_until_cleared() {
     }
     wait_until("master retention", || m.first_retained_seq() > behind + 1).await;
     let b = Slave::open(cfg.clone()).await.unwrap();
-    wait_state(&b, "LogGap halt", |s| *s == SlaveState::Halted(HaltReason::LogGap)).await;
+    wait_state(&b, "LogGap halt", |s| {
+        *s == SlaveState::Halted(HaltReason::LogGap)
+    })
+    .await;
     assert_eq!(b.last_seq(), behind);
     assert_eq!(b.list_cfs(), vec![CfSpec::new("c")], "reads keep working");
 
@@ -134,8 +144,16 @@ async fn a_log_gap_halt_persists_across_restart_until_cleared() {
     let (mut cfg2, listener) = c.slave_config("b", m.serve_addr().unwrap());
     cfg2.on_log_gap = GapPolicy::Halt;
     let b = Slave::open(cfg2).await.unwrap();
-    assert_eq!(b.status().state, SlaveState::Halted(HaltReason::LogGap), "persisted across restart");
-    b.clear_halt(HaltAction::Rebootstrap { accept_loss: AcceptDataLoss }).await.unwrap();
+    assert_eq!(
+        b.status().state,
+        SlaveState::Halted(HaltReason::LogGap),
+        "persisted across restart"
+    );
+    b.clear_halt(HaltAction::Rebootstrap {
+        accept_loss: AcceptDataLoss,
+    })
+    .await
+    .unwrap();
     assert_converged(&m, &[("b", &b)]).await;
     assert_eq!(listener.bootstraps(), 1);
 }

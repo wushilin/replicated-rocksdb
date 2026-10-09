@@ -7,12 +7,20 @@ use std::time::Duration;
 
 use replicated_rocksdb::admin::{self, Comparison};
 use replicated_rocksdb::{
-    AllowAll, AllowMethods, Method, CfSpec, DivergencePolicy, EpochStart, Error, HaltReason, LogApi, Master, Op, ReadApi, Role, Slave, SlaveState, UpstreamConfig,
+    AllowAll, AllowMethods, CfSpec, DivergencePolicy, EpochStart, Error, HaltReason, LogApi,
+    Master, Method, Op, ReadApi, Role, Slave, SlaveState, UpstreamConfig,
 };
-use support::{assert_converged, check_edge_cases, wait_state, wait_until, write_edge_cases, Cluster};
+use support::{
+    Cluster, assert_converged, check_edge_cases, wait_state, wait_until, write_edge_cases,
+};
 
 /// Reopens slave `name` (shut down by the caller) pointed at `upstream`.
-async fn reopen(c: &Cluster, name: &str, upstream: SocketAddr, tweak: impl FnOnce(&mut replicated_rocksdb::SlaveConfig)) -> (Slave, std::sync::Arc<support::RecordingListener>) {
+async fn reopen(
+    c: &Cluster,
+    name: &str,
+    upstream: SocketAddr,
+    tweak: impl FnOnce(&mut replicated_rocksdb::SlaveConfig),
+) -> (Slave, std::sync::Arc<support::RecordingListener>) {
     let (mut cfg, listener) = c.slave_config(name, upstream);
     tweak(&mut cfg);
     (Slave::open(cfg).await.unwrap(), listener)
@@ -37,7 +45,8 @@ async fn promotion_end_to_end() {
     for (name, s) in [("b", &b), ("c", &cn), ("d", &d), ("e", &e)] {
         wait_state(s, name, |st| *st == SlaveState::Streaming).await;
     }
-    a.put_with_ttl("c", b"session", b"s", Duration::from_secs(60)).unwrap();
+    a.put_with_ttl("c", b"session", b"s", Duration::from_secs(60))
+        .unwrap();
     for i in 0..5u8 {
         a.put("c", &[i], &[i]).unwrap();
     }
@@ -58,7 +67,19 @@ async fn promotion_end_to_end() {
     mcfg.identifier = "b".into();
     let b = b.promote(mcfg).await.unwrap();
     assert_eq!(b.identity().epoch, 2);
-    assert_eq!(b.epoch_history(), vec![EpochStart { epoch: 1, start_seq: 1 }, EpochStart { epoch: 2, start_seq: fork }]);
+    assert_eq!(
+        b.epoch_history(),
+        vec![
+            EpochStart {
+                epoch: 1,
+                start_seq: 1
+            },
+            EpochStart {
+                epoch: 2,
+                start_seq: fork
+            }
+        ]
+    );
     let b_addr = b.serve_addr().unwrap();
 
     // C (behind the fork) continues without a bootstrap.
@@ -71,8 +92,14 @@ async fn promotion_end_to_end() {
     d.shutdown().await.unwrap();
     e.shutdown().await.unwrap();
     let (d, _) = reopen(&c, "d", b_addr, |_| {}).await;
-    let (e, le) = reopen(&c, "e", b_addr, |cfg| cfg.on_divergence = DivergencePolicy::Rebootstrap).await;
-    wait_state(&d, "Diverged halt", |s| *s == SlaveState::Halted(HaltReason::Diverged)).await;
+    let (e, le) = reopen(&c, "e", b_addr, |cfg| {
+        cfg.on_divergence = DivergencePolicy::Rebootstrap
+    })
+    .await;
+    wait_state(&d, "Diverged halt", |s| {
+        *s == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
     assert_eq!(d.last_seq(), ahead, "D keeps its data");
     wait_until("E re-bootstraps after DIVERGED", || le.bootstraps() == 1).await;
     assert_converged(&b, &[("c", &cn), ("e", &e)]).await;
@@ -85,8 +112,18 @@ async fn promotion_end_to_end() {
     write_edge_cases(&b, "edge");
     assert_converged(&b, &[("c", &cn), ("e", &e)]).await;
     // The new master's reaper Delete itself reached C through the log.
-    let reaped: Vec<Op> = cn.entries_since(before_reap).unwrap().flat_map(|e| e.unwrap().decode_ops().unwrap()).collect();
-    assert!(reaped.contains(&Op::Delete { cf: "c".into(), key: b"session".to_vec() }), "{reaped:?}");
+    let reaped: Vec<Op> = cn
+        .entries_since(before_reap)
+        .unwrap()
+        .flat_map(|e| e.unwrap().decode_ops().unwrap())
+        .collect();
+    assert!(
+        reaped.contains(&Op::Delete {
+            cf: "c".into(),
+            key: b"session".to_vec()
+        }),
+        "{reaped:?}"
+    );
     check_edge_cases(&cn, "edge");
     check_edge_cases(&e, "edge");
 
@@ -129,7 +166,13 @@ async fn the_old_master_is_refused_with_stale_epoch_and_the_client_retries() {
     old.put("c", b"split brain", b"x").unwrap();
     cn.shutdown().await.unwrap();
     let (cn, _) = reopen(&c, "c", a_addr, |_| {}).await;
-    wait_until("STALE_EPOCH reported", || cn.status().last_error.as_deref().is_some_and(|e| e.contains("STALE_EPOCH"))).await;
+    wait_until("STALE_EPOCH reported", || {
+        cn.status()
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("STALE_EPOCH"))
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let s = cn.status();
     assert_eq!(s.state, SlaveState::Connecting, "retrying, not halted");
@@ -147,21 +190,40 @@ async fn the_old_master_is_refused_with_stale_epoch_and_the_client_retries() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn promotion_is_refused_without_data_and_needs_released_snapshots() {
     let c = Cluster::new();
-    let nobody = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let nobody = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
     let (empty, _) = c.slave("empty", nobody).await;
-    assert!(matches!(empty.promote(c.master_config("empty")).await, Err(Error::Config(_))));
+    assert!(matches!(
+        empty.promote(c.master_config("empty")).await,
+        Err(Error::Config(_))
+    ));
 
     let a = c.master("a").await;
     a.create_cf(CfSpec::new("c")).unwrap();
     let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
     assert_converged(&a, &[("b", &b)]).await;
-    assert!(matches!(b.promote(c.master_config("elsewhere")).await, Err(Error::Config(_))), "path must match");
+    assert!(
+        matches!(
+            b.promote(c.master_config("elsewhere")).await,
+            Err(Error::Config(_))
+        ),
+        "path must match"
+    );
 
     let (b, _) = reopen(&c, "b", a.serve_addr().unwrap(), |_| {}).await;
     b.wait_for_seq(1, support::WAIT).await.unwrap();
     let snap = b.snapshot().unwrap();
-    let err = b.promote(c.master_config("b")).await.err().expect("an open snapshot keeps the database open");
-    assert!(matches!(&err, Error::Config(m) if m.contains("ReadSnapshot")), "{err}");
+    let err = b
+        .promote(c.master_config("b"))
+        .await
+        .err()
+        .expect("an open snapshot keeps the database open");
+    assert!(
+        matches!(&err, Error::Config(m) if m.contains("ReadSnapshot")),
+        "{err}"
+    );
     drop(snap);
     // Nothing was changed: the directory is still a slave that resumes.
     let (b, lb) = reopen(&c, "b", a.serve_addr().unwrap(), |_| {}).await;
@@ -181,20 +243,52 @@ async fn the_status_rpc_and_promotion_info_report_positions() {
     wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
     a.put("c", b"k", b"v").unwrap();
     assert_converged(&a, &[("b", &b)]).await;
-    wait_until("b in sync on a", || a.replicas().iter().any(|r| r.node_id == "b" && r.in_sync)).await;
+    wait_until("b in sync on a", || {
+        a.replicas().iter().any(|r| r.node_id == "b" && r.in_sync)
+    })
+    .await;
 
-    let of_a = admin::node_status(&UpstreamConfig::from_addr(a.serve_addr().unwrap()), "operator").await.unwrap();
-    assert_eq!((of_a.node_id.as_str(), of_a.role, of_a.last_seq), ("a", Role::Master, 2));
+    let of_a = admin::node_status(
+        &UpstreamConfig::from_addr(a.serve_addr().unwrap()),
+        "operator",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (of_a.node_id.as_str(), of_a.role, of_a.last_seq),
+        ("a", Role::Master, 2)
+    );
     assert_eq!(of_a.identity, Some(a.identity()));
     assert_eq!(of_a.upstream, None);
-    assert_eq!(of_a.replicas.iter().map(|r| (r.node_id.as_str(), r.applied_seq, r.in_sync)).collect::<Vec<_>>(), vec![("b", 2, true)]);
+    assert_eq!(
+        of_a.replicas
+            .iter()
+            .map(|r| (r.node_id.as_str(), r.applied_seq, r.in_sync))
+            .collect::<Vec<_>>(),
+        vec![("b", 2, true)]
+    );
     assert!(of_a.last_ts_ms > 0);
 
-    let of_b = admin::node_status(&UpstreamConfig::from_addr(b.serve_addr().unwrap()), "operator").await.unwrap();
-    assert_eq!(of_b, b.promotion_info(), "the RPC and the in-process call agree");
-    assert_eq!((of_b.role, of_b.last_seq, of_b.node_state.as_str()), (Role::Slave, 2, "ready"));
+    let of_b = admin::node_status(
+        &UpstreamConfig::from_addr(b.serve_addr().unwrap()),
+        "operator",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        of_b,
+        b.promotion_info(),
+        "the RPC and the in-process call agree"
+    );
+    assert_eq!(
+        (of_b.role, of_b.last_seq, of_b.node_state.as_str()),
+        (Role::Slave, 2, "ready")
+    );
     assert_eq!(of_b.last_entry_crc, of_a.last_entry_crc);
-    assert_eq!(of_b.upstream, Some(format!("http://{}", a.serve_addr().unwrap())));
+    assert_eq!(
+        of_b.upstream,
+        Some(format!("http://{}", a.serve_addr().unwrap()))
+    );
     assert_eq!(admin::compare(&of_a, &of_b), Comparison::Equal);
 }
 
@@ -220,29 +314,63 @@ async fn promote_checked_refuses_when_a_reachable_peer_is_later() {
 
     let (b, _) = reopen(&c, "b", a_addr, |_| {}).await;
     let c_addr = UpstreamConfig::from_addr(cn.serve_addr().unwrap());
-    let refused = b.promote_checked(c.master_config("b"), std::slice::from_ref(&c_addr)).await.err().expect("c is later");
-    assert!(matches!(&refused.error, Error::NotMostAdvanced { leader, seq: 2, .. } if leader == "c"), "{refused}");
+    let refused = b
+        .promote_checked(c.master_config("b"), std::slice::from_ref(&c_addr))
+        .await
+        .err()
+        .expect("c is later");
+    assert!(
+        matches!(&refused.error, Error::NotMostAdvanced { leader, seq: 2, .. } if leader == "c"),
+        "{refused}"
+    );
     // Refused by default: b comes back untouched and still running.
     let b = refused.into_slave().expect("a refusal returns the slave");
     // D is ahead too, but its history cannot be verified (bootstrapped past B's last entry):
     // refused as well, not treated as diverged and ignored.
     let d_addr = UpstreamConfig::from_addr(d.serve_addr().unwrap());
-    let refused = b.promote_checked(c.master_config("b"), std::slice::from_ref(&d_addr)).await.err().expect("d is unverifiable");
-    assert!(matches!(&refused.error, Error::PromotionUnverifiable { peer, seq: 2, .. } if peer == "d"), "{refused}");
+    let refused = b
+        .promote_checked(c.master_config("b"), std::slice::from_ref(&d_addr))
+        .await
+        .err()
+        .expect("d is unverifiable");
+    assert!(
+        matches!(&refused.error, Error::PromotionUnverifiable { peer, seq: 2, .. } if peer == "d"),
+        "{refused}"
+    );
     let b = refused.into_slave().expect("a refusal returns the slave");
-    assert_eq!(b.get("c", b"only c has it").unwrap(), None, "b still serves its own data");
+    assert_eq!(
+        b.get("c", b"only c has it").unwrap(),
+        None,
+        "b still serves its own data"
+    );
     assert_eq!(b.last_seq(), 1);
     // A refusal from promote's own checks returns it too.
-    let refused = b.promote_checked(c.master_config("elsewhere"), &[]).await.err().expect("wrong path");
+    let refused = b
+        .promote_checked(c.master_config("elsewhere"), &[])
+        .await
+        .err()
+        .expect("wrong path");
     assert!(matches!(refused.error, Error::Config(_)));
     let b = refused.into_slave().expect("a refusal returns the slave");
 
     // The most advanced node passes the check; the unreachable old master does not block it.
-    let check = cn.check_promotion(&[UpstreamConfig::from_addr(b.serve_addr().unwrap()), UpstreamConfig::from_addr(a_addr)]).await.unwrap();
+    let check = cn
+        .check_promotion(&[
+            UpstreamConfig::from_addr(b.serve_addr().unwrap()),
+            UpstreamConfig::from_addr(a_addr),
+        ])
+        .await
+        .unwrap();
     assert_eq!(check.unreachable.len(), 1);
     assert!(check.diverged.is_empty() && check.foreign.is_empty() && check.unverifiable.is_empty());
-    let new_master = cn.promote_checked(c.master_config("c"), &[UpstreamConfig::from_addr(a_addr)]).await.unwrap();
-    assert_eq!(new_master.get("c", b"only c has it").unwrap(), Some(b"v".to_vec()));
+    let new_master = cn
+        .promote_checked(c.master_config("c"), &[UpstreamConfig::from_addr(a_addr)])
+        .await
+        .unwrap();
+    assert_eq!(
+        new_master.get("c", b"only c has it").unwrap(),
+        Some(b"v".to_vec())
+    );
     // The returned slave is fully alive: it still serves a downstream replica.
     let (e, _) = c.slave("e", b.serve_addr().unwrap()).await;
     assert_converged(&b, &[("e", &e)]).await;
@@ -271,7 +399,11 @@ async fn demote_undoes_a_wrong_promotion_with_zero_loss() {
     b_master.can_demote().unwrap();
     let (b_cfg, _) = c.slave_config("b", a_addr);
     let b = b_master.demote(b_cfg).await.unwrap();
-    assert_eq!(b.status().origin_identity.unwrap().epoch, 1, "the old identity is back");
+    assert_eq!(
+        b.status().origin_identity.unwrap().epoch,
+        1,
+        "the old identity is back"
+    );
     support::assert_same("b after demote", &before, &support::dump(&b));
 
     // c is promoted instead; b follows it without a bootstrap: nothing was lost.
@@ -296,11 +428,21 @@ async fn demote_is_refused_once_the_new_epoch_has_entries() {
     let seq = b_master.put("c", b"new epoch", b"v").unwrap();
     assert!(matches!(b_master.can_demote(), Err(Error::Config(_))));
     let (b_cfg, _) = c.slave_config("b", a_addr);
-    let refused = b_master.demote(b_cfg).await.err().expect("the new epoch has entries");
+    let refused = b_master
+        .demote(b_cfg)
+        .await
+        .err()
+        .expect("the new epoch has entries");
     assert!(matches!(refused.error, Error::Config(_)), "{refused}");
     // Refused by default: the master comes back untouched and still running.
     let b_master = refused.into_master().expect("a refusal returns the master");
-    assert_eq!((b_master.last_seq(), b_master.get("c", b"new epoch").unwrap()), (seq, Some(b"v".to_vec())));
+    assert_eq!(
+        (
+            b_master.last_seq(),
+            b_master.get("c", b"new epoch").unwrap()
+        ),
+        (seq, Some(b"v".to_vec()))
+    );
     let (d, _) = c.slave("d", b_master.serve_addr().unwrap()).await;
     b_master.put("c", b"still writable", b"v").unwrap();
     assert_converged(&b_master, &[("d", &d)]).await;
@@ -339,16 +481,29 @@ async fn same_epoch_divergence_is_found_by_the_crc_probe() {
     assert_eq!((b.last_seq(), cn.last_seq()), (4, 5));
     a.shutdown().await.unwrap();
 
-    let peers = [UpstreamConfig::from_addr(b.serve_addr().unwrap()), UpstreamConfig::from_addr(cn.serve_addr().unwrap())];
+    let peers = [
+        UpstreamConfig::from_addr(b.serve_addr().unwrap()),
+        UpstreamConfig::from_addr(cn.serve_addr().unwrap()),
+    ];
     let gathered = admin::gather(&peers, "operator").await;
     assert!(gathered.unreachable.is_empty());
     let choice = admin::choose_promotion_candidate(&gathered.nodes).unwrap();
     assert_eq!(choice.candidate.node_id, "c");
-    assert_eq!(choice.diverged, vec![("b".to_string(), 4)], "same epoch, different entry 4");
+    assert_eq!(
+        choice.diverged,
+        vec![("b".to_string(), 4)],
+        "same epoch, different entry 4"
+    );
     assert!(choice.compatible.is_empty());
     // C holds entries 4..=5 that promoting B would discard: refused by default.
-    let err = b.check_promotion(&peers[1..]).await.expect_err("c holds entries b would discard");
-    assert!(matches!(err, Error::PromotionWouldDiscard { ref peer, fork: 4, peer_last_seq: 5 } if peer == "c"), "{err}");
+    let err = b
+        .check_promotion(&peers[1..])
+        .await
+        .expect_err("c holds entries b would discard");
+    assert!(
+        matches!(err, Error::PromotionWouldDiscard { ref peer, fork: 4, peer_last_seq: 5 } if peer == "c"),
+        "{err}"
+    );
 }
 
 /// A reachable peer that is itself a master (promoted by mistake) blocks `promote_checked`
@@ -368,16 +523,30 @@ async fn promote_checked_refuses_while_another_master_is_reachable() {
     // b is promoted by mistake: epoch 2 starts after its last_seq and is empty.
     let b_master = b.promote(c.master_config("b")).await.unwrap();
     let b_peer = UpstreamConfig::from_addr(b_master.serve_addr().unwrap());
-    let refused = cn.promote_checked(c.master_config("c"), std::slice::from_ref(&b_peer)).await.err().expect("b is a master");
-    assert!(matches!(&refused.error, Error::MasterReachable { peer } if peer == "b"), "{refused}");
+    let refused = cn
+        .promote_checked(c.master_config("c"), std::slice::from_ref(&b_peer))
+        .await
+        .err()
+        .expect("b is a master");
+    assert!(
+        matches!(&refused.error, Error::MasterReachable { peer } if peer == "b"),
+        "{refused}"
+    );
     let cn = refused.into_slave().expect("a refusal returns the slave");
-    assert_eq!(cn.get("c", b"nothing").unwrap(), None, "c still serves reads");
+    assert_eq!(
+        cn.get("c", b"nothing").unwrap(),
+        None,
+        "c still serves reads"
+    );
 
     // Demote b (nothing was written), then c may be promoted with b as a replica peer.
     let (b_cfg, _) = c.slave_config("b", a_addr);
     let b = b_master.demote(b_cfg).await.unwrap();
     let b_peer = UpstreamConfig::from_addr(b.serve_addr().unwrap());
-    let c_master = cn.promote_checked(c.master_config("c"), std::slice::from_ref(&b_peer)).await.unwrap();
+    let c_master = cn
+        .promote_checked(c.master_config("c"), std::slice::from_ref(&b_peer))
+        .await
+        .unwrap();
     // b burned epoch 2 by demoting (a replica may have followed it): c starts epoch 3.
     assert_eq!(b.promotion_info().max_burned_epoch, 2);
     assert_eq!(c_master.identity().epoch, 3);
@@ -393,18 +562,39 @@ async fn a_peer_that_answers_with_an_error_blocks_promote_checked() {
     a.create_cf(CfSpec::new("c")).unwrap();
     let (b, _) = c.slave("b", a_addr).await;
     let (mut d_cfg, _) = c.slave_config("d", a_addr);
-    d_cfg.serve.as_mut().unwrap().authenticator =
-        std::sync::Arc::new(AllowMethods::new(std::sync::Arc::new(AllowAll), &[Method::Handshake, Method::Tail, Method::Bootstrap, Method::Verify]));
+    d_cfg.serve.as_mut().unwrap().authenticator = std::sync::Arc::new(AllowMethods::new(
+        std::sync::Arc::new(AllowAll),
+        &[
+            Method::Handshake,
+            Method::Tail,
+            Method::Bootstrap,
+            Method::Verify,
+        ],
+    ));
     let d = Slave::open(d_cfg).await.unwrap();
     assert_converged(&a, &[("b", &b), ("d", &d)]).await;
     a.shutdown().await.unwrap();
 
     let d_peer = UpstreamConfig::from_addr(d.serve_addr().unwrap());
-    let refused = b.promote_checked(c.master_config("b"), std::slice::from_ref(&d_peer)).await.err().expect("d refuses Status");
-    assert!(matches!(&refused.error, Error::PromotionUnverifiable { peer, .. } if peer.contains("PermissionDenied") || peer.contains("permission")), "{refused}");
+    let refused = b
+        .promote_checked(c.master_config("b"), std::slice::from_ref(&d_peer))
+        .await
+        .err()
+        .expect("d refuses Status");
+    assert!(
+        matches!(&refused.error, Error::PromotionUnverifiable { peer, .. } if peer.contains("PermissionDenied") || peer.contains("permission")),
+        "{refused}"
+    );
     let b = refused.into_slave().expect("a refusal returns the slave");
-    let check = b.check_promotion(&[UpstreamConfig::from_addr(a_addr)]).await.unwrap();
-    assert_eq!(check.unreachable.len(), 1, "a refused connection is unreachable, not blocking");
+    let check = b
+        .check_promotion(&[UpstreamConfig::from_addr(a_addr)])
+        .await
+        .unwrap();
+    assert_eq!(
+        check.unreachable.len(),
+        1,
+        "a refused connection is unreachable, not blocking"
+    );
 }
 
 /// A refusal returns a slave that keeps replicating from its live upstream.
@@ -415,7 +605,11 @@ async fn a_refused_slave_keeps_replicating_from_its_live_upstream() {
     a.create_cf(CfSpec::new("c")).unwrap();
     let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
     assert_converged(&a, &[("b", &b)]).await;
-    let refused = b.promote_checked(c.master_config("elsewhere"), &[]).await.err().expect("wrong path");
+    let refused = b
+        .promote_checked(c.master_config("elsewhere"), &[])
+        .await
+        .err()
+        .expect("wrong path");
     let b = refused.into_slave().expect("a refusal returns the slave");
     a.put("c", b"after refusal", b"v").unwrap();
     assert_converged(&a, &[("b", &b)]).await;
@@ -453,7 +647,11 @@ async fn promotion_that_would_discard_entries_is_refused() {
     assert_converged(&b_master, &[("d", &d)]).await;
     let c_peer = UpstreamConfig::from_addr(cn.serve_addr().unwrap());
 
-    let refused = d.promote_checked(c.master_config("d"), std::slice::from_ref(&c_peer)).await.err().expect("c holds entries");
+    let refused = d
+        .promote_checked(c.master_config("d"), std::slice::from_ref(&c_peer))
+        .await
+        .err()
+        .expect("c holds entries");
     assert!(
         matches!(&refused.error, Error::PromotionWouldDiscard { peer, fork: f, peer_last_seq } if peer == "c" && *f == fork && *peer_last_seq == cn.last_seq()),
         "{refused}"
@@ -462,7 +660,10 @@ async fn promotion_that_would_discard_entries_is_refused() {
     let d_peer = UpstreamConfig::from_addr(d.serve_addr().unwrap());
 
     // The other way round nothing is discarded: reported, not blocking.
-    let check = cn.check_promotion(std::slice::from_ref(&d_peer)).await.unwrap();
+    let check = cn
+        .check_promotion(std::slice::from_ref(&d_peer))
+        .await
+        .unwrap();
     assert_eq!(check.diverged, vec![("d".to_string(), fork)]);
 }
 
@@ -472,7 +673,15 @@ async fn promotion_that_would_discard_entries_is_refused() {
 /// `s_r > s_w`; A is lost. W is promoted by mistake (epoch 2 from `s_w + 1`), X follows it
 /// (adopting that epoch), and W is demoted again: epoch 2 is burned, but X still holds it.
 /// Returns W (a slave again), X, R (a slave of the dead A), X's listener and `s_w`.
-async fn wrong_promotion_followed_then_undone(c: &Cluster) -> (Slave, Slave, Slave, std::sync::Arc<support::RecordingListener>, u64) {
+async fn wrong_promotion_followed_then_undone(
+    c: &Cluster,
+) -> (
+    Slave,
+    Slave,
+    Slave,
+    std::sync::Arc<support::RecordingListener>,
+    u64,
+) {
     let a = c.master("a").await;
     let a_addr = a.serve_addr().unwrap();
     a.create_cf(CfSpec::new("c")).unwrap();
@@ -496,12 +705,34 @@ async fn wrong_promotion_followed_then_undone(c: &Cluster) -> (Slave, Slave, Sla
 
     let (w, _) = reopen(c, "w", a_addr, |_| {}).await;
     let w_master = w.promote(c.master_config("w")).await.unwrap();
-    assert_eq!(w_master.epoch_history().last(), Some(&EpochStart { epoch: 2, start_seq: s_w + 1 }));
+    assert_eq!(
+        w_master.epoch_history().last(),
+        Some(&EpochStart {
+            epoch: 2,
+            start_seq: s_w + 1
+        })
+    );
     let (x, lx) = reopen(c, "x", w_master.serve_addr().unwrap(), |_| {}).await;
-    wait_until("x adopts w's epoch", || x.status().origin_identity.is_some_and(|id| id.epoch == 2)).await;
-    let w = w_master.demote(c.slave_config("w", a_addr).0).await.unwrap();
-    assert_eq!(w.promotion_info().max_burned_epoch, 2, "the undone epoch is burned");
-    assert_eq!(x.promotion_info().epoch_history.last(), Some(&EpochStart { epoch: 2, start_seq: s_w + 1 }));
+    wait_until("x adopts w's epoch", || {
+        x.status().origin_identity.is_some_and(|id| id.epoch == 2)
+    })
+    .await;
+    let w = w_master
+        .demote(c.slave_config("w", a_addr).0)
+        .await
+        .unwrap();
+    assert_eq!(
+        w.promotion_info().max_burned_epoch,
+        2,
+        "the undone epoch is burned"
+    );
+    assert_eq!(
+        x.promotion_info().epoch_history.last(),
+        Some(&EpochStart {
+            epoch: 2,
+            start_seq: s_w + 1
+        })
+    );
     (w, x, r, lx, s_w)
 }
 
@@ -513,14 +744,27 @@ async fn wrong_promotion_followed_then_undone(c: &Cluster) -> (Slave, Slave, Sla
 async fn promote_checked_never_reuses_a_burned_epoch_and_the_sibling_converges() {
     let c = Cluster::new();
     let (w, x, r, lx, _) = wrong_promotion_followed_then_undone(&c).await;
-    let peers = [UpstreamConfig::from_addr(w.serve_addr().unwrap()), UpstreamConfig::from_addr(x.serve_addr().unwrap())];
-    let r = r.promote_checked(c.master_config("r"), &peers).await.unwrap();
-    assert!(r.identity().epoch > 2, "the new epoch {} reuses the burned epoch 2", r.identity().epoch);
+    let peers = [
+        UpstreamConfig::from_addr(w.serve_addr().unwrap()),
+        UpstreamConfig::from_addr(x.serve_addr().unwrap()),
+    ];
+    let r = r
+        .promote_checked(c.master_config("r"), &peers)
+        .await
+        .unwrap();
+    assert!(
+        r.identity().epoch > 2,
+        "the new epoch {} reuses the burned epoch 2",
+        r.identity().epoch
+    );
     assert_eq!(r.identity().epoch, 3);
 
     let outcome = tokio::time::timeout(
         support::WAIT,
-        x.repoint(UpstreamConfig::from_addr(r.serve_addr().unwrap()), replicated_rocksdb::RepointOptions::default()),
+        x.repoint(
+            UpstreamConfig::from_addr(r.serve_addr().unwrap()),
+            replicated_rocksdb::RepointOptions::default(),
+        ),
     )
     .await
     .expect("repoint settles")
@@ -528,7 +772,11 @@ async fn promote_checked_never_reuses_a_burned_epoch_and_the_sibling_converges()
     assert_eq!(outcome, replicated_rocksdb::RepointOutcome::EpochAdvanced);
     r.put("c", b"after", b"v").unwrap();
     assert_converged(&r, &[("x", &x)]).await;
-    assert_eq!(x.promotion_info().epoch_history, r.epoch_history(), "x follows r's history");
+    assert_eq!(
+        x.promotion_info().epoch_history,
+        r.epoch_history(),
+        "x follows r's history"
+    );
     assert_eq!(lx.bootstraps(), 0, "no bootstrap since x was reopened");
     assert_eq!(x.status().last_error, None);
     lx.assert_no_violations();
@@ -545,12 +793,22 @@ async fn a_reused_epoch_number_is_detected_by_its_start_seq() {
     let (w, x, r, lx, s_w) = wrong_promotion_followed_then_undone(&c).await;
     let s_r = r.last_seq();
     let r = r.promote(c.master_config("r")).await.unwrap();
-    assert_eq!(r.epoch_history().last(), Some(&EpochStart { epoch: 2, start_seq: s_r + 1 }), "same number, other start");
+    assert_eq!(
+        r.epoch_history().last(),
+        Some(&EpochStart {
+            epoch: 2,
+            start_seq: s_r + 1
+        }),
+        "same number, other start"
+    );
     assert_ne!(s_r, s_w);
 
     let outcome = tokio::time::timeout(
         support::WAIT,
-        x.repoint(UpstreamConfig::from_addr(r.serve_addr().unwrap()), replicated_rocksdb::RepointOptions::default()),
+        x.repoint(
+            UpstreamConfig::from_addr(r.serve_addr().unwrap()),
+            replicated_rocksdb::RepointOptions::default(),
+        ),
     )
     .await
     .expect("repoint settles")
@@ -560,7 +818,11 @@ async fn a_reused_epoch_number_is_detected_by_its_start_seq() {
     assert_converged(&r, &[("x", &x)]).await;
     assert_eq!(x.promotion_info().epoch_history, r.epoch_history());
     assert_eq!(x.get("c", b"only r").unwrap(), Some(b"1".to_vec()));
-    assert_eq!(lx.bootstraps(), 0, "no bootstrap since x was reopened: nothing lost");
+    assert_eq!(
+        lx.bootstraps(),
+        0,
+        "no bootstrap since x was reopened: nothing lost"
+    );
     assert_eq!(x.status().last_error, None);
     lx.assert_no_violations();
     drop(w);

@@ -43,7 +43,11 @@ fn diverged(p: &Policies) -> Action {
 /// `IdentityPolicy::Refuse` and `DivergencePolicy::Halt`; that is intended, because the
 /// operator asked for it through `clear_halt`. Rejections that retrying or reconfiguring
 /// cannot fix (protocol, envelope, loop, stale epoch, not ready) are not overridden.
-pub(crate) fn after_handshake(r: &pb::HandshakeResponse, p: &Policies, force_bootstrap: bool) -> Action {
+pub(crate) fn after_handshake(
+    r: &pb::HandshakeResponse,
+    p: &Policies,
+    force_bootstrap: bool,
+) -> Action {
     let decision = Decision::try_from(r.decision).unwrap_or(Decision::Unspecified);
     let reason = Reason::try_from(r.reason).unwrap_or(Reason::Unspecified);
     let proceed = matches!(decision, Decision::Resume | Decision::Bootstrap)
@@ -51,7 +55,13 @@ pub(crate) fn after_handshake(r: &pb::HandshakeResponse, p: &Policies, force_boo
     if force_bootstrap && proceed {
         return Action::Bootstrap;
     }
-    let unexpected = || Action::Retry(format!("unexpected handshake answer {}/{}", decision.as_str_name(), reason.as_str_name()));
+    let unexpected = || {
+        Action::Retry(format!(
+            "unexpected handshake answer {}/{}",
+            decision.as_str_name(),
+            reason.as_str_name()
+        ))
+    };
     match decision {
         // Any reason on RESUME is informational, except an advanced epoch.
         Decision::Resume => match reason {
@@ -84,7 +94,9 @@ pub(crate) fn after_handshake(r: &pb::HandshakeResponse, p: &Policies, force_boo
         },
         Decision::Reject => match reason {
             Reason::Diverged => diverged(p),
-            Reason::StaleEpoch | Reason::NotReady => Action::Retry(format!("{}: {}", reason.as_str_name(), r.detail)),
+            Reason::StaleEpoch | Reason::NotReady => {
+                Action::Retry(format!("{}: {}", reason.as_str_name(), r.detail))
+            }
             Reason::ProtocolMismatch => Action::Halt(HaltReason::ProtocolMismatch),
             Reason::EnvelopeMismatch => Action::Halt(HaltReason::EnvelopeMismatch),
             Reason::LoopDetected => Action::Halt(HaltReason::LoopDetected),
@@ -147,7 +159,12 @@ mod tests {
     };
 
     fn answer(d: Decision, r: Reason) -> pb::HandshakeResponse {
-        pb::HandshakeResponse { decision: d as i32, reason: r as i32, detail: "why".into(), ..Default::default() }
+        pb::HandshakeResponse {
+            decision: d as i32,
+            reason: r as i32,
+            detail: "why".into(),
+            ..Default::default()
+        }
     }
 
     fn act(d: Decision, r: Reason, p: &Policies) -> Action {
@@ -156,55 +173,145 @@ mod tests {
 
     #[test]
     fn resume_rows() {
-        assert_eq!(act(Decision::Resume, Reason::Unspecified, &DEFAULTS), Action::Tail);
-        assert_eq!(act(Decision::Resume, Reason::EpochAdvanced, &DEFAULTS), Action::AdoptEpochThenTail);
+        assert_eq!(
+            act(Decision::Resume, Reason::Unspecified, &DEFAULTS),
+            Action::Tail
+        );
+        assert_eq!(
+            act(Decision::Resume, Reason::EpochAdvanced, &DEFAULTS),
+            Action::AdoptEpochThenTail
+        );
     }
 
     #[test]
     fn bootstrap_rows_follow_policies() {
-        assert_eq!(act(Decision::Bootstrap, Reason::NoLocalState, &DEFAULTS), Action::Bootstrap);
-        assert_eq!(act(Decision::Bootstrap, Reason::IdentityChanged, &DEFAULTS), Action::Halt(HaltReason::IdentityChanged));
-        assert_eq!(act(Decision::Bootstrap, Reason::IdentityChanged, &OPPOSITE), Action::Bootstrap);
-        assert_eq!(act(Decision::Bootstrap, Reason::LogGap, &DEFAULTS), Action::Bootstrap);
-        assert_eq!(act(Decision::Bootstrap, Reason::LogGap, &OPPOSITE), Action::Halt(HaltReason::LogGap));
+        assert_eq!(
+            act(Decision::Bootstrap, Reason::NoLocalState, &DEFAULTS),
+            Action::Bootstrap
+        );
+        assert_eq!(
+            act(Decision::Bootstrap, Reason::IdentityChanged, &DEFAULTS),
+            Action::Halt(HaltReason::IdentityChanged)
+        );
+        assert_eq!(
+            act(Decision::Bootstrap, Reason::IdentityChanged, &OPPOSITE),
+            Action::Bootstrap
+        );
+        assert_eq!(
+            act(Decision::Bootstrap, Reason::LogGap, &DEFAULTS),
+            Action::Bootstrap
+        );
+        assert_eq!(
+            act(Decision::Bootstrap, Reason::LogGap, &OPPOSITE),
+            Action::Halt(HaltReason::LogGap)
+        );
     }
 
     #[test]
     fn reject_rows() {
-        assert_eq!(act(Decision::Reject, Reason::Diverged, &DEFAULTS), Action::Halt(HaltReason::Diverged));
-        assert_eq!(act(Decision::Reject, Reason::Diverged, &OPPOSITE), Action::Bootstrap);
-        assert_eq!(act(Decision::Reject, Reason::StaleEpoch, &DEFAULTS), Action::Retry("STALE_EPOCH: why".into()));
-        assert_eq!(act(Decision::Reject, Reason::NotReady, &DEFAULTS), Action::Retry("NOT_READY: why".into()));
-        assert_eq!(act(Decision::Reject, Reason::ProtocolMismatch, &DEFAULTS), Action::Halt(HaltReason::ProtocolMismatch));
-        assert_eq!(act(Decision::Reject, Reason::EnvelopeMismatch, &DEFAULTS), Action::Halt(HaltReason::EnvelopeMismatch));
-        assert_eq!(act(Decision::Reject, Reason::LoopDetected, &DEFAULTS), Action::Halt(HaltReason::LoopDetected));
-        assert!(matches!(act(Decision::Unspecified, Reason::Busy, &DEFAULTS), Action::Retry(_)));
+        assert_eq!(
+            act(Decision::Reject, Reason::Diverged, &DEFAULTS),
+            Action::Halt(HaltReason::Diverged)
+        );
+        assert_eq!(
+            act(Decision::Reject, Reason::Diverged, &OPPOSITE),
+            Action::Bootstrap
+        );
+        assert_eq!(
+            act(Decision::Reject, Reason::StaleEpoch, &DEFAULTS),
+            Action::Retry("STALE_EPOCH: why".into())
+        );
+        assert_eq!(
+            act(Decision::Reject, Reason::NotReady, &DEFAULTS),
+            Action::Retry("NOT_READY: why".into())
+        );
+        assert_eq!(
+            act(Decision::Reject, Reason::ProtocolMismatch, &DEFAULTS),
+            Action::Halt(HaltReason::ProtocolMismatch)
+        );
+        assert_eq!(
+            act(Decision::Reject, Reason::EnvelopeMismatch, &DEFAULTS),
+            Action::Halt(HaltReason::EnvelopeMismatch)
+        );
+        assert_eq!(
+            act(Decision::Reject, Reason::LoopDetected, &DEFAULTS),
+            Action::Halt(HaltReason::LoopDetected)
+        );
+        assert!(matches!(
+            act(Decision::Unspecified, Reason::Busy, &DEFAULTS),
+            Action::Retry(_)
+        ));
     }
 
     #[test]
     fn forced_bootstrap_overrides_only_answers_that_let_the_client_proceed() {
         let forced = |d, r| after_handshake(&answer(d, r), &DEFAULTS, true);
-        assert_eq!(forced(Decision::Resume, Reason::Unspecified), Action::Bootstrap);
-        assert_eq!(forced(Decision::Bootstrap, Reason::IdentityChanged), Action::Bootstrap);
-        assert_eq!(forced(Decision::Reject, Reason::Diverged), Action::Bootstrap);
-        assert!(matches!(forced(Decision::Reject, Reason::StaleEpoch), Action::Retry(_)));
-        assert_eq!(forced(Decision::Reject, Reason::LoopDetected), Action::Halt(HaltReason::LoopDetected));
+        assert_eq!(
+            forced(Decision::Resume, Reason::Unspecified),
+            Action::Bootstrap
+        );
+        assert_eq!(
+            forced(Decision::Bootstrap, Reason::IdentityChanged),
+            Action::Bootstrap
+        );
+        assert_eq!(
+            forced(Decision::Reject, Reason::Diverged),
+            Action::Bootstrap
+        );
+        assert!(matches!(
+            forced(Decision::Reject, Reason::StaleEpoch),
+            Action::Retry(_)
+        ));
+        assert_eq!(
+            forced(Decision::Reject, Reason::LoopDetected),
+            Action::Halt(HaltReason::LoopDetected)
+        );
     }
 
     #[test]
     fn status_rows() {
         let s = |r| reason_status(r, "x");
-        assert_eq!(after_status(&Status::unauthenticated("x"), &DEFAULTS), Action::Halt(HaltReason::AuthRejected));
-        assert_eq!(after_status(&Status::permission_denied("x"), &DEFAULTS), Action::Halt(HaltReason::AuthRejected));
-        assert_eq!(after_status(&s(Reason::ProtocolMismatch), &DEFAULTS), Action::Halt(HaltReason::ProtocolMismatch));
-        assert_eq!(after_status(&s(Reason::Diverged), &DEFAULTS), Action::Halt(HaltReason::Diverged));
-        assert_eq!(after_status(&s(Reason::Diverged), &OPPOSITE), Action::Bootstrap);
-        for r in [Reason::LogGap, Reason::IdentityChanged, Reason::UpstreamReset] {
+        assert_eq!(
+            after_status(&Status::unauthenticated("x"), &DEFAULTS),
+            Action::Halt(HaltReason::AuthRejected)
+        );
+        assert_eq!(
+            after_status(&Status::permission_denied("x"), &DEFAULTS),
+            Action::Halt(HaltReason::AuthRejected)
+        );
+        assert_eq!(
+            after_status(&s(Reason::ProtocolMismatch), &DEFAULTS),
+            Action::Halt(HaltReason::ProtocolMismatch)
+        );
+        assert_eq!(
+            after_status(&s(Reason::Diverged), &DEFAULTS),
+            Action::Halt(HaltReason::Diverged)
+        );
+        assert_eq!(
+            after_status(&s(Reason::Diverged), &OPPOSITE),
+            Action::Bootstrap
+        );
+        for r in [
+            Reason::LogGap,
+            Reason::IdentityChanged,
+            Reason::UpstreamReset,
+        ] {
             assert_eq!(after_status(&s(r), &DEFAULTS), Action::Again, "{r:?}");
         }
-        for r in [Reason::NotReady, Reason::Busy, Reason::ShuttingDown, Reason::Corrupt] {
-            assert!(matches!(after_status(&s(r), &DEFAULTS), Action::Retry(_)), "{r:?}");
+        for r in [
+            Reason::NotReady,
+            Reason::Busy,
+            Reason::ShuttingDown,
+            Reason::Corrupt,
+        ] {
+            assert!(
+                matches!(after_status(&s(r), &DEFAULTS), Action::Retry(_)),
+                "{r:?}"
+            );
         }
-        assert!(matches!(after_status(&Status::unavailable("connection refused"), &DEFAULTS), Action::Retry(_)));
+        assert!(matches!(
+            after_status(&Status::unavailable("connection refused"), &DEFAULTS),
+            Action::Retry(_)
+        ));
     }
 }

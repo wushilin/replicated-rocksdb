@@ -58,8 +58,11 @@ pub(crate) fn internal_status(message: impl Into<String>) -> Status {
 /// A failed RPC with `code` and `ErrorInfo` (`REASON_UNSPECIFIED`), for failures that have no
 /// protocol reason of their own (`INVALID_ARGUMENT`, `UNIMPLEMENTED`).
 fn unspecified_status(code: Code, message: impl Into<String>) -> Status {
-    let details =
-        ErrorDetails::with_error_info(pb::Reason::Unspecified.as_str_name(), ERROR_DOMAIN, HashMap::new());
+    let details = ErrorDetails::with_error_info(
+        pb::Reason::Unspecified.as_str_name(),
+        ERROR_DOMAIN,
+        HashMap::new(),
+    );
     Status::with_error_details(code, message, details)
 }
 
@@ -86,7 +89,10 @@ pub(crate) fn reason_of(status: &Status) -> Option<pb::Reason> {
 /// Fails with `FAILED_PRECONDITION / PROTOCOL_MISMATCH` unless the call carries our
 /// `x-rrdb-protocol-version` (every RPC except Handshake, PROTOCOL.md §3.2).
 pub(crate) fn check_protocol_version(md: &MetadataMap) -> Result<(), Status> {
-    let sent = md.get(MD_PROTOCOL_VERSION).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u32>().ok());
+    let sent = md
+        .get(MD_PROTOCOL_VERSION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u32>().ok());
     match sent {
         Some(v) if v == PROTOCOL_VERSION => Ok(()),
         other => Err(reason_status(
@@ -104,7 +110,9 @@ pub(crate) fn bearer_token(md: &MetadataMap) -> Option<Vec<u8>> {
 
 /// The self-asserted node id from `x-rrdb-node-id`.
 pub(crate) fn node_id(md: &MetadataMap) -> Option<String> {
-    md.get(MD_NODE_ID).and_then(|v| v.to_str().ok()).map(str::to_string)
+    md.get(MD_NODE_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -159,16 +167,28 @@ mod tests {
     fn metadata_helpers() {
         let mut md = MetadataMap::new();
         assert!(check_protocol_version(&md).is_err());
-        md.insert(MD_PROTOCOL_VERSION, AsciiMetadataValue::from(PROTOCOL_VERSION));
+        md.insert(
+            MD_PROTOCOL_VERSION,
+            AsciiMetadataValue::from(PROTOCOL_VERSION),
+        );
         check_protocol_version(&md).unwrap();
-        md.insert(MD_PROTOCOL_VERSION, AsciiMetadataValue::from(PROTOCOL_VERSION + 1));
+        md.insert(
+            MD_PROTOCOL_VERSION,
+            AsciiMetadataValue::from(PROTOCOL_VERSION + 1),
+        );
         let err = check_protocol_version(&md).unwrap_err();
         assert_eq!(reason_of(&err), Some(pb::Reason::ProtocolMismatch));
 
         assert_eq!(bearer_token(&md), None);
-        md.insert(MD_AUTHORIZATION, AsciiMetadataValue::from_static("Bearer s3cr.et-_~+/="));
+        md.insert(
+            MD_AUTHORIZATION,
+            AsciiMetadataValue::from_static("Bearer s3cr.et-_~+/="),
+        );
         assert_eq!(bearer_token(&md).unwrap(), b"s3cr.et-_~+/=");
-        md.insert(MD_AUTHORIZATION, AsciiMetadataValue::from_static("Basic abc"));
+        md.insert(
+            MD_AUTHORIZATION,
+            AsciiMetadataValue::from_static("Basic abc"),
+        );
         assert_eq!(bearer_token(&md), None);
         md.insert(MD_NODE_ID, AsciiMetadataValue::from_static("node-b"));
         assert_eq!(node_id(&md).as_deref(), Some("node-b"));

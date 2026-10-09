@@ -48,7 +48,10 @@ pub struct CfSpec {
 
 impl CfSpec {
     pub fn new(name: impl Into<String>) -> Self {
-        CfSpec { name: name.into(), comparator: None }
+        CfSpec {
+            name: name.into(),
+            comparator: None,
+        }
     }
 
     pub fn with_comparator(mut self, comparator: impl Into<String>) -> Self {
@@ -74,12 +77,28 @@ impl CfEntry {
 /// One absolute operation. Applying it never depends on prior state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
-    Put { cf: String, key: Vec<u8>, value: Vec<u8>, expire_at_ms: Option<u64> },
-    Delete { cf: String, key: Vec<u8> },
+    Put {
+        cf: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expire_at_ms: Option<u64>,
+    },
+    Delete {
+        cf: String,
+        key: Vec<u8>,
+    },
     /// Removes keys in `[start, end)` under the CF's comparator.
-    DeleteRange { cf: String, start: Vec<u8>, end: Vec<u8> },
-    CreateCf { spec: CfSpec },
-    DropCf { name: String },
+    DeleteRange {
+        cf: String,
+        start: Vec<u8>,
+        end: Vec<u8>,
+    },
+    CreateCf {
+        spec: CfSpec,
+    },
+    DropCf {
+        name: String,
+    },
 }
 
 impl Op {
@@ -123,19 +142,38 @@ pub struct EpochStart {
 
 /// The epoch an entry with this seq must carry, given a history sorted by epoch.
 pub(crate) fn epoch_for(history: &[EpochStart], seq: Seq) -> Option<u64> {
-    history.iter().rev().find(|e| e.start_seq <= seq).map(|e| e.epoch)
+    history
+        .iter()
+        .rev()
+        .find(|e| e.start_seq <= seq)
+        .map(|e| e.epoch)
 }
 
 /// The fork point after `epoch`: the first seq of the next epoch, if any.
 pub(crate) fn fork_after(history: &[EpochStart], epoch: u64) -> Option<Seq> {
-    history.iter().find(|e| e.epoch > epoch).map(|e| e.start_seq)
+    history
+        .iter()
+        .find(|e| e.epoch > epoch)
+        .map(|e| e.start_seq)
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum BatchOp {
-    Put { cf: String, key: Vec<u8>, value: Vec<u8>, ttl: Option<Duration> },
-    Delete { cf: String, key: Vec<u8> },
-    DeleteRange { cf: String, start: Vec<u8>, end: Vec<u8> },
+    Put {
+        cf: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    },
+    Delete {
+        cf: String,
+        key: Vec<u8>,
+    },
+    DeleteRange {
+        cf: String,
+        start: Vec<u8>,
+        end: Vec<u8>,
+    },
 }
 
 /// Several data operations committed as one log entry. May span CFs; must not be empty.
@@ -152,25 +190,42 @@ impl Batch {
 
     /// Adds an absolute put with no expiry.
     pub fn put(&mut self, cf: &str, key: &[u8], value: &[u8]) -> &mut Self {
-        self.ops.push(BatchOp::Put { cf: cf.into(), key: key.into(), value: value.into(), ttl: None });
+        self.ops.push(BatchOp::Put {
+            cf: cf.into(),
+            key: key.into(),
+            value: value.into(),
+            ttl: None,
+        });
         self
     }
 
     /// Adds a put that expires `ttl` after the batch commits (computed on the master).
     pub fn put_with_ttl(&mut self, cf: &str, key: &[u8], value: &[u8], ttl: Duration) -> &mut Self {
-        self.ops.push(BatchOp::Put { cf: cf.into(), key: key.into(), value: value.into(), ttl: Some(ttl) });
+        self.ops.push(BatchOp::Put {
+            cf: cf.into(),
+            key: key.into(),
+            value: value.into(),
+            ttl: Some(ttl),
+        });
         self
     }
 
     /// Adds a delete of `key`.
     pub fn delete(&mut self, cf: &str, key: &[u8]) -> &mut Self {
-        self.ops.push(BatchOp::Delete { cf: cf.into(), key: key.into() });
+        self.ops.push(BatchOp::Delete {
+            cf: cf.into(),
+            key: key.into(),
+        });
         self
     }
 
     /// Adds a delete of `[start, end)` under the CF's comparator.
     pub fn delete_range(&mut self, cf: &str, start: &[u8], end: &[u8]) -> &mut Self {
-        self.ops.push(BatchOp::DeleteRange { cf: cf.into(), start: start.into(), end: end.into() });
+        self.ops.push(BatchOp::DeleteRange {
+            cf: cf.into(),
+            start: start.into(),
+            end: end.into(),
+        });
         self
     }
 
@@ -189,7 +244,12 @@ impl Batch {
         self.ops
             .into_iter()
             .map(|op| match op {
-                BatchOp::Put { cf, key, value, ttl } => Op::Put {
+                BatchOp::Put {
+                    cf,
+                    key,
+                    value,
+                    ttl,
+                } => Op::Put {
                     cf,
                     key,
                     value,
@@ -229,7 +289,10 @@ mod tests {
 
     #[test]
     fn physical_name_uses_create_seq() {
-        let e = CfEntry { spec: CfSpec::new("a:b"), create_seq: 42 };
+        let e = CfEntry {
+            spec: CfSpec::new("a:b"),
+            create_seq: 42,
+        };
         assert_eq!(e.physical_name(), "u:a:b:42");
     }
 
@@ -245,29 +308,63 @@ mod tests {
         let ops = b.into_ops(1_000);
         assert_eq!(
             ops[0],
-            Op::Put { cf: "c".into(), key: b"k1".to_vec(), value: b"v1".to_vec(), expire_at_ms: None }
+            Op::Put {
+                cf: "c".into(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                expire_at_ms: None
+            }
         );
         assert_eq!(
             ops[1],
-            Op::Put { cf: "c".into(), key: b"k2".to_vec(), value: b"v2".to_vec(), expire_at_ms: Some(6_000) }
+            Op::Put {
+                cf: "c".into(),
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                expire_at_ms: Some(6_000)
+            }
         );
         assert_eq!(
             ops[2],
-            Op::Put { cf: "c".into(), key: b"k3".to_vec(), value: b"v3".to_vec(), expire_at_ms: Some(u64::MAX) }
+            Op::Put {
+                cf: "c".into(),
+                key: b"k3".to_vec(),
+                value: b"v3".to_vec(),
+                expire_at_ms: Some(u64::MAX)
+            }
         );
-        assert_eq!(ops[3], Op::Delete { cf: "c".into(), key: b"k4".to_vec() });
+        assert_eq!(
+            ops[3],
+            Op::Delete {
+                cf: "c".into(),
+                key: b"k4".to_vec()
+            }
+        );
         assert_eq!(
             ops[4],
-            Op::DeleteRange { cf: "c".into(), start: b"a".to_vec(), end: b"b".to_vec() }
+            Op::DeleteRange {
+                cf: "c".into(),
+                start: b"a".to_vec(),
+                end: b"b".to_vec()
+            }
         );
     }
 
     #[test]
     fn epoch_history_lookups() {
         let h = [
-            EpochStart { epoch: 1, start_seq: 1 },
-            EpochStart { epoch: 2, start_seq: 701 },
-            EpochStart { epoch: 4, start_seq: 900 },
+            EpochStart {
+                epoch: 1,
+                start_seq: 1,
+            },
+            EpochStart {
+                epoch: 2,
+                start_seq: 701,
+            },
+            EpochStart {
+                epoch: 4,
+                start_seq: 900,
+            },
         ];
         assert_eq!(epoch_for(&h, 0), None);
         assert_eq!(epoch_for(&h, 1), Some(1));

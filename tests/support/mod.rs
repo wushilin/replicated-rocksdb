@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use replicated_rocksdb::{
-    AllowAll, Backoff, CfSpec, IterMode, LogApi, LogEntry, ManualClock, Master, MasterConfig, ReadApi,
-    ReplicationListener, Seq, ServeConfig, Slave, SlaveConfig, SlaveState, UpstreamConfig, ValueMeta,
+    AllowAll, Backoff, CfSpec, IterMode, LogApi, LogEntry, ManualClock, Master, MasterConfig,
+    ReadApi, ReplicationListener, Seq, ServeConfig, Slave, SlaveConfig, SlaveState, UpstreamConfig,
+    ValueMeta,
 };
 
 pub const T0: u64 = 1_700_000_000_000;
@@ -29,7 +30,10 @@ pub struct Cluster {
 
 impl Cluster {
     pub fn new() -> Self {
-        Cluster { clock: Arc::new(ManualClock::new(T0)), dir: tempfile::tempdir().unwrap() }
+        Cluster {
+            clock: Arc::new(ManualClock::new(T0)),
+            dir: tempfile::tempdir().unwrap(),
+        }
     }
 
     pub fn path(&self, name: &str) -> PathBuf {
@@ -77,13 +81,21 @@ impl Cluster {
     }
 
     /// A serving slave with fast reconnects and a recording listener.
-    pub fn slave_config(&self, name: &str, upstream: SocketAddr) -> (SlaveConfig, Arc<RecordingListener>) {
+    pub fn slave_config(
+        &self,
+        name: &str,
+        upstream: SocketAddr,
+    ) -> (SlaveConfig, Arc<RecordingListener>) {
         let listener = Arc::new(RecordingListener::default());
         let mut cfg = SlaveConfig::new(name, self.path(name), UpstreamConfig::from_addr(upstream));
         cfg.clock = self.clock.clone();
         cfg.heartbeat = HEARTBEAT;
         cfg.retention.check_interval = Duration::from_secs(3600);
-        cfg.reconnect = Backoff { initial: Duration::from_millis(20), max: Duration::from_millis(200), factor: 2 };
+        cfg.reconnect = Backoff {
+            initial: Duration::from_millis(20),
+            max: Duration::from_millis(200),
+            factor: 2,
+        };
         cfg.serve = Some(self.serve());
         cfg.listener = Some(listener.clone());
         (cfg, listener)
@@ -110,7 +122,10 @@ impl Cluster {
 pub async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + WAIT;
     while !f() {
-        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -134,7 +149,10 @@ pub fn dump(n: &dyn Node) -> Dump {
             .unwrap()
             .map(|r| {
                 let (k, _) = r.unwrap();
-                let (v, meta) = n.get_with_meta(&spec.name, &k).unwrap().expect("iterated key is readable");
+                let (v, meta) = n
+                    .get_with_meta(&spec.name, &k)
+                    .unwrap()
+                    .expect("iterated key is readable");
                 (k, v, meta)
             })
             .collect();
@@ -145,10 +163,20 @@ pub fn dump(n: &dyn Node) -> Dump {
 
 /// Exact equality, with a short message instead of megabytes of Debug output.
 pub fn assert_same(what: &str, a: &Dump, b: &Dump) {
-    assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>(), "{what}: CF lists differ");
+    assert_eq!(
+        a.keys().collect::<Vec<_>>(),
+        b.keys().collect::<Vec<_>>(),
+        "{what}: CF lists differ"
+    );
     for (cf, rows) in a {
         let other = &b[cf];
-        assert_eq!(rows.len(), other.len(), "{what}: CF {cf} has {} vs {} keys", rows.len(), other.len());
+        assert_eq!(
+            rows.len(),
+            other.len(),
+            "{what}: CF {cf} has {} vs {} keys",
+            rows.len(),
+            other.len()
+        );
         for (x, y) in rows.iter().zip(other) {
             assert!(
                 x == y,
@@ -166,7 +194,9 @@ pub async fn assert_converged(master: &dyn Node, slaves: &[(&str, &Slave)]) {
     let seq = master.last_seq();
     let expected = dump(master);
     for (name, s) in slaves {
-        s.wait_for_seq(seq, WAIT).await.unwrap_or_else(|e| panic!("{name} did not reach {seq}: {e}"));
+        s.wait_for_seq(seq, WAIT)
+            .await
+            .unwrap_or_else(|e| panic!("{name} did not reach {seq}: {e}"));
         assert_eq!(s.last_seq(), seq, "{name} is past the master");
         assert_same(name, &expected, &dump(*s));
     }
@@ -195,11 +225,22 @@ pub fn write_edge_cases(m: &Master, cf: &str) {
 /// Checks the edge cases through point reads on `n`.
 pub fn check_edge_cases(n: &dyn Node, cf: &str) {
     for (k, v) in edge_cases() {
-        let got = n.get(cf, &k).unwrap().unwrap_or_else(|| panic!("key of {} bytes missing", k.len()));
+        let got = n
+            .get(cf, &k)
+            .unwrap()
+            .unwrap_or_else(|| panic!("key of {} bytes missing", k.len()));
         assert!(got == v, "value of key with {} bytes differs", k.len());
     }
-    assert_eq!(n.get(cf, b"").unwrap(), Some(vec![]), "an empty value is a value");
-    assert_eq!(n.get(cf, b"\0\0").unwrap(), None, "b\"\\0\\0\" was never written");
+    assert_eq!(
+        n.get(cf, b"").unwrap(),
+        Some(vec![]),
+        "an empty value is a value"
+    );
+    assert_eq!(
+        n.get(cf, b"\0\0").unwrap(),
+        None,
+        "b\"\\0\\0\" was never written"
+    );
 }
 
 /// Copies a closed node directory (a consistent backup of a stopped node).
@@ -240,15 +281,24 @@ impl RecordingListener {
     }
 
     pub fn entries(&self) -> Vec<Seq> {
-        self.entries.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn states(&self) -> Vec<SlaveState> {
-        self.states.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        self.states
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn assert_no_violations(&self) {
-        let v = self.violations.lock().unwrap_or_else(PoisonError::into_inner);
+        let v = self
+            .violations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         assert!(v.is_empty(), "listener violations: {v:?}");
     }
 }
@@ -257,9 +307,15 @@ impl ReplicationListener for RecordingListener {
     fn on_entry(&self, entry: &LogEntry) {
         let last = self.last.swap(entry.seq, Ordering::SeqCst);
         if entry.seq <= last {
-            self.violations.lock().unwrap_or_else(PoisonError::into_inner).push(format!("entry {} after {last}", entry.seq));
+            self.violations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(format!("entry {} after {last}", entry.seq));
         }
-        self.entries.lock().unwrap_or_else(PoisonError::into_inner).push(entry.seq);
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(entry.seq);
     }
 
     fn on_bootstrap_begin(&self, _: Seq) {
@@ -272,6 +328,9 @@ impl ReplicationListener for RecordingListener {
     }
 
     fn on_state_change(&self, state: &SlaveState) {
-        self.states.lock().unwrap_or_else(PoisonError::into_inner).push(state.clone());
+        self.states
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(state.clone());
     }
 }

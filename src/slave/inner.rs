@@ -1,12 +1,12 @@
 //! Shared state of one slave: the store plus everything the driver, the API and the
 //! replication server (when serving) read.
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::SystemTime;
 
-use tokio::sync::{watch, Notify};
+use tokio::sync::{Notify, watch};
 
 use super::config::{SlaveConfig, UpstreamConfig};
 use super::policy::Policies;
@@ -14,8 +14,8 @@ use super::repoint::PendingRepoint;
 use super::state::{HaltReason, NodeState, SlaveState, SlaveStatus};
 use crate::error::{Error, Result};
 use crate::listener::ReplicationListener;
-use crate::store::meta::{key, MetaSnapshot};
 use crate::store::Store;
+use crate::store::meta::{MetaSnapshot, key};
 use crate::types::{DbIdentity, EpochStart, Seq};
 
 /// A requested bootstrap, tagged with the repoint generation it was requested for. A request
@@ -37,7 +37,9 @@ impl ForcedBootstrap {
 
     /// Clears the request of `generation` (a request of another generation stays).
     pub(crate) fn clear(&self, generation: u64) {
-        let _ = self.0.compare_exchange(generation + 1, 0, Ordering::SeqCst, Ordering::SeqCst);
+        let _ = self
+            .0
+            .compare_exchange(generation + 1, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 
@@ -89,7 +91,9 @@ impl Inner {
         let ident = match (meta.identity, node_state) {
             (_, NodeState::Bootstrapping) | (None, _) => None,
             (Some(_), _) if meta.epoch_history.is_empty() => {
-                return Err(Error::corrupt("origin_identity without epoch_history in __meta"));
+                return Err(Error::corrupt(
+                    "origin_identity without epoch_history in __meta",
+                ));
             }
             (Some(id), _) => Some((id, meta.epoch_history.clone())),
         };
@@ -131,23 +135,38 @@ impl Inner {
     }
 
     pub(crate) fn upstream(&self) -> UpstreamConfig {
-        self.upstream.read().unwrap_or_else(PoisonError::into_inner).clone()
+        self.upstream
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn set_upstream(&self, up: UpstreamConfig) {
-        *self.upstream.write().unwrap_or_else(PoisonError::into_inner) = up;
+        *self
+            .upstream
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = up;
     }
 
     pub(crate) fn pending_repoint(&self) -> std::sync::MutexGuard<'_, Option<PendingRepoint>> {
-        self.pending_repoint.lock().unwrap_or_else(PoisonError::into_inner)
+        self.pending_repoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn policies(&self) -> Policies {
-        Policies { identity: self.cfg.on_identity_change, divergence: self.cfg.on_divergence, gap: self.cfg.on_log_gap }
+        Policies {
+            identity: self.cfg.on_identity_change,
+            divergence: self.cfg.on_divergence,
+            gap: self.cfg.on_log_gap,
+        }
     }
 
     pub(crate) fn ident(&self) -> Option<(DbIdentity, Vec<EpochStart>)> {
-        self.ident.read().unwrap_or_else(PoisonError::into_inner).clone()
+        self.ident
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn set_ident(&self, v: Option<(DbIdentity, Vec<EpochStart>)>) {
@@ -156,7 +175,10 @@ impl Inner {
 
     /// Readable and servable: the slave holds a consistent state at some seq.
     pub(crate) fn is_ready(&self) -> bool {
-        self.ident.read().unwrap_or_else(PoisonError::into_inner).is_some()
+        self.ident
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
     }
 
     pub(crate) fn now_ms(&self) -> u64 {
@@ -208,11 +230,17 @@ impl Inner {
 
     /// Forgets the chain learned from the previous upstream, until the new one answers.
     pub(crate) fn clear_upstream_chain(&self) {
-        self.upstream_chain.write().unwrap_or_else(PoisonError::into_inner).clear();
+        self.upstream_chain
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     pub(crate) fn upstream_chain(&self) -> Vec<String> {
-        self.upstream_chain.read().unwrap_or_else(PoisonError::into_inner).clone()
+        self.upstream_chain
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Records what the upstream said about itself in a handshake. Returns the upstream's
@@ -220,24 +248,39 @@ impl Inner {
     pub(crate) fn note_upstream(&self, r: &crate::pb::HandshakeResponse) -> Option<u64> {
         let mut chain = vec![r.server_id.clone()];
         chain.extend(r.upstream_chain.iter().cloned());
-        *self.upstream_chain.write().unwrap_or_else(PoisonError::into_inner) = chain;
+        *self
+            .upstream_chain
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = chain;
         self.note_positions(r.last_seq, r.origin_last_seq);
         self.note_contact();
-        let changed = r.max_entry_bytes > 0 && self.max_entry_bytes.swap(r.max_entry_bytes, Ordering::SeqCst) != r.max_entry_bytes;
+        let changed = r.max_entry_bytes > 0
+            && self
+                .max_entry_bytes
+                .swap(r.max_entry_bytes, Ordering::SeqCst)
+                != r.max_entry_bytes;
         changed.then_some(r.max_entry_bytes)
     }
 
     pub(crate) fn note_positions(&self, upstream_last_seq: Seq, origin_last_seq: Seq) {
-        self.upstream_last_seq.store(upstream_last_seq, Ordering::SeqCst);
-        self.origin_last_seq.fetch_max(origin_last_seq, Ordering::SeqCst);
+        self.upstream_last_seq
+            .store(upstream_last_seq, Ordering::SeqCst);
+        self.origin_last_seq
+            .fetch_max(origin_last_seq, Ordering::SeqCst);
     }
 
     pub(crate) fn note_contact(&self) {
-        *self.last_contact.lock().unwrap_or_else(PoisonError::into_inner) = Some(SystemTime::now());
+        *self
+            .last_contact
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(SystemTime::now());
     }
 
     pub(crate) fn set_last_error(&self, e: Option<String>) {
-        *self.last_error.lock().unwrap_or_else(PoisonError::into_inner) = e;
+        *self
+            .last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = e;
     }
 
     /// Calls the listener, if any. A panic is caught, logged, and disables the listener.
@@ -260,11 +303,21 @@ impl Inner {
             applied_seq: pos.last_seq,
             first_retained_seq: self.store.first_retained_seq(),
             upstream_last_seq: self.upstream_last_seq.load(Ordering::SeqCst),
-            origin_last_seq: self.origin_last_seq.load(Ordering::SeqCst).max(pos.last_seq),
+            origin_last_seq: self
+                .origin_last_seq
+                .load(Ordering::SeqCst)
+                .max(pos.last_seq),
             upstream: self.upstream_uri(),
             upstream_chain: self.upstream_chain(),
-            last_contact: *self.last_contact.lock().unwrap_or_else(PoisonError::into_inner),
-            last_error: self.last_error.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+            last_contact: *self
+                .last_contact
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            last_error: self
+                .last_error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
             listener_failed: self.listener_failed.load(Ordering::SeqCst),
         }
     }
@@ -296,7 +349,10 @@ mod tests {
         f.request(1);
         assert!(f.is_requested_for(1) && !f.is_requested_for(0));
         f.clear(0);
-        assert!(f.is_requested_for(1), "clearing another generation is a no-op");
+        assert!(
+            f.is_requested_for(1),
+            "clearing another generation is a no-op"
+        );
         f.clear(1);
         assert!(!f.is_requested_for(1));
     }

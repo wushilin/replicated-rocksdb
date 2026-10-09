@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use rocksdb::{BoundColumnFamily, DBIteratorWithThreadMode, DB};
+use rocksdb::{BoundColumnFamily, DB, DBIteratorWithThreadMode};
 
 use super::cfs::PhysCf;
 use super::snapshot::OwnedSnapshot;
@@ -34,7 +34,9 @@ impl<'a> ReadCtx<'a> {
     }
 
     pub(crate) fn get(&self, cf: &PhysCf, key: &[u8]) -> Result<Option<(Vec<u8>, ValueMeta)>> {
-        let Some(raw) = self.get_raw(cf, key)? else { return Ok(None) };
+        let Some(raw) = self.get_raw(cf, key)? else {
+            return Ok(None);
+        };
         let env = envelope::decode(&raw)?;
         if env.is_expired(self.now_ms) {
             return Ok(None);
@@ -42,19 +44,34 @@ impl<'a> ReadCtx<'a> {
         Ok(Some((env.value.to_vec(), env.meta)))
     }
 
-    pub(crate) fn iter(&self, cf: Arc<PhysCf>, mode: IterMode<'_>, prefix: Option<&[u8]>) -> Result<DbIter<'a>> {
+    pub(crate) fn iter(
+        &self,
+        cf: Arc<PhysCf>,
+        mode: IterMode<'_>,
+        prefix: Option<&[u8]>,
+    ) -> Result<DbIter<'a>> {
         let mode = match mode {
             IterMode::Start => rocksdb::IteratorMode::Start,
             IterMode::End => rocksdb::IteratorMode::End,
-            IterMode::From(k, Direction::Forward) => rocksdb::IteratorMode::From(k, rocksdb::Direction::Forward),
-            IterMode::From(k, Direction::Reverse) => rocksdb::IteratorMode::From(k, rocksdb::Direction::Reverse),
+            IterMode::From(k, Direction::Forward) => {
+                rocksdb::IteratorMode::From(k, rocksdb::Direction::Forward)
+            }
+            IterMode::From(k, Direction::Reverse) => {
+                rocksdb::IteratorMode::From(k, rocksdb::Direction::Reverse)
+            }
         };
         let h = handle(self.db, &cf)?;
         let inner = match self.snap {
             Some(s) => s.iterator_cf(&h, mode),
             None => self.db.iterator_cf(&h, mode),
         };
-        Ok(DbIter { inner, _cf: cf, now_ms: self.now_ms, prefix: prefix.map(<[u8]>::to_vec), done: false })
+        Ok(DbIter {
+            inner,
+            _cf: cf,
+            now_ms: self.now_ms,
+            prefix: prefix.map(<[u8]>::to_vec),
+            done: false,
+        })
     }
 }
 
@@ -101,15 +118,38 @@ mod tests {
     use crate::types::{CfSpec, Direction, IterMode, Op};
 
     fn put(k: &[u8], v: &[u8], ttl_at: Option<u64>) -> Op {
-        Op::Put { cf: "c".into(), key: k.to_vec(), value: v.to_vec(), expire_at_ms: ttl_at }
+        Op::Put {
+            cf: "c".into(),
+            key: k.to_vec(),
+            value: v.to_vec(),
+            expire_at_ms: ttl_at,
+        }
     }
 
     fn setup() -> (tempfile::TempDir, crate::store::Store) {
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
-        apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
-        apply(&store, vec![put(b"a", b"1", None), put(b"b", b"2", Some(100)), put(b"ba", b"3", None)]).unwrap();
-        apply(&store, vec![put(b"c", b"4", None), put(b"", b"empty", None)]).unwrap();
+        apply(
+            &store,
+            vec![Op::CreateCf {
+                spec: CfSpec::new("c"),
+            }],
+        )
+        .unwrap();
+        apply(
+            &store,
+            vec![
+                put(b"a", b"1", None),
+                put(b"b", b"2", Some(100)),
+                put(b"ba", b"3", None),
+            ],
+        )
+        .unwrap();
+        apply(
+            &store,
+            vec![put(b"c", b"4", None), put(b"", b"empty", None)],
+        )
+        .unwrap();
         (dir, store)
     }
 
@@ -126,7 +166,10 @@ mod tests {
         assert_eq!(meta.write_seq, 2);
         assert_eq!(meta.expire_at_ms, Some(100));
         assert_eq!(store.live_ctx(100).get(&cf, b"b").unwrap(), None);
-        assert_eq!(store.live_ctx(100).get(&cf, b"").unwrap().unwrap().0, b"empty");
+        assert_eq!(
+            store.live_ctx(100).get(&cf, b"").unwrap().unwrap().0,
+            b"empty"
+        );
         assert_eq!(store.live_ctx(0).get(&cf, b"zz").unwrap(), None);
     }
 
@@ -135,18 +178,42 @@ mod tests {
         let (_d, store) = setup();
         let cf = store.live_cf("c").unwrap();
         let ctx = store.live_ctx(100);
-        assert_eq!(keys(ctx.iter(cf.clone(), IterMode::Start, None).unwrap()), vec![b"".to_vec(), b"a".to_vec(), b"ba".to_vec(), b"c".to_vec()]);
-        assert_eq!(keys(ctx.iter(cf.clone(), IterMode::End, None).unwrap()), vec![b"c".to_vec(), b"ba".to_vec(), b"a".to_vec(), b"".to_vec()]);
         assert_eq!(
-            keys(ctx.iter(cf.clone(), IterMode::From(b"b", Direction::Forward), None).unwrap()),
+            keys(ctx.iter(cf.clone(), IterMode::Start, None).unwrap()),
+            vec![b"".to_vec(), b"a".to_vec(), b"ba".to_vec(), b"c".to_vec()]
+        );
+        assert_eq!(
+            keys(ctx.iter(cf.clone(), IterMode::End, None).unwrap()),
+            vec![b"c".to_vec(), b"ba".to_vec(), b"a".to_vec(), b"".to_vec()]
+        );
+        assert_eq!(
+            keys(
+                ctx.iter(cf.clone(), IterMode::From(b"b", Direction::Forward), None)
+                    .unwrap()
+            ),
             vec![b"ba".to_vec(), b"c".to_vec()]
         );
         assert_eq!(
-            keys(ctx.iter(cf.clone(), IterMode::From(b"b", Direction::Forward), Some(b"b")).unwrap()),
+            keys(
+                ctx.iter(
+                    cf.clone(),
+                    IterMode::From(b"b", Direction::Forward),
+                    Some(b"b")
+                )
+                .unwrap()
+            ),
             vec![b"ba".to_vec()]
         );
         let at_99 = store.live_ctx(99);
-        assert_eq!(keys(at_99.iter(cf, IterMode::From(b"b", Direction::Forward), Some(b"b")).unwrap()).len(), 2);
+        assert_eq!(
+            keys(
+                at_99
+                    .iter(cf, IterMode::From(b"b", Direction::Forward), Some(b"b"))
+                    .unwrap()
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
@@ -155,34 +222,81 @@ mod tests {
         let snap = store.read_snapshot(99).unwrap();
         assert_eq!(snap.seq(), 3);
         apply(&store, vec![put(b"a", b"changed", None)]).unwrap();
-        apply(&store, vec![Op::CreateCf { spec: CfSpec::new("later") }]).unwrap();
+        apply(
+            &store,
+            vec![Op::CreateCf {
+                spec: CfSpec::new("later"),
+            }],
+        )
+        .unwrap();
         assert_eq!(snap.get("c", b"a").unwrap().unwrap(), b"1");
-        assert_eq!(snap.get("c", b"b").unwrap().unwrap(), b"2", "now is fixed at 99");
+        assert_eq!(
+            snap.get("c", b"b").unwrap().unwrap(),
+            b"2",
+            "now is fixed at 99"
+        );
         assert_eq!(snap.list_cfs(), vec![CfSpec::new("c")]);
         assert_eq!(
             snap.multi_get("c", &[b"a", b"zz"]).unwrap(),
             vec![Some(b"1".to_vec()), None]
         );
         assert_eq!(keys(snap.prefix_iter("c", b"b").unwrap()).len(), 2);
-        assert!(matches!(snap.get("later", b"k"), Err(crate::Error::NoSuchCf(_))));
+        assert!(matches!(
+            snap.get("later", b"k"),
+            Err(crate::Error::NoSuchCf(_))
+        ));
     }
 
     #[test]
     fn nul_and_empty_keys_order_and_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
-        apply(&store, vec![Op::CreateCf { spec: CfSpec::new("n") }]).unwrap();
-        let p = |k: &[u8]| Op::Put { cf: "n".into(), key: k.to_vec(), value: k.to_vec(), expire_at_ms: None };
+        apply(
+            &store,
+            vec![Op::CreateCf {
+                spec: CfSpec::new("n"),
+            }],
+        )
+        .unwrap();
+        let p = |k: &[u8]| Op::Put {
+            cf: "n".into(),
+            key: k.to_vec(),
+            value: k.to_vec(),
+            expire_at_ms: None,
+        };
         apply(&store, vec![p(b"a"), p(b"\0\0"), p(b""), p(b"\0")]).unwrap();
         let cf = store.live_cf("n").unwrap();
         let ctx = store.live_ctx(0);
-        let all: Vec<(Vec<u8>, Vec<u8>)> =
-            ctx.iter(cf.clone(), IterMode::Start, None).unwrap().map(Result::unwrap).collect();
-        assert_eq!(all.iter().map(|(k, _)| k.as_slice()).collect::<Vec<_>>(), vec![&b""[..], b"\0", b"\0\0", b"a"]);
-        assert!(all.iter().all(|(k, v)| k == v), "values equal keys, including empty ones");
-        assert_eq!(keys(ctx.iter(cf.clone(), IterMode::From(b"", Direction::Forward), Some(b"")).unwrap()).len(), 4);
+        let all: Vec<(Vec<u8>, Vec<u8>)> = ctx
+            .iter(cf.clone(), IterMode::Start, None)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(
-            keys(ctx.iter(cf, IterMode::From(b"\0", Direction::Forward), Some(b"\0")).unwrap()),
+            all.iter().map(|(k, _)| k.as_slice()).collect::<Vec<_>>(),
+            vec![&b""[..], b"\0", b"\0\0", b"a"]
+        );
+        assert!(
+            all.iter().all(|(k, v)| k == v),
+            "values equal keys, including empty ones"
+        );
+        assert_eq!(
+            keys(
+                ctx.iter(
+                    cf.clone(),
+                    IterMode::From(b"", Direction::Forward),
+                    Some(b"")
+                )
+                .unwrap()
+            )
+            .len(),
+            4
+        );
+        assert_eq!(
+            keys(
+                ctx.iter(cf, IterMode::From(b"\0", Direction::Forward), Some(b"\0"))
+                    .unwrap()
+            ),
             vec![b"\0".to_vec(), b"\0\0".to_vec()]
         );
     }
@@ -193,7 +307,11 @@ mod tests {
         let cf = store.live_cf("c").unwrap();
         let it = store.live_ctx(0).iter(cf, IterMode::Start, None).unwrap();
         apply(&store, vec![Op::DropCf { name: "c".into() }]).unwrap();
-        assert_eq!(store.drop_unreferenced_cfs().unwrap(), 0, "iterator still references the CF");
+        assert_eq!(
+            store.drop_unreferenced_cfs().unwrap(),
+            0,
+            "iterator still references the CF"
+        );
         assert_eq!(keys(it).len(), 5, "now = 0: nothing expired");
         assert_eq!(store.drop_unreferenced_cfs().unwrap(), 1);
     }

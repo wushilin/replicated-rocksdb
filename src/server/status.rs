@@ -11,7 +11,12 @@ use crate::types::{Role, Seq};
 
 /// What this node reports about itself.
 /// `probes`: seqs whose entry CRC to report as well (`NodeInfo::probes`).
-pub(crate) fn node_info(src: &dyn LogSource, replicas: &ReplicaRegistry, lag_max: Duration, probes: &[Seq]) -> NodeInfo {
+pub(crate) fn node_info(
+    src: &dyn LogSource,
+    replicas: &ReplicaRegistry,
+    lag_max: Duration,
+    probes: &[Seq],
+) -> NodeInfo {
     let ident = src.identity();
     let pos = src.store().position();
     let last_ts_ms = src
@@ -34,11 +39,18 @@ pub(crate) fn node_info(src: &dyn LogSource, replicas: &ReplicaRegistry, lag_max
         replicas: replicas
             .summary(epoch, lag_max)
             .into_iter()
-            .map(|(node_id, applied_seq, in_sync)| ReplicaSummary { node_id, applied_seq, in_sync })
+            .map(|(node_id, applied_seq, in_sync)| ReplicaSummary {
+                node_id,
+                applied_seq,
+                in_sync,
+            })
             .collect(),
         // `entry_crc` includes this node's own `last_entry_crc` at `last_seq`; a read error
         // reports the entry as not held.
-        probes: probes.iter().map(|&seq| (seq, src.store().entry_crc(seq).ok().flatten())).collect(),
+        probes: probes
+            .iter()
+            .map(|&seq| (seq, src.store().entry_crc(seq).ok().flatten()))
+            .collect(),
         // A read error reports none; promotion tooling also reads every history record.
         max_burned_epoch: src.store().max_burned_epoch().unwrap_or(0),
     }
@@ -62,7 +74,11 @@ pub(crate) fn to_pb(i: &NodeInfo, probe_seq: Option<Seq>) -> pb::StatusResponse 
         replicas: i
             .replicas
             .iter()
-            .map(|r| pb::ReplicaSummary { node_id: r.node_id.clone(), applied_seq: r.applied_seq, in_sync: r.in_sync })
+            .map(|r| pb::ReplicaSummary {
+                node_id: r.node_id.clone(),
+                applied_seq: r.applied_seq,
+                in_sync: r.in_sync,
+            })
             .collect(),
         probe_crc: probe_seq.and_then(|seq| i.probes.get(&seq).copied().flatten()),
         max_burned_epoch: i.max_burned_epoch,

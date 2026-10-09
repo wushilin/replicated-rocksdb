@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::auth::{CredentialsProvider, NoCredentials};
 use crate::clock::{Clock, SystemClock};
-use crate::config::{validate_identifier, Retention, ServeConfig, TlsClientConfig};
+use crate::config::{Retention, ServeConfig, TlsClientConfig, validate_identifier};
 use crate::error::{Error, Result};
 use crate::listener::ReplicationListener;
 use crate::tuning::RocksTuning;
@@ -25,7 +25,12 @@ pub struct UpstreamConfig {
 
 impl UpstreamConfig {
     pub fn new(server: impl Into<String>, port: u16) -> Self {
-        UpstreamConfig { server: server.into(), port, tls: None, credentials: Arc::new(NoCredentials) }
+        UpstreamConfig {
+            server: server.into(),
+            port,
+            tls: None,
+            credentials: Arc::new(NoCredentials),
+        }
     }
 
     pub fn from_addr(addr: SocketAddr) -> Self {
@@ -86,7 +91,11 @@ pub struct FetchConfig {
 
 impl Default for FetchConfig {
     fn default() -> Self {
-        FetchConfig { min_batch_bytes: 0, max_wait: Duration::from_millis(100), max_batch_bytes: 1 << 20 }
+        FetchConfig {
+            min_batch_bytes: 0,
+            max_wait: Duration::from_millis(100),
+            max_batch_bytes: 1 << 20,
+        }
     }
 }
 
@@ -100,7 +109,11 @@ pub struct Backoff {
 
 impl Default for Backoff {
     fn default() -> Self {
-        Backoff { initial: Duration::from_millis(100), max: Duration::from_secs(30), factor: 2 }
+        Backoff {
+            initial: Duration::from_millis(100),
+            max: Duration::from_secs(30),
+            factor: 2,
+        }
     }
 }
 
@@ -161,7 +174,11 @@ pub struct SlaveConfig {
 }
 
 impl SlaveConfig {
-    pub fn new(identifier: impl Into<String>, path: impl Into<PathBuf>, upstream: UpstreamConfig) -> Self {
+    pub fn new(
+        identifier: impl Into<String>,
+        path: impl Into<PathBuf>,
+        upstream: UpstreamConfig,
+    ) -> Self {
         SlaveConfig {
             identifier: identifier.into(),
             path: path.into(),
@@ -185,16 +202,30 @@ impl SlaveConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         validate_identifier(&self.identifier)?;
         if self.upstream.server.is_empty() || self.upstream.port == 0 {
-            return Err(Error::Config("upstream server and port are required".into()));
+            return Err(Error::Config(
+                "upstream server and port are required".into(),
+            ));
         }
-        if self.reconnect.initial.is_zero() || self.reconnect.max < self.reconnect.initial || self.reconnect.factor == 0 {
-            return Err(Error::Config("reconnect backoff needs 0 < initial <= max and factor >= 1".into()));
+        if self.reconnect.initial.is_zero()
+            || self.reconnect.max < self.reconnect.initial
+            || self.reconnect.factor == 0
+        {
+            return Err(Error::Config(
+                "reconnect backoff needs 0 < initial <= max and factor >= 1".into(),
+            ));
         }
         if self.fetch.max_batch_bytes == 0 {
-            return Err(Error::Config("fetch.max_batch_bytes must be positive".into()));
+            return Err(Error::Config(
+                "fetch.max_batch_bytes must be positive".into(),
+            ));
         }
-        if self.heartbeat.is_zero() || self.connect_timeout.is_zero() || self.retention.check_interval.is_zero() {
-            return Err(Error::Config("heartbeat, connect_timeout and retention.check_interval must be positive".into()));
+        if self.heartbeat.is_zero()
+            || self.connect_timeout.is_zero()
+            || self.retention.check_interval.is_zero()
+        {
+            return Err(Error::Config(
+                "heartbeat, connect_timeout and retention.check_interval must be positive".into(),
+            ));
         }
         if let Some(serve) = &self.serve {
             serve.validate()?;
@@ -225,25 +256,47 @@ mod tests {
 
     #[test]
     fn upstream_uri_brackets_ipv6() {
-        assert_eq!(UpstreamConfig::new("10.0.0.1", 7000).uri(), "http://10.0.0.1:7000");
-        assert_eq!(UpstreamConfig::from_addr("[::1]:7000".parse().unwrap()).uri(), "http://[::1]:7000");
+        assert_eq!(
+            UpstreamConfig::new("10.0.0.1", 7000).uri(),
+            "http://10.0.0.1:7000"
+        );
+        assert_eq!(
+            UpstreamConfig::from_addr("[::1]:7000".parse().unwrap()).uri(),
+            "http://[::1]:7000"
+        );
     }
 
     #[test]
     fn config_is_validated() {
         let up = UpstreamConfig::new("127.0.0.1", 7000);
-        SlaveConfig::new("b", "/tmp/x", up.clone()).validate().unwrap();
-        assert!(SlaveConfig::new("bad id", "/tmp/x", up.clone()).validate().is_err());
-        assert!(SlaveConfig::new("b", "/tmp/x", UpstreamConfig::new("h", 0)).validate().is_err());
+        SlaveConfig::new("b", "/tmp/x", up.clone())
+            .validate()
+            .unwrap();
+        assert!(
+            SlaveConfig::new("bad id", "/tmp/x", up.clone())
+                .validate()
+                .is_err()
+        );
+        assert!(
+            SlaveConfig::new("b", "/tmp/x", UpstreamConfig::new("h", 0))
+                .validate()
+                .is_err()
+        );
         let mut cfg = SlaveConfig::new("b", "/tmp/x", up.clone());
         cfg.reconnect.max = Duration::from_millis(1);
         assert!(cfg.validate().is_err());
         // Serving: the heartbeat must be at most half of the in-sync window.
         let mut cfg = SlaveConfig::new("b", "/tmp/x", up);
-        cfg.serve = Some(ServeConfig::new(std::net::IpAddr::from([127, 0, 0, 1]), 0, Arc::new(crate::auth::AllowAll)));
+        cfg.serve = Some(ServeConfig::new(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            0,
+            Arc::new(crate::auth::AllowAll),
+        ));
         cfg.heartbeat = Duration::from_secs(5);
         cfg.validate().unwrap();
         cfg.serve.as_mut().unwrap().limits.replica_lag_time_max = Duration::from_millis(9_999);
-        assert!(matches!(cfg.validate(), Err(Error::Config(m)) if m.contains("replica_lag_time_max")));
+        assert!(
+            matches!(cfg.validate(), Err(Error::Config(m)) if m.contains("replica_lag_time_max"))
+        );
     }
 }

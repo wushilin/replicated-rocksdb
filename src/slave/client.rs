@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tonic::metadata::AsciiMetadataValue;
-use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
@@ -27,18 +27,24 @@ pub(crate) struct CallMeta {
 impl Interceptor for CallMeta {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         let md = req.metadata_mut();
-        md.insert(MD_PROTOCOL_VERSION, AsciiMetadataValue::from(PROTOCOL_VERSION));
+        md.insert(
+            MD_PROTOCOL_VERSION,
+            AsciiMetadataValue::from(PROTOCOL_VERSION),
+        );
         md.insert(MD_NODE_ID, self.node_id.clone());
         if let Some(token) = self.credentials.token() {
             // An invalid token is refused locally as UNAUTHENTICATED, which halts the slave
             // with `AuthRejected` (not persisted).
             if crate::auth::validate_token(&token).is_err() {
-                return Err(Status::unauthenticated("the configured token has characters outside RFC 6750 b64token"));
+                return Err(Status::unauthenticated(
+                    "the configured token has characters outside RFC 6750 b64token",
+                ));
             }
             let mut v = b"Bearer ".to_vec();
             v.extend_from_slice(&token);
-            let value = AsciiMetadataValue::try_from(v.as_slice())
-                .map_err(|_| Status::unauthenticated("the configured token is not valid header text"))?;
+            let value = AsciiMetadataValue::try_from(v.as_slice()).map_err(|_| {
+                Status::unauthenticated("the configured token is not valid header text")
+            })?;
             md.insert(MD_AUTHORIZATION, value);
         }
         Ok(req)
@@ -49,11 +55,19 @@ pub(crate) type Client = ReplicationClient<InterceptedService<Channel, CallMeta>
 
 /// A client for the slave's current upstream. Connects on first use and reconnects by itself.
 pub(crate) fn connect(inner: &Inner) -> Result<Client> {
-    connect_upstream(&inner.upstream(), &inner.cfg.identifier, inner.cfg.connect_timeout)
+    connect_upstream(
+        &inner.upstream(),
+        &inner.cfg.identifier,
+        inner.cfg.connect_timeout,
+    )
 }
 
 /// A client for `up`, identifying itself as `identifier`.
-pub(crate) fn connect_upstream(up: &UpstreamConfig, identifier: &str, connect_timeout: Duration) -> Result<Client> {
+pub(crate) fn connect_upstream(
+    up: &UpstreamConfig,
+    identifier: &str,
+    connect_timeout: Duration,
+) -> Result<Client> {
     let mut endpoint = Endpoint::from_shared(up.uri())
         .map_err(|e| Error::Config(format!("upstream address {}: {e}", up.uri())))?
         .connect_timeout(connect_timeout)
@@ -68,6 +82,12 @@ pub(crate) fn connect_upstream(up: &UpstreamConfig, identifier: &str, connect_ti
     crate::config::validate_identifier(identifier)?;
     let node_id = AsciiMetadataValue::try_from(identifier)
         .map_err(|_| Error::Config("identifier is not valid header text".into()))?;
-    let meta = CallMeta { node_id, credentials: up.credentials.clone() };
-    Ok(ReplicationClient::with_interceptor(endpoint.connect_lazy(), meta))
+    let meta = CallMeta {
+        node_id,
+        credentials: up.credentials.clone(),
+    };
+    Ok(ReplicationClient::with_interceptor(
+        endpoint.connect_lazy(),
+        meta,
+    ))
 }

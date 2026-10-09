@@ -6,10 +6,10 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{watch, Notify};
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::WatchStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::WatchStream;
 
 use tonic::Status;
 
@@ -24,8 +24,8 @@ use super::state::{HaltReason, NodeState, SlaveState};
 use crate::background::blocking;
 use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 use crate::failpoint;
-use crate::net::convert::{checked_history, entry_from_pb, identity_from_pb, identity_to_pb};
 use crate::net::DECODE_SLACK;
+use crate::net::convert::{checked_history, entry_from_pb, identity_from_pb, identity_to_pb};
 use crate::pb;
 use crate::pb::tail_client_message::Kind as ClientKind;
 use crate::pb::tail_message::Kind;
@@ -62,7 +62,11 @@ pub(crate) fn end_for(inner: &Inner, generation: u64, action: Action) -> Session
 /// Awaits `f` (a network call), or ends the session with `Again` once the slave is repointed
 /// away from the upstream of session `generation`. Store writes are never cancelled this way: the
 /// driver checks only between them.
-pub(crate) async fn unless_repointed<T>(inner: &Inner, generation: u64, f: impl Future<Output = T>) -> Result<T, SessionEnd> {
+pub(crate) async fn unless_repointed<T>(
+    inner: &Inner,
+    generation: u64,
+    f: impl Future<Output = T>,
+) -> Result<T, SessionEnd> {
     let mut repoints = inner.repoint_tx.subscribe();
     tokio::select! {
         biased;
@@ -75,7 +79,9 @@ pub(crate) fn status_end(inner: &Inner, generation: u64, s: &Status) -> SessionE
     // After a repoint, a Tail or Bootstrap ending with DIVERGED follows the repoint's mode.
     if crate::net::reason_of(s) == Some(pb::Reason::Diverged) {
         match inner.repoint_mode() {
-            Some(RepointDivergence::Rebootstrap { .. }) => return end_for(inner, generation, Action::Bootstrap),
+            Some(RepointDivergence::Rebootstrap { .. }) => {
+                return end_for(inner, generation, Action::Bootstrap);
+            }
             // No handshake here to compute the fork from: handshake again, which answers
             // `DIVERGED` under the same mode and halts with the exact `Error::Diverged`.
             Some(RepointDivergence::Refuse | RepointDivergence::Repair { .. }) => {
@@ -85,7 +91,11 @@ pub(crate) fn status_end(inner: &Inner, generation: u64, s: &Status) -> SessionE
             None => {}
         }
     }
-    end_for(inner, generation, policy::after_status(s, &inner.policies()))
+    end_for(
+        inner,
+        generation,
+        policy::after_status(s, &inner.policies()),
+    )
 }
 
 /// Starts the driver. It holds only a `Weak<Inner>` while it waits (halted, or backing off),
@@ -195,7 +205,11 @@ fn clear_halt_for_repoint(inner: &Inner) {
 async fn commit_halt_clear(inner: &Arc<Inner>) {
     if inner.halt_clear_pending.swap(false, Ordering::SeqCst) {
         let i = inner.clone();
-        let r = blocking(move || i.store.write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true)).await;
+        let r = blocking(move || {
+            i.store
+                .write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true)
+        })
+        .await;
         if let Err(e) = r {
             tracing::warn!(node = %inner.cfg.identifier, error = %e, "could not persist the cleared halt");
             inner.halt_clear_pending.store(true, Ordering::SeqCst);
@@ -212,14 +226,25 @@ fn handshake_request(inner: &Inner) -> pb::HandshakeRequest {
         client_id: inner.cfg.identifier.clone(),
         known_identity: ident.as_ref().map(|(id, _)| identity_to_pb(id)),
         last_seq: if ident.is_some() { pos.last_seq } else { 0 },
-        last_crc32c: if ident.is_some() { pos.last_entry_crc } else { None },
+        last_crc32c: if ident.is_some() {
+            pos.last_entry_crc
+        } else {
+            None
+        },
         // Tells the server which promotion's epoch this is, not only its number (PROTOCOL §6.3).
-        known_epoch_start: ident.as_ref().and_then(|(id, h)| h.iter().find(|e| e.epoch == id.epoch).map(|e| e.start_seq)),
+        known_epoch_start: ident
+            .as_ref()
+            .and_then(|(id, h)| h.iter().find(|e| e.epoch == id.epoch).map(|e| e.start_seq)),
     }
 }
 
 /// One connect → handshake → act cycle against the upstream of repoint `generation`.
-async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, Client)>, backoff: &mut BackoffState) -> SessionEnd {
+async fn session(
+    inner: &Arc<Inner>,
+    generation: u64,
+    client: &mut Option<(u64, Client)>,
+    backoff: &mut BackoffState,
+) -> SessionEnd {
     inner.set_state(SlaveState::Connecting);
     let c = match client {
         Some((_, c)) => c.clone(),
@@ -228,7 +253,13 @@ async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, 
             Err(e) => return SessionEnd::Retry(e.to_string()),
         },
     };
-    let hs = match unless_repointed(inner, generation, c.clone().handshake(handshake_request(inner))).await {
+    let hs = match unless_repointed(
+        inner,
+        generation,
+        c.clone().handshake(handshake_request(inner)),
+    )
+    .await
+    {
         Ok(Ok(r)) => r.into_inner(),
         Ok(Err(s)) => return status_end(inner, generation, &s),
         Err(end) => return end,
@@ -236,7 +267,10 @@ async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, 
     if hs.decision() != pb::Decision::Reject {
         if let Some(max) = inner.note_upstream(&hs) {
             let i = inner.clone();
-            let persisted = blocking(move || i.store.write_meta(&[(key::MAX_ENTRY_BYTES, &max.to_be_bytes())], false));
+            let persisted = blocking(move || {
+                i.store
+                    .write_meta(&[(key::MAX_ENTRY_BYTES, &max.to_be_bytes())], false)
+            });
             if let Err(e) = persisted.await {
                 tracing::warn!(error = %e, "could not persist max_entry_bytes");
             }
@@ -305,7 +339,9 @@ fn tail_decode_limit(max_entry_bytes: u64, max_batch_bytes: u32) -> usize {
         0 => crate::server::DEFAULT_MAX_BATCH_BYTES as u64,
         n => u64::from(n),
     };
-    usize::try_from(max_entry_bytes.max(batch)).unwrap_or(usize::MAX).saturating_add(DECODE_SLACK)
+    usize::try_from(max_entry_bytes.max(batch))
+        .unwrap_or(usize::MAX)
+        .saturating_add(DECODE_SLACK)
 }
 
 const CONTRADICTION: &str = "upstream reported DIVERGED on the stream but not in the handshake";
@@ -321,14 +357,19 @@ fn contradicting_resume(after_stream_diverged: bool, action: &Action) -> Option<
 /// RESUME / EPOCH_ADVANCED: persist the new identity and history atomically, then tail.
 /// An invalid identity or history from the upstream halts the slave (`Corrupt`).
 async fn adopt_epoch(inner: &Arc<Inner>, hs: &pb::HandshakeResponse) -> Result<(), SessionEnd> {
-    let id = hs.identity.as_ref().ok_or(SessionEnd::Halt(HaltReason::Corrupt))?;
+    let id = hs
+        .identity
+        .as_ref()
+        .ok_or(SessionEnd::Halt(HaltReason::Corrupt))?;
     let id = identity_from_pb(id).map_err(|_| SessionEnd::Halt(HaltReason::Corrupt))?;
     let history = checked_history(&id, &hs.epoch_history).map_err(|e| {
         tracing::error!(node = %inner.cfg.identifier, error = %e, "upstream sent an invalid epoch history");
         SessionEnd::Halt(HaltReason::Corrupt)
     })?;
     let (i, h) = (inner.clone(), history.clone());
-    blocking(move || i.store.adopt_identity(&id, &h)).await.map_err(|e| SessionEnd::Retry(e.to_string()))?;
+    blocking(move || i.store.adopt_identity(&id, &h))
+        .await
+        .map_err(|e| SessionEnd::Retry(e.to_string()))?;
     tracing::info!(node = %inner.cfg.identifier, epoch = id.epoch, "adopted new epoch from upstream");
     inner.set_ident(Some((id, history)));
     inner.reset_downstream();
@@ -344,7 +385,9 @@ async fn tail(
     lease: Option<Vec<u8>>,
     backoff: &mut BackoffState,
 ) -> SessionEnd {
-    let Some((identity, _)) = inner.ident() else { return SessionEnd::Again };
+    let Some((identity, _)) = inner.ident() else {
+        return SessionEnd::Again;
+    };
     let pos = inner.store.position();
     let fetch = &inner.cfg.fetch;
     let limit = tail_decode_limit(hs.max_entry_bytes, fetch.max_batch_bytes);
@@ -361,11 +404,20 @@ async fn tail(
     // The request stream: `start`, then an ack whenever `acks` changes. A watch coalesces
     // acks that back up: the upstream always gets the latest applied seq.
     let (acks, ack_rx) = watch::channel(pos.last_seq);
-    let start = pb::TailClientMessage { kind: Some(ClientKind::Start(req)) };
-    let ack_stream = WatchStream::from_changes(ack_rx)
-        .map(|applied_seq| pb::TailClientMessage { kind: Some(ClientKind::Ack(pb::TailAck { applied_seq })) });
+    let start = pb::TailClientMessage {
+        kind: Some(ClientKind::Start(req)),
+    };
+    let ack_stream = WatchStream::from_changes(ack_rx).map(|applied_seq| pb::TailClientMessage {
+        kind: Some(ClientKind::Ack(pb::TailAck { applied_seq })),
+    });
     let outbound = tokio_stream::iter([start]).chain(ack_stream);
-    let mut stream = match unless_repointed(inner, generation, c.clone().max_decoding_message_size(limit).tail(outbound)).await {
+    let mut stream = match unless_repointed(
+        inner,
+        generation,
+        c.clone().max_decoding_message_size(limit).tail(outbound),
+    )
+    .await
+    {
         Ok(Ok(r)) => r.into_inner(),
         Ok(Err(s)) => return status_end(inner, generation, &s),
         Err(end) => return end,
@@ -375,7 +427,13 @@ async fn tail(
     let mut cleared = false;
     let started = Instant::now();
     loop {
-        let next = match unless_repointed(inner, generation, tokio::time::timeout(idle, stream.message())).await {
+        let next = match unless_repointed(
+            inner,
+            generation,
+            tokio::time::timeout(idle, stream.message()),
+        )
+        .await
+        {
             Ok(next) => next,
             Err(end) => return end,
         };
@@ -430,7 +488,9 @@ mod tests {
     #[test]
     fn resume_after_a_stream_diverged_is_retried_with_backoff() {
         for a in [Action::Tail, Action::AdoptEpochThenTail] {
-            assert!(matches!(contradicting_resume(true, &a), Some(SessionEnd::Retry(m)) if m == CONTRADICTION));
+            assert!(
+                matches!(contradicting_resume(true, &a), Some(SessionEnd::Retry(m)) if m == CONTRADICTION)
+            );
             assert!(contradicting_resume(false, &a).is_none());
         }
         assert!(contradicting_resume(true, &Action::Bootstrap).is_none());

@@ -33,7 +33,9 @@ impl LogSource for Inner {
     }
 
     fn origin_last_seq(&self) -> Seq {
-        self.origin_last_seq.load(Ordering::SeqCst).max(self.store.position().last_seq)
+        self.origin_last_seq
+            .load(Ordering::SeqCst)
+            .max(self.store.position().last_seq)
     }
 
     fn upstream_chain(&self) -> Vec<String> {
@@ -61,7 +63,11 @@ impl LogSource for Inner {
             SlaveState::Bootstrapping { .. } => "bootstrapping".into(),
             SlaveState::Halted(r) => format!("halted:{}", r.name()),
             SlaveState::Connecting | SlaveState::Streaming => {
-                if Inner::is_ready(self) { "ready".into() } else { "bootstrapping".into() }
+                if Inner::is_ready(self) {
+                    "ready".into()
+                } else {
+                    "bootstrapping".into()
+                }
             }
         }
     }

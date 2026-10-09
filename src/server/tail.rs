@@ -10,7 +10,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use super::replicas::{FetchSettings, NewReplica, ReplicaCell, ReplicaHandle};
-use super::{call_info, store_status, Lease, ServerState, TailStream};
+use super::{Lease, ServerState, TailStream, call_info, store_status};
 use crate::auth::Method;
 use crate::clock::{Clock, SystemClock};
 use crate::error::Error;
@@ -45,7 +45,9 @@ pub(super) async fn tail(
         _ = super::stopped(&mut shutdown) => return Err(shutting_down()),
     };
     let r = match first {
-        Ok(Ok(Some(pb::TailClientMessage { kind: Some(ClientKind::Start(r)) }))) => r,
+        Ok(Ok(Some(pb::TailClientMessage {
+            kind: Some(ClientKind::Start(r)),
+        }))) => r,
         Ok(Ok(_)) => return Err(invalid_argument("the first Tail message must be `start`")),
         Ok(Err(status)) => return Err(status),
         Err(_) => return Err(invalid_argument("no `start` message within 10 s")),
@@ -56,7 +58,10 @@ pub(super) async fn tail(
     resets.borrow_and_update();
     let junction = validate(&*src, &r)?;
     state.expire_leases(std::time::Instant::now());
-    let lease = r.bootstrap_lease.as_deref().and_then(|id| state.take_lease(id, &r.client_id, r.from_seq));
+    let lease = r
+        .bootstrap_lease
+        .as_deref()
+        .and_then(|id| state.take_lease(id, &r.client_id, r.from_seq));
     let (tx, rx) = mpsc::channel(CHANNEL);
     let fetch = Fetch::clamp(&r, src.heartbeat(), state.cfg.limits.max_tail_batch_bytes);
     // `validate` checked the identity, so this is the epoch the replica follows.
@@ -71,10 +76,26 @@ pub(super) async fn tail(
     });
     let (violation_tx, violation_rx) = oneshot::channel();
     let (done_tx, done_rx) = oneshot::channel();
-    tokio::spawn(read_acks(inbound, replica.cell().clone(), src.subscribe(), violation_tx, done_rx));
-    let stream = Stream { replica, violation: Some(violation_rx), _done: done_tx };
-    let out = Out { tx, shutdown: state.shutdown.clone(), resets };
-    tokio::spawn(produce(src, out, r.from_seq, fetch, lease, stream, junction));
+    tokio::spawn(read_acks(
+        inbound,
+        replica.cell().clone(),
+        src.subscribe(),
+        violation_tx,
+        done_rx,
+    ));
+    let stream = Stream {
+        replica,
+        violation: Some(violation_rx),
+        _done: done_tx,
+    };
+    let out = Out {
+        tx,
+        shutdown: state.shutdown.clone(),
+        resets,
+    };
+    tokio::spawn(produce(
+        src, out, r.from_seq, fetch, lease, stream, junction,
+    ));
     Ok(Response::new(ReceiverStream::new(rx)))
 }
 
@@ -91,12 +112,21 @@ pub(crate) struct Junction {
 fn validate(src: &dyn LogSource, r: &pb::TailRequest) -> Result<Option<Junction>, Status> {
     let ident = src.identity().filter(|_| src.is_ready());
     let Some((server_id, _)) = ident else {
-        return Err(reason_status(pb::Reason::NotReady, "server is bootstrapping"));
+        return Err(reason_status(
+            pb::Reason::NotReady,
+            "server is bootstrapping",
+        ));
     };
-    let want = r.identity.as_ref().ok_or_else(|| crate::net::invalid_argument("identity is required"))?;
+    let want = r
+        .identity
+        .as_ref()
+        .ok_or_else(|| crate::net::invalid_argument("identity is required"))?;
     let want = identity_from_pb(want).map_err(|e| crate::net::invalid_argument(e.to_string()))?;
     if want != server_id {
-        return Err(reason_status(pb::Reason::IdentityChanged, format!("server identity is {server_id:?}")));
+        return Err(reason_status(
+            pb::Reason::IdentityChanged,
+            format!("server identity is {server_id:?}"),
+        ));
     }
     if r.from_seq == 0 {
         return Err(crate::net::invalid_argument("from_seq starts at 1"));
@@ -104,23 +134,37 @@ fn validate(src: &dyn LogSource, r: &pb::TailRequest) -> Result<Option<Junction>
     let store = src.store();
     let last = store.position().last_seq;
     if src.role() == Role::Master && r.from_seq > last + 1 {
-        return Err(reason_status(pb::Reason::Diverged, format!("from_seq {} is past master last_seq {last}", r.from_seq)));
+        return Err(reason_status(
+            pb::Reason::Diverged,
+            format!("from_seq {} is past master last_seq {last}", r.from_seq),
+        ));
     }
     let mut junction = None;
     if let Some(prev) = r.prev_crc32c {
         match store.entry_crc(r.from_seq - 1).map_err(store_status)? {
             Some(have) if have != prev => {
-                return Err(reason_status(pb::Reason::Diverged, format!("entry {} differs", r.from_seq - 1)));
+                return Err(reason_status(
+                    pb::Reason::Diverged,
+                    format!("entry {} differs", r.from_seq - 1),
+                ));
             }
             Some(_) => {}
             // Not held yet (the client is ahead of this replica): checked before `from_seq`
             // is sent. A trimmed entry stays unknown and is not checked.
-            None => junction = Some(Junction { seq: r.from_seq - 1, crc: prev }),
+            None => {
+                junction = Some(Junction {
+                    seq: r.from_seq - 1,
+                    crc: prev,
+                })
+            }
         }
     }
     let first = store.first_retained_seq();
     if r.from_seq < first {
-        return Err(reason_status(pb::Reason::LogGap, format!("from_seq {} < first retained {first}", r.from_seq)));
+        return Err(reason_status(
+            pb::Reason::LogGap,
+            format!("from_seq {} < first retained {first}", r.from_seq),
+        ));
     }
     Ok(junction)
 }
@@ -131,7 +175,10 @@ fn check_junction(src: &dyn LogSource, j: Junction) -> Result<(), Status> {
     match src.store().entry_crc(j.seq).map_err(store_status)? {
         Some(have) if have != j.crc => Err(reason_status(
             pb::Reason::Diverged,
-            format!("entry {} differs (checked once this server caught up with the client)", j.seq),
+            format!(
+                "entry {} differs (checked once this server caught up with the client)",
+                j.seq
+            ),
         )),
         _ => Ok(()),
     }
@@ -188,7 +235,9 @@ async fn read_acks(
             _ = &mut done => return,
         };
         let problem = match msg {
-            Ok(Some(pb::TailClientMessage { kind: Some(ClientKind::Ack(a)) })) => {
+            Ok(Some(pb::TailClientMessage {
+                kind: Some(ClientKind::Ack(a)),
+            })) => {
                 let node_last = *seqs.borrow();
                 match cell.ack(a.applied_seq, node_last) {
                     Ok(()) => continue,
@@ -263,7 +312,11 @@ impl Fetch {
         }
     }
 
-    pub(crate) fn clamp(r: &pb::TailRequest, heartbeat: Duration, max_tail_batch_bytes: usize) -> Fetch {
+    pub(crate) fn clamp(
+        r: &pb::TailRequest,
+        heartbeat: Duration,
+        max_tail_batch_bytes: usize,
+    ) -> Fetch {
         let max_bytes = match r.max_batch_bytes {
             0 => DEFAULT_MAX_BATCH_BYTES,
             n => n as usize,
@@ -300,7 +353,11 @@ impl Pending {
     fn take(&mut self) -> pb::TailMessage {
         self.bytes = 0;
         self.since = None;
-        pb::TailMessage { kind: Some(Kind::Batch(pb::EntryBatch { entries: std::mem::take(&mut self.entries) })) }
+        pb::TailMessage {
+            kind: Some(Kind::Batch(pb::EntryBatch {
+                entries: std::mem::take(&mut self.entries),
+            })),
+        }
     }
 }
 
@@ -318,7 +375,11 @@ async fn produce(
     let hb: Duration = src.heartbeat();
     let mut seqs = src.subscribe();
     let mut ahead: VecDeque<LogEntry> = VecDeque::new();
-    let mut pending = Pending { entries: Vec::new(), bytes: 0, since: None };
+    let mut pending = Pending {
+        entries: Vec::new(),
+        bytes: 0,
+        since: None,
+    };
     // The first heartbeat goes out at once, so the client learns positions immediately.
     let mut next_hb = Instant::now();
     macro_rules! send {
@@ -335,7 +396,10 @@ async fn produce(
     macro_rules! send_pending {
         () => {{
             if let Some(last) = pending.entries.last() {
-                stream.replica.cell().note_sent(last.seq, src.store().position().last_seq);
+                stream
+                    .replica
+                    .cell()
+                    .note_sent(last.seq, src.store().position().last_seq);
             }
             send!(pending.take());
         }};
@@ -372,18 +436,28 @@ async fn produce(
         // Read ahead everything that is available (in blocks of READ_BATCH).
         if ahead.is_empty() && next <= src.store().position().last_seq {
             let s = src.clone();
-            let read = tokio::task::spawn_blocking(move || s.store().read_entries(next, READ_BATCH, fetch.max_bytes)).await;
+            let read = tokio::task::spawn_blocking(move || {
+                s.store().read_entries(next, READ_BATCH, fetch.max_bytes)
+            })
+            .await;
             let failure = match read {
                 Ok(Ok(entries)) => {
                     // The lease only protects `S + 1`: release it once that entry is read.
-                    if lease.as_ref().is_some_and(|l| entries.last().is_some_and(|e| e.seq > l.snapshot_seq)) {
+                    if lease
+                        .as_ref()
+                        .is_some_and(|l| entries.last().is_some_and(|e| e.seq > l.snapshot_seq))
+                    {
                         lease = None;
-                        tracing::debug!("bootstrap lease released: the entries after the snapshot are read");
+                        tracing::debug!(
+                            "bootstrap lease released: the entries after the snapshot are read"
+                        );
                     }
                     ahead.extend(entries);
                     None
                 }
-                Ok(Err(e @ Error::Gap { .. })) => Some(reason_status(pb::Reason::LogGap, e.to_string())),
+                Ok(Err(e @ Error::Gap { .. })) => {
+                    Some(reason_status(pb::Reason::LogGap, e.to_string()))
+                }
                 Ok(Err(e)) => Some(store_status(e)),
                 Err(e) => Some(internal_status(format!("log read failed: {e}"))),
             };
@@ -410,9 +484,13 @@ async fn produce(
             pending.entries.push(entry_to_pb(entry));
             if failpoint::fire("server-tail-after-entry") {
                 send_pending!();
-                return out.end(Status::unavailable("failpoint server-tail-after-entry")).await;
+                return out
+                    .end(Status::unavailable("failpoint server-tail-after-entry"))
+                    .await;
             }
-            if pending.bytes >= fetch.max_bytes || (fetch.min_bytes > 0 && pending.bytes >= fetch.min_bytes) {
+            if pending.bytes >= fetch.max_bytes
+                || (fetch.min_bytes > 0 && pending.bytes >= fetch.min_bytes)
+            {
                 flush!();
             }
             continue;
@@ -420,7 +498,9 @@ async fn produce(
         // Everything available is pending: real-time mode sends it now, otherwise it waits
         // for min_batch_bytes or until the oldest pending entry has waited max_wait.
         let deadline = pending.since.map(|t| t + fetch.max_wait);
-        if !pending.entries.is_empty() && (fetch.min_bytes == 0 || deadline.is_some_and(|d| Instant::now() >= d)) {
+        if !pending.entries.is_empty()
+            && (fetch.min_bytes == 0 || deadline.is_some_and(|d| Instant::now() >= d))
+        {
             flush!();
             continue;
         }
@@ -454,18 +534,46 @@ mod tests {
     use super::*;
 
     fn req(min: u32, wait_ms: u32, max: u32) -> pb::TailRequest {
-        pb::TailRequest { min_batch_bytes: min, max_wait_ms: wait_ms, max_batch_bytes: max, ..Default::default() }
+        pb::TailRequest {
+            min_batch_bytes: min,
+            max_wait_ms: wait_ms,
+            max_batch_bytes: max,
+            ..Default::default()
+        }
     }
 
     #[test]
     fn fetch_parameters_are_clamped_to_server_limits() {
         let hb = Duration::from_millis(500);
         let f = Fetch::clamp(&req(10, 100, 2048), hb, 4 << 20);
-        assert_eq!(f, Fetch { min_bytes: 10, max_wait: Duration::from_millis(100), max_bytes: 2048 });
-        assert_eq!(Fetch::clamp(&req(0, 60_000, 0), hb, 4 << 20).max_wait, hb, "max_wait <= heartbeat");
-        assert_eq!(Fetch::clamp(&req(0, 0, 0), hb, 4 << 20).max_bytes, DEFAULT_MAX_BATCH_BYTES, "0 = 1 MiB");
-        assert_eq!(Fetch::clamp(&req(0, 0, u32::MAX), hb, 4 << 20).max_bytes, 4 << 20, "capped");
-        assert_eq!(Fetch::clamp(&req(0, 0, 0), hb, 1000).max_bytes, 1000, "default is capped too");
+        assert_eq!(
+            f,
+            Fetch {
+                min_bytes: 10,
+                max_wait: Duration::from_millis(100),
+                max_bytes: 2048
+            }
+        );
+        assert_eq!(
+            Fetch::clamp(&req(0, 60_000, 0), hb, 4 << 20).max_wait,
+            hb,
+            "max_wait <= heartbeat"
+        );
+        assert_eq!(
+            Fetch::clamp(&req(0, 0, 0), hb, 4 << 20).max_bytes,
+            DEFAULT_MAX_BATCH_BYTES,
+            "0 = 1 MiB"
+        );
+        assert_eq!(
+            Fetch::clamp(&req(0, 0, u32::MAX), hb, 4 << 20).max_bytes,
+            4 << 20,
+            "capped"
+        );
+        assert_eq!(
+            Fetch::clamp(&req(0, 0, 0), hb, 1000).max_bytes,
+            1000,
+            "default is capped too"
+        );
     }
 
     #[test]
@@ -504,8 +612,24 @@ mod tests {
         });
         let (_violation_tx, violation) = oneshot::channel();
         let (done, _done_rx) = oneshot::channel();
-        let stream = Stream { replica, violation: Some(violation), _done: done };
-        tokio::spawn(produce(src, Out { tx, shutdown, resets }, 1, fetch, None, stream, None));
+        let stream = Stream {
+            replica,
+            violation: Some(violation),
+            _done: done,
+        };
+        tokio::spawn(produce(
+            src,
+            Out {
+                tx,
+                shutdown,
+                resets,
+            },
+            1,
+            fetch,
+            None,
+            stream,
+            None,
+        ));
         let mut rx = rx;
         let err = within("the stream status", async {
             loop {
@@ -521,7 +645,11 @@ mod tests {
     }
 
     /// Starts a producer over `m` at `from` (no validation) and returns its receiving end.
-    fn producer(m: &crate::master::Master, from: Seq, junction: Option<Junction>) -> mpsc::Receiver<Result<pb::TailMessage, Status>> {
+    fn producer(
+        m: &crate::master::Master,
+        from: Seq,
+        junction: Option<Junction>,
+    ) -> mpsc::Receiver<Result<pb::TailMessage, Status>> {
         let src = m.log_source();
         let mut resets = src.resets();
         resets.borrow_and_update();
@@ -541,17 +669,37 @@ mod tests {
         let (violation_tx, violation) = oneshot::channel();
         std::mem::forget(violation_tx);
         let (done, _done_rx) = oneshot::channel();
-        let stream = Stream { replica, violation: Some(violation), _done: done };
-        tokio::spawn(produce(src, Out { tx, shutdown, resets }, from, fetch, None, stream, junction));
+        let stream = Stream {
+            replica,
+            violation: Some(violation),
+            _done: done,
+        };
+        tokio::spawn(produce(
+            src,
+            Out {
+                tx,
+                shutdown,
+                resets,
+            },
+            from,
+            fetch,
+            None,
+            stream,
+            junction,
+        ));
         rx
     }
 
     /// The first entry batch, or the status that ended the stream.
-    async fn first_batch_or_end(rx: &mut mpsc::Receiver<Result<pb::TailMessage, Status>>) -> Result<Vec<pb::LogEntry>, Status> {
+    async fn first_batch_or_end(
+        rx: &mut mpsc::Receiver<Result<pb::TailMessage, Status>>,
+    ) -> Result<Vec<pb::LogEntry>, Status> {
         crate::server::test_client::within("a batch or the end of the stream", async {
             loop {
                 match rx.recv().await {
-                    Some(Ok(pb::TailMessage { kind: Some(Kind::Batch(b)) })) => return Ok(b.entries),
+                    Some(Ok(pb::TailMessage {
+                        kind: Some(Kind::Batch(b)),
+                    })) => return Ok(b.entries),
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e),
                     None => panic!("stream ended without a status"),
@@ -574,16 +722,35 @@ mod tests {
         m.create_cf(CfSpec::new("c")).unwrap(); // seq 1
 
         // The client claims entry 2 has CRC 0xDEAD; the server writes 2 and 3 later.
-        let mut diverged = producer(&m, 3, Some(Junction { seq: 2, crc: 0xDEAD }));
+        let mut diverged = producer(
+            &m,
+            3,
+            Some(Junction {
+                seq: 2,
+                crc: 0xDEAD,
+            }),
+        );
         // The client's entry 2 is the server's (CRC known after the write below).
         m.put("c", b"k", b"v").unwrap(); // seq 2
         let crc2 = m.log_source().store().entry_crc(2).unwrap().unwrap();
         let mut matching = producer(&m, 4, Some(Junction { seq: 3, crc: 0 }));
         m.put("c", b"k2", b"v").unwrap(); // seq 3
-        let e = first_batch_or_end(&mut diverged).await.expect_err("entry 2 differs");
-        assert_eq!(crate::net::reason_of(&e), Some(pb::Reason::Diverged), "{e:?}");
-        let e = first_batch_or_end(&mut matching).await.expect_err("entry 3 differs (crc 0)");
-        assert_eq!(crate::net::reason_of(&e), Some(pb::Reason::Diverged), "{e:?}");
+        let e = first_batch_or_end(&mut diverged)
+            .await
+            .expect_err("entry 2 differs");
+        assert_eq!(
+            crate::net::reason_of(&e),
+            Some(pb::Reason::Diverged),
+            "{e:?}"
+        );
+        let e = first_batch_or_end(&mut matching)
+            .await
+            .expect_err("entry 3 differs (crc 0)");
+        assert_eq!(
+            crate::net::reason_of(&e),
+            Some(pb::Reason::Diverged),
+            "{e:?}"
+        );
 
         let mut ok = producer(&m, 3, Some(Junction { seq: 2, crc: crc2 }));
         let batch = first_batch_or_end(&mut ok).await.expect("entry 2 matches");
@@ -595,6 +762,9 @@ mod tests {
         m.put("c", b"k3", b"v").unwrap(); // seq 4
         m.put("c", b"k4", b"v").unwrap(); // seq 5
         assert_eq!(first_batch_or_end(&mut fine).await.unwrap()[0].seq, 4);
-        assert!(first_batch_or_end(&mut ahead).await.is_err(), "entry 4 differs (crc 0)");
+        assert!(
+            first_batch_or_end(&mut ahead).await.is_err(),
+            "entry 4 differs (crc 0)"
+        );
     }
 }

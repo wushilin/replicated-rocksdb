@@ -4,18 +4,24 @@ mod support;
 
 use replicated_rocksdb::admin;
 use replicated_rocksdb::{
-    AcceptDataLoss, CfSpec, Error, HaltAction, HaltReason, LogApi, Master, ReadApi, RepointDivergence, RepointOptions, RepointOutcome,
-    Slave, SlaveState, UpstreamConfig,
+    AcceptDataLoss, CfSpec, Error, HaltAction, HaltReason, LogApi, Master, ReadApi,
+    RepointDivergence, RepointOptions, RepointOutcome, Slave, SlaveState, UpstreamConfig,
 };
-use support::{assert_converged, wait_state, wait_until, Cluster};
+use support::{Cluster, assert_converged, wait_state, wait_until};
 
 fn up(addr: std::net::SocketAddr) -> UpstreamConfig {
     UpstreamConfig::from_addr(addr)
 }
 
 /// `Slave::repoint`, bounded by the harness wait.
-async fn repoint(s: &Slave, upstream: UpstreamConfig, opts: RepointOptions) -> Result<RepointOutcome, Error> {
-    tokio::time::timeout(support::WAIT, s.repoint(upstream, opts)).await.expect("repoint settles")
+async fn repoint(
+    s: &Slave,
+    upstream: UpstreamConfig,
+    opts: RepointOptions,
+) -> Result<RepointOutcome, Error> {
+    tokio::time::timeout(support::WAIT, s.repoint(upstream, opts))
+        .await
+        .expect("repoint settles")
 }
 
 /// The failover runbook (DESIGN.md §13.1): the master is lost; the operator compares the
@@ -37,22 +43,39 @@ async fn failover_runbook_end_to_end() {
     a.shutdown().await.unwrap(); // the master is lost
 
     // 1. Compare. 2. Promote the candidate, checking its peers once more.
-    let choice = admin::choose_promotion_candidate(&[b.promotion_info(), cn.promotion_info()]).unwrap();
-    assert_eq!(choice.candidate.node_id, "b", "equal positions: lowest node id");
+    let choice =
+        admin::choose_promotion_candidate(&[b.promotion_info(), cn.promotion_info()]).unwrap();
+    assert_eq!(
+        choice.candidate.node_id, "b",
+        "equal positions: lowest node id"
+    );
     assert_eq!(choice.compatible, vec!["c".to_string()]);
     assert!(choice.diverged.is_empty());
-    let b = b.promote_checked(c.master_config("b"), &[up(cn.serve_addr().unwrap())]).await.unwrap();
+    let b = b
+        .promote_checked(c.master_config("b"), &[up(cn.serve_addr().unwrap())])
+        .await
+        .unwrap();
     // 3. Repoint the others. Reads keep working throughout.
-    let outcome = repoint(&cn, up(b.serve_addr().unwrap()), RepointOptions::default()).await.unwrap();
+    let outcome = repoint(&cn, up(b.serve_addr().unwrap()), RepointOptions::default())
+        .await
+        .unwrap();
     assert_eq!(outcome, RepointOutcome::EpochAdvanced);
     assert_eq!(cn.get("c", &[4]).unwrap(), Some(vec![4]));
     b.put("c", b"after failover", b"1").unwrap();
     assert_converged(&b, &[("c", &cn)]).await;
     assert_eq!(lc.bootstraps(), 1, "only the initial bootstrap");
     assert_eq!(cn.status().upstream_chain, vec!["b".to_string()]);
-    wait_until("c in sync on b", || b.replicas().iter().any(|r| r.node_id == "c" && r.in_sync)).await;
+    wait_until("c in sync on b", || {
+        b.replicas().iter().any(|r| r.node_id == "c" && r.in_sync)
+    })
+    .await;
     // Repointing to the upstream it already follows resumes.
-    assert_eq!(repoint(&cn, up(b.serve_addr().unwrap()), RepointOptions::default()).await.unwrap(), RepointOutcome::Resumed);
+    assert_eq!(
+        repoint(&cn, up(b.serve_addr().unwrap()), RepointOptions::default())
+            .await
+            .unwrap(),
+        RepointOutcome::Resumed
+    );
 }
 
 /// D holds entries the new master never saw. Repoint refuses by default and keeps D's data
@@ -78,27 +101,57 @@ async fn divergence_is_refused_unless_data_loss_is_accepted() {
     let b = b.promote(c.master_config("b")).await.unwrap();
     let b_up = up(b.serve_addr().unwrap());
 
-    let err = repoint(&d, b_up.clone(), RepointOptions::default()).await.unwrap_err();
+    let err = repoint(&d, b_up.clone(), RepointOptions::default())
+        .await
+        .unwrap_err();
     match err {
-        Error::Diverged { fork_seq, local_last_seq, divergent_entries } => {
-            assert_eq!((fork_seq, local_last_seq, divergent_entries), (fork, d.last_seq(), 2));
+        Error::Diverged {
+            fork_seq,
+            local_last_seq,
+            divergent_entries,
+        } => {
+            assert_eq!(
+                (fork_seq, local_last_seq, divergent_entries),
+                (fork, d.last_seq(), 2)
+            );
         }
         e => panic!("expected Diverged, got {e}"),
     }
     assert_eq!(d.status().state, SlaveState::Halted(HaltReason::Diverged));
-    assert_eq!(d.get("c", b"only on d").unwrap(), Some(b"2".to_vec()), "data intact and readable");
+    assert_eq!(
+        d.get("c", b"only on d").unwrap(),
+        Some(b"2".to_vec()),
+        "data intact and readable"
+    );
 
-    let repair = RepointOptions { on_divergence: RepointDivergence::Repair { accept_loss: AcceptDataLoss } };
-    assert!(matches!(repoint(&d, b_up.clone(), repair).await, Err(Error::Unsupported(_))));
+    let repair = RepointOptions {
+        on_divergence: RepointDivergence::Repair {
+            accept_loss: AcceptDataLoss,
+        },
+    };
+    assert!(matches!(
+        repoint(&d, b_up.clone(), repair).await,
+        Err(Error::Unsupported(_))
+    ));
     assert_eq!(d.status().state, SlaveState::Halted(HaltReason::Diverged));
     assert_eq!(d.get("c", b"also only on d").unwrap(), Some(b"3".to_vec()));
 
-    let rebootstrap =
-        RepointOptions { on_divergence: RepointDivergence::Rebootstrap { accept_loss: AcceptDataLoss } };
-    assert_eq!(repoint(&d, b_up, rebootstrap).await.unwrap(), RepointOutcome::Bootstrapped);
+    let rebootstrap = RepointOptions {
+        on_divergence: RepointDivergence::Rebootstrap {
+            accept_loss: AcceptDataLoss,
+        },
+    };
+    assert_eq!(
+        repoint(&d, b_up, rebootstrap).await.unwrap(),
+        RepointOutcome::Bootstrapped
+    );
     b.put("c", b"after", b"4").unwrap();
     assert_converged(&b, &[("d", &d)]).await;
-    assert_eq!(d.get("c", b"only on d").unwrap(), None, "the divergent entries were discarded");
+    assert_eq!(
+        d.get("c", b"only on d").unwrap(),
+        None,
+        "the divergent entries were discarded"
+    );
     assert_eq!(ld.bootstraps(), 2);
 }
 
@@ -115,12 +168,23 @@ async fn repoint_refuses_loops() {
     assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
 
     let to_self = repoint(&b, up(b.serve_addr().unwrap()), RepointOptions::default()).await;
-    assert!(matches!(to_self, Err(Error::Halted(HaltReason::LoopDetected))), "{to_self:?}");
+    assert!(
+        matches!(to_self, Err(Error::Halted(HaltReason::LoopDetected))),
+        "{to_self:?}"
+    );
     let to_downstream = repoint(&b, up(cn.serve_addr().unwrap()), RepointOptions::default()).await;
-    assert!(matches!(to_downstream, Err(Error::Halted(HaltReason::LoopDetected))), "{to_downstream:?}");
+    assert!(
+        matches!(to_downstream, Err(Error::Halted(HaltReason::LoopDetected))),
+        "{to_downstream:?}"
+    );
     assert_eq!(b.get("c", b"k").unwrap(), Some(b"v".to_vec()));
 
-    assert_eq!(repoint(&b, up(a.serve_addr().unwrap()), RepointOptions::default()).await.unwrap(), RepointOutcome::Resumed);
+    assert_eq!(
+        repoint(&b, up(a.serve_addr().unwrap()), RepointOptions::default())
+            .await
+            .unwrap(),
+        RepointOutcome::Resumed
+    );
     a.put("c", b"k2", b"v2").unwrap();
     assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
     assert_eq!(lb.bootstraps(), 1);
@@ -144,7 +208,12 @@ async fn repoint_to_a_stale_master_keeps_retrying() {
     a.shutdown().await.unwrap();
     let b = b.promote(c.master_config("b")).await.unwrap();
     let b_up = up(b.serve_addr().unwrap());
-    assert_eq!(repoint(&cn, b_up.clone(), RepointOptions::default()).await.unwrap(), RepointOutcome::EpochAdvanced);
+    assert_eq!(
+        repoint(&cn, b_up.clone(), RepointOptions::default())
+            .await
+            .unwrap(),
+        RepointOutcome::EpochAdvanced
+    );
     b.put("c", b"k2", b"v2").unwrap();
     assert_converged(&b, &[("c", &cn)]).await;
 
@@ -152,14 +221,22 @@ async fn repoint_to_a_stale_master_keeps_retrying() {
     a_cfg.serve.as_mut().unwrap().port = a_addr.port();
     let old = Master::open(a_cfg).await.unwrap();
     old.put("c", b"split brain", b"x").unwrap();
-    match repoint(&cn, up(a_addr), RepointOptions::default()).await.unwrap() {
-        RepointOutcome::Retrying { last_error } => assert!(last_error.contains("STALE_EPOCH"), "{last_error}"),
+    match repoint(&cn, up(a_addr), RepointOptions::default())
+        .await
+        .unwrap()
+    {
+        RepointOutcome::Retrying { last_error } => {
+            assert!(last_error.contains("STALE_EPOCH"), "{last_error}")
+        }
         o => panic!("expected Retrying, got {o:?}"),
     }
     assert!(!matches!(cn.status().state, SlaveState::Halted(_)));
     assert_eq!(cn.get("c", b"split brain").unwrap(), None);
 
-    assert_eq!(repoint(&cn, b_up, RepointOptions::default()).await.unwrap(), RepointOutcome::Resumed);
+    assert_eq!(
+        repoint(&cn, b_up, RepointOptions::default()).await.unwrap(),
+        RepointOutcome::Resumed
+    );
     b.put("c", b"k3", b"v3").unwrap();
     assert_converged(&b, &[("c", &cn)]).await;
     assert_eq!(lc.bootstraps(), 1);
@@ -188,17 +265,37 @@ async fn a_refusing_repoint_still_refuses_after_retrying() {
     a.shutdown().await.unwrap();
 
     // A free port: nothing listens there until B is promoted onto it.
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let target = UpstreamConfig::new("127.0.0.1", port);
-    assert!(matches!(repoint(&d, target, RepointOptions::default()).await.unwrap(), RepointOutcome::Retrying { .. }));
+    assert!(matches!(
+        repoint(&d, target, RepointOptions::default())
+            .await
+            .unwrap(),
+        RepointOutcome::Retrying { .. }
+    ));
 
     let b = Slave::open(b_cfg).await.unwrap();
     let mut mcfg = c.master_config("b");
     mcfg.serve.as_mut().unwrap().port = port;
     let b = b.promote(mcfg).await.unwrap();
-    wait_state(&d, "Diverged halt", |s| *s == SlaveState::Halted(HaltReason::Diverged)).await;
-    assert_eq!(d.get("c", b"only on d").unwrap(), Some(b"2".to_vec()), "data intact");
-    assert_eq!(ld.bootstraps(), 1, "the configured Rebootstrap policy was not applied");
+    wait_state(&d, "Diverged halt", |s| {
+        *s == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
+    assert_eq!(
+        d.get("c", b"only on d").unwrap(),
+        Some(b"2".to_vec()),
+        "data intact"
+    );
+    assert_eq!(
+        ld.bootstraps(),
+        1,
+        "the configured Rebootstrap policy was not applied"
+    );
     drop(b);
 }
 
@@ -206,7 +303,12 @@ async fn a_refusing_repoint_still_refuses_after_retrying() {
 /// D's listener; A is gone and B is not running.
 async fn diverged_pair(
     c: &Cluster,
-) -> (replicated_rocksdb::SlaveConfig, Slave, replicated_rocksdb::SlaveConfig, std::sync::Arc<support::RecordingListener>) {
+) -> (
+    replicated_rocksdb::SlaveConfig,
+    Slave,
+    replicated_rocksdb::SlaveConfig,
+    std::sync::Arc<support::RecordingListener>,
+) {
     let a = c.master("a").await;
     a.create_cf(CfSpec::new("c")).unwrap();
     let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
@@ -224,7 +326,11 @@ async fn diverged_pair(
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// A forced bootstrap left over from `clear_halt(Rebootstrap)` (or a gap) is not consent to
@@ -235,27 +341,57 @@ async fn a_leftover_forced_bootstrap_does_not_override_a_refusing_repoint() {
     let (b_cfg, d, _, ld) = diverged_pair(&c).await;
     let (p1, p2) = (free_port(), free_port());
     assert!(matches!(
-        repoint(&d, UpstreamConfig::new("127.0.0.1", p1), RepointOptions::default()).await.unwrap(),
+        repoint(
+            &d,
+            UpstreamConfig::new("127.0.0.1", p1),
+            RepointOptions::default()
+        )
+        .await
+        .unwrap(),
         RepointOutcome::Retrying { .. }
     ));
     let b = Slave::open(b_cfg).await.unwrap();
     let mut mcfg = c.master_config("b");
     mcfg.serve.as_mut().unwrap().port = p1;
     let b = b.promote(mcfg.clone()).await.unwrap();
-    wait_state(&d, "Diverged halt", |s| *s == SlaveState::Halted(HaltReason::Diverged)).await;
+    wait_state(&d, "Diverged halt", |s| {
+        *s == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
     b.shutdown().await.unwrap();
 
     // The operator asks for a rebootstrap, but the upstream is gone: the flag stays set.
-    d.clear_halt(HaltAction::Rebootstrap { accept_loss: AcceptDataLoss }).await.unwrap();
+    d.clear_halt(HaltAction::Rebootstrap {
+        accept_loss: AcceptDataLoss,
+    })
+    .await
+    .unwrap();
     assert!(matches!(
-        repoint(&d, UpstreamConfig::new("127.0.0.1", p2), RepointOptions::default()).await.unwrap(),
+        repoint(
+            &d,
+            UpstreamConfig::new("127.0.0.1", p2),
+            RepointOptions::default()
+        )
+        .await
+        .unwrap(),
         RepointOutcome::Retrying { .. }
     ));
     mcfg.serve.as_mut().unwrap().port = p2;
     let b = Master::open(mcfg).await.unwrap();
-    wait_state(&d, "Diverged halt", |s| *s == SlaveState::Halted(HaltReason::Diverged)).await;
-    assert_eq!(d.get("c", b"only on d").unwrap(), Some(b"2".to_vec()), "data intact");
-    assert_eq!(ld.bootstraps(), 1, "the leftover flag bootstrapped the slave");
+    wait_state(&d, "Diverged halt", |s| {
+        *s == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
+    assert_eq!(
+        d.get("c", b"only on d").unwrap(),
+        Some(b"2".to_vec()),
+        "data intact"
+    );
+    assert_eq!(
+        ld.bootstraps(),
+        1,
+        "the leftover flag bootstrapped the slave"
+    );
     drop(b);
 }
 
@@ -266,19 +402,41 @@ async fn a_restart_before_the_repoint_settles_reopens_halted() {
     let c = Cluster::new();
     let (b_cfg, d, d_cfg, _) = diverged_pair(&c).await;
     let port = free_port();
-    repoint(&d, UpstreamConfig::new("127.0.0.1", port), RepointOptions::default()).await.unwrap();
+    repoint(
+        &d,
+        UpstreamConfig::new("127.0.0.1", port),
+        RepointOptions::default(),
+    )
+    .await
+    .unwrap();
     let b = Slave::open(b_cfg).await.unwrap();
     let mut mcfg = c.master_config("b");
     mcfg.serve.as_mut().unwrap().port = port;
     let b = b.promote(mcfg).await.unwrap();
-    wait_state(&d, "Diverged halt", |s| *s == SlaveState::Halted(HaltReason::Diverged)).await;
+    wait_state(&d, "Diverged halt", |s| {
+        *s == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
     // Repoint again at a dead address and restart before anything settles successfully.
-    let r = repoint(&d, UpstreamConfig::new("127.0.0.1", free_port()), RepointOptions::default()).await.unwrap();
+    let r = repoint(
+        &d,
+        UpstreamConfig::new("127.0.0.1", free_port()),
+        RepointOptions::default(),
+    )
+    .await
+    .unwrap();
     assert!(matches!(r, RepointOutcome::Retrying { .. }));
-    assert!(!matches!(d.status().state, SlaveState::Halted(_)), "cleared in memory");
+    assert!(
+        !matches!(d.status().state, SlaveState::Halted(_)),
+        "cleared in memory"
+    );
     d.shutdown().await.unwrap();
     let d = Slave::open(d_cfg).await.unwrap();
-    assert_eq!(d.status().state, SlaveState::Halted(HaltReason::Diverged), "reopens halted");
+    assert_eq!(
+        d.status().state,
+        SlaveState::Halted(HaltReason::Diverged),
+        "reopens halted"
+    );
     assert_eq!(d.get("c", b"only on d").unwrap(), Some(b"2".to_vec()));
     drop(b);
 }
@@ -290,11 +448,19 @@ async fn status_reports_the_current_upstream() {
     let a = c.master("a").await;
     let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
     wait_state(&b, "b streaming", |s| *s == SlaveState::Streaming).await;
-    assert_eq!(b.status().upstream, format!("http://{}", a.serve_addr().unwrap()));
+    assert_eq!(
+        b.status().upstream,
+        format!("http://{}", a.serve_addr().unwrap())
+    );
     let port = free_port();
     let target = UpstreamConfig::new("127.0.0.1", port);
     let uri = format!("http://127.0.0.1:{port}");
-    assert!(matches!(repoint(&b, target, RepointOptions::default()).await.unwrap(), RepointOutcome::Retrying { .. }));
+    assert!(matches!(
+        repoint(&b, target, RepointOptions::default())
+            .await
+            .unwrap(),
+        RepointOutcome::Retrying { .. }
+    ));
     assert_eq!(b.status().upstream, uri);
     assert!(b.status().upstream_chain.is_empty());
 }
@@ -309,8 +475,17 @@ async fn consent_to_lose_data_ends_when_its_repoint_settles() {
     let (b_cfg, d, _, ld) = diverged_pair(&c).await;
     let b = Slave::open(b_cfg).await.unwrap();
     let b = b.promote(c.master_config("b")).await.unwrap();
-    let rebootstrap = RepointOptions { on_divergence: RepointDivergence::Rebootstrap { accept_loss: AcceptDataLoss } };
-    assert_eq!(repoint(&d, up(b.serve_addr().unwrap()), rebootstrap).await.unwrap(), RepointOutcome::Bootstrapped);
+    let rebootstrap = RepointOptions {
+        on_divergence: RepointDivergence::Rebootstrap {
+            accept_loss: AcceptDataLoss,
+        },
+    };
+    assert_eq!(
+        repoint(&d, up(b.serve_addr().unwrap()), rebootstrap)
+            .await
+            .unwrap(),
+        RepointOutcome::Bootstrapped
+    );
     assert_converged(&b, &[("d", &d)]).await;
     assert_eq!(ld.bootstraps(), 2);
 
@@ -326,8 +501,19 @@ async fn consent_to_lose_data_ends_when_its_repoint_settles() {
     cfg.serve.as_mut().unwrap().port = port;
     let b = Master::open(cfg).await.unwrap();
 
-    wait_state(&d, "Diverged halt", |s| *s == SlaveState::Halted(HaltReason::Diverged)).await;
-    assert_eq!(d.get("c", b"after the backup 2").unwrap(), Some(b"2".to_vec()), "data intact");
-    assert_eq!(ld.bootstraps(), 2, "the settled repoint's consent was not reused");
+    wait_state(&d, "Diverged halt", |s| {
+        *s == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
+    assert_eq!(
+        d.get("c", b"after the backup 2").unwrap(),
+        Some(b"2".to_vec()),
+        "data intact"
+    );
+    assert_eq!(
+        ld.bootstraps(),
+        2,
+        "the settled repoint's consent was not reused"
+    );
     drop(b);
 }

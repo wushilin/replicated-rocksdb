@@ -36,7 +36,11 @@ pub struct ReaperConfig {
 
 impl Default for ReaperConfig {
     fn default() -> Self {
-        ReaperConfig { interval: Duration::from_secs(30), max_deletes_per_entry: 1_000, max_deletes_per_round: 100_000 }
+        ReaperConfig {
+            interval: Duration::from_secs(30),
+            max_deletes_per_entry: 1_000,
+            max_deletes_per_round: 100_000,
+        }
     }
 }
 
@@ -61,14 +65,20 @@ pub struct WriteConcern {
 
 impl Default for WriteConcern {
     fn default() -> Self {
-        WriteConcern { min_insync_replicas: 0, ack_timeout: Duration::from_secs(5) }
+        WriteConcern {
+            min_insync_replicas: 0,
+            ack_timeout: Duration::from_secs(5),
+        }
     }
 }
 
 impl WriteConcern {
     /// Wait for `n` in-sync replicas, with the default 5 s timeout.
     pub fn in_sync(n: usize) -> Self {
-        WriteConcern { min_insync_replicas: n, ..Self::default() }
+        WriteConcern {
+            min_insync_replicas: n,
+            ..Self::default()
+        }
     }
 }
 
@@ -121,14 +131,18 @@ impl MasterConfig {
             return Err(Error::Config("heartbeat must be positive".into()));
         }
         if self.retention.check_interval.is_zero() || self.reaper.interval.is_zero() {
-            return Err(Error::Config("maintenance intervals must be positive".into()));
+            return Err(Error::Config(
+                "maintenance intervals must be positive".into(),
+            ));
         }
         if let Some(serve) = &self.serve {
             serve.validate()?;
             serve.check_heartbeat(self.heartbeat)?;
         }
         if self.write_concern.min_insync_replicas > 0 && self.write_concern.ack_timeout.is_zero() {
-            return Err(Error::Config("write_concern.ack_timeout must be positive".into()));
+            return Err(Error::Config(
+                "write_concern.ack_timeout must be positive".into(),
+            ));
         }
         Ok(())
     }
@@ -136,11 +150,15 @@ impl MasterConfig {
 
 pub(crate) fn validate_identifier(id: &str) -> Result<()> {
     let ok = (1..=128).contains(&id.len())
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
     if ok {
         Ok(())
     } else {
-        Err(Error::Config(format!("identifier {id:?} must be 1-128 characters of [A-Za-z0-9._-]")))
+        Err(Error::Config(format!(
+            "identifier {id:?} must be 1-128 characters of [A-Za-z0-9._-]"
+        )))
     }
 }
 
@@ -170,8 +188,10 @@ pub struct TlsServerConfig {
 impl TlsServerConfig {
     pub(crate) fn to_tonic(&self) -> tonic::transport::ServerTlsConfig {
         use tonic::transport::{Certificate, Identity, ServerTlsConfig};
-        let mut t = ServerTlsConfig::new()
-            .identity(Identity::from_pem(&self.identity.cert_pem, &self.identity.key_pem));
+        let mut t = ServerTlsConfig::new().identity(Identity::from_pem(
+            &self.identity.cert_pem,
+            &self.identity.key_pem,
+        ));
         if let Some(ca) = &self.client_ca_pem {
             t = t.client_ca_root(Certificate::from_pem(ca));
         }
@@ -195,7 +215,11 @@ impl TlsClientConfig {
         use tonic::transport::{Certificate, ClientTlsConfig, Identity};
         let mut t = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(&self.ca_pem))
-            .domain_name(self.domain_name.clone().unwrap_or_else(|| default_domain.to_string()));
+            .domain_name(
+                self.domain_name
+                    .clone()
+                    .unwrap_or_else(|| default_domain.to_string()),
+            );
         if let Some(id) = &self.identity {
             t = t.identity(Identity::from_pem(&id.cert_pem, &id.key_pem));
         }
@@ -260,8 +284,19 @@ pub struct ServeConfig {
 }
 
 impl ServeConfig {
-    pub fn new(bind: std::net::IpAddr, port: u16, authenticator: Arc<dyn crate::auth::Authenticator>) -> Self {
-        ServeConfig { bind, port, tls: None, authenticator, allow_plaintext_token: false, limits: ServeLimits::default() }
+    pub fn new(
+        bind: std::net::IpAddr,
+        port: u16,
+        authenticator: Arc<dyn crate::auth::Authenticator>,
+    ) -> Self {
+        ServeConfig {
+            bind,
+            port,
+            tls: None,
+            authenticator,
+            allow_plaintext_token: false,
+            limits: ServeLimits::default(),
+        }
     }
 
     /// A replica acks at least once per heartbeat of its server, and an idle replica stays in
@@ -297,7 +332,9 @@ impl ServeConfig {
             return Err(Error::Config("serve limits must be positive".into()));
         }
         if l.bootstrap_chunk_bytes == 0 || l.bootstrap_chunk_bytes > MAX_BOOTSTRAP_CHUNK_BYTES {
-            return Err(Error::Config(format!("bootstrap_chunk_bytes must be 1..={MAX_BOOTSTRAP_CHUNK_BYTES}")));
+            return Err(Error::Config(format!(
+                "bootstrap_chunk_bytes must be 1..={MAX_BOOTSTRAP_CHUNK_BYTES}"
+            )));
         }
         if l.bootstrap_lease_ttl.is_zero()
             || l.verify_session_timeout.is_zero()
@@ -322,12 +359,18 @@ mod serve_tests {
         assert!(matches!(cfg.validate(), Err(Error::Config(m)) if m.contains("without TLS")));
         cfg.allow_plaintext_token = true;
         cfg.validate().unwrap();
-        ServeConfig::new(localhost, 0, Arc::new(AllowAll)).validate().unwrap();
+        ServeConfig::new(localhost, 0, Arc::new(AllowAll))
+            .validate()
+            .unwrap();
     }
 
     #[test]
     fn limits_are_validated() {
-        let mut cfg = ServeConfig::new(std::net::IpAddr::from([127, 0, 0, 1]), 0, Arc::new(AllowAll));
+        let mut cfg = ServeConfig::new(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            0,
+            Arc::new(AllowAll),
+        );
         cfg.limits.bootstrap_chunk_bytes = MAX_BOOTSTRAP_CHUNK_BYTES + 1;
         assert!(cfg.validate().is_err());
         cfg.limits.bootstrap_chunk_bytes = 1;
@@ -338,10 +381,25 @@ mod serve_tests {
 
     #[test]
     fn tls_identity_debug_hides_key_and_timeouts_are_validated() {
-        let id = TlsIdentity { cert_pem: b"CERT".to_vec(), key_pem: b"SECRETKEY".to_vec() };
-        let d = format!("{id:?} {:?}", TlsServerConfig { identity: id.clone(), client_ca_pem: None });
+        let id = TlsIdentity {
+            cert_pem: b"CERT".to_vec(),
+            key_pem: b"SECRETKEY".to_vec(),
+        };
+        let d = format!(
+            "{id:?} {:?}",
+            TlsServerConfig {
+                identity: id.clone(),
+                client_ca_pem: None
+            }
+        );
         assert!(!d.contains("SECRETKEY") && !d.contains("CERT"));
-        let new = || ServeConfig::new(std::net::IpAddr::from([127, 0, 0, 1]), 0, Arc::new(AllowAll));
+        let new = || {
+            ServeConfig::new(
+                std::net::IpAddr::from([127, 0, 0, 1]),
+                0,
+                Arc::new(AllowAll),
+            )
+        };
         let mut cfg = new();
         cfg.limits.max_auth_failures_per_minute = 0;
         assert!(cfg.validate().is_err());
@@ -360,11 +418,17 @@ mod serve_tests {
     fn heartbeat_must_be_at_most_half_the_in_sync_window() {
         let mut m = MasterConfig::new("a", "/tmp/unused");
         m.validate().unwrap();
-        m.serve = Some(ServeConfig::new(std::net::IpAddr::from([127, 0, 0, 1]), 0, Arc::new(AllowAll)));
+        m.serve = Some(ServeConfig::new(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            0,
+            Arc::new(AllowAll),
+        ));
         m.heartbeat = Duration::from_secs(5);
         m.validate().unwrap(); // 2 × 5 s = 10 s, the default window
         m.heartbeat = Duration::from_millis(5_001);
-        assert!(matches!(m.validate(), Err(Error::Config(msg)) if msg.contains("replica_lag_time_max")));
+        assert!(
+            matches!(m.validate(), Err(Error::Config(msg)) if msg.contains("replica_lag_time_max"))
+        );
         m.serve.as_mut().unwrap().limits.replica_lag_time_max = Duration::from_secs(11);
         m.validate().unwrap();
         m.serve = None;
@@ -374,7 +438,11 @@ mod serve_tests {
 
     #[test]
     fn invalid_token_secrets_are_refused() {
-        let mut cfg = ServeConfig::new(std::net::IpAddr::from([127, 0, 0, 1]), 0, Arc::new(TokenAuthenticator::new([""])));
+        let mut cfg = ServeConfig::new(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            0,
+            Arc::new(TokenAuthenticator::new([""])),
+        );
         cfg.allow_plaintext_token = true;
         assert!(matches!(cfg.validate(), Err(Error::Config(m)) if m.contains("b64token")));
     }

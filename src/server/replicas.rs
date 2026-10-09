@@ -107,14 +107,24 @@ impl ReplicaCell {
         {
             let mut p = self.progress();
             if applied_seq < p.applied_seq {
-                return Err(format!("ack {applied_seq} is below the previous ack {}", p.applied_seq));
+                return Err(format!(
+                    "ack {applied_seq} is below the previous ack {}",
+                    p.applied_seq
+                ));
             }
             if applied_seq > p.sent_seq {
-                return Err(format!("ack {applied_seq} is above the last sent seq {}", p.sent_seq));
+                return Err(format!(
+                    "ack {applied_seq} is above the last sent seq {}",
+                    p.sent_seq
+                ));
             }
             p.applied_seq = applied_seq;
             let mut caught_up = (applied_seq >= node_last_seq).then(Instant::now);
-            while p.drained.front().is_some_and(|&(seq, _)| seq <= applied_seq) {
+            while p
+                .drained
+                .front()
+                .is_some_and(|&(seq, _)| seq <= applied_seq)
+            {
                 let (_, at) = p.drained.pop_front().expect("checked");
                 caught_up = caught_up.max(Some(at));
             }
@@ -205,19 +215,26 @@ impl ReplicaRegistry {
     /// under one id) counts once, by its best stream: in sync first, then the highest
     /// `applied_seq`. Otherwise one replica could satisfy a write concern of N > 1 alone.
     pub(crate) fn acks(&self, epoch: u64, lag_max: Duration) -> Vec<(Seq, bool)> {
-        let mut best: std::collections::BTreeMap<String, (bool, Seq)> = std::collections::BTreeMap::new();
+        let mut best: std::collections::BTreeMap<String, (bool, Seq)> =
+            std::collections::BTreeMap::new();
         for c in self.streams().values() {
             let p = c.progress();
             let this = (p.in_sync(c.epoch, epoch, lag_max), p.applied_seq);
             let e = best.entry(c.node_id.clone()).or_insert(this);
             *e = (*e).max(this);
         }
-        best.into_values().map(|(in_sync, applied)| (applied, in_sync)).collect()
+        best.into_values()
+            .map(|(in_sync, applied)| (applied, in_sync))
+            .collect()
     }
 
     /// Blocks until `done` holds for the current acks, or `timeout` passes. Returns whether
     /// `done` held. For synchronous writers; never call it on an async worker thread.
-    pub(crate) fn wait_until(&self, timeout: Duration, mut done: impl FnMut(&Self) -> bool) -> bool {
+    pub(crate) fn wait_until(
+        &self,
+        timeout: Duration,
+        mut done: impl FnMut(&Self) -> bool,
+    ) -> bool {
         let deadline = Instant::now() + timeout;
         let mut changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
@@ -235,7 +252,11 @@ impl ReplicaRegistry {
             if *changes != seen {
                 continue;
             }
-            changes = self.changed.wait_timeout(changes, deadline - now).unwrap_or_else(PoisonError::into_inner).0;
+            changes = self
+                .changed
+                .wait_timeout(changes, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
     }
 
@@ -246,7 +267,11 @@ impl ReplicaRegistry {
             .values()
             .map(|c| {
                 let p = c.progress();
-                (c.node_id.clone(), p.applied_seq, p.in_sync(c.epoch, epoch, lag_max))
+                (
+                    c.node_id.clone(),
+                    p.applied_seq,
+                    p.in_sync(c.epoch, epoch, lag_max),
+                )
             })
             .collect();
         out.sort();
@@ -254,7 +279,12 @@ impl ReplicaRegistry {
     }
 
     /// The status of every open stream.
-    pub(crate) fn status(&self, src: &dyn LogSource, now_ms: u64, lag_max: Duration) -> Vec<ReplicaStatus> {
+    pub(crate) fn status(
+        &self,
+        src: &dyn LogSource,
+        now_ms: u64,
+        lag_max: Duration,
+    ) -> Vec<ReplicaStatus> {
         let epoch = src.identity().map_or(0, |(id, _)| id.epoch);
         let last = src.store().position().last_seq;
         let mut out: Vec<ReplicaStatus> = self
@@ -286,7 +316,11 @@ impl ReplicaRegistry {
                 }
             })
             .collect();
-        out.sort_by(|a, b| a.node_id.cmp(&b.node_id).then(a.connected_since.cmp(&b.connected_since)));
+        out.sort_by(|a, b| {
+            a.node_id
+                .cmp(&b.node_id)
+                .then(a.connected_since.cmp(&b.connected_since))
+        });
         out
     }
 }
@@ -306,7 +340,11 @@ mod tests {
             peer_verified: false,
             epoch: 1,
             has_up_to,
-            fetch: FetchSettings { min_batch_bytes: 0, max_wait: Duration::ZERO, max_batch_bytes: 1 << 20 },
+            fetch: FetchSettings {
+                min_batch_bytes: 0,
+                max_wait: Duration::ZERO,
+                max_batch_bytes: 1 << 20,
+            },
         }
     }
 
@@ -315,16 +353,37 @@ mod tests {
         let reg = registry();
         let h = reg.open(new(5));
         h.cell().ack(5, 9).unwrap();
-        assert!(h.cell().ack(6, 9).unwrap_err().contains("above the last sent"));
+        assert!(
+            h.cell()
+                .ack(6, 9)
+                .unwrap_err()
+                .contains("above the last sent")
+        );
         h.cell().note_sent(9, 9);
         h.cell().ack(7, 9).unwrap();
-        assert!(h.cell().ack(6, 9).unwrap_err().contains("below the previous"));
-        assert_eq!(reg.acks(1, Duration::from_secs(10)), vec![(7, false)], "not caught up yet");
+        assert!(
+            h.cell()
+                .ack(6, 9)
+                .unwrap_err()
+                .contains("below the previous")
+        );
+        assert_eq!(
+            reg.acks(1, Duration::from_secs(10)),
+            vec![(7, false)],
+            "not caught up yet"
+        );
         h.cell().ack(9, 9).unwrap();
         assert_eq!(reg.acks(1, Duration::from_secs(10)), vec![(9, true)]);
-        assert_eq!(reg.acks(2, Duration::from_secs(10)), vec![(9, false)], "other epoch: not in sync");
+        assert_eq!(
+            reg.acks(2, Duration::from_secs(10)),
+            vec![(9, false)],
+            "other epoch: not in sync"
+        );
         drop(h);
-        assert!(reg.acks(1, Duration::from_secs(10)).is_empty(), "closed streams leave the registry");
+        assert!(
+            reg.acks(1, Duration::from_secs(10)).is_empty(),
+            "closed streams leave the registry"
+        );
     }
 
     /// M5: two streams of one node count once (its best stream); another node counts apart.
@@ -335,8 +394,15 @@ mod tests {
         let b = reg.open(new(3));
         a.cell().ack(5, 5).unwrap(); // caught up: in sync
         let lag = Duration::from_secs(10);
-        assert_eq!(reg.acks(1, lag), vec![(5, true)], "node b: one entry, its in-sync stream");
-        let other = reg.open(NewReplica { node_id: "c".into(), ..new(2) });
+        assert_eq!(
+            reg.acks(1, lag),
+            vec![(5, true)],
+            "node b: one entry, its in-sync stream"
+        );
+        let other = reg.open(NewReplica {
+            node_id: "c".into(),
+            ..new(2)
+        });
         assert_eq!(reg.acks(1, lag), vec![(5, true), (2, false)]);
         drop((a, b, other));
         assert!(reg.acks(1, lag).is_empty());
@@ -376,10 +442,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(30));
             cell.ack(4, 4).unwrap();
         });
-        assert!(reg.wait_until(Duration::from_secs(5), |r| r.acks(1, Duration::from_secs(10)).iter().any(|a| a.0 >= 4)));
+        assert!(reg.wait_until(Duration::from_secs(5), |r| {
+            r.acks(1, Duration::from_secs(10)).iter().any(|a| a.0 >= 4)
+        }));
         t.join().unwrap();
         let t0 = Instant::now();
-        assert!(!reg.wait_until(Duration::from_millis(50), |r| r.acks(1, Duration::from_secs(10)).iter().any(|a| a.0 >= 5)));
+        assert!(!reg.wait_until(Duration::from_millis(50), |r| {
+            r.acks(1, Duration::from_secs(10)).iter().any(|a| a.0 >= 5)
+        }));
         assert!(t0.elapsed() >= Duration::from_millis(50));
     }
 }
