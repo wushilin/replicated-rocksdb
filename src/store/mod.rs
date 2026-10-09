@@ -3,6 +3,8 @@
 pub(crate) mod apply;
 pub(crate) mod cfs;
 pub(crate) mod meta;
+pub(crate) mod read;
+pub(crate) mod snapshot;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -190,6 +192,26 @@ impl Store {
         self.db
             .cf_handle(&cf.physical)
             .ok_or_else(|| Error::corrupt(format!("physical column family {} is missing", cf.physical)))
+    }
+
+    pub(crate) fn live_ctx(&self, now_ms: u64) -> read::ReadCtx<'_> {
+        read::ReadCtx { db: &*self.db, snap: None, now_ms }
+    }
+
+    /// Takes a snapshot. The registry read lock is held while the RocksDB snapshot is taken;
+    /// CF changes commit under the write lock, so the CF list always matches the data.
+    pub(crate) fn read_snapshot(&self, now_ms: u64) -> Result<crate::read::ReadSnapshot> {
+        let live = self.cfs.read();
+        let snap = snapshot::OwnedSnapshot::new(self.db.clone());
+        let cfs = live.clone();
+        drop(live);
+        let meta_cf = self.cf(CF_META);
+        let seq = match snap.db().get_cf_opt(&meta_cf, key::LAST_SEQ, &snap.read_opts())? {
+            Some(v) => meta::be64(&v)?,
+            None => 0,
+        };
+        drop(meta_cf);
+        Ok(crate::read::ReadSnapshot { snap, cfs, seq, now_ms })
     }
 
     pub(crate) fn live_cf(&self, name: &str) -> Result<Arc<PhysCf>> {

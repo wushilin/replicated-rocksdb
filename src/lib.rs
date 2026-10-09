@@ -11,6 +11,7 @@ pub(crate) use proto::replication::v1 as pb;
 pub mod clock;
 pub mod error;
 pub mod tuning;
+pub mod read;
 pub mod types;
 
 pub use clock::{Clock, ManualClock, SystemClock};
@@ -22,3 +23,5 @@ pub mod codec;
 pub(crate) mod store;
 pub use codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 pub use tuning::{CfKind, ComparatorRegistry, Compression, RocksTuning, Tunable};
+pub use read::{ReadApi, ReadSnapshot};
+pub use store::read::DbIter;

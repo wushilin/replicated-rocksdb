@@ -421,7 +421,8 @@ pub trait LogApi {
     fn subscribe(&self) -> watch::Receiver<Seq>;
 }
 
-pub struct ReadSnapshot<'a> { .. }   // impl ReadApi; fn seq(&self) -> Seq; `now` fixed at creation
+pub struct ReadSnapshot { .. }       // impl ReadApi; fn seq(&self) -> Seq; `now` fixed at creation;
+                                     // owns an Arc of the DB, so it can be moved into tasks
 
 // Shared
 pub struct ServeConfig {
@@ -462,7 +463,7 @@ impl Master {
     pub fn create_cf(&self, spec: CfSpec) -> Result<Seq>;
     pub fn drop_cf(&self, name: &str) -> Result<Seq>;
 
-    pub fn snapshot(&self) -> Result<ReadSnapshot<'_>>;
+    pub fn snapshot(&self) -> Result<ReadSnapshot>;
     pub fn replicas(&self) -> Vec<ReplicaStatus>;      // direct downstream only
     pub fn bump_epoch(&self) -> Result<DbIdentity>;
     pub fn epoch_history(&self) -> Vec<EpochStart>;
@@ -539,7 +540,7 @@ impl Slave {
     pub async fn verify_now(&self, mode: VerifyMode) -> Result<VerifyReport>;
     pub async fn clear_halt(&self, action: HaltAction) -> Result<()>;   // operator action
     pub async fn promote(self, cfg: MasterConfig) -> Result<Master>;    // operator action (§13.1)
-    pub fn snapshot(&self) -> Result<ReadSnapshot<'_>>;
+    pub fn snapshot(&self) -> Result<ReadSnapshot>;
     pub fn replicas(&self) -> Vec<ReplicaStatus>;
     pub async fn shutdown(self) -> Result<()>;
 }
