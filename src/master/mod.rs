@@ -32,6 +32,12 @@ use writer::Inner;
 /// change will be lost.** If a new value is derived from an old one, hold your own lock
 /// around the whole get → compute → put sequence, and make every writer of those keys take
 /// the same lock. See DESIGN.md §5.1.
+///
+/// # Closing
+///
+/// Dropping the `Master` (or calling [`shutdown`](Self::shutdown)) releases the database once
+/// no maintenance tick is running. Any [`ReadSnapshot`] still alive keeps the database open,
+/// and its directory LOCK held, until that snapshot is dropped.
 pub struct Master {
     inner: Arc<Inner>,
     task: Option<JoinHandle<()>>,
@@ -65,10 +71,11 @@ impl Master {
         if bump && !fresh {
             inner.bump_epoch()?;
         }
-        let task = maintenance::spawn(inner.clone());
+        let task = maintenance::spawn(&inner);
         Ok(Master { inner, task: Some(task) })
     }
 
+    /// The origin identity (`db_uuid` and current epoch) stamped on every entry.
     pub fn identity(&self) -> DbIdentity {
         self.inner.identity()
     }
@@ -83,6 +90,8 @@ impl Master {
     /// This is an absolute write. It is **not** safe to compute `value` from a previous
     /// [`get`](Self::get) without holding an application lock around both calls; see the
     /// [type-level docs](Self#read-modify-write).
+    ///
+    /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     pub fn put(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<Seq> {
         let op = Op::Put { cf: cf.into(), key: key.into(), value: value.into(), expire_at_ms: None };
         self.inner.commit_ops(|_| Ok(vec![op]))
@@ -90,17 +99,24 @@ impl Master {
 
     /// Like [`put`](Self::put), with an expiry of commit time + `ttl`. Expired values are
     /// hidden from reads at once and deleted by the reaper later.
+    ///
+    /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     pub fn put_with_ttl(&self, cf: &str, key: &[u8], value: &[u8], ttl: Duration) -> Result<Seq> {
         let (cf, key, value) = (cf.to_string(), key.to_vec(), value.to_vec());
         self.inner.commit_ops(|ts| Ok(vec![Op::Put { cf, key, value, expire_at_ms: Some(expire_at(ts, ttl)) }]))
     }
 
+    /// Deletes `key`. A no-op delete is still logged as an entry.
+    ///
+    /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     pub fn delete(&self, cf: &str, key: &[u8]) -> Result<Seq> {
         let op = Op::Delete { cf: cf.into(), key: key.into() };
         self.inner.commit_ops(|_| Ok(vec![op]))
     }
 
     /// Deletes keys in `[start, end)` under the CF's comparator. `start` must sort before `end`.
+    ///
+    /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     pub fn delete_range(&self, cf: &str, start: &[u8], end: &[u8]) -> Result<Seq> {
         let op = Op::DeleteRange { cf: cf.into(), start: start.into(), end: end.into() };
         self.inner.commit_ops(|_| Ok(vec![op]))
@@ -111,6 +127,8 @@ impl Master {
     /// A batch is not a transaction over reads: values computed from earlier reads can be
     /// stale by the time the batch commits unless the application holds its own lock; see
     /// the [type-level docs](Self#read-modify-write).
+    ///
+    /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     pub fn write(&self, batch: Batch) -> Result<Seq> {
         self.inner.commit_ops(|ts| Ok(batch.into_ops(ts)))
     }
@@ -121,11 +139,19 @@ impl Master {
         self.inner.reap_round()
     }
 
+    /// Creates a column family. Fails with `AlreadyExists`, `InvalidCfName` or
+    /// `UnknownComparator`. Logged as its own entry.
+    ///
+    /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     pub fn create_cf(&self, spec: CfSpec) -> Result<Seq> {
         validate_cf_name(&spec.name)?;
         self.inner.commit_ops(|_| Ok(vec![Op::CreateCf { spec }]))
     }
 
+    /// Logically drops a column family. The physical drop is deferred while any snapshot or
+    /// iterator still references it. Logged as its own entry.
+    ///
+    /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     pub fn drop_cf(&self, name: &str) -> Result<Seq> {
         validate_cf_name(name)?;
         let op = Op::DropCf { name: name.into() };
@@ -141,6 +167,8 @@ impl Master {
         ReadApi::get(self, cf, key)
     }
 
+    /// A consistent point-in-time view; "now" for TTL is fixed when it is taken. Holding it
+    /// keeps dropped column families on disk and the database open (see [`Master`] docs).
     pub fn snapshot(&self) -> Result<ReadSnapshot> {
         self.inner.store.read_snapshot(self.inner.now_ms())
     }
@@ -150,7 +178,8 @@ impl Master {
         self.inner.bump_epoch()
     }
 
-    /// Stops background work and waits for it to finish.
+    /// Stops background work and waits for it to finish. Outstanding [`ReadSnapshot`]s (and
+    /// iterators borrowed from them) keep the database open, with its LOCK held, until dropped.
     pub async fn shutdown(mut self) -> Result<()> {
         self.inner.shutdown_tx.send_replace(true);
         if let Some(task) = self.task.take() {

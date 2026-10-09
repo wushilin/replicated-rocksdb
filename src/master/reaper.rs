@@ -21,15 +21,17 @@ impl Inner {
     pub(crate) fn reap_round(&self) -> Result<ReapStats> {
         let cfg = &self.cfg.reaper;
         let mut stats = ReapStats::default();
+        let mut resume: Option<Vec<u8>> = None;
         while stats.deleted < cfg.max_deletes_per_round {
             let limit = cfg.max_deletes_per_entry.min(cfg.max_deletes_per_round - stats.deleted);
             // The writer lock is held per entry and released between entries, so the reaper
             // never blocks application writes for long.
             let mut w = self.lock_writer()?;
-            let due = self.store.ttl_due(self.now_ms(), limit)?;
+            let due = self.store.ttl_due(self.now_ms(), limit, resume.as_deref())?;
             if due.is_empty() {
                 break;
             }
+            resume = due.last().map(|e| e.raw_key.clone());
             let mut ops = Vec::new();
             for e in &due {
                 if self.store.ttl_entry_is_live(e)? {

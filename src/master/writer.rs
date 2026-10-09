@@ -64,7 +64,16 @@ impl Inner {
     }
 
     pub(crate) fn lock_writer(&self) -> Result<MutexGuard<'_, WriterState>> {
-        let w = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let w = match self.writer.lock() {
+            Ok(w) => w,
+            Err(poisoned) => {
+                // A panic while holding the lock leaves durability unknown: fence.
+                let mut w = poisoned.into_inner();
+                w.fenced = true;
+                tracing::error!("writer mutex poisoned; writer fenced until reopen");
+                return Err(Error::WriterFenced);
+            }
+        };
         if w.fenced { Err(Error::WriterFenced) } else { Ok(w) }
     }
 

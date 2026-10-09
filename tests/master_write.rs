@@ -242,3 +242,17 @@ async fn invalid_identifier_is_rejected() {
     cfg.identifier = "bad id!".into();
     assert!(matches!(Master::open(cfg).await, Err(Error::Config(_))));
 }
+
+/// Dropping a `Master` releases the DB at once, even on a current-thread runtime where the
+/// maintenance task cannot run in between.
+#[tokio::test]
+async fn drop_releases_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = clock();
+    let m = Master::open(config(dir.path(), &c)).await.unwrap();
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", b"k", b"v").unwrap();
+    drop(m);
+    let m = Master::open(config(dir.path(), &c)).await.unwrap();
+    assert_eq!(m.get("c", b"k").unwrap().unwrap(), b"v");
+}

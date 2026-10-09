@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use rocksdb::{BoundColumnFamily, DBIteratorWithThreadMode, ReadOptions, DB};
+use rocksdb::{BoundColumnFamily, DBIteratorWithThreadMode, DB};
 
 use super::cfs::PhysCf;
 use super::snapshot::OwnedSnapshot;
@@ -24,13 +24,13 @@ fn handle<'d>(db: &'d DB, cf: &PhysCf) -> Result<Arc<BoundColumnFamily<'d>>> {
 }
 
 impl<'a> ReadCtx<'a> {
-    fn opts(&self) -> ReadOptions {
-        self.snap.map(OwnedSnapshot::read_opts).unwrap_or_default()
-    }
-
     /// The raw envelope, expired or not.
     pub(crate) fn get_raw(&self, cf: &PhysCf, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.db.get_cf_opt(&handle(self.db, cf)?, key, &self.opts())?)
+        let h = handle(self.db, cf)?;
+        match self.snap {
+            Some(s) => s.get_cf(&h, key),
+            None => Ok(self.db.get_cf(&h, key)?),
+        }
     }
 
     pub(crate) fn get(&self, cf: &PhysCf, key: &[u8]) -> Result<Option<(Vec<u8>, ValueMeta)>> {
@@ -49,12 +49,19 @@ impl<'a> ReadCtx<'a> {
             IterMode::From(k, Direction::Forward) => rocksdb::IteratorMode::From(k, rocksdb::Direction::Forward),
             IterMode::From(k, Direction::Reverse) => rocksdb::IteratorMode::From(k, rocksdb::Direction::Reverse),
         };
-        let inner = self.db.iterator_cf_opt(&handle(self.db, &cf)?, self.opts(), mode);
+        let h = handle(self.db, &cf)?;
+        let inner = match self.snap {
+            Some(s) => s.iterator_cf(&h, mode),
+            None => self.db.iterator_cf(&h, mode),
+        };
         Ok(DbIter { inner, _cf: cf, now_ms: self.now_ms, prefix: prefix.map(<[u8]>::to_vec), done: false })
     }
 }
 
 /// Iterator over `(key, value)` pairs of a CF, with envelopes stripped and expired values skipped.
+///
+/// Yields `Err` for an unreadable or corrupt record. It keeps its column family alive, so a
+/// logical CF drop does not free the physical CF until the iterator is dropped.
 pub struct DbIter<'a> {
     inner: DBIteratorWithThreadMode<'a, DB>,
     // Keeps the physical CF from being dropped while iterating.
@@ -178,6 +185,17 @@ mod tests {
             keys(ctx.iter(cf, IterMode::From(b"\0", Direction::Forward), Some(b"\0")).unwrap()),
             vec![b"\0".to_vec(), b"\0\0".to_vec()]
         );
+    }
+
+    #[test]
+    fn live_iterator_pins_a_dropped_cf() {
+        let (_d, store) = setup();
+        let cf = store.live_cf("c").unwrap();
+        let it = store.live_ctx(0).iter(cf, IterMode::Start, None).unwrap();
+        apply(&store, vec![Op::DropCf { name: "c".into() }]).unwrap();
+        assert_eq!(store.drop_unreferenced_cfs().unwrap(), 0, "iterator still references the CF");
+        assert_eq!(keys(it).len(), 5, "now = 0: nothing expired");
+        assert_eq!(store.drop_unreferenced_cfs().unwrap(), 1);
     }
 
     #[test]

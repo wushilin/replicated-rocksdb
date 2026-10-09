@@ -11,31 +11,36 @@ use crate::error::Result;
 
 const CF_DROP_INTERVAL: Duration = Duration::from_secs(5);
 
-pub(crate) fn spawn(inner: Arc<Inner>) -> JoinHandle<()> {
+/// The task holds only a `Weak<Inner>`, upgraded for the duration of one tick, so dropping the
+/// `Master` releases the database (and its LOCK) without waiting for the task.
+pub(crate) fn spawn(inner: &Arc<Inner>) -> JoinHandle<()> {
     let mut shutdown = inner.shutdown_tx.subscribe();
+    let (retention_every, reaper_every) = (inner.cfg.retention.check_interval, inner.cfg.reaper.interval);
+    let weak = Arc::downgrade(inner);
     tokio::spawn(async move {
         let every = |period: Duration| {
             let mut t = interval_at(Instant::now() + period, period);
             t.set_missed_tick_behavior(MissedTickBehavior::Delay);
             t
         };
-        let mut retention = every(inner.cfg.retention.check_interval);
-        let mut reaper = every(inner.cfg.reaper.interval);
+        let mut retention = every(retention_every);
+        let mut reaper = every(reaper_every);
         let mut cf_drops = every(CF_DROP_INTERVAL);
         loop {
-            tokio::select! {
+            let (name, f): (&'static str, fn(&Inner) -> Result<()>) = tokio::select! {
                 _ = shutdown.changed() => break,
-                _ = retention.tick() => run(&inner, "retention", |i| i.trim_changelog().map(drop)).await,
-                _ = reaper.tick() => run(&inner, "reaper", |i| i.reap_round().map(drop)).await,
-                _ = cf_drops.tick() => run(&inner, "cf-drop", |i| i.store.drop_unreferenced_cfs().map(drop)).await,
-            }
+                _ = retention.tick() => ("retention", |i| i.trim_changelog().map(drop)),
+                _ = reaper.tick() => ("reaper", |i| i.reap_round().map(drop)),
+                _ = cf_drops.tick() => ("cf-drop", |i| i.store.drop_unreferenced_cfs().map(drop)),
+            };
+            let Some(inner) = weak.upgrade() else { break };
+            run(inner, name, f).await;
         }
     })
 }
 
-async fn run(inner: &Arc<Inner>, task: &'static str, f: fn(&Inner) -> Result<()>) {
-    let i = inner.clone();
-    match tokio::task::spawn_blocking(move || f(&i)).await {
+async fn run(inner: Arc<Inner>, task: &'static str, f: fn(&Inner) -> Result<()>) {
+    match tokio::task::spawn_blocking(move || f(&inner)).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!(task, error = %e, "maintenance task failed"),
         Err(e) => tracing::error!(task, error = %e, "maintenance task panicked"),

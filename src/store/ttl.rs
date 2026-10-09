@@ -57,15 +57,25 @@ impl Store {
         Ok(())
     }
 
-    /// Up to `limit` index entries with `expire_at <= now_ms`, oldest first.
-    pub(crate) fn ttl_due(&self, now_ms: u64, limit: usize) -> Result<Vec<IndexEntry>> {
+    /// Up to `limit` index entries with `expire_at <= now_ms`, oldest first. With `after`, the
+    /// scan starts strictly after that raw index key, so a caller that has already processed
+    /// earlier entries does not rescan them (or their tombstones).
+    pub(crate) fn ttl_due(&self, now_ms: u64, limit: usize, after: Option<&[u8]>) -> Result<Vec<IndexEntry>> {
         let cf = self.cf(CF_TTL_INDEX);
+        let mode = match after {
+            Some(k) => IteratorMode::From(k, rocksdb::Direction::Forward),
+            None => IteratorMode::Start,
+        };
         let mut due = Vec::new();
-        for item in self.db().iterator_cf(&cf, IteratorMode::Start) {
+        for item in self.db().iterator_cf(&cf, mode) {
             if due.len() >= limit {
                 break;
             }
-            let entry = parse_index_key(&item?.0)?;
+            let (raw, _) = item?;
+            if after == Some(&*raw) {
+                continue;
+            }
+            let entry = parse_index_key(&raw)?;
             if entry.expire_at > now_ms {
                 break;
             }

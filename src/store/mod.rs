@@ -67,6 +67,16 @@ impl Store {
         let db_opts = tuning.db_options();
         let existing: Vec<String> =
             if path.join("CURRENT").exists() { DB::list_cf(&Options::default(), path)? } else { Vec::new() };
+        if !existing.iter().any(|n| n == CF_META) {
+            // No `__meta`: either a fresh directory or a crash during first creation (which can
+            // leave our reserved `__` CFs). Anything else is someone else's database.
+            if let Some(foreign) = existing.iter().find(|n| *n != "default" && !n.starts_with("__")) {
+                return Err(Error::Config(format!(
+                    "{} holds a RocksDB database not created by this crate (column family {foreign:?})",
+                    path.display()
+                )));
+            }
+        }
         let prior = if existing.iter().any(|n| n == CF_META) { read_meta_read_only(path)? } else { None };
         if let Some(m) = &prior {
             check_compatible(m, role)?;
@@ -212,7 +222,7 @@ impl Store {
         let cfs = live.clone();
         drop(live);
         let meta_cf = self.cf(CF_META);
-        let seq = match snap.db().get_cf_opt(&meta_cf, key::LAST_SEQ, &snap.read_opts())? {
+        let seq = match snap.get_cf(&meta_cf, key::LAST_SEQ)? {
             Some(v) => meta::be64(&v)?,
             None => 0,
         };
@@ -282,6 +292,22 @@ mod tests {
     use crate::tuning::RocksTuning;
     use crate::types::{CfEntry, CfSpec, DbIdentity, EpochStart, Role};
     use crate::error::Error;
+
+    #[test]
+    fn refuses_a_foreign_rocksdb_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut o = Options::default();
+            o.create_if_missing(true);
+            o.create_missing_column_families(true);
+            let db = DB::open_cf(&o, dir.path(), ["foreign"]).unwrap();
+            db.put(b"k", b"v").unwrap();
+        }
+        match Store::open(dir.path(), Role::Master, RocksTuning::new()) {
+            Err(Error::Config(m)) => assert!(m.contains("foreign"), "{m}"),
+            other => panic!("expected Config error, got {:?}", other.map(|_| ())),
+        }
+    }
 
     #[test]
     fn fresh_store_initialises_meta() {
