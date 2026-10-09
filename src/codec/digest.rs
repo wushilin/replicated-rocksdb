@@ -2,6 +2,8 @@
 
 use crate::types::Seq;
 
+/// Incremental BLAKE3 digest over CF markers and `(key, payload)` records, used by Bootstrap
+/// and Verify so both sides hash identical framing.
 pub struct Digest {
     hasher: blake3::Hasher,
     records: u64,
@@ -14,6 +16,7 @@ impl Default for Digest {
 }
 
 impl Digest {
+    /// An empty digest.
     pub fn new() -> Self {
         Digest { hasher: blake3::Hasher::new(), records: 0 }
     }
@@ -36,6 +39,7 @@ impl Digest {
         self.records += 1;
     }
 
+    /// Number of records hashed so far (CF markers are not counted).
     pub fn records(&self) -> u64 {
         self.records
     }

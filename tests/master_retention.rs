@@ -30,3 +30,23 @@ async fn maintenance_runs_in_the_background() {
     let m = Master::open(config(dir.path(), &c)).await.unwrap();
     assert_eq!(m.first_retained_seq(), 6);
 }
+
+/// The maintenance task physically drops a logically dropped CF on its own (every 5 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_drops_released_cfs() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = clock();
+    let m = Master::open(config(dir.path(), &c)).await.unwrap();
+    m.create_cf(CfSpec::new("gone")).unwrap();
+    let physical = |path: &std::path::Path| {
+        rocksdb::DB::list_cf(&rocksdb::Options::default(), path).unwrap().into_iter().filter(|n| n.starts_with("u:gone:")).count()
+    };
+    assert_eq!(physical(dir.path()), 1);
+    m.drop_cf("gone").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while physical(dir.path()) != 0 {
+        assert!(tokio::time::Instant::now() < deadline, "physical CF was not dropped");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    m.shutdown().await.unwrap();
+}

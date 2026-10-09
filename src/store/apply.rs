@@ -104,6 +104,8 @@ impl Store {
         let mut p = p;
         match p.cf_change.take() {
             Some(CfChange::Create(entry)) => {
+                // The registry write lock is held across the fsynced intent, create_cf and the
+                // batch, so readers stall briefly during a CF create. Acceptable: creates are rare.
                 let mut live = self.cfs.write();
                 // Record the intent durably first: a crash after create_cf leaves a CF whose
                 // comparator would otherwise be unknown at the next open.

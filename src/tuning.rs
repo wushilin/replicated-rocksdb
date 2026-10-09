@@ -26,6 +26,8 @@ impl fmt::Debug for ComparatorRegistry {
 }
 
 impl ComparatorRegistry {
+    /// Registers `f` under `name`. Re-registering a name **replaces** the earlier ordering; a
+    /// name must map to the same ordering forever, or existing data becomes unreadable.
     pub fn register(
         &mut self,
         name: impl Into<String>,
@@ -45,7 +47,6 @@ impl ComparatorRegistry {
 
     /// Orders two keys of a CF. `None`, or a name that is not registered, means bytewise;
     /// callers validate names before data reaches this point.
-    #[allow(dead_code)] // used by later tasks
     pub(crate) fn compare(&self, name: Option<&str>, a: &[u8], b: &[u8]) -> Ordering {
         match name.and_then(|n| self.map.get(n)) {
             Some(f) => f(a, b),

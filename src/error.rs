@@ -2,7 +2,9 @@ use crate::types::{Role, Seq};
 
 /// Errors returned by this crate.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
+    /// A slave that is still bootstrapping cannot serve reads yet.
     #[error("node is not ready: it is bootstrapping")]
     NotReady,
     #[error("no such column family: {0}")]
@@ -11,27 +13,36 @@ pub enum Error {
     AlreadyExists(String),
     #[error("invalid column family name {0:?}: must be 1-255 bytes and must not start with \"__\"")]
     InvalidCfName(String),
+    /// A `Batch` with no operations cannot be committed.
     #[error("batch is empty")]
     EmptyBatch,
+    /// `delete_range` needs `start` to sort strictly before `end` under the CF comparator.
     #[error("invalid range: start must sort strictly before end")]
     InvalidRange,
+    /// The encoded log entry exceeds `max_entry_bytes`; split the batch.
     #[error("entry too large: {size} bytes exceeds max_entry_bytes {max}")]
     EntryTooLarge { size: u64, max: u64 },
+    /// The CF names a comparator that is not in the `ComparatorRegistry`.
     #[error("unknown comparator: {0}")]
     UnknownComparator(String),
     /// For a hole in the middle of the log, `first_retained` is the next seq actually present.
     #[error("log gap: seq {requested} requested, first retained is {first_retained}")]
     Gap { requested: Seq, first_retained: Seq },
+    /// Stored or received data failed a structural or integrity check.
     #[error("corrupt data: {0}")]
     Corrupt(String),
+    /// The directory was created by a master and opened as a slave, or vice versa.
     #[error("database was created as {found:?} and cannot be opened as {expected:?}")]
     WrongRole { expected: Role, found: Role },
+    /// A protocol, envelope or storage version differs from this build.
     #[error("{what} is {found}, this build supports {expected}")]
     VersionMismatch { what: &'static str, found: u64, expected: u64 },
+    /// A write failed with unknown durability, so further writes are refused to avoid reusing seqs.
     #[error("the writer is fenced after a failed write; reopen the database")]
     WriterFenced,
     #[error("invalid configuration: {0}")]
     Config(String),
+    /// An operation did not finish within its deadline.
     #[error("timed out")]
     Timeout,
     #[error(transparent)]

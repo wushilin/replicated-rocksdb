@@ -19,10 +19,14 @@ pub trait ReadApi {
     /// Like [`get`](Self::get), plus the value's `write_seq` and expiry.
     fn get_with_meta(&self, cf: &str, key: &[u8]) -> Result<Option<(Vec<u8>, ValueMeta)>>;
 
+    /// Reads several keys of one CF with one CF lookup and one clock read. The result has one
+    /// element per key, in order.
     fn multi_get(&self, cf: &str, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
         keys.iter().map(|k| self.get(cf, k)).collect()
     }
 
+    /// Iterates a CF from `mode`, in the CF's comparator order, skipping expired values.
+    /// The iterator borrows `self`; a live iterator keeps a dropped CF on disk.
     fn iter(&self, cf: &str, mode: IterMode<'_>) -> Result<DbIter<'_>>;
 
     /// Keys starting with `prefix`, in order. Meaningful for bytewise-ordered CFs.

@@ -36,7 +36,6 @@ impl LogEntry {
         decode_ops(&self.ops)
     }
 
-    #[allow(dead_code)]
     fn to_pb(&self) -> pb::LogEntry {
         pb::LogEntry {
             seq: self.seq,
@@ -47,17 +46,14 @@ impl LogEntry {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn encode_to_vec(&self) -> Vec<u8> {
         self.to_pb().encode_to_vec()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn encoded_len(&self) -> usize {
         self.to_pb().encoded_len()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn decode(bytes: &[u8]) -> Result<LogEntry> {
         let p = pb::LogEntry::decode(bytes)
             .map_err(|e| Error::corrupt(format!("undecodable log entry: {e}")))?;
@@ -65,7 +61,6 @@ impl LogEntry {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn encode_ops(ops: &[Op]) -> Bytes {
     let list = pb::OpList { ops: ops.iter().map(op_to_pb).collect() };
     Bytes::from(list.encode_to_vec())
@@ -103,7 +98,6 @@ pub fn validate_cf_name(name: &str) -> Result<()> {
     }
 }
 
-#[allow(dead_code)]
 fn op_to_pb(op: &Op) -> pb::Op {
     use pb::op::Kind;
     let kind = match op {
@@ -205,6 +199,27 @@ pub(crate) mod tests {
         assert!(matches!(decode_ops(&reserved), Err(Error::Corrupt(_))));
 
         assert!(matches!(decode_ops(b"\xff\xff"), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn decode_rejects_more_structural_violations() {
+        let two_cf_ops = encode_ops(&[
+            Op::CreateCf { spec: CfSpec::new("a") },
+            Op::CreateCf { spec: CfSpec::new("b") },
+        ]);
+        assert!(matches!(decode_ops(&two_cf_ops), Err(Error::Corrupt(_))));
+
+        let drop_mixed = encode_ops(&[
+            Op::DropCf { name: "a".into() },
+            Op::Put { cf: "a".into(), key: vec![], value: vec![], expire_at_ms: None },
+        ]);
+        assert!(matches!(decode_ops(&drop_mixed), Err(Error::Corrupt(_))));
+
+        let reserved_create = encode_ops(&[Op::CreateCf { spec: CfSpec::new("__meta") }]);
+        assert!(matches!(decode_ops(&reserved_create), Err(Error::Corrupt(_))));
+
+        let reserved_drop = encode_ops(&[Op::DropCf { name: "__changelog".into() }]);
+        assert!(matches!(decode_ops(&reserved_drop), Err(Error::Corrupt(_))));
     }
 
     #[test]

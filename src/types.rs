@@ -122,19 +122,18 @@ pub struct EpochStart {
 }
 
 /// The epoch an entry with this seq must carry, given a history sorted by epoch.
-#[allow(dead_code)]
+#[allow(dead_code)] // used by the replication server (Plan 2)
 pub(crate) fn epoch_for(history: &[EpochStart], seq: Seq) -> Option<u64> {
     history.iter().rev().find(|e| e.start_seq <= seq).map(|e| e.epoch)
 }
 
 /// The fork point after `epoch`: the first seq of the next epoch, if any.
-#[allow(dead_code)]
+#[allow(dead_code)] // used by the replication server (Plan 2)
 pub(crate) fn fork_after(history: &[EpochStart], epoch: u64) -> Option<Seq> {
     history.iter().find(|e| e.epoch > epoch).map(|e| e.start_seq)
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) enum BatchOp {
     Put { cf: String, key: Vec<u8>, value: Vec<u8>, ttl: Option<Duration> },
     Delete { cf: String, key: Vec<u8> },
@@ -148,40 +147,46 @@ pub struct Batch {
 }
 
 impl Batch {
+    /// An empty batch.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Adds an absolute put with no expiry.
     pub fn put(&mut self, cf: &str, key: &[u8], value: &[u8]) -> &mut Self {
         self.ops.push(BatchOp::Put { cf: cf.into(), key: key.into(), value: value.into(), ttl: None });
         self
     }
 
+    /// Adds a put that expires `ttl` after the batch commits (computed on the master).
     pub fn put_with_ttl(&mut self, cf: &str, key: &[u8], value: &[u8], ttl: Duration) -> &mut Self {
         self.ops.push(BatchOp::Put { cf: cf.into(), key: key.into(), value: value.into(), ttl: Some(ttl) });
         self
     }
 
+    /// Adds a delete of `key`.
     pub fn delete(&mut self, cf: &str, key: &[u8]) -> &mut Self {
         self.ops.push(BatchOp::Delete { cf: cf.into(), key: key.into() });
         self
     }
 
+    /// Adds a delete of `[start, end)` under the CF's comparator.
     pub fn delete_range(&mut self, cf: &str, start: &[u8], end: &[u8]) -> &mut Self {
         self.ops.push(BatchOp::DeleteRange { cf: cf.into(), start: start.into(), end: end.into() });
         self
     }
 
+    /// Number of operations.
     pub fn len(&self) -> usize {
         self.ops.len()
     }
 
+    /// True if no operations were added (such a batch cannot be committed).
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
 
     /// Converts to absolute ops: each TTL becomes `expire_at_ms = ts_ms + ttl` (saturating).
-    #[allow(dead_code)]
     pub(crate) fn into_ops(self, ts_ms: u64) -> Vec<Op> {
         self.ops
             .into_iter()
@@ -200,7 +205,6 @@ impl Batch {
 }
 
 /// `ts_ms + ttl` in ms, saturating at `u64::MAX`.
-#[allow(dead_code)]
 pub(crate) fn expire_at(ts_ms: u64, ttl: Duration) -> u64 {
     let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
     ts_ms.saturating_add(ttl_ms)
