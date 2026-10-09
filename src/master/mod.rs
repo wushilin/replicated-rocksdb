@@ -1,6 +1,9 @@
 //! The writable master node.
 
+mod reaper;
 pub(crate) mod writer;
+
+pub use reaper::ReapStats;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,6 +111,12 @@ impl Master {
     /// the [type-level docs](Self#read-modify-write).
     pub fn write(&self, batch: Batch) -> Result<Seq> {
         self.inner.commit_ops(|ts| Ok(batch.into_ops(ts)))
+    }
+
+    /// Runs one reaper round now: logs `Delete`s for expired keys, in entries of at most
+    /// `reaper.max_deletes_per_entry`, up to `reaper.max_deletes_per_round` deletes.
+    pub fn reap_expired(&self) -> Result<ReapStats> {
+        self.inner.reap_round()
     }
 
     pub fn create_cf(&self, spec: CfSpec) -> Result<Seq> {

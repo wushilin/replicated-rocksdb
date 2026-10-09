@@ -6,6 +6,7 @@ pub(crate) mod log;
 pub(crate) mod meta;
 pub(crate) mod read;
 pub(crate) mod snapshot;
+pub(crate) mod ttl;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -229,11 +230,6 @@ impl Store {
         let mut wo = WriteOptions::default();
         wo.set_sync(sync);
         Ok(self.db.write_opt(batch, &wo)?)
-    }
-
-    /// Adds `__ttl_index` entries for TTL puts. Master only. Implemented in Task 9.
-    pub(crate) fn add_ttl_index(&self, _batch: &mut WriteBatch, _ops: &[crate::types::Op]) -> Result<()> {
-        Ok(())
     }
 
     fn first_changelog_seq(&self) -> Result<Option<Seq>> {

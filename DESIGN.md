@@ -47,7 +47,7 @@ Master(A) ──► Slave(B) ──► Slave(C)
 
 - User CF names must be non-empty UTF-8 and must not start with `__`.
 - The physical name includes `create_seq` (the seq of the `CreateCf` entry). It is deterministic across nodes and lets a CF be dropped and re-created with the same name while the old physical CF is still pending physical deletion.
-- `__ttl_index` is a derived structure that only the master reads. Slaves never reap, so they do not need it. It can be rebuilt from a full scan of the envelopes, for example on a future promotion.
+- `__ttl_index` is a derived structure that only the master reads. Key: `BE64(expire_at_ms) ‖ BE64(create_seq) ‖ BE16(len(name)) ‖ name ‖ key`, empty value. Including `create_seq` stops a dropped and re-created CF from matching old index entries. Slaves never reap, so they do not need it. It can be rebuilt from a full scan of the envelopes, for example on a future promotion.
 
 ### 3.2 `__meta` keys
 
