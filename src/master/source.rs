@@ -62,6 +62,7 @@ mod tests {
     use tonic::Code;
 
     use crate::config::Retention;
+    use crate::log::LogApi;
     use crate::net::reason_of;
     use crate::pb;
     use crate::pb::tail_message::Kind;
@@ -105,7 +106,48 @@ mod tests {
         })
         .await;
         // Entries the producer had already read are delivered; the next read hits the gap.
-        assert!(last < 200 && last % crate::server::READ_BATCH as u64 == 0, "last delivered: {last}");
+        // Reads stop at 64 entries or at the default 1 MiB batch size, whichever comes first;
+        // the first read also holds the small CreateCf entry 1, so reads end at 1 + k * per_read.
+        let per_read = ((1usize << 20).div_ceil(first.last().unwrap().encoded_len())).min(crate::server::READ_BATCH) as u64;
+        assert!(last < 200 && (last - 1) % per_read == 0, "last delivered: {last} (reads of {per_read})");
         assert_eq!((err.code(), reason_of(&err)), (Code::OutOfRange, Some(pb::Reason::LogGap)));
+    }
+
+    /// The lease protects `S + 1` until the stream has actually read it, even when the Tail
+    /// starts far before the snapshot.
+    #[tokio::test]
+    async fn lease_is_kept_until_the_entry_after_the_snapshot_is_read() {
+        use crate::pb::bootstrap_chunk::Kind as Chunk;
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(dir.path(), |_| {}).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        // 130 entries of 256 KiB: the producer blocks long before it reads past entry 128.
+        for i in 0..130u8 {
+            m.put("c", &[i], &vec![i; 256 << 10]).unwrap();
+        }
+        let mut c = client(m.serve_addr().unwrap(), "b");
+        let mut boot = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
+        let (mut lease, mut s_seq) = (Vec::new(), 0);
+        within("the bootstrap", async {
+            loop {
+                match boot.message().await.unwrap().unwrap().kind.unwrap() {
+                    Chunk::Header(h) => (lease, s_seq) = (h.lease_id, h.snapshot_seq),
+                    Chunk::Records(_) => {}
+                    Chunk::Footer(_) => break,
+                }
+            }
+        })
+        .await;
+        for i in 0..5u8 {
+            m.put("c", &[i], b"v").unwrap();
+        }
+        let mut req = tail_req(&m.identity(), 1);
+        req.bootstrap_lease = Some(lease);
+        let mut s = client(m.serve_addr().unwrap(), "b").tail(req).await.unwrap().into_inner();
+        next_batch(&mut s).await; // the first block is read; entry S + 1 is not
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let keep_one = Retention { max_age: None, max_entries: Some(1), check_interval: Duration::from_secs(1) };
+        m.inner.store.trim_changelog(0, &keep_one).unwrap();
+        assert_eq!(m.first_retained_seq(), s_seq + 1, "the lease still holds S + 1");
     }
 }

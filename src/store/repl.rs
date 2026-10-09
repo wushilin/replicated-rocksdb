@@ -31,10 +31,22 @@ impl Store {
         Ok(if seq == pos.last_seq { pos.last_entry_crc } else { None })
     }
 
-    /// Up to `max` consecutive entries starting at `from`. Fewer if the log ends sooner;
-    /// `Err(Gap)` if `from` (or a later entry in the range) has been trimmed.
-    pub(crate) fn read_entries(&self, from: Seq, max: usize) -> Result<Vec<LogEntry>> {
-        self.entries_after(from.saturating_sub(1))?.take(max).collect()
+    /// Up to `max` consecutive entries starting at `from`, stopping early once their
+    /// encoded size reaches `max_bytes` (so at least one entry is returned if there is any).
+    /// Fewer if the log ends sooner; `Err(Gap)` if `from` (or a later entry in the range)
+    /// has been trimmed.
+    pub(crate) fn read_entries(&self, from: Seq, max: usize, max_bytes: usize) -> Result<Vec<LogEntry>> {
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        for entry in self.entries_after(from.saturating_sub(1))?.take(max) {
+            let entry = entry?;
+            bytes = bytes.saturating_add(entry.encoded_len());
+            out.push(entry);
+            if bytes >= max_bytes {
+                break;
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -109,10 +121,14 @@ mod tests {
         for i in 0..4u8 {
             apply(&store, vec![put(&[i], b"v", None)]).unwrap();
         }
-        let all = store.read_entries(1, 100).unwrap();
+        let all = store.read_entries(1, 100, usize::MAX).unwrap();
         assert_eq!(all.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
-        assert_eq!(store.read_entries(2, 2).unwrap().iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
-        assert!(store.read_entries(6, 10).unwrap().is_empty());
+        assert_eq!(store.read_entries(2, 2, usize::MAX).unwrap().iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
+        assert!(store.read_entries(6, 10, usize::MAX).unwrap().is_empty());
+        // The byte budget stops a read after the entry that reaches it; one entry is always read.
+        let one = all[0].encoded_len();
+        assert_eq!(store.read_entries(1, 100, one + 1).unwrap().len(), 2);
+        assert_eq!(store.read_entries(1, 100, 1).unwrap().len(), 1);
         assert_eq!(store.entry_crc(3).unwrap(), Some(all[2].crc32c));
         assert_eq!(store.entry_crc(0).unwrap(), None);
         assert_eq!(store.entry_crc(6).unwrap(), None);
@@ -121,7 +137,7 @@ mod tests {
         store.trim_changelog(0, &r).unwrap();
         assert_eq!(store.entry_crc(3).unwrap(), None, "trimmed");
         assert_eq!(store.entry_crc(5).unwrap(), Some(all[4].crc32c));
-        assert!(matches!(store.read_entries(3, 10), Err(Error::Gap { requested: 3, first_retained: 4 })));
+        assert!(matches!(store.read_entries(3, 10, usize::MAX), Err(Error::Gap { requested: 3, first_retained: 4 })));
 
         // With the whole log trimmed, the CRC of the last entry is still known.
         let none = Retention { max_age: Some(Duration::from_millis(1)), max_entries: None, check_interval: Duration::from_secs(1) };
@@ -144,7 +160,7 @@ mod tests {
         let m = snap.meta().unwrap();
         assert_eq!(m.last_seq, 2);
         assert_eq!(m.cf_specs, vec![CfEntry { spec: CfSpec::new("c"), create_seq: 1 }]);
-        assert_eq!(m.last_entry_crc, store.read_entries(2, 1).unwrap().first().map(|e| e.crc32c));
+        assert_eq!(m.last_entry_crc, store.read_entries(2, 1, usize::MAX).unwrap().first().map(|e| e.crc32c));
 
         let phys = snap.phys("c").unwrap();
         assert!(snap.phys("d").is_none());

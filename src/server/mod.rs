@@ -118,9 +118,9 @@ pub(crate) struct CallInfo {
 impl CallInfo {
     /// The request's `client_id` must be a valid id and equal the `x-rrdb-node-id` metadata.
     pub(crate) fn check_client_id(&self, client_id: &str) -> Result<(), Status> {
-        validate_identifier(client_id).map_err(|e| Status::invalid_argument(format!("client_id: {e}")))?;
+        validate_identifier(client_id).map_err(|e| net::invalid_argument(format!("client_id: {e}")))?;
         if client_id != self.node_id {
-            return Err(Status::invalid_argument("client_id must equal the x-rrdb-node-id metadata"));
+            return Err(net::invalid_argument("client_id must equal the x-rrdb-node-id metadata"));
         }
         Ok(())
     }
@@ -132,8 +132,8 @@ pub(crate) fn call_info<T>(req: &Request<T>, method: Method) -> Result<CallInfo,
     if method != Method::Handshake {
         net::check_protocol_version(req.metadata())?;
     }
-    let node_id = net::node_id(req.metadata()).ok_or_else(|| Status::invalid_argument("x-rrdb-node-id is required"))?;
-    validate_identifier(&node_id).map_err(|e| Status::invalid_argument(format!("x-rrdb-node-id: {e}")))?;
+    let node_id = net::node_id(req.metadata()).ok_or_else(|| net::invalid_argument("x-rrdb-node-id is required"))?;
+    validate_identifier(&node_id).map_err(|e| net::invalid_argument(format!("x-rrdb-node-id: {e}")))?;
     let remote_addr = req.remote_addr().unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
     let client_cert = req.peer_certs().and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()));
     let peer = match client_cert.as_deref().and_then(subject_common_name) {
@@ -167,7 +167,7 @@ impl Replication for Svc {
         call.check_client_id(&r.client_id)?;
         if let Some(known) = &r.known_identity {
             crate::net::convert::identity_from_pb(known)
-                .map_err(|_| Status::invalid_argument("known_identity.db_uuid must be 16 bytes"))?;
+                .map_err(|_| net::invalid_argument("known_identity.db_uuid must be 16 bytes"))?;
         }
         let view = server_view(&*src, r.last_seq)?;
         let v = handshake::decide(&view, &r);
@@ -209,7 +209,7 @@ impl Replication for Svc {
     }
 
     async fn verify_begin(&self, _: Request<pb::VerifyBeginRequest>) -> Result<Response<pb::VerifyBeginResponse>, Status> {
-        Err(Status::unimplemented("Verify is not implemented by this version"))
+        Err(net::unimplemented("Verify is not implemented by this version"))
     }
 
     type VerifyRangeStream = VerifyRangeStream;
@@ -218,11 +218,11 @@ impl Replication for Svc {
         &self,
         _: Request<tonic::Streaming<pb::VerifyRangeRequest>>,
     ) -> Result<Response<VerifyRangeStream>, Status> {
-        Err(Status::unimplemented("Verify is not implemented by this version"))
+        Err(net::unimplemented("Verify is not implemented by this version"))
     }
 
     async fn verify_end(&self, _: Request<pb::VerifyEndRequest>) -> Result<Response<pb::VerifyEndResponse>, Status> {
-        Err(Status::unimplemented("Verify is not implemented by this version"))
+        Err(net::unimplemented("Verify is not implemented by this version"))
     }
 }
 
@@ -265,6 +265,8 @@ impl ServerHandle {
         if tokio::time::timeout(Duration::from_secs(5), self.state.bootstraps.acquire_many(all)).await.is_err() {
             tracing::warn!(addr = %self.addr, "bootstrap jobs did not stop in 5 s");
         }
+        // A Bootstrap that arrives later on an existing connection is refused.
+        self.state.bootstraps.close();
         self.state.leases().clear();
         if let Some(sweep) = self.sweep.take() {
             let _ = sweep.await;

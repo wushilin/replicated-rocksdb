@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, TryAcquireError};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -29,6 +29,12 @@ pub(super) async fn bootstrap(
     let src = state.authorize(&call, Method::Bootstrap).await?;
     let client_id = req.into_inner().client_id;
     call.check_client_id(&client_id)?;
+    // Subscribe before anything else, so a reset after this point is never missed.
+    let mut resets = src.resets();
+    resets.borrow_and_update();
+    if state.is_shutting_down() {
+        return Err(reason_status(pb::Reason::ShuttingDown, "server is shutting down"));
+    }
     state.expire_leases(std::time::Instant::now());
     if !src.is_ready() {
         return Err(reason_status(pb::Reason::NotReady, "server is bootstrapping"));
@@ -37,7 +43,10 @@ pub(super) async fn bootstrap(
         .bootstraps
         .clone()
         .try_acquire_owned()
-        .map_err(|_| reason_status(pb::Reason::Busy, "too many bootstraps in progress"))?;
+        .map_err(|e| match e {
+            TryAcquireError::Closed => reason_status(pb::Reason::ShuttingDown, "server is shutting down"),
+            TryAcquireError::NoPermits => reason_status(pb::Reason::Busy, "too many bootstraps in progress"),
+        })?;
     let store = src.store();
     // Guard first (at a seq no later than the snapshot's), so retention cannot remove
     // entry S + 1 between taking the snapshot and registering the real guard.
@@ -63,8 +72,6 @@ pub(super) async fn bootstrap(
     };
     tracing::info!(client = %client_id, snapshot_seq = meta.last_seq, cfs = meta.cf_specs.len(), "serving bootstrap");
     let (tx, rx) = mpsc::channel(CHANNEL);
-    let mut resets = src.resets();
-    resets.borrow_and_update();
     let job = Job {
         state: state.clone(),
         snap,
@@ -99,6 +106,14 @@ struct Job {
     runtime: tokio::runtime::Handle,
 }
 
+enum Sent {
+    Ok,
+    /// The client went away.
+    Gone,
+    /// The stream must end with this status.
+    End(Status),
+}
+
 fn chunk(kind: Kind) -> Result<pb::BootstrapChunk, Status> {
     Ok(pb::BootstrapChunk { kind: Some(kind) })
 }
@@ -109,24 +124,40 @@ impl Job {
     fn run(self) {
         let Job { state, snap, meta, header, guard, lease_id, client_id, tx, resets, runtime } = self;
         // A send also gives up on shutdown or reset, so a client that stops reading cannot
-        // keep this job (and the node's database) alive.
+        // keep this job (and the node's database) alive. It then ends the stream with the
+        // matching status (see `end_stream`).
         let mut stop = state.shutdown.clone();
         let mut reset = resets.clone();
         let mut send = |m: Result<pb::BootstrapChunk, Status>| {
             runtime.block_on(async {
                 tokio::select! {
-                    r = tx.send(m) => r.is_ok(),
-                    _ = super::stopped(&mut stop) => false,
-                    _ = reset.changed() => false,
+                    biased;
+                    _ = super::stopped(&mut stop) => Sent::End(reason_status(pb::Reason::ShuttingDown, "server is shutting down")),
+                    _ = reset.changed() => Sent::End(reason_status(pb::Reason::UpstreamReset, "server state was replaced")),
+                    r = tx.send(m) => if r.is_ok() { Sent::Ok } else { Sent::Gone },
                 }
             })
         };
-        // Ends the stream with an error (see `end_stream`).
         let (mut stop_end, mut reset_end) = (state.shutdown.clone(), resets.clone());
-        let mut end = |status: Status| runtime.block_on(super::end_stream(&tx, status, &mut stop_end, &mut reset_end));
-        if !send(chunk(Kind::Header(header))) {
-            return;
+        let mut end = |status: Status| {
+            // A reset the job has seen must not make `end_stream` drop the status.
+            reset_end.borrow_and_update();
+            runtime.block_on(super::end_stream(&tx, status, &mut stop_end, &mut reset_end));
+        };
+        // Sends a message; on a stop the stream ends with its status and the job returns.
+        macro_rules! send {
+            ($m:expr) => {
+                match send($m) {
+                    Sent::Ok => {}
+                    Sent::Gone => return,
+                    Sent::End(status) => {
+                        end(status);
+                        return;
+                    }
+                }
+            };
         }
+        send!(chunk(Kind::Header(header)));
         let chunk_bytes = state.cfg.limits.bootstrap_chunk_bytes;
         let mut digest = Digest::new();
         let ctx = snap.raw_ctx();
@@ -166,22 +197,25 @@ impl Job {
                 records.push(pb::Record { key: key.into_vec(), envelope: envelope.into_vec() });
                 if size >= chunk_bytes {
                     let msg = pb::BootstrapRecords { cf: cf.spec.name.clone(), records: std::mem::take(&mut records) };
-                    if !send(chunk(Kind::Records(msg))) {
-                        return;
-                    }
+                    send!(chunk(Kind::Records(msg)));
                     size = 0;
                 }
             }
-            if !records.is_empty() && !send(chunk(Kind::Records(pb::BootstrapRecords { cf: cf.spec.name.clone(), records }))) {
-                return;
+            if !records.is_empty() {
+                send!(chunk(Kind::Records(pb::BootstrapRecords { cf: cf.spec.name.clone(), records })));
             }
         }
         let (record_count, digest) = digest.finish_bootstrap(meta.last_seq);
         // The lease exists before the client can see the footer and call Tail.
         state.insert_lease(lease_id, client_id, meta.last_seq, guard);
         let footer = pb::BootstrapFooter { record_count, digest: digest.to_vec() };
-        if !send(chunk(Kind::Footer(footer))) {
-            state.remove_lease(&lease_id);
+        match send(chunk(Kind::Footer(footer))) {
+            Sent::Ok => {}
+            Sent::Gone => state.remove_lease(&lease_id),
+            Sent::End(status) => {
+                state.remove_lease(&lease_id);
+                end(status);
+            }
         }
     }
 }

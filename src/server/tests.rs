@@ -85,7 +85,9 @@ async fn malformed_handshake_input_is_invalid_argument() {
 
     let mut short_uuid = hello("b");
     short_uuid.known_identity = Some(pb::Identity { db_uuid: vec![1; 15], epoch: 1 });
-    assert_eq!(c.handshake(short_uuid).await.unwrap_err().code(), Code::InvalidArgument, "15-byte db_uuid");
+    let e = c.handshake(short_uuid).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument, "15-byte db_uuid");
+    assert_eq!(reason_of(&e), Some(pb::Reason::Unspecified), "INVALID_ARGUMENT carries ErrorInfo");
 
     // An empty client_id (the node-id metadata is "b", so it would also mismatch).
     assert_eq!(c.handshake(hello("")).await.unwrap_err().code(), Code::InvalidArgument, "empty client_id");
@@ -255,6 +257,7 @@ async fn verify_is_not_implemented_yet() {
     let (m, _) = serving_master(dir.path(), |_| {}).await;
     let e = client(m.serve_addr().unwrap(), "b").verify_begin(pb::VerifyBeginRequest::default()).await.unwrap_err();
     assert_eq!(e.code(), Code::Unimplemented);
+    assert_eq!(reason_of(&e), Some(pb::Reason::Unspecified), "UNIMPLEMENTED carries ErrorInfo");
 }
 
 /// Reads a whole bootstrap stream: (header, records per message, footer).
@@ -445,9 +448,9 @@ async fn real_time_mode_delivers_each_entry_promptly_one_batch_at_a_time() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn small_writes_wait_for_max_wait_and_arrive_together() {
     let dir = tempfile::tempdir().unwrap();
-    let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_secs(1)).await;
+    let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_secs(3)).await;
     m.create_cf(CfSpec::new("c")).unwrap();
-    let req = fetch_req(&m.identity(), 2, 1 << 20, 300, 0);
+    let req = fetch_req(&m.identity(), 2, 1 << 20, 1500, 0);
     let mut s = client(m.serve_addr().unwrap(), "b").tail(req).await.unwrap().into_inner();
     m.put("c", &[0], b"v").unwrap();
     let t0 = Instant::now(); // entry 2 became available no later than this
@@ -457,8 +460,8 @@ async fn small_writes_wait_for_max_wait_and_arrive_together() {
     let batch = next_batch(&mut s).await;
     let waited = t0.elapsed();
     assert_eq!(batch.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3, 4], "one batch");
-    assert!(waited >= Duration::from_millis(200), "sent before max_wait (300 ms): {waited:?}");
-    assert!(waited < Duration::from_secs(3), "sent long after max_wait: {waited:?}");
+    assert!(waited >= Duration::from_millis(1000), "sent before max_wait (1500 ms): {waited:?}");
+    assert!(waited < Duration::from_secs(6), "sent long after max_wait: {waited:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -542,4 +545,66 @@ async fn max_wait_is_clamped_to_the_heartbeat() {
     assert_eq!(batch.len(), 1);
     assert!(waited >= Duration::from_millis(100), "sent before the clamped max_wait: {waited:?}");
     assert!(waited < Duration::from_secs(5), "max_wait (30 s) was not clamped to the 200 ms heartbeat: {waited:?}");
+}
+
+/// Large log: both producers block on a client that does not read.
+async fn big_log(dir: &std::path::Path) -> crate::Master {
+    let (m, _) = serving_master(dir, |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..128u8 {
+        m.put("c", &[i], &vec![i; 256 << 10]).unwrap();
+    }
+    m
+}
+
+/// A reset while the channel is full must still reach the client as a status, not a clean EOF.
+#[tokio::test]
+async fn tail_reset_under_backpressure_ends_with_upstream_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = big_log(dir.path()).await;
+    let mut s = client(m.serve_addr().unwrap(), "b").tail(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
+    assert!(within("the first tail message", s.message()).await.unwrap().is_some());
+    tokio::time::sleep(Duration::from_millis(300)).await; // the producer is blocked, channel full
+    m.bump_epoch().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let err = stream_error(&mut s).await;
+    assert_eq!((err.code(), reason_of(&err)), (Code::Unavailable, Some(pb::Reason::UpstreamReset)));
+}
+
+#[tokio::test]
+async fn bootstrap_reset_under_backpressure_ends_with_upstream_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = big_log(dir.path()).await;
+    let mut s = client(m.serve_addr().unwrap(), "b")
+        .bootstrap(pb::BootstrapRequest { client_id: "b".into() })
+        .await
+        .unwrap()
+        .into_inner();
+    let first = within("the bootstrap header", s.message()).await.unwrap().unwrap();
+    assert!(matches!(first.kind, Some(Chunk::Header(_))));
+    tokio::time::sleep(Duration::from_millis(300)).await; // the job is blocked, channel full
+    m.bump_epoch().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let err = stream_error(&mut s).await;
+    assert_eq!((err.code(), reason_of(&err)), (Code::Unavailable, Some(pb::Reason::UpstreamReset)));
+}
+
+/// A batch never exceeds `max_batch_bytes` on the wire, per-entry framing included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batches_fit_max_batch_bytes_including_framing() {
+    use prost::Message;
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..200u32 {
+        m.put("c", &i.to_be_bytes(), &[1; 60]).unwrap();
+    }
+    let mut s = client(m.serve_addr().unwrap(), "b").tail(fetch_req(&m.identity(), 1, 0, 0, 1000)).await.unwrap().into_inner();
+    let mut seen = 0;
+    while seen < 201 {
+        let batch = next_batch(&mut s).await;
+        let wire = pb::EntryBatch { entries: batch.iter().cloned().map(crate::net::convert::entry_to_pb).collect() }.encoded_len();
+        assert!(wire <= 1000, "batch of {} entries is {wire} bytes on the wire", batch.len());
+        seen += batch.len();
+    }
 }

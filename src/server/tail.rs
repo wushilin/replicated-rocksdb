@@ -31,12 +31,15 @@ pub(super) async fn tail(state: &Arc<ServerState>, req: Request<pb::TailRequest>
     let src = state.authorize(&call, Method::Tail).await?;
     let r = req.into_inner();
     call.check_client_id(&r.client_id)?;
+    // Subscribe before validating, so a reset after validation is never missed.
+    let mut resets = src.resets();
+    resets.borrow_and_update();
     validate(&*src, &r)?;
     state.expire_leases(std::time::Instant::now());
     let lease = r.bootstrap_lease.as_deref().and_then(|id| state.take_lease(id, &r.client_id, r.from_seq));
     let (tx, rx) = mpsc::channel(CHANNEL);
     let fetch = Fetch::clamp(&r, src.heartbeat(), state.cfg.limits.max_tail_batch_bytes);
-    tokio::spawn(produce(src, tx, r.from_seq, fetch, lease, state.shutdown.clone()));
+    tokio::spawn(produce(src, tx, r.from_seq, fetch, lease, state.shutdown.clone(), resets));
     Ok(Response::new(ReceiverStream::new(rx)))
 }
 
@@ -45,13 +48,13 @@ fn validate(src: &dyn LogSource, r: &pb::TailRequest) -> Result<(), Status> {
     let Some((server_id, _)) = ident else {
         return Err(reason_status(pb::Reason::NotReady, "server is bootstrapping"));
     };
-    let want = r.identity.as_ref().ok_or_else(|| Status::invalid_argument("identity is required"))?;
-    let want = identity_from_pb(want).map_err(|e| Status::invalid_argument(e.to_string()))?;
+    let want = r.identity.as_ref().ok_or_else(|| crate::net::invalid_argument("identity is required"))?;
+    let want = identity_from_pb(want).map_err(|e| crate::net::invalid_argument(e.to_string()))?;
     if want != server_id {
         return Err(reason_status(pb::Reason::IdentityChanged, format!("server identity is {server_id:?}")));
     }
     if r.from_seq == 0 {
-        return Err(Status::invalid_argument("from_seq starts at 1"));
+        return Err(crate::net::invalid_argument("from_seq starts at 1"));
     }
     let store = src.store();
     let last = store.position().last_seq;
@@ -103,9 +106,10 @@ enum Sent {
 impl Out {
     async fn send(&mut self, msg: pb::TailMessage) -> Sent {
         tokio::select! {
-            r = self.tx.send(Ok(msg)) => if r.is_ok() { Sent::Ok } else { Sent::Gone },
+            biased;
             _ = super::stopped(&mut self.shutdown) => Sent::End(shutting_down()),
             _ = self.resets.changed() => Sent::End(upstream_reset()),
+            r = self.tx.send(Ok(msg)) => if r.is_ok() { Sent::Ok } else { Sent::Gone },
         }
     }
 
@@ -147,6 +151,18 @@ impl Fetch {
     }
 }
 
+/// Size of an entry inside an `EntryBatch`: its encoded length plus its framing (field tag
+/// and length varint), so a batch never exceeds `max_batch_bytes` on the wire.
+fn framed_len(entry_len: usize) -> usize {
+    let mut varint = 1;
+    let mut n = entry_len >> 7;
+    while n > 0 {
+        varint += 1;
+        n >>= 7;
+    }
+    entry_len + 1 + varint
+}
+
 /// Entries read but not yet sent.
 struct Pending {
     entries: Vec<pb::LogEntry>,
@@ -172,11 +188,10 @@ async fn produce(
     fetch: Fetch,
     mut lease: Option<Lease>,
     shutdown: watch::Receiver<bool>,
+    resets: watch::Receiver<u64>,
 ) {
     let hb: Duration = src.heartbeat();
     let mut seqs = src.subscribe();
-    let mut resets = src.resets();
-    resets.borrow_and_update();
     let mut out = Out { tx, shutdown, resets };
     let mut ahead: VecDeque<LogEntry> = VecDeque::new();
     let mut pending = Pending { entries: Vec::new(), bytes: 0, since: None };
@@ -202,6 +217,8 @@ async fn produce(
     }
     loop {
         if out.resets.has_changed().unwrap_or(true) {
+            // Mark the reset seen, so `end_stream` waits for room instead of dropping the status.
+            out.resets.borrow_and_update();
             return out.end(upstream_reset()).await;
         }
         if *out.shutdown.borrow() {
@@ -210,10 +227,12 @@ async fn produce(
         // Read ahead everything that is available (in blocks of READ_BATCH).
         if ahead.is_empty() && next <= src.store().position().last_seq {
             let s = src.clone();
-            let read = tokio::task::spawn_blocking(move || s.store().read_entries(next, READ_BATCH)).await;
+            let read = tokio::task::spawn_blocking(move || s.store().read_entries(next, READ_BATCH, fetch.max_bytes)).await;
             let failure = match read {
                 Ok(Ok(entries)) => {
-                    if !entries.is_empty() && lease.take().is_some() {
+                    // The lease only protects `S + 1`: release it once that entry is read.
+                    if lease.as_ref().is_some_and(|l| entries.last().is_some_and(|e| e.seq > l.snapshot_seq)) {
+                        lease = None;
                         tracing::debug!("bootstrap lease released: the entries after the snapshot are read");
                     }
                     ahead.extend(entries);
@@ -236,7 +255,7 @@ async fn produce(
             if let Err(e) = entry.verify_crc() {
                 return out.end(store_status(e)).await;
             }
-            let size = entry.encoded_len();
+            let size = framed_len(entry.encoded_len());
             if !pending.entries.is_empty() && pending.bytes + size > fetch.max_bytes {
                 flush!();
             }
@@ -296,5 +315,45 @@ mod tests {
         assert_eq!(Fetch::clamp(&req(0, 0, 0), hb, 4 << 20).max_bytes, DEFAULT_MAX_BATCH_BYTES, "0 = 1 MiB");
         assert_eq!(Fetch::clamp(&req(0, 0, u32::MAX), hb, 4 << 20).max_bytes, 4 << 20, "capped");
         assert_eq!(Fetch::clamp(&req(0, 0, 0), hb, 1000).max_bytes, 1000, "default is capped too");
+    }
+
+    #[test]
+    fn framing_counts_tag_and_length_varint() {
+        assert_eq!(framed_len(0), 2);
+        assert_eq!(framed_len(127), 127 + 2);
+        assert_eq!(framed_len(128), 128 + 3);
+        assert_eq!(framed_len(16_383), 16_383 + 3);
+        assert_eq!(framed_len(16_384), 16_384 + 4);
+    }
+
+    /// A reset between validation and the first poll of the producer is not missed: the
+    /// receiver is subscribed (and marked seen) first, as the handler does.
+    #[tokio::test]
+    async fn a_reset_after_subscription_but_before_streaming_ends_the_stream() {
+        use crate::server::test_client::{serving_master, within};
+        use crate::types::CfSpec;
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(dir.path(), |cfg| cfg.serve = None).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        let src = m.log_source();
+        let mut resets = src.resets();
+        resets.borrow_and_update();
+        m.bump_epoch().unwrap();
+        let (tx, rx) = mpsc::channel(CHANNEL);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let fetch = Fetch::clamp(&req(0, 0, 0), Duration::from_secs(1), 1 << 20);
+        tokio::spawn(produce(src, tx, 1, fetch, None, shutdown, resets));
+        let mut rx = rx;
+        let err = within("the stream status", async {
+            loop {
+                match rx.recv().await {
+                    Some(Err(e)) => return e,
+                    Some(Ok(_)) => {}
+                    None => panic!("stream ended without a status"),
+                }
+            }
+        })
+        .await;
+        assert_eq!(crate::net::reason_of(&err), Some(pb::Reason::UpstreamReset));
     }
 }

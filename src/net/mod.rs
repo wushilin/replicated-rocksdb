@@ -53,9 +53,25 @@ pub(crate) fn reason_status(reason: pb::Reason, message: impl Into<String>) -> S
 /// An unexpected server-side failure: `INTERNAL`, still with `ErrorInfo`
 /// (`REASON_UNSPECIFIED`), so every failure carries the error domain.
 pub(crate) fn internal_status(message: impl Into<String>) -> Status {
+    unspecified_status(Code::Internal, message)
+}
+
+/// A failed RPC with `code` and `ErrorInfo` (`REASON_UNSPECIFIED`), for failures that have no
+/// protocol reason of their own (`INVALID_ARGUMENT`, `UNIMPLEMENTED`).
+fn unspecified_status(code: Code, message: impl Into<String>) -> Status {
     let details =
         ErrorDetails::with_error_info(pb::Reason::Unspecified.as_str_name(), ERROR_DOMAIN, HashMap::new());
-    Status::with_error_details(Code::Internal, message, details)
+    Status::with_error_details(code, message, details)
+}
+
+/// `INVALID_ARGUMENT` with `ErrorInfo` (`REASON_UNSPECIFIED`).
+pub(crate) fn invalid_argument(message: impl Into<String>) -> Status {
+    unspecified_status(Code::InvalidArgument, message)
+}
+
+/// `UNIMPLEMENTED` with `ErrorInfo` (`REASON_UNSPECIFIED`).
+pub(crate) fn unimplemented(message: impl Into<String>) -> Status {
+    unspecified_status(Code::Unimplemented, message)
 }
 
 /// The protocol reason carried by `status`, if any.

@@ -394,7 +394,7 @@ Then it applies the entry atomically, together with its own `last_seq` and a cop
 
 ### 7.5 Fetch batching
 
-The client chooses the trade-off between latency and batching per stream, in the spirit of Kafka's `fetch.min.bytes`, `fetch.max.wait.ms` and `fetch.max.bytes`. The size of an entry is its encoded `LogEntry` size.
+The client chooses the trade-off between latency and batching per stream, in the spirit of Kafka's `fetch.min.bytes`, `fetch.max.wait.ms` and `fetch.max.bytes`. The size of an entry is its encoded `LogEntry` size; a batch's size includes the per-entry framing within `EntryBatch` (field tag and length prefix).
 
 The server keeps a *pending* batch of entries that are available (committed on the server, at or after the next seq to send) and not yet sent. It sends the pending batch as soon as any of these holds:
 

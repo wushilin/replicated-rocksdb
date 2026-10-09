@@ -184,15 +184,24 @@ impl Master {
         self.inner.bump_epoch()
     }
 
+    /// The master as a replication source, for server tests.
+    #[cfg(test)]
+    pub(crate) fn log_source(&self) -> Arc<dyn crate::source::LogSource> {
+        self.inner.clone()
+    }
+
     /// The address the replication server listens on, if this master serves replication.
     pub fn serve_addr(&self) -> Option<SocketAddr> {
         self.server.as_ref().map(ServerHandle::addr)
     }
 
     /// Ends every replication stream with `SHUTTING_DOWN`, stops background work, and waits
-    /// until the database is closed, so the directory can be reopened at once.
-    /// `Err(Timeout)` if something still holds the database after 10 s (for example an
-    /// outstanding [`ReadSnapshot`], which keeps the database open until dropped).
+    /// until the server and maintenance tasks are gone and every internal holder of the
+    /// database has released it. `Err(Timeout)` if one still holds it after 10 s.
+    ///
+    /// `Ok` does not mean the database is closed: an outstanding [`ReadSnapshot`] (or an
+    /// iterator borrowed from one) pins the database, and its directory LOCK, until it is
+    /// dropped. Drop those first if the directory must be reopened at once.
     pub async fn shutdown(mut self) -> Result<()> {
         if let Some(server) = self.server.take() {
             server.shutdown().await;

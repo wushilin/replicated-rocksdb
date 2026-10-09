@@ -36,7 +36,7 @@ impl Store {
     /// A guard only protects entries that are still present: callers must check
     /// `first_retained_seq()` AFTER acquiring the guard (`trim_changelog` holds the same
     /// lock for its whole critical section, so taking a guard serialises against a trim).
-        pub(crate) fn guard(&self, seq: Seq) -> RetentionGuard {
+    pub(crate) fn guard(&self, seq: Seq) -> RetentionGuard {
         let mut set = self.guards.lock().unwrap_or_else(PoisonError::into_inner);
         let id = set.next_id;
         set.next_id += 1;
