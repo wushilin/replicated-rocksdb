@@ -80,7 +80,7 @@ async fn next(inner: &Inner, generation: u64, s: &mut Streaming<pb::BootstrapChu
     match unless_repointed(inner, generation, s.message()).await? {
         Ok(Some(chunk)) => chunk.kind.ok_or_else(|| retry("empty bootstrap chunk")),
         Ok(None) => Err(retry("bootstrap stream ended before the footer")),
-        Err(status) => Err(status_end(inner, &status)),
+        Err(status) => Err(status_end(inner, generation, &status)),
     }
 }
 
@@ -109,7 +109,7 @@ pub(crate) async fn install(
     let req = pb::BootstrapRequest { client_id: inner.cfg.identifier.clone() };
     let mut stream = match unless_repointed(inner, generation, c.clone().max_decoding_message_size(limit).bootstrap(req)).await? {
         Ok(r) => r.into_inner(),
-        Err(s) => return Err(status_end(inner, &s)),
+        Err(s) => return Err(status_end(inner, generation, &s)),
     };
     let Kind::Header(header) = next(inner, generation, &mut stream).await? else {
         return Err(retry("bootstrap stream did not start with a header"));

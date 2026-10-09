@@ -134,6 +134,8 @@ pub struct SlaveStatus {
     pub first_retained_seq: Seq,
     pub upstream_last_seq: Seq,
     pub origin_last_seq: Seq,
+    /// The address of the current upstream (the target of the latest `Slave::repoint`, if any).
+    pub upstream: String,
     /// Node ids from the upstream to the master, closest first.
     pub upstream_chain: Vec<String>,
     pub last_contact: Option<SystemTime>,

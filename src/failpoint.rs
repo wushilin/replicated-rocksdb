@@ -4,7 +4,8 @@
 //! Points: `slave-after-apply` (after an entry commits, before the listener),
 //! `slave-bootstrap-after-chunk` (after a bootstrap records message is written),
 //! `server-tail-after-entry` (the server ends the Tail stream after sending an entry),
-//! `master-bump-epoch-write` (the synced write of `bump_epoch` fails).
+//! `master-bump-epoch-write` (the synced write of `bump_epoch` fails),
+//! `slave-before-halt` (a session ended in a halt, before it is persisted; use `cfg_callback`).
 //!
 //! Configure with `fail::cfg(name, "1*return")` to make the point fire once, or
 //! `fail::cfg(name, "pause")` to block the thread there until `fail::remove(name)`.

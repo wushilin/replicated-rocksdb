@@ -50,6 +50,9 @@ pub(crate) struct Inner {
     /// The divergence mode of the latest repoint. It replaces `cfg.on_divergence` for every
     /// session from then on (until the next repoint), not only for the first handshake.
     pub(crate) repoint_divergence: Mutex<Option<super::repoint::RepointDivergence>>,
+    /// A repoint cleared a halt in memory only: `node_state = ready` is persisted once the new
+    /// upstream is accepted (so a restart before that reopens halted).
+    pub halt_clear_pending: AtomicBool,
 }
 
 impl Inner {
@@ -89,6 +92,7 @@ impl Inner {
             repoint_tx: watch::channel(0).0,
             pending_repoint: Mutex::new(None),
             repoint_divergence: Mutex::new(None),
+            halt_clear_pending: AtomicBool::new(false),
         })
     }
 
@@ -173,6 +177,11 @@ impl Inner {
         self.reset_tx.send_modify(|n| *n += 1);
     }
 
+    /// Forgets the chain learned from the previous upstream, until the new one answers.
+    pub(crate) fn clear_upstream_chain(&self) {
+        self.upstream_chain.write().unwrap_or_else(PoisonError::into_inner).clear();
+    }
+
     pub(crate) fn upstream_chain(&self) -> Vec<String> {
         self.upstream_chain.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
@@ -223,6 +232,7 @@ impl Inner {
             first_retained_seq: self.store.first_retained_seq(),
             upstream_last_seq: self.upstream_last_seq.load(Ordering::SeqCst),
             origin_last_seq: self.origin_last_seq.load(Ordering::SeqCst).max(pos.last_seq),
+            upstream: self.upstream_uri(),
             upstream_chain: self.upstream_chain(),
             last_contact: *self.last_contact.lock().unwrap_or_else(PoisonError::into_inner),
             last_error: self.last_error.lock().unwrap_or_else(PoisonError::into_inner).clone(),

@@ -4,7 +4,7 @@ mod support;
 
 use replicated_rocksdb::admin;
 use replicated_rocksdb::{
-    AcceptDataLoss, CfSpec, Error, HaltReason, LogApi, Master, ReadApi, RepointDivergence, RepointOptions, RepointOutcome,
+    AcceptDataLoss, CfSpec, Error, HaltAction, HaltReason, LogApi, Master, ReadApi, RepointDivergence, RepointOptions, RepointOutcome,
     Slave, SlaveState, UpstreamConfig,
 };
 use support::{assert_converged, wait_state, wait_until, Cluster};
@@ -200,4 +200,101 @@ async fn a_refusing_repoint_still_refuses_after_retrying() {
     assert_eq!(d.get("c", b"only on d").unwrap(), Some(b"2".to_vec()), "data intact");
     assert_eq!(ld.bootstraps(), 1, "the configured Rebootstrap policy was not applied");
     drop(b);
+}
+
+/// D holds an entry the (to be promoted) B never saw. Returns B's config, D, D's config and
+/// D's listener; A is gone and B is not running.
+async fn diverged_pair(
+    c: &Cluster,
+) -> (replicated_rocksdb::SlaveConfig, Slave, replicated_rocksdb::SlaveConfig, std::sync::Arc<support::RecordingListener>) {
+    let a = c.master("a").await;
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
+    let (d_cfg, ld) = c.slave_config("d", a.serve_addr().unwrap());
+    let d = Slave::open(d_cfg.clone()).await.unwrap();
+    wait_state(&b, "b streaming", |s| *s == SlaveState::Streaming).await;
+    a.put("c", b"k", b"1").unwrap();
+    assert_converged(&a, &[("b", &b), ("d", &d)]).await;
+    let b_cfg = c.slave_config("b", a.serve_addr().unwrap()).0;
+    b.shutdown().await.unwrap();
+    a.put("c", b"only on d", b"2").unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    a.shutdown().await.unwrap();
+    (b_cfg, d, d_cfg, ld)
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+/// A forced bootstrap left over from `clear_halt(Rebootstrap)` (or a gap) is not consent to
+/// discard data on a later repoint: the repoint's own mode decides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leftover_forced_bootstrap_does_not_override_a_refusing_repoint() {
+    let c = Cluster::new();
+    let (b_cfg, d, _, ld) = diverged_pair(&c).await;
+    let (p1, p2) = (free_port(), free_port());
+    assert!(matches!(
+        repoint(&d, UpstreamConfig::new("127.0.0.1", p1), RepointOptions::default()).await.unwrap(),
+        RepointOutcome::Retrying { .. }
+    ));
+    let b = Slave::open(b_cfg).await.unwrap();
+    let mut mcfg = c.master_config("b");
+    mcfg.serve.as_mut().unwrap().port = p1;
+    let b = b.promote(mcfg.clone()).await.unwrap();
+    wait_state(&d, "Diverged halt", |s| *s == SlaveState::Halted(HaltReason::Diverged)).await;
+    b.shutdown().await.unwrap();
+
+    // The operator asks for a rebootstrap, but the upstream is gone: the flag stays set.
+    d.clear_halt(HaltAction::Rebootstrap).await.unwrap();
+    assert!(matches!(
+        repoint(&d, UpstreamConfig::new("127.0.0.1", p2), RepointOptions::default()).await.unwrap(),
+        RepointOutcome::Retrying { .. }
+    ));
+    mcfg.serve.as_mut().unwrap().port = p2;
+    let b = Master::open(mcfg).await.unwrap();
+    wait_state(&d, "Diverged halt", |s| *s == SlaveState::Halted(HaltReason::Diverged)).await;
+    assert_eq!(d.get("c", b"only on d").unwrap(), Some(b"2".to_vec()), "data intact");
+    assert_eq!(ld.bootstraps(), 1, "the leftover flag bootstrapped the slave");
+    drop(b);
+}
+
+/// A restart before the new upstream is accepted does not bypass the refusal: the halt is
+/// cleared in memory only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_before_the_repoint_settles_reopens_halted() {
+    let c = Cluster::new();
+    let (b_cfg, d, d_cfg, _) = diverged_pair(&c).await;
+    let port = free_port();
+    repoint(&d, UpstreamConfig::new("127.0.0.1", port), RepointOptions::default()).await.unwrap();
+    let b = Slave::open(b_cfg).await.unwrap();
+    let mut mcfg = c.master_config("b");
+    mcfg.serve.as_mut().unwrap().port = port;
+    let b = b.promote(mcfg).await.unwrap();
+    wait_state(&d, "Diverged halt", |s| *s == SlaveState::Halted(HaltReason::Diverged)).await;
+    // Repoint again at a dead address and restart before anything settles successfully.
+    let r = repoint(&d, UpstreamConfig::new("127.0.0.1", free_port()), RepointOptions::default()).await.unwrap();
+    assert!(matches!(r, RepointOutcome::Retrying { .. }));
+    assert!(!matches!(d.status().state, SlaveState::Halted(_)), "cleared in memory");
+    d.shutdown().await.unwrap();
+    let d = Slave::open(d_cfg).await.unwrap();
+    assert_eq!(d.status().state, SlaveState::Halted(HaltReason::Diverged), "reopens halted");
+    assert_eq!(d.get("c", b"only on d").unwrap(), Some(b"2".to_vec()));
+    drop(b);
+}
+
+/// The status names the current upstream and forgets the old chain until the new one answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_reports_the_current_upstream() {
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
+    wait_state(&b, "b streaming", |s| *s == SlaveState::Streaming).await;
+    assert_eq!(b.status().upstream, format!("http://{}", a.serve_addr().unwrap()));
+    let port = free_port();
+    let target = UpstreamConfig::new("127.0.0.1", port);
+    let uri = format!("http://127.0.0.1:{port}");
+    assert!(matches!(repoint(&b, target, RepointOptions::default()).await.unwrap(), RepointOutcome::Retrying { .. }));
+    assert_eq!(b.status().upstream, uri);
+    assert!(b.status().upstream_chain.is_empty());
 }

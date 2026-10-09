@@ -1,17 +1,17 @@
 //! Switching upstream at runtime (DESIGN.md §13.1).
 
 use std::ops::RangeInclusive;
+use std::sync::atomic::Ordering;
 
 use tokio::sync::oneshot;
 
 use super::client::connect_upstream;
 use super::driver::SessionEnd;
 use super::inner::Inner;
-use super::state::{NodeState, SlaveState};
+use super::state::SlaveState;
 use super::{Slave, UpstreamConfig};
 use crate::error::{Error, Result};
 use crate::pb;
-use crate::store::meta::key;
 use crate::types::{fork_after, EpochStart, Seq};
 
 /// Acknowledges that an operation discards data. A caller constructs it explicitly
@@ -127,10 +127,27 @@ pub(crate) fn divergence(local_epoch: u64, local_last: Seq, hs: &pb::HandshakeRe
     Error::Diverged { fork_seq, local_last_seq: local_last, divergent_entries: local_last + 1 - fork_seq.min(local_last + 1) }
 }
 
+/// `Error::Diverged` when only the local position is known (a Tail or Bootstrap stream ended
+/// `DIVERGED` after the handshake): the last entry differs, earlier ones may too.
+pub(crate) fn divergence_at(local_last: Seq) -> Error {
+    Error::Diverged { fork_seq: local_last, local_last_seq: local_last, divergent_entries: local_last.min(1) }
+}
+
+/// The error a repoint reports when `mode` halts on divergence: `diverged` for `Refuse`,
+/// `Unsupported` for `Repair`.
+pub(crate) fn mode_error(mode: RepointDivergence, diverged: impl FnOnce() -> Error) -> Error {
+    match mode {
+        RepointDivergence::Repair { .. } => Error::Unsupported("divergence repair needs verify sessions (Plan 3)".into()),
+        _ => diverged(),
+    }
+}
+
 impl Slave {
     /// Switches this slave to another upstream at runtime, without reopening; reads keep
     /// being served throughout. The new upstream is not persisted: after a restart, open
-    /// the slave with it.
+    /// the slave with it. Likewise a halt is cleared in memory only, and `ready` is persisted
+    /// once the new upstream is accepted: if the process restarts before that, the slave
+    /// reopens still halted (never past its divergence refusal) and the operator repoints again.
     ///
     /// The current upstream stream is closed (a bootstrap in progress is abandoned and
     /// starts from scratch against the new upstream), a halt is cleared, and the new
@@ -149,6 +166,8 @@ impl Slave {
     ///   Plan 3's verify sessions) and also leaves the slave halted with its data intact.
     /// - `Err(Halted(LoopDetected))`: the new upstream is this slave or replicates from it;
     ///   the slave halts until it is repointed again.
+    /// - `Err(RepointSuperseded)`: a later repoint replaced this one (or the slave shut down)
+    ///   before the handshake settled.
     /// - `Err(Halted(reason))` for any other halt, `Err(Config)` for an invalid address.
     ///
     /// The wait includes a whole bootstrap when one is needed. To bound it, wrap the call in
@@ -159,28 +178,31 @@ impl Slave {
             return Err(Error::Config("upstream server and port are required".into()));
         }
         connect_upstream(&upstream, &self.inner.cfg.identifier, self.inner.cfg.connect_timeout)?;
-        if let SlaveState::Halted(reason) = self.inner.state() {
-            let i = self.inner.clone();
-            crate::background::blocking(move || i.store.write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true))
-                .await?;
-            tracing::info!(node = %self.inner.cfg.identifier, reason = reason.name(), "halt cleared by repoint");
-        }
         let (reply, settled) = oneshot::channel();
         {
             let mut pending = self.inner.pending_repoint();
             tracing::info!(node = %self.inner.cfg.identifier, upstream = %upstream.uri(), "repointing");
             self.inner.set_upstream(upstream);
+            self.inner.clear_upstream_chain();
+            // Only this repoint's mode consents to discarding data: a leftover forced bootstrap
+            // (a gap, an earlier `Rebootstrap`) must not resolve the new upstream's divergence.
+            // A `clear_halt(Rebootstrap)` issued after this call still applies.
+            self.inner.force_bootstrap.store(false, Ordering::SeqCst);
             *self.inner.repoint_divergence.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(opts.on_divergence);
             let generation = *self.inner.repoint_tx.borrow() + 1;
             *pending = Some(PendingRepoint { generation, halt_error: None, reply });
             self.inner.repoint_tx.send_replace(generation);
         }
         self.inner.set_last_error(None);
-        if matches!(self.inner.state(), SlaveState::Halted(_)) {
+        if let SlaveState::Halted(reason) = self.inner.state() {
+            // Cleared in memory only; `ready` is persisted once the new upstream is accepted, so a
+            // restart before that reopens halted.
+            tracing::info!(node = %self.inner.cfg.identifier, reason = reason.name(), "halt cleared by repoint");
+            self.inner.halt_clear_pending.store(true, Ordering::SeqCst);
             self.inner.set_state(SlaveState::Connecting);
             self.inner.halt_cleared.notify_one();
         }
         // The sender is dropped when a later repoint supersedes this one or the slave shuts down.
-        settled.await.unwrap_or_else(|_| Err(Error::Config("the repoint was superseded or the slave shut down".into())))
+        settled.await.unwrap_or(Err(Error::RepointSuperseded))
     }
 }

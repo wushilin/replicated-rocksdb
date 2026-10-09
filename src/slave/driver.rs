@@ -20,10 +20,10 @@ use super::config::BackoffState;
 use super::inner::Inner;
 use super::policy::{self, Action};
 use super::repoint::{self, RepointDivergence, RepointOutcome};
-use super::state::{HaltReason, SlaveState};
+use super::state::{HaltReason, NodeState, SlaveState};
 use crate::background::blocking;
-use crate::error::Error;
 use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
+use crate::failpoint;
 use crate::net::convert::{checked_history, entry_from_pb, identity_from_pb, identity_to_pb};
 use crate::net::DECODE_SLACK;
 use crate::pb;
@@ -71,12 +71,17 @@ pub(crate) async fn unless_repointed<T>(inner: &Inner, generation: u64, f: impl 
     }
 }
 
-pub(crate) fn status_end(inner: &Inner, s: &Status) -> SessionEnd {
+pub(crate) fn status_end(inner: &Inner, generation: u64, s: &Status) -> SessionEnd {
     // After a repoint, a Tail or Bootstrap ending with DIVERGED follows the repoint's mode.
     if crate::net::reason_of(s) == Some(pb::Reason::Diverged) {
         match inner.repoint_mode() {
             Some(RepointDivergence::Rebootstrap { .. }) => return end_for(inner, Action::Bootstrap),
-            Some(RepointDivergence::Refuse | RepointDivergence::Repair { .. }) => return SessionEnd::Halt(HaltReason::Diverged),
+            Some(mode @ (RepointDivergence::Refuse | RepointDivergence::Repair { .. })) => {
+                // A repoint still waiting for its first answer learns why the slave halts.
+                let last = inner.store.position().last_seq;
+                inner.fail_repoint_on_halt(generation, repoint::mode_error(mode, || repoint::divergence_at(last)));
+                return SessionEnd::Halt(HaltReason::Diverged);
+            }
             None => {}
         }
     }
@@ -112,6 +117,13 @@ async fn run(
             drop(inner);
             tokio::select! {
                 _ = halt_cleared.notified() => backoff.reset(),
+                _ = repoints.changed() => {
+                    // A repoint that raced the halt: it clears the halt in memory.
+                    if let Some(inner) = weak.upgrade() {
+                        clear_halt_for_repoint(&inner);
+                    }
+                    backoff.reset();
+                }
                 r = shutdown.changed() => if r.is_err() { return },
             }
             continue;
@@ -137,12 +149,19 @@ async fn run(
             SessionEnd::Halt(reason) => {
                 let i = inner.clone();
                 let _ = blocking(move || {
+                    // Test hook: lets a repoint arrive between ending the session and the halt.
+                    failpoint::fire("slave-before-halt");
                     i.halt(reason);
                     Ok(())
                 })
                 .await;
                 // A repoint waiting on this session sees the halt in place.
                 inner.settle_repoint_end(generation, &end);
+                // A repoint that arrived while the halt was being persisted would find the driver
+                // parked: it supersedes the halt.
+                if *repoints.borrow() != generation {
+                    clear_halt_for_repoint(&inner);
+                }
                 continue;
             }
             SessionEnd::Again => AGAIN_PAUSE,
@@ -158,6 +177,28 @@ async fn run(
             _ = tokio::time::sleep(pause) => {}
             _ = repoints.changed() => {}
             r = shutdown.changed() => if r.is_err() { return },
+        }
+    }
+}
+
+/// A repoint supersedes a halt: clear it in memory for the new generation. Persisting
+/// `ready` waits until the new upstream is accepted ([`commit_halt_clear`]).
+fn clear_halt_for_repoint(inner: &Inner) {
+    if matches!(inner.state(), SlaveState::Halted(_)) {
+        inner.halt_clear_pending.store(true, Ordering::SeqCst);
+        inner.set_state(SlaveState::Connecting);
+    }
+}
+
+/// Persists `node_state = ready` for a halt a repoint cleared in memory, once the new
+/// upstream has been accepted.
+async fn commit_halt_clear(inner: &Arc<Inner>) {
+    if inner.halt_clear_pending.swap(false, Ordering::SeqCst) {
+        let i = inner.clone();
+        let r = blocking(move || i.store.write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true)).await;
+        if let Err(e) = r {
+            tracing::warn!(node = %inner.cfg.identifier, error = %e, "could not persist the cleared halt");
+            inner.halt_clear_pending.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -187,7 +228,7 @@ async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, 
     };
     let hs = match unless_repointed(inner, generation, c.clone().handshake(handshake_request(inner))).await {
         Ok(Ok(r)) => r.into_inner(),
-        Ok(Err(s)) => return status_end(inner, &s),
+        Ok(Err(s)) => return status_end(inner, generation, &s),
         Err(end) => return end,
     };
     if hs.decision() != pb::Decision::Reject {
@@ -211,10 +252,9 @@ async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, 
                 RepointDivergence::Rebootstrap { .. } => Action::Bootstrap,
                 RepointDivergence::Refuse | RepointDivergence::Repair { .. } => {
                     let local_epoch = inner.ident().map_or(0, |(id, _)| id.epoch);
-                    let err = match mode {
-                        RepointDivergence::Refuse => repoint::divergence(local_epoch, inner.store.position().last_seq, &hs),
-                        _ => Error::Unsupported("divergence repair needs verify sessions (Plan 3)".into()),
-                    };
+                    let err = repoint::mode_error(mode, || {
+                        repoint::divergence(local_epoch, inner.store.position().last_seq, &hs)
+                    });
                     tracing::warn!(node = %inner.cfg.identifier, error = %err, "repoint refused: diverged");
                     inner.fail_repoint_on_halt(generation, err);
                     Action::Halt(HaltReason::Diverged)
@@ -224,11 +264,13 @@ async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, 
     }
     match action {
         Action::Tail => {
+            commit_halt_clear(inner).await;
             inner.settle_repoint(generation, Ok(RepointOutcome::Resumed));
             tail(inner, generation, &c, &hs, None, backoff).await
         }
         Action::AdoptEpochThenTail => match adopt_epoch(inner, &hs).await {
             Ok(()) => {
+                commit_halt_clear(inner).await;
                 inner.settle_repoint(generation, Ok(RepointOutcome::EpochAdvanced));
                 tail(inner, generation, &c, &hs, None, backoff).await
             }
@@ -236,6 +278,8 @@ async fn session(inner: &Arc<Inner>, generation: u64, client: &mut Option<(u64, 
         },
         Action::Bootstrap => match bootstrap::install(inner, generation, &c, &hs).await {
             Ok(lease) => {
+                // The bootstrap commit wrote `ready` itself.
+                inner.halt_clear_pending.store(false, Ordering::SeqCst);
                 inner.settle_repoint(generation, Ok(RepointOutcome::Bootstrapped));
                 tail(inner, generation, &c, &hs, Some(lease), backoff).await
             }
@@ -298,7 +342,7 @@ async fn tail(
     let outbound = tokio_stream::iter([start]).chain(ack_stream);
     let mut stream = match unless_repointed(inner, generation, c.clone().max_decoding_message_size(limit).tail(outbound)).await {
         Ok(Ok(r)) => r.into_inner(),
-        Ok(Err(s)) => return status_end(inner, &s),
+        Ok(Err(s)) => return status_end(inner, generation, &s),
         Err(end) => return end,
     };
     inner.set_state(SlaveState::Streaming);
@@ -312,7 +356,7 @@ async fn tail(
         };
         let msg = match next {
             Err(_) => return SessionEnd::Retry(format!("no message from upstream for {idle:?}")),
-            Ok(Err(s)) => return status_end(inner, &s),
+            Ok(Err(s)) => return status_end(inner, generation, &s),
             Ok(Ok(None)) => return SessionEnd::Retry("upstream ended the tail stream".into()),
             Ok(Ok(Some(m))) => m,
         };

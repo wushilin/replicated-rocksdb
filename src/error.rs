@@ -76,6 +76,10 @@ pub enum Error {
     /// last entry; earlier ones may differ too). Local data is intact.
     #[error("local log diverged from the upstream at seq {fork_seq} ({divergent_entries} entries up to {local_last_seq})")]
     Diverged { fork_seq: Seq, local_last_seq: Seq, divergent_entries: u64 },
+    /// A `Slave::repoint` was replaced by a later repoint, or the slave shut down, before the
+    /// first handshake with its upstream settled. The later repoint (if any) is in force.
+    #[error("the repoint was superseded by a later repoint or the slave shut down")]
+    RepointSuperseded,
     /// The operation is not available in this version of the crate.
     #[error("not supported by this version: {0}")]
     Unsupported(String),
