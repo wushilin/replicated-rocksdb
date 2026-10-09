@@ -72,8 +72,8 @@ pub enum GapPolicy {
 
 /// Tail fetch batching (PROTOCOL.md §7.5), like Kafka's `fetch.min.bytes`,
 /// `fetch.max.wait.ms` and `fetch.max.bytes`.
+// Deliberately exhaustive: users build it with a struct literal; a new field is a breaking change.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct FetchConfig {
     /// The upstream waits until this many bytes of entries are ready. 0 = real-time push.
     pub min_batch_bytes: u32,
