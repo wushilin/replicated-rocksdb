@@ -226,6 +226,10 @@ impl Master {
     /// epoch history from before the promotion, and opens the directory as a slave with `cfg`
     /// (`cfg.path` must be this master's path).
     ///
+    /// Replicas that already followed the wrongly promoted master are refused by it with
+    /// `STALE_EPOCH` after the demotion (they know the newer epoch) until they are repointed
+    /// at the real master.
+    ///
     /// **Refused by default:** when [`can_demote`](Self::can_demote) fails or `cfg.path`
     /// differs, the master is handed back untouched and still running
     /// ([`DemoteRefused::into_master`]). Only a failure after the master has started shutting

@@ -105,20 +105,37 @@ impl Slave {
     /// entry. Peers proven diverged are reported (in the result, and in a refusal's error),
     /// not refused; unreachable peers (no answer within `admin::STATUS_TIMEOUT`), foreign
     /// peers and unverifiable peers that are behind are reported too: the operator decides.
+    /// A peer that is reachable but answered `Status` with an error (permission denied, another
+    /// protocol, ...) blocks as `PromotionUnverifiable` (`seq` 0, the error in `peer`): its state
+    /// is unknown. A peer that reports `role == Master` blocks with `Error::MasterReachable`:
+    /// fence it, or `Master::demote` it if it was promoted by mistake.
+    ///
+    /// This slave's `last_seq` is sampled while it may still be replicating; the failover
+    /// runbook requires the old master to be fenced first, so it is no longer advancing.
     pub async fn check_promotion(&self, peers: &[UpstreamConfig]) -> Result<PromotionCheck> {
         let mut me = self.promotion_info();
         let mut check = PromotionCheck::default();
         let (mut later, mut unverified_ahead) = (Vec::new(), Vec::new());
         for peer in peers {
             let probe = Some(me.last_seq).filter(|&s| s > 0);
-            let info = match admin::node_status_probed(peer, &me.node_id, probe).await {
+            let info = match admin::status_classified(peer, &me.node_id, probe).await {
                 Ok(info) => info,
-                Err(e) => {
+                Err(admin::StatusFailure::Unreachable(e)) => {
                     tracing::warn!(peer = %peer.uri(), error = %e, "promotion check: peer unreachable");
-                    check.unreachable.push((peer.uri(), e.to_string()));
+                    check.unreachable.push((peer.uri(), e));
+                    continue;
+                }
+                // The peer is alive but its state is unknown (refused the call, spoke another
+                // protocol, ...): it may be ahead, so it blocks like an unverifiable peer.
+                Err(admin::StatusFailure::Answered(e)) => {
+                    tracing::warn!(peer = %peer.uri(), error = %e, "promotion check: peer answered with an error");
+                    unverified_ahead.push((format!("{} ({e})", peer.uri()), 0));
                     continue;
                 }
             };
+            if info.role == Role::Master {
+                return Err(Error::MasterReachable { peer: info.node_id });
+            }
             if info.last_seq > 0 && info.last_seq < me.last_seq {
                 let crc = self.inner.store.entry_crc(info.last_seq)?;
                 me.probes.insert(info.last_seq, crc);

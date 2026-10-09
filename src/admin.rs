@@ -130,7 +130,11 @@ fn fork_between(a: &[EpochStart], b: &[EpochStart]) -> Option<Seq> {
 /// their epoch histories differ, **and** the shorter node's last entry is present in the
 /// longer node with the same CRC: equal `last_entry_crc` at equal `last_seq`, or the longer
 /// node's probe at the shorter node's `last_seq` ([`NodeInfo::probes`]). The later of two
-/// compatible nodes has the newer epoch, then the higher `last_seq`. Anything that cannot be
+/// compatible nodes has the newer epoch, then the higher `last_seq`: a node whose newest
+/// epoch is still empty (a promotion that took no writes) is later than a node of the older
+/// epoch that holds *fewer* entries than its epoch's start, and **diverged** from one that
+/// holds entries at or past that start (`fork` is that epoch's `start_seq`; demoting the
+/// empty-epoch node and promoting the other would lose nothing). Anything that cannot be
 /// shown compatible because of a CRC mismatch is `Diverged`; when the
 /// histories agree, `fork` is then the shorter node's `last_seq` (the first seq known not to
 /// match may be earlier). A comparison that needs a CRC nobody can supply is `Unverifiable`,
@@ -150,29 +154,44 @@ pub fn compare(a: &NodeInfo, b: &NodeInfo) -> Comparison {
             return Comparison::Diverged { fork };
         }
     }
+    // The side that is later by position: newest epoch first, then `last_seq`.
+    let by_position = match a.newest().cmp(&b.newest()) {
+        std::cmp::Ordering::Greater => Some(Side::A),
+        std::cmp::Ordering::Less => Some(Side::B),
+        std::cmp::Ordering::Equal => None,
+    };
     let (short, long, long_side) = match a.last_seq.cmp(&b.last_seq) {
         std::cmp::Ordering::Equal => {
             return match (a.last_entry_crc, b.last_entry_crc) {
-                _ if a.last_seq == 0 => Comparison::Equal,
-                (Some(x), Some(y)) if x == y => Comparison::Equal,
+                _ if a.last_seq == 0 => by_position.map_or(Comparison::Equal, Comparison::Later),
+                (Some(x), Some(y)) if x == y => by_position.map_or(Comparison::Equal, Comparison::Later),
                 (Some(_), Some(_)) => Comparison::Diverged { fork: a.last_seq },
-                _ => Comparison::Unverifiable { later: None },
+                _ => Comparison::Unverifiable { later: by_position },
             };
         }
         std::cmp::Ordering::Less => (a, b, Side::B),
         std::cmp::Ordering::Greater => (b, a, Side::A),
     };
+    // The shorter node has the newer epoch, which is still empty (a promotion that has taken no
+    // writes: its newest epoch starts after its `last_seq`). The longer node holding entries
+    // from that epoch's start on holds entries the shorter node's epoch will never contain.
+    let newest_epoch = |n: &NodeInfo| n.epoch_history.last().copied();
+    if let (Some(se), Some(le)) = (newest_epoch(short), newest_epoch(long)) {
+        if se.epoch > le.epoch && long.last_seq >= se.start_seq {
+            return Comparison::Diverged { fork: se.start_seq };
+        }
+    }
     if short.last_seq > 0 {
         let held = long.probes.get(&short.last_seq).copied().flatten();
         match (short.last_entry_crc, held) {
             (Some(x), Some(y)) if x == y => {}
             (Some(_), Some(_)) => return Comparison::Diverged { fork: short.last_seq },
-            _ => return Comparison::Unverifiable { later: Some(long_side) },
+            _ => return Comparison::Unverifiable { later: by_position },
         }
     }
-    // Compatible: the longer node holds everything the shorter one holds. Its newest epoch is
-    // at least as new (a newer epoch on the shorter node would have forked above).
-    Comparison::Later(long_side)
+    // Compatible: the longer node holds everything the shorter one holds. Order by position:
+    // the node with the newer epoch (even an empty one) is later, otherwise the longer one.
+    Comparison::Later(by_position.unwrap_or(long_side))
 }
 
 /// The node to promote, and how the others relate to it.
@@ -205,8 +224,9 @@ pub fn choose_promotion_candidate(nodes: &[NodeInfo]) -> Result<Choice> {
     for n in nodes.iter().filter(|n| n.node_id != choice.candidate.node_id) {
         match compare(&choice.candidate, n) {
             Comparison::Later(Side::A) | Comparison::Equal => choice.compatible.push(n.node_id.clone()),
-            // Not reachable for the most advanced node, but never lose a node silently.
-            Comparison::Later(Side::B) => choice.compatible.push(n.node_id.clone()),
+            // The candidate is the latest by position, so this cannot happen; if it ever does,
+            // the node is not known to be safe to follow the candidate.
+            Comparison::Later(Side::B) => choice.unverifiable.push(n.node_id.clone()),
             Comparison::Diverged { fork } => choice.diverged.push((n.node_id.clone(), fork)),
             Comparison::DifferentDatabase => choice.foreign.push(n.node_id.clone()),
             Comparison::Unverifiable { .. } => choice.unverifiable.push(n.node_id.clone()),
@@ -228,16 +248,52 @@ pub async fn node_status(upstream: &UpstreamConfig, client_id: &str) -> Result<N
 
 /// [`node_status`], also asking for the CRC of the node's entry at `probe_seq`.
 pub async fn node_status_probed(upstream: &UpstreamConfig, client_id: &str, probe_seq: Option<Seq>) -> Result<NodeInfo> {
-    let mut c = crate::slave::connect_upstream(upstream, client_id, STATUS_TIMEOUT)?;
+    status_classified(upstream, client_id, probe_seq).await.map_err(|f| match f {
+        StatusFailure::Unreachable(m) | StatusFailure::Answered(m) => Error::Config(m),
+    })
+}
+
+/// Why a `Status` call failed: the peer could not be reached, or it was reached and answered
+/// with an error (or an undecodable answer), so its state is unknown but it is alive.
+pub(crate) enum StatusFailure {
+    Unreachable(String),
+    Answered(String),
+}
+
+/// Transport failures, connect errors, `Unavailable` and the timeout are `Unreachable`; every
+/// other status (`PermissionDenied`, `Unimplemented`, `FailedPrecondition`, ...) is `Answered`.
+pub(crate) async fn status_classified(
+    upstream: &UpstreamConfig,
+    client_id: &str,
+    probe_seq: Option<Seq>,
+) -> std::result::Result<NodeInfo, StatusFailure> {
+    let uri = upstream.uri();
+    let mut c = crate::slave::connect_upstream(upstream, client_id, STATUS_TIMEOUT)
+        .map_err(|e| StatusFailure::Unreachable(format!("Status from {uri}: {e}")))?;
     let call = c.status(pb::StatusRequest { client_id: client_id.to_string(), probe_seq });
     let r = tokio::time::timeout(STATUS_TIMEOUT, call)
         .await
-        .map_err(|_| Error::Config(format!("Status from {}: no answer within {STATUS_TIMEOUT:?}", upstream.uri())))?
-        .map_err(|s| Error::Config(format!("Status from {}: {}: {}", upstream.uri(), s.code(), s.message())))?;
-    NodeInfo::from_pb(r.into_inner(), probe_seq)
+        .map_err(|_| StatusFailure::Unreachable(format!("Status from {uri}: no answer within {STATUS_TIMEOUT:?}")))?
+        .map_err(|s| {
+            let m = format!("Status from {uri}: {}: {}", s.code(), s.message());
+            if is_transport_failure(&s) { StatusFailure::Unreachable(m) } else { StatusFailure::Answered(m) }
+        })?;
+    NodeInfo::from_pb(r.into_inner(), probe_seq).map_err(|e| StatusFailure::Answered(format!("Status from {uri}: {e}")))
 }
 
-/// What [`gather`] collected.
+fn is_transport_failure(s: &tonic::Status) -> bool {
+    use tonic::Code;
+    // tonic reports connection failures as `Unavailable` or, for lower-level transport
+    // errors, `Unknown` with a transport error as the source.
+    match s.code() {
+        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled => true,
+        Code::Unknown => std::error::Error::source(s).is_some() || s.message().contains("transport error"),
+        _ => false,
+    }
+}
+
+/// What [`gather`] collected. `unreachable` also lists nodes that answered `Status` with an
+/// error (the text says which); `Slave::check_promotion` treats those as blocking instead.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Gathered {
     /// Every node that answered, with probes at the other nodes' `last_seq`s below its own.
@@ -359,5 +415,42 @@ mod tests {
         let empty = NodeInfo { identity: None, epoch_history: vec![], ..node("e", 1, &[(1, 1)], 0, None) };
         assert!(matches!(choose_promotion_candidate(&[empty]), Err(Error::Config(_))));
         assert!(matches!(choose_promotion_candidate(&[]), Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn an_empty_newest_epoch_is_later_by_position_but_diverged_from_entries_past_its_start() {
+        // Wrongly promoted: history [(1,1),(2,11)], last_seq 10, the new epoch has no entries.
+        let w = node("w", 1, &[(1, 1), (2, 11)], 10, Some(5));
+        let b = node("b", 1, &[(1, 1)], 10, Some(5));
+        // Equal seq and CRC: ordered by epoch, not Equal.
+        assert_eq!(compare(&w, &b), Comparison::Later(Side::A));
+        assert_eq!(compare(&b, &w), Comparison::Later(Side::B));
+        // The other node is longer but still before the new epoch's start: the newer epoch wins.
+        let w9 = node("w", 1, &[(1, 1), (2, 11)], 9, Some(3));
+        let long = probed(node("b", 1, &[(1, 1)], 10, Some(5)), 9, Some(3));
+        assert_eq!(compare(&w9, &long), Comparison::Later(Side::A));
+        assert_eq!(compare(&long, &w9), Comparison::Later(Side::B));
+        // The other node holds entries at or past the start (11, 12): diverged at the start.
+        let past = probed(node("b", 1, &[(1, 1)], 12, Some(6)), 10, Some(5));
+        assert_eq!(compare(&w, &past), Comparison::Diverged { fork: 11 });
+        assert_eq!(compare(&past, &w), Comparison::Diverged { fork: 11 });
+        // Equal position with an unverifiable CRC keeps the order by epoch.
+        let no_crc = node("b", 1, &[(1, 1)], 10, None);
+        assert_eq!(compare(&w, &no_crc), Comparison::Unverifiable { later: Some(Side::A) });
+    }
+
+    #[test]
+    fn the_chooser_never_lists_a_later_node_as_compatible() {
+        let w = node("w", 1, &[(1, 1), (2, 11)], 10, Some(5));
+        let past = probed(node("b", 1, &[(1, 1)], 12, Some(6)), 10, Some(5));
+        let choice = choose_promotion_candidate(&[past.clone(), w]).unwrap();
+        assert_eq!(choice.candidate.node_id, "w");
+        assert_eq!(choice.diverged, vec![("b".to_string(), 11)]);
+        assert!(choice.compatible.is_empty() && choice.unverifiable.is_empty());
+        // Equal position, older epoch on the other node: compatible, candidate is the newer epoch.
+        let b = node("b", 1, &[(1, 1)], 10, Some(5));
+        let w = node("w", 1, &[(1, 1), (2, 11)], 10, Some(5));
+        let choice = choose_promotion_candidate(&[b, w]).unwrap();
+        assert_eq!((choice.candidate.node_id.as_str(), choice.compatible), ("w", vec!["b".to_string()]));
     }
 }

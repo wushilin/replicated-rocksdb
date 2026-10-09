@@ -63,6 +63,11 @@ pub enum Error {
     /// operator decision. `diverged` as for `NotMostAdvanced`.
     #[error("{peer} (last_seq {seq}) is at least as far and its history cannot be verified; promote explicitly if intended (diverged peers: {diverged:?})")]
     PromotionUnverifiable { peer: String, seq: Seq, diverged: Vec<(String, Seq)> },
+    /// `promote_checked` found a reachable peer that is itself a master. Promoting would give
+    /// the database two masters: fence it (stop it), or `demote` it if it was promoted by
+    /// mistake and has taken no writes, then check again.
+    #[error("{peer} is a reachable master; fence it, or demote it if it was promoted by mistake and has no writes, before promoting")]
+    MasterReachable { peer: String },
     #[error(transparent)]
     RocksDb(#[from] rocksdb::Error),
     #[error(transparent)]

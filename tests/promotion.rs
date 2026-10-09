@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use replicated_rocksdb::admin::{self, Comparison};
 use replicated_rocksdb::{
-    CfSpec, DivergencePolicy, EpochStart, Error, HaltReason, LogApi, Master, Op, ReadApi, Role, Slave, SlaveState, UpstreamConfig,
+    AllowAll, AllowMethods, Method, CfSpec, DivergencePolicy, EpochStart, Error, HaltReason, LogApi, Master, Op, ReadApi, Role, Slave, SlaveState, UpstreamConfig,
 };
 use support::{assert_converged, check_edge_cases, wait_state, wait_until, write_edge_cases, Cluster};
 
@@ -348,4 +348,73 @@ async fn same_epoch_divergence_is_found_by_the_crc_probe() {
     assert!(choice.compatible.is_empty());
     let check = b.check_promotion(&peers[1..]).await.unwrap();
     assert_eq!(check.diverged, vec![("c".to_string(), 4)]);
+}
+
+/// A reachable peer that is itself a master (promoted by mistake) blocks `promote_checked`
+/// with `MasterReachable`, whatever its position; the slave comes back running. After the
+/// wrong master is demoted, the same check passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promote_checked_refuses_while_another_master_is_reachable() {
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    let a_addr = a.serve_addr().unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (b, _) = c.slave("b", a_addr).await;
+    let (cn, _) = c.slave("c", a_addr).await;
+    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
+    a.shutdown().await.unwrap();
+
+    // b is promoted by mistake: epoch 2 starts after its last_seq and is empty.
+    let b_master = b.promote(c.master_config("b")).await.unwrap();
+    let b_peer = UpstreamConfig::from_addr(b_master.serve_addr().unwrap());
+    let refused = cn.promote_checked(c.master_config("c"), std::slice::from_ref(&b_peer)).await.err().expect("b is a master");
+    assert!(matches!(&refused.error, Error::MasterReachable { peer } if peer == "b"), "{refused}");
+    let cn = refused.into_slave().expect("a refusal returns the slave");
+    assert_eq!(cn.get("c", b"nothing").unwrap(), None, "c still serves reads");
+
+    // Demote b (nothing was written), then c may be promoted with b as a replica peer.
+    let (b_cfg, _) = c.slave_config("b", a_addr);
+    let b = b_master.demote(b_cfg).await.unwrap();
+    let b_peer = UpstreamConfig::from_addr(b.serve_addr().unwrap());
+    let c_master = cn.promote_checked(c.master_config("c"), std::slice::from_ref(&b_peer)).await.unwrap();
+    assert_eq!(c_master.identity().epoch, 2);
+}
+
+/// A peer that is reachable but refuses `Status` (here: its authenticator excludes it) has an
+/// unknown state, so it blocks as `PromotionUnverifiable` and is not treated as unreachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_answers_with_an_error_blocks_promote_checked() {
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    let a_addr = a.serve_addr().unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (b, _) = c.slave("b", a_addr).await;
+    let (mut d_cfg, _) = c.slave_config("d", a_addr);
+    d_cfg.serve.as_mut().unwrap().authenticator =
+        std::sync::Arc::new(AllowMethods::new(std::sync::Arc::new(AllowAll), &[Method::Handshake, Method::Tail, Method::Bootstrap, Method::Verify]));
+    let d = Slave::open(d_cfg).await.unwrap();
+    assert_converged(&a, &[("b", &b), ("d", &d)]).await;
+    a.shutdown().await.unwrap();
+
+    let d_peer = UpstreamConfig::from_addr(d.serve_addr().unwrap());
+    let refused = b.promote_checked(c.master_config("b"), std::slice::from_ref(&d_peer)).await.err().expect("d refuses Status");
+    assert!(matches!(&refused.error, Error::PromotionUnverifiable { peer, .. } if peer.contains("PermissionDenied") || peer.contains("permission")), "{refused}");
+    let b = refused.into_slave().expect("a refusal returns the slave");
+    let check = b.check_promotion(&[UpstreamConfig::from_addr(a_addr)]).await.unwrap();
+    assert_eq!(check.unreachable.len(), 1, "a refused connection is unreachable, not blocking");
+}
+
+/// A refusal returns a slave that keeps replicating from its live upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_slave_keeps_replicating_from_its_live_upstream() {
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
+    assert_converged(&a, &[("b", &b)]).await;
+    let refused = b.promote_checked(c.master_config("elsewhere"), &[]).await.err().expect("wrong path");
+    let b = refused.into_slave().expect("a refusal returns the slave");
+    a.put("c", b"after refusal", b"v").unwrap();
+    assert_converged(&a, &[("b", &b)]).await;
+    assert_eq!(b.get("c", b"after refusal").unwrap(), Some(b"v".to_vec()));
 }
