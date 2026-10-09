@@ -9,9 +9,7 @@ pub(crate) mod proto;
 pub(crate) use proto::replication::v1 as pb;
 
 pub mod clock;
-#[allow(dead_code)] // crate-private helpers are used by later tasks
 pub mod error;
-#[allow(dead_code)] // crate-private helpers are used by later tasks
 pub mod types;
 
 pub use clock::{Clock, ManualClock, SystemClock};

@@ -21,6 +21,7 @@ pub enum Role {
     Slave,
 }
 
+#[allow(dead_code)]
 impl Role {
     pub(crate) fn as_bytes(self) -> &'static [u8] {
         match self {
@@ -59,11 +60,13 @@ impl CfSpec {
 
 /// A registered user CF: its spec plus the seq of the `CreateCf` entry that created it.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct CfEntry {
     pub spec: CfSpec,
     pub create_seq: Seq,
 }
 
+#[allow(dead_code)]
 impl CfEntry {
     /// Physical RocksDB CF name, `u:{name}:{create_seq}`. Never parsed back.
     pub fn physical_name(&self) -> String {
@@ -122,16 +125,19 @@ pub struct EpochStart {
 }
 
 /// The epoch an entry with this seq must carry, given a history sorted by epoch.
+#[allow(dead_code)]
 pub(crate) fn epoch_for(history: &[EpochStart], seq: Seq) -> Option<u64> {
     history.iter().rev().find(|e| e.start_seq <= seq).map(|e| e.epoch)
 }
 
 /// The fork point after `epoch`: the first seq of the next epoch, if any.
+#[allow(dead_code)]
 pub(crate) fn fork_after(history: &[EpochStart], epoch: u64) -> Option<Seq> {
     history.iter().find(|e| e.epoch > epoch).map(|e| e.start_seq)
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) enum BatchOp {
     Put { cf: String, key: Vec<u8>, value: Vec<u8>, ttl: Option<Duration> },
     Delete { cf: String, key: Vec<u8> },
@@ -178,6 +184,7 @@ impl Batch {
     }
 
     /// Converts to absolute ops: each TTL becomes `expire_at_ms = ts_ms + ttl` (saturating).
+    #[allow(dead_code)]
     pub(crate) fn into_ops(self, ts_ms: u64) -> Vec<Op> {
         self.ops
             .into_iter()
@@ -196,6 +203,7 @@ impl Batch {
 }
 
 /// `ts_ms + ttl` in ms, saturating at `u64::MAX`.
+#[allow(dead_code)]
 pub(crate) fn expire_at(ts_ms: u64, ttl: Duration) -> u64 {
     let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
     ts_ms.saturating_add(ttl_ms)

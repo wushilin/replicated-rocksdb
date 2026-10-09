@@ -35,7 +35,13 @@ impl ManualClock {
 
     pub fn advance(&self, by: Duration) {
         let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
-        let _ = self.0.try_update(Ordering::SeqCst, Ordering::SeqCst, |t| Some(t.saturating_add(by)));
+        let mut cur = self.0.load(Ordering::SeqCst);
+        loop {
+            match self.0.compare_exchange_weak(cur, cur.saturating_add(by), Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 }
 
@@ -58,6 +64,13 @@ mod tests {
         assert_eq!(c.now_ms(), 15);
         c.set(3);
         assert_eq!(c.now_ms(), 3);
+    }
+
+    #[test]
+    fn advance_saturates_instead_of_overflowing() {
+        let c = ManualClock::new(7);
+        c.advance(Duration::MAX);
+        assert_eq!(c.now_ms(), u64::MAX);
     }
 
     #[test]
