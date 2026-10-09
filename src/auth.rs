@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use subtle::ConstantTimeEq;
 
+use crate::error::{Error, Result};
+
 /// The RPC being authorised. `Bootstrap` and `Verify` expose the whole database.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Method {
@@ -42,6 +44,11 @@ pub enum AuthError {
     PermissionDenied,
 }
 
+/// Decides whether a call is allowed.
+///
+/// **Security:** `uses_tokens` defaults to `false`, which fails open. Any implementation that
+/// checks bearer tokens MUST override it to return `true`, otherwise a server can be started
+/// with that authenticator on a plaintext listener without the `allow_plaintext_token` guard.
 #[async_trait::async_trait]
 pub trait Authenticator: Send + Sync + 'static {
     async fn authenticate(&self, peer: &PeerInfo, method: Method, token: Option<&[u8]>) -> Result<(), AuthError>;
@@ -50,6 +57,25 @@ pub trait Authenticator: Send + Sync + 'static {
     /// such an authenticator on a plaintext listener unless `allow_plaintext_token` is set.
     fn uses_tokens(&self) -> bool {
         false
+    }
+
+    /// Checks the authenticator's own configuration; called by `ServeConfig::validate`.
+    fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Checks that `token` is a valid RFC 6750 `b64token` (`[A-Za-z0-9\-._~+/]+=*`), as PROTOCOL.md
+/// §3.2 requires. Servers validate their secrets with it; clients should call it before
+/// building the `authorization` metadata.
+pub fn validate_token(token: &[u8]) -> Result<()> {
+    let body_len = token.iter().rposition(|&b| b != b'=').map_or(0, |i| i + 1);
+    let ok = body_len > 0
+        && token[..body_len].iter().all(|&b| b.is_ascii_alphanumeric() || b"-._~+/".contains(&b));
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Config("token must be a non-empty RFC 6750 b64token ([A-Za-z0-9-._~+/]+=*)".into()))
     }
 }
 
@@ -72,12 +98,17 @@ impl Authenticator for AllowAll {
 /// Accepts calls carrying any of the configured secrets. Several secrets can be valid at
 /// once so they can be rotated.
 pub struct TokenAuthenticator {
+    /// Raw secrets, kept for validation only.
     secrets: Vec<Vec<u8>>,
+    /// Fixed-size digests compared in constant time, so the secret length does not leak.
+    digests: Vec<[u8; 32]>,
 }
 
 impl TokenAuthenticator {
     pub fn new(secrets: impl IntoIterator<Item = impl Into<Vec<u8>>>) -> Self {
-        TokenAuthenticator { secrets: secrets.into_iter().map(Into::into).collect() }
+        let secrets: Vec<Vec<u8>> = secrets.into_iter().map(Into::into).collect();
+        let digests = secrets.iter().map(|s| *blake3::hash(s).as_bytes()).collect();
+        TokenAuthenticator { secrets, digests }
     }
 }
 
@@ -91,16 +122,24 @@ impl fmt::Debug for TokenAuthenticator {
 impl Authenticator for TokenAuthenticator {
     async fn authenticate(&self, _: &PeerInfo, _: Method, token: Option<&[u8]>) -> Result<(), AuthError> {
         let Some(token) = token else { return Err(AuthError::Unauthenticated) };
-        // Compare against every secret without early exit.
+        // Compare digests against every secret without early exit.
+        let given = *blake3::hash(token).as_bytes();
         let mut ok = subtle::Choice::from(0);
-        for s in &self.secrets {
-            ok |= s.as_slice().ct_eq(token);
+        for d in &self.digests {
+            ok |= d.as_slice().ct_eq(given.as_slice());
         }
         if bool::from(ok) { Ok(()) } else { Err(AuthError::Unauthenticated) }
     }
 
     fn uses_tokens(&self) -> bool {
         true
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.secrets.is_empty() {
+            return Err(Error::Config("TokenAuthenticator needs at least one secret".into()));
+        }
+        self.secrets.iter().try_for_each(|s| validate_token(s))
     }
 }
 
@@ -198,10 +237,19 @@ impl Authenticator for AllowMethods {
     fn uses_tokens(&self) -> bool {
         self.inner.uses_tokens()
     }
+
+    fn validate(&self) -> Result<()> {
+        self.inner.validate()
+    }
 }
 
 /// Limits failed authentications per remote address: after `max` failures within one
 /// minute, calls from that address are refused without checking credentials.
+///
+/// The check and the recording are separate steps, so calls already in flight can push the
+/// number of checked attempts past `max` by up to the number of concurrent attempts.
+/// IPv4-mapped IPv6 addresses count as their IPv4 address and IPv6 addresses are bucketed by
+/// /64. Memory is bounded: at most [`FailureLimiter::MAX_TRACKED`] addresses, `max` timestamps each.
 #[derive(Debug)]
 pub(crate) struct FailureLimiter {
     max: usize,
@@ -210,6 +258,9 @@ pub(crate) struct FailureLimiter {
 }
 
 impl FailureLimiter {
+    /// Hard cap on tracked addresses.
+    pub(crate) const MAX_TRACKED: usize = 10_000;
+
     pub(crate) fn new(max_per_minute: u32) -> Self {
         FailureLimiter {
             max: max_per_minute as usize,
@@ -218,7 +269,19 @@ impl FailureLimiter {
         }
     }
 
+    fn bucket(ip: IpAddr) -> IpAddr {
+        match ip.to_canonical() {
+            IpAddr::V6(v6) => {
+                let mut o = v6.octets();
+                o[8..].fill(0);
+                IpAddr::V6(o.into())
+            }
+            v4 => v4,
+        }
+    }
+
     pub(crate) fn is_blocked(&self, ip: IpAddr, now: Instant) -> bool {
+        let ip = Self::bucket(ip);
         let mut map = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(q) = map.get_mut(&ip) else { return false };
         while q.front().is_some_and(|t| now.saturating_duration_since(*t) >= self.window) {
@@ -232,7 +295,31 @@ impl FailureLimiter {
     }
 
     pub(crate) fn record_failure(&self, ip: IpAddr, now: Instant) {
-        self.failures.lock().unwrap_or_else(PoisonError::into_inner).entry(ip).or_default().push_back(now);
+        let ip = Self::bucket(ip);
+        let mut map = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
+        let q = map.entry(ip).or_default();
+        while q.front().is_some_and(|t| now.saturating_duration_since(*t) >= self.window) {
+            q.pop_front();
+        }
+        q.push_back(now);
+        while q.len() > self.max {
+            q.pop_front();
+        }
+        if map.len() > Self::MAX_TRACKED {
+            let window = self.window;
+            map.retain(|_, q| q.back().is_some_and(|t| now.saturating_duration_since(*t) < window));
+            if map.len() > Self::MAX_TRACKED {
+                // Still too many live entries: evict those with the oldest latest failure.
+                let mut by_age: Vec<(Instant, IpAddr)> =
+                    map.iter().filter_map(|(k, q)| q.back().map(|t| (*t, *k))).collect();
+                by_age.sort();
+                // Evict down to 3/4 of the cap so this O(n log n) pass is amortised.
+                let excess = map.len() - Self::MAX_TRACKED * 3 / 4;
+                for (_, k) in by_age.into_iter().take(excess) {
+                    map.remove(&k);
+                }
+            }
+        }
     }
 }
 
@@ -384,5 +471,73 @@ mod tests {
         assert_eq!(subject_common_name(cert.der()).as_deref(), Some("node-b"));
         assert_eq!(subject_common_name(&[0x30, 0x82, 0xFF]), None);
         assert_eq!(subject_common_name(&[]), None);
+    }
+
+    #[test]
+    fn failure_limiter_boundary_and_buckets() {
+        let l = FailureLimiter::new(3);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let t0 = Instant::now();
+        l.record_failure(ip, t0);
+        l.record_failure(ip, t0);
+        assert!(!l.is_blocked(ip, t0), "max - 1 failures is not blocked");
+        // The IPv4-mapped form shares the bucket with the plain address.
+        l.record_failure("::ffff:10.0.0.1".parse().unwrap(), t0);
+        assert!(l.is_blocked(ip, t0), "max failures is blocked");
+        // IPv6 is bucketed by /64.
+        let a: IpAddr = "2001:db8::1".parse().unwrap();
+        let b: IpAddr = "2001:db8::ffff".parse().unwrap();
+        let c: IpAddr = "2001:db8:0:1::1".parse().unwrap();
+        for _ in 0..3 {
+            l.record_failure(a, t0);
+        }
+        assert!(l.is_blocked(b, t0));
+        assert!(!l.is_blocked(c, t0));
+        assert!(!l.is_blocked(ip, t0 + Duration::from_secs(60)), "window expiry unblocks");
+    }
+
+    #[test]
+    fn failure_limiter_memory_is_bounded() {
+        let l = FailureLimiter::new(3);
+        let t0 = Instant::now();
+        for i in 0..50_000u32 {
+            l.record_failure(IpAddr::from(i.to_be_bytes()), t0 + Duration::from_millis(u64::from(i)));
+        }
+        assert!(l.failures.lock().unwrap().len() <= FailureLimiter::MAX_TRACKED);
+        let hot: IpAddr = "10.9.9.9".parse().unwrap();
+        for _ in 0..100 {
+            l.record_failure(hot, t0 + Duration::from_secs(1000));
+        }
+        assert!(l.failures.lock().unwrap()[&hot].len() <= 3, "per-address queue is capped at max");
+    }
+
+    #[test]
+    fn token_syntax_is_validated() {
+        for ok in [&b"abc"[..], b"A-z9_", b"a.b-c~d+e/f", b"abc=="] {
+            validate_token(ok).unwrap();
+        }
+        for bad in [&b""[..], b"=", b"a b", b"a\nb", b"a\r", "tökén".as_bytes(), b"ab=c", b"a\"b"] {
+            assert!(validate_token(bad).is_err(), "{bad:?}");
+        }
+        assert!(TokenAuthenticator::new(["good", "bad token"]).validate().is_err());
+        assert!(TokenAuthenticator::new(Vec::<Vec<u8>>::new()).validate().is_err());
+        assert!(TokenAuthenticator::new([""]).validate().is_err());
+        TokenAuthenticator::new(["good"]).validate().unwrap();
+        let wrapped = AllowMethods::new(Arc::new(TokenAuthenticator::new(["bad token"])), &[Method::Tail]);
+        assert!(wrapped.validate().is_err());
+        AllowAll.validate().unwrap();
+    }
+
+    #[test]
+    fn common_name_never_panics_on_truncated_certificates() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name.push(rcgen::DnType::CommonName, "node-b");
+        let cert = params.self_signed(&key).unwrap();
+        let der = cert.der().to_vec();
+        for n in 0..der.len() {
+            assert_eq!(subject_common_name(&der[..n]), None, "truncated at {n}");
+        }
+        assert_eq!(subject_common_name(&der).as_deref(), Some("node-b"));
     }
 }

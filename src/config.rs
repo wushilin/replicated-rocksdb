@@ -209,6 +209,10 @@ impl ServeConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
+        self.authenticator.validate()?;
+        if self.allow_plaintext_token && self.tls.is_none() && !self.bind.is_loopback() {
+            tracing::warn!(bind = %self.bind, "allow_plaintext_token is set on a non-loopback address; tokens travel unencrypted");
+        }
         if self.tls.is_none() && self.authenticator.uses_tokens() && !self.allow_plaintext_token {
             return Err(Error::Config(
                 "token authentication without TLS is refused; configure tls or set allow_plaintext_token".into(),
@@ -256,5 +260,29 @@ mod serve_tests {
         cfg.validate().unwrap();
         cfg.limits.max_concurrent_bootstraps = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn tls_identity_debug_hides_key_and_timeouts_are_validated() {
+        let id = TlsIdentity { cert_pem: b"CERT".to_vec(), key_pem: b"SECRETKEY".to_vec() };
+        let d = format!("{id:?} {:?}", TlsServerConfig { identity: id.clone(), client_ca_pem: None });
+        assert!(!d.contains("SECRETKEY") && !d.contains("CERT"));
+        let new = || ServeConfig::new(std::net::IpAddr::from([127, 0, 0, 1]), 0, Arc::new(AllowAll));
+        let mut cfg = new();
+        cfg.limits.max_auth_failures_per_minute = 0;
+        assert!(cfg.validate().is_err());
+        let mut cfg = new();
+        cfg.limits.bootstrap_lease_ttl = Duration::ZERO;
+        assert!(cfg.validate().is_err());
+        let mut cfg = new();
+        cfg.limits.verify_session_timeout = Duration::ZERO;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_token_secrets_are_refused() {
+        let mut cfg = ServeConfig::new(std::net::IpAddr::from([127, 0, 0, 1]), 0, Arc::new(TokenAuthenticator::new([""])));
+        cfg.allow_plaintext_token = true;
+        assert!(matches!(cfg.validate(), Err(Error::Config(m)) if m.contains("b64token")));
     }
 }
