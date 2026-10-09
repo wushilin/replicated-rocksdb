@@ -39,6 +39,8 @@ pub(crate) struct Inner {
     /// Shared with the driver, which waits on it without holding the `Inner`.
     pub halt_cleared: Arc<Notify>,
     listener_failed: AtomicBool,
+    /// Downstream replicas served by this slave.
+    pub(crate) replicas: Arc<crate::server::replicas::ReplicaRegistry>,
 }
 
 impl Inner {
@@ -73,7 +75,13 @@ impl Inner {
             force_bootstrap: AtomicBool::new(false),
             halt_cleared: Arc::new(Notify::new()),
             listener_failed: AtomicBool::new(false),
+            replicas: Arc::default(),
         })
+    }
+
+    /// The upstream's address.
+    pub(crate) fn upstream_uri(&self) -> String {
+        self.cfg.upstream.uri()
     }
 
     pub(crate) fn policies(&self) -> Policies {

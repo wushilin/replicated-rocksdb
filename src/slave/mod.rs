@@ -8,8 +8,10 @@ mod driver;
 mod inner;
 mod maintenance;
 mod policy;
+mod source;
 mod state;
 
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +22,7 @@ use tokio::task::JoinHandle;
 use crate::error::{Error, Result};
 use crate::log::{EntryIter, LogApi};
 use crate::read::{ReadApi, ReadSnapshot};
+use crate::server::replicas::ReplicaStatus;
 use crate::server::{await_sole_owner, ServerHandle};
 use crate::store::meta::key;
 use crate::store::read::DbIter;
@@ -50,9 +53,24 @@ impl Slave {
         cfg.validate()?;
         let (store, meta) = Store::open(&cfg.path, Role::Slave, cfg.rocksdb.clone())?;
         let inner = Arc::new(Inner::new(store, cfg, &meta)?);
+        let server = crate::server::start_for(&inner, inner.cfg.serve.clone(), inner.replicas.clone()).await?;
         let driver = driver::spawn(&inner);
         let maintenance = maintenance::spawn(&inner);
-        Ok(Slave { inner, driver: Some(driver), maintenance: Some(maintenance), server: None })
+        Ok(Slave { inner, driver: Some(driver), maintenance: Some(maintenance), server })
+    }
+
+    /// Direct downstream replicas of this slave (see `Master::replicas`). Empty when it does
+    /// not serve replication.
+    pub fn replicas(&self) -> Vec<ReplicaStatus> {
+        match &self.server {
+            Some(s) => self.inner.replicas.status(&*self.inner, self.inner.now_ms(), s.replica_lag_time_max()),
+            None => Vec::new(),
+        }
+    }
+
+    /// The address this slave serves downstream replicas on, if `serve` is configured.
+    pub fn serve_addr(&self) -> Option<SocketAddr> {
+        self.server.as_ref().map(ServerHandle::addr)
     }
 
     pub fn status(&self) -> SlaveStatus {

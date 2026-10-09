@@ -575,6 +575,7 @@ impl Slave {
     pub async fn open(cfg: SlaveConfig) -> Result<Self>;   // serves local data immediately unless Bootstrapping
     pub fn status(&self) -> SlaveStatus;
     pub fn applied_seq(&self) -> Seq;
+    pub fn serve_addr(&self) -> Option<SocketAddr>;     // when serve is configured
     pub async fn wait_for_seq(&self, seq: Seq, timeout: Duration) -> Result<()>;
     pub fn watch_state(&self) -> watch::Receiver<SlaveState>;
     pub async fn verify_now(&self, mode: VerifyMode) -> Result<VerifyReport>;

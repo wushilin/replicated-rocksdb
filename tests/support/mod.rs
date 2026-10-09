@@ -84,6 +84,7 @@ impl Cluster {
         cfg.heartbeat = HEARTBEAT;
         cfg.retention.check_interval = Duration::from_secs(3600);
         cfg.reconnect = Backoff { initial: Duration::from_millis(20), max: Duration::from_millis(200), factor: 2 };
+        cfg.serve = Some(self.serve());
         cfg.listener = Some(listener.clone());
         (cfg, listener)
     }
@@ -91,6 +92,17 @@ impl Cluster {
     pub async fn slave(&self, name: &str, upstream: SocketAddr) -> (Slave, Arc<RecordingListener>) {
         let (cfg, listener) = self.slave_config(name, upstream);
         (Slave::open(cfg).await.unwrap(), listener)
+    }
+
+    /// Reopens a slave on the port it served before, so its downstream finds it again.
+    pub async fn restart_slave(&self, s: Slave, cfg: SlaveConfig) -> Slave {
+        let port = s.serve_addr().map(|a| a.port());
+        s.shutdown().await.unwrap();
+        let mut cfg = cfg;
+        if let (Some(port), Some(serve)) = (port, cfg.serve.as_mut()) {
+            serve.port = port;
+        }
+        Slave::open(cfg).await.unwrap()
     }
 }
 
