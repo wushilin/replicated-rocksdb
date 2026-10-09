@@ -2,124 +2,148 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn Plan 1's single-node master into a replicating system: a gRPC replication server (Handshake, Tail with Kafka-style fetch batching, Bootstrap with retention leases) with token/mTLS auth and TLS, read-only `Slave`s that bootstrap, tail, chain, halt and recover by policy, and `Slave::promote` — every path proven by real multi-node tests over 127.0.0.1.
+**Goal:** Turn Plan 1's single-node master into a replicating system: a gRPC replication server (Handshake, a bidirectional Tail with Kafka-style fetch batching and replica acknowledgements, Bootstrap with retention leases, a read-only Status RPC) with token/mTLS auth and TLS, read-only `Slave`s that bootstrap, tail, acknowledge, chain, halt and recover by policy, an optional write concern on the master (in-sync replicas), `Slave::repoint`, and promotion with safety tooling (`promote_checked`, `admin::choose_promotion_candidate`, `Master::demote`) — every path proven by real multi-node tests over 127.0.0.1.
 
-**Architecture:** One replication server (`src/server/`) runs over a `LogSource` trait that both `master::Inner` and `slave::Inner` implement; it holds the source weakly and every producer gives up on shutdown or reset, so a server never keeps a closed node's database open. A slave is a Plan 1 `Store` plus one driver task: connect → handshake → act on a pure policy table → bootstrap (a crash-safe install into fresh physical CFs) and/or tail (each entry applied through the same `Store::prepare`/`commit` as the master, unsynced). Decision tables (handshake rules, slave policies) are pure functions with one unit test per row; everything else is tested end to end with nodes talking real gRPC on 127.0.0.1.
+**Architecture:** One replication server (`src/server/`) runs over a `LogSource` trait that both `master::Inner` and `slave::Inner` implement; it holds the source weakly and every producer gives up on shutdown or reset, so a server never keeps a closed node's database open. Each Tail stream registers in a per-node replica registry (`server::replicas`) that records what was sent and what the replica acknowledged; the node reports it (`replicas()`, `Status`) and the master's writer waits on it for a write concern. A slave is a Plan 1 `Store` plus one driver task: connect → handshake → act on a pure policy table → bootstrap (a crash-safe install into fresh physical CFs) and/or tail (each entry applied through the same `Store::prepare`/`commit` as the master, unsynced unless `sync_writes`), acknowledging what it committed. Decision tables (handshake rules, slave policies) are pure functions with one unit test per row; everything else is tested end to end with nodes talking real gRPC on 127.0.0.1.
 
 **Tech Stack:** Plan 1's stack (Rust 1.99, edition 2024, rocksdb 0.25.0, prost 0.14.4, tokio 1.53, …) plus tonic 0.14.6 (`tls-ring`), tonic-prost 0.14.6, tonic-types 0.14.6 (`ErrorInfo`), tokio-stream 0.1.19, subtle 2.6.1, async-trait 0.1.92, optional fail 0.5.1 (feature `failpoints`); dev rcgen 0.14.10.
 
-**Spec:** [DESIGN.md](../../../DESIGN.md), [PROTOCOL.md](../../../PROTOCOL.md) (as of commit `f960d4e`, which added Tail fetch batching, PROTOCOL.md §7.1, §7.3–§7.5) and [the Plan 2/3 design notes](../specs/2026-10-09-plan2-3-design-notes.md) (all of it except the "Plan 3: Verify" section). Read DESIGN.md §6, §10–§16 and PROTOCOL.md §3, §6–§8, §10–§12 before starting. This plan builds on [Plan 1](2026-10-09-plan1-storage-and-master.md). **The Plan 1 code under `src/` is the source of truth, not the Plan 1 document**: in particular `Store.db` is `Arc<DbCore>` (`Deref<Target = DB>`, never wrap the DB in another `Arc`), runtime-created CFs keep their options alive through `Store::retain_cf_options`, `OwnedSnapshot` reads only through `get_cf`/`iterator_cf` bound to `&self`, background tasks hold `Weak<Inner>`, `Store::commit` re-checks the seq, and `Store::ttl_due` takes a cursor. Every type and function the Plan 1 Interfaces blocks name exists, as implemented (`Store`, `Store::retain_cf_options`, `DbCore`, `prepare`/`commit`, `MetaSnapshot`, `CfRegistry`, `PhysCf`, `ReadCtx`, `ReadSnapshot`, `OwnedSnapshot`, `entries_after`, `guard`/`RetentionGuard`, `trim_changelog`, `drop_unreferenced_cfs`, `master::writer::Inner`, `Master`, `LogApi`, `Digest`, `envelope`, …) exists exactly as written there.
+**Spec:** [DESIGN.md](../../../DESIGN.md), [PROTOCOL.md](../../../PROTOCOL.md) (as of commit `f960d4e`, which added Tail fetch batching, PROTOCOL.md §7.1, §7.3–§7.5), [the Plan 2/3 design notes](../specs/2026-10-09-plan2-3-design-notes.md) (all of it except the "Plan 3: Verify" section) and §1–§4 and §6 of [the acks/failover/repair addendum](../specs/2026-10-09-failover-acks-repair.md) (commit `3b4b07e`), which wins over DESIGN/PROTOCOL until Tasks 6, 7, 11, 12 and 13 merge it. Read DESIGN.md §6, §10–§16 and PROTOCOL.md §3, §6–§8, §10–§12 before starting. This plan builds on [Plan 1](2026-10-09-plan1-storage-and-master.md). **The Plan 1 code under `src/` is the source of truth, not the Plan 1 document**: in particular `Store.db` is `Arc<DbCore>` (`Deref<Target = DB>`, never wrap the DB in another `Arc`), runtime-created CFs keep their options alive through `Store::retain_cf_options`, `OwnedSnapshot` reads only through `get_cf`/`iterator_cf` bound to `&self`, background tasks hold `Weak<Inner>`, `Store::commit` re-checks the seq, and `Store::ttl_due` takes a cursor. Every type and function the Plan 1 Interfaces blocks name exists, as implemented (`Store`, `Store::retain_cf_options`, `DbCore`, `prepare`/`commit`, `MetaSnapshot`, `CfRegistry`, `PhysCf`, `ReadCtx`, `ReadSnapshot`, `OwnedSnapshot`, `entries_after`, `guard`/`RetentionGuard`, `trim_changelog`, `drop_unreferenced_cfs`, `master::writer::Inner`, `Master`, `LogApi`, `Digest`, `envelope`, …) exists exactly as written there.
+
+**Amendment (addendum §1–§4).** Tasks 1–5 were implemented before the addendum and are unchanged; **from Task 6 on, the code under `src/` written by Tasks 1–5 (commit `7bdd8fc`) is the source of truth**, and where Task 6 replaces a file it gives the whole file. Task 6 turns Tail into a bidirectional stream with acknowledgements and adds the `Status` RPC; Tasks 7–10 are the slave tasks (now acknowledging and with `sync_writes`); Task 11 adds the promotion tooling next to `promote`; Task 12 adds the write concern; Task 13 adds `repoint`; Tasks 14–15 are the security and failure/resume tasks.
 
 **Series:**
 - Plan 1: storage engine and master (done before this plan).
-- **Plan 2 (this):** replication server, auth/TLS, `Slave` (bootstrap, tail, halts, policies, listener), chaining, promotion, failure/resume tests.
-- Plan 3: Verify (sessions, range hashing, `ListRange`), `replicas()`, `lag_ms`, `last_verify`, observability spans.
+- **Plan 2 (this):** replication server with acks and Status, auth/TLS, `Slave` (bootstrap, tail, acks, halts, policies, listener), chaining, `replicas()`, write concern, promotion with safety tooling, `repoint`, failure/resume tests.
+- Plan 3: Verify (sessions, range hashing, `ListRange`), divergence repair (the `repoint` `Repair` arm), `SlaveStatus::{lag_ms, last_verify}`, observability spans.
 
 ## Global Constraints
 
 - Everything in Plan 1's Global Constraints still holds; in particular: absolute ops only (`Put`, `Delete`, `DeleteRange`, `CreateCf`, `DropCf`), no merge; mutation + `__changelog[seq]` + `__meta.last_seq` in one `WriteBatch`; `__meta.last_seq` is the source of truth; the master always fsyncs; `LogEntry.ops` is never re-encoded.
-- **No read-modify-write API** (no `update`, CAS or merge). Nothing in this plan adds one; the rustdoc of `Master::put`, `Master::write`, `Master::get` and the crate docs keep the DESIGN.md §5.1 warning.
+- **No read-modify-write API** (no `update`, CAS or merge). Nothing in this plan adds one; the rustdoc of `Master::put`, `Master::write`, `Master::get` and the crate docs keep the DESIGN.md §5.1 warning, and `Master::write_with` refers to it.
+- **Data-loss-capable operations are explicit and refuse by default.** `repoint` never discards divergent entries unless the caller passes `RepointDivergence::{Repair, Rebootstrap} { accept_loss: AcceptDataLoss }`; `demote` refuses once the new epoch has entries and `promote_checked` when a reachable peer is later — and a refusal hands the untouched, still-running node back (`Err(DemoteRefused { error, master })`, `Err(PromoteRefused { error, slave })`), losing it only on a failure after the irreversible shutdown began, as their rustdoc says; `Error::AckTimeout` says (in its rustdoc and `WriteConcern`'s) that the write is committed and must not be retried blindly.
 - **Slaves forward entries unchanged** (`seq`, `epoch`, `ts_ms`, `ops` bytes, `crc32c`). Identity always refers to the origin master.
-- Slaves apply each entry with `Store::prepare` + `Store::commit(sync = false)`; one entry is one `WriteBatch`. Bootstrap records are written unsynced; the final bootstrap batch is synced.
+- Slaves apply each entry with `Store::prepare` + `Store::commit(sync = SlaveConfig::sync_writes, default false)`; one entry is one `WriteBatch`. Bootstrap records are written unsynced; the final bootstrap batch is synced.
 - `PROTOCOL_VERSION = 1` and `ENVELOPE_VERSION = 1` must match exactly. Handshake reports a mismatch in its body; every other RPC requires `x-rrdb-protocol-version` and fails with `FAILED_PRECONDITION / PROTOCOL_MISMATCH`.
 - Request metadata on every call: `x-rrdb-protocol-version`, `x-rrdb-node-id`, and `authorization: Bearer <token>` with token auth.
-- Every protocol failure is a gRPC status with `google.rpc.ErrorInfo { domain: "rrdb.replication.v1", reason: <Reason name> }`, including unexpected server failures (`INTERNAL` with reason `REASON_UNSPECIFIED`, `net::internal_status`); authentication failures (`UNAUTHENTICATED`, `PERMISSION_DENIED`) carry no `ErrorInfo`; malformed requests are `INVALID_ARGUMENT` and the Verify stubs `UNIMPLEMENTED`.
+- Every protocol failure is a gRPC status with `google.rpc.ErrorInfo { domain: "rrdb.replication.v1", reason: <Reason name> }`, including unexpected server failures (`INTERNAL` with reason `REASON_UNSPECIFIED`, `net::internal_status`); authentication failures (`UNAUTHENTICATED`, `PERMISSION_DENIED`) carry no `ErrorInfo`; malformed requests (including a Tail whose first message is not `start`, or an ack that goes backwards or past the last sent seq) are `INVALID_ARGUMENT` and the Verify stubs `UNIMPLEMENTED`.
+- Tail is `rpc Tail(stream TailClientMessage) returns (stream TailMessage)`: the client sends `start` (a `TailRequest`) and then `ack { applied_seq }` after each applied batch (coalesced through a `watch`) and at least once per heartbeat; a stream that ends with no status is transient (back off, handshake again). PROTOCOL.md §14 stays byte-identical to `proto/replication.proto` (`tests/proto_sync.rs`).
 - Tail fetch batching (PROTOCOL.md §7.5): `TailMessage` carries `EntryBatch { repeated LogEntry entries }` or `Heartbeat`; the server sends a pending batch when `min_batch_bytes = 0` and it is non-empty, when it reaches `min_batch_bytes`, when `max_wait_ms` has passed since its oldest entry became available, or when the next entry would exceed `max_batch_bytes` (a single larger entry goes alone); `max_wait_ms` ≤ `heartbeat_ms`, `max_batch_bytes` ≤ `ServeLimits::max_tail_batch_bytes` (default 4 MiB), 0 → 1 MiB. Catch-up is never slowed by `max_wait_ms`. Slaves apply each entry of a batch as its own atomic write. `SlaveConfig::fetch` defaults to `{ min_batch_bytes: 0, max_wait: 100 ms, max_batch_bytes: 1 MiB }`.
 - Decode limits: server requests 4 MiB; client Tail `max(max_entry_bytes, max_batch_bytes) + 64 KiB`; client Bootstrap `max(max_entry_bytes, 16 MiB) + 64 KiB`; `bootstrap_chunk_bytes` ≤ 16 MiB.
-- Defaults (DESIGN.md §18): heartbeat 5 s, idle timeout 3 × heartbeat, reconnect 100 ms → 30 s ×2 with full jitter (reset after 60 s of streaming), bootstrap lease TTL 15 min, 2 concurrent bootstraps, 4 verify sessions, chunk 1 MiB, 10 failed authentications per minute per address, `IdentityPolicy::Refuse`, `DivergencePolicy::Halt`, `GapPolicy::Rebootstrap`.
+- Defaults (DESIGN.md §18): heartbeat 5 s, idle timeout 3 × heartbeat, reconnect 100 ms → 30 s ×2 with full jitter (reset after 60 s of streaming), bootstrap lease TTL 15 min, 2 concurrent bootstraps, 4 verify sessions, chunk 1 MiB, 10 failed authentications per minute per address, `replica_lag_time_max` 10 s, write concern `{ min_insync_replicas: 0, ack_timeout: 5 s }`, `sync_writes` false, `IdentityPolicy::Refuse`, `DivergencePolicy::Halt`, `GapPolicy::Rebootstrap`, `RepointDivergence::Refuse`.
 - Token authentication on a plaintext listener is refused unless `allow_plaintext_token`. Tokens are compared in constant time (`subtle`) and never logged or printed.
 - Data-related halts (`IdentityChanged`, `Diverged`, `LogGap`, `Corrupt`, `SpecMismatch`) are persisted in `__meta.node_state` and survive restart; configuration halts (`ProtocolMismatch`, `EnvelopeMismatch`, `AuthRejected`, `LoopDetected`) are not.
 - TTL stays master-driven: slaves never reap and have no `__ttl_index`; promotion rebuilds it.
-- Plan 1 code conventions apply to new code: every `create_cf` is followed by `Store::retain_cf_options(opts)`; snapshot iterators are created and consumed where the `ReadSnapshot` is owned (the bootstrap job iterates inside the blocking closure that owns it); periodic background tasks (master and slave maintenance) hold `Weak<Inner>` and upgrade only for one tick; the slave driver holds `Weak<Inner>` while it waits (halted, backing off) and a strong reference only for one session, and Tail producers hold the source for one stream — sessions and streams are cancelled by the shutdown signal that `shutdown()` and `Drop` send, so dropping a node releases its database. RocksDB I/O that may fsync (halts, epoch adoption, meta writes) runs on blocking threads (`background::blocking`), never on async workers.
+- Plan 1 code conventions apply to new code: every `create_cf` is followed by `Store::retain_cf_options(opts)`; snapshot iterators are created and consumed where the `ReadSnapshot` is owned (the bootstrap job iterates inside the blocking closure that owns it); periodic background tasks (master and slave maintenance) hold `Weak<Inner>` and upgrade only for one tick; the slave driver holds `Weak<Inner>` while it waits (halted, backing off) and a strong reference only for one session, and Tail producers hold the source for one stream — sessions and streams are cancelled by the shutdown signal that `shutdown()` and `Drop` send, so dropping a node releases its database. RocksDB I/O that may fsync (halts, epoch adoption, meta writes) runs on blocking threads (`background::blocking`), never on async workers. A write waiting for acknowledgements blocks its own thread on a `Condvar` (`ReplicaRegistry::wait_until`), never an async worker and never while holding the writer lock. A repoint cancels a session only at network awaits (`driver::unless_repointed`), never in the middle of a store write.
 - Every epoch history received from upstream (handshake `EPOCH_ADVANCED`, bootstrap header) is validated: non-empty, first record `{1, 1}`, epochs strictly increasing, start seqs non-decreasing, last epoch equal to the identity's epoch; otherwise the slave halts `Corrupt`.
 - On a slave, a failed `Store::prepare` or `Store::commit` halts the slave (`SpecMismatch` for an unknown comparator, otherwise `Corrupt`); the same entry is never retried in-process.
 - The Verify RPCs exist (generated service) but return `UNIMPLEMENTED` until Plan 3.
-- Tests that matter are **real**: nodes in one process, real gRPC over `127.0.0.1` with port 0, data compared exactly with the harness `dump`, bootstraps counted with the `RecordingListener`. Failpoint tests live only in `tests/failpoints.rs`, run serially, and need `--features failpoints`.
+- Tests that matter are **real**: nodes in one process, real gRPC over `127.0.0.1` with port 0, data compared exactly with the harness `dump`, bootstraps counted with the `RecordingListener`. Failpoint tests live only in `tests/failpoints.rs`, run serially, and need `--features failpoints`. Tests never use sleep as synchronisation, and every wait is bounded (server unit tests 10 s through `test_client::{within, eventually}`; the integration harness `support::WAIT`); `repoint` calls in tests are wrapped in a bounded timeout.
+- `cargo clippy --all-targets -- -D warnings` and `cargo clippy --all-targets --features failpoints -- -D warnings` pass at the end of Task 6 and of every task from Task 8 on. (Task 7 adds slave building blocks that only Task 8 uses, so dead-code warnings are expected in between.)
 - Every commit message ends with the line `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Review Focus
 
-1. **A client that stops reading must not pin the database.** Tonic serves each connection on its own spawned task, so a Tail or Bootstrap producer blocked on a full channel would keep `Arc<dyn LogSource>` (and the RocksDB handle) alive forever and make `shutdown()` time out. Every producer send also waits on shutdown and reset. (Test `shutdown_with_unread_streams_releases_the_database` in Task 5.)
-2. **A slave pointed at its own address** must halt with `LoopDetected` (rule 3, `client_id == server_id`), not loop or deadlock. (Test `a_slave_pointed_at_itself_halts_loop_detected` in Task 9.)
-3. **Re-bootstrap while a reader holds a snapshot of a CF with the same physical name** (`u:{name}:{create_seq}` repeats when re-bootstrapping from the same origin): the snapshot keeps its old view, the new data is correct, and the live CF is never physically dropped afterwards. (Test `a_cf_held_by_a_snapshot_is_taken_over_without_disturbing_the_snapshot` in Task 6.)
-4. **Promotion while a `ReadSnapshot` is alive** keeps the DB open: promotion must fail cleanly and leave a slave directory that reopens and resumes. Refused promotions must shut the slave down (not leak tasks holding the DB). (Test `promotion_is_refused_without_data_and_needs_released_snapshots` in Task 10.)
-5. **A restarted slave whose bootstrap was interrupted** must never serve the partial data: reads answer `NotReady` until the bootstrap is redone from scratch, and the leftover physical CFs (whose comparators must be known at open) are dropped. (Test `crash_mid_bootstrap_restarts_the_bootstrap` in Task 12, store-level `crash_mid_bootstrap_reopens_and_the_next_reset_drops_leftovers` in Task 6.)
+1. **A client that stops reading must not pin the database.** Tonic serves each connection on its own spawned task, so a Tail or Bootstrap producer blocked on a full channel would keep `Arc<dyn LogSource>` (and the RocksDB handle) alive forever and make `shutdown()` time out. Every producer send also waits on shutdown and reset; after a reset the bootstrap job drops its snapshot and permit **before** delivering its final status to a client that may never read it. (Tests `shutdown_with_unread_streams_releases_the_database` in Task 5, `a_reset_releases_a_stalled_bootstraps_snapshot_and_slot` in Task 6.)
+2. **Acks are untrusted input.** An ack that goes backwards or above the last sent seq ends the stream with `INVALID_ARGUMENT`; the ack reader is its own task, so a client that never acks cannot stall the producer, and closed streams leave the registry. (Tests `ack_violations_end_the_stream_with_invalid_argument`, `the_first_tail_message_must_be_start` in Task 6.)
+3. **Write concern semantics.** `NotEnoughReplicas` consumes no seq; `AckTimeout` means *committed but not acknowledged in time*; the writer lock is never held while waiting. (Tests in `master::write_concern` and `tests/write_concern.rs`, Task 12; `a_replica_that_stops_acking_times_the_write_out`, Task 15.)
+4. **Repoint never discards data implicitly** and never cancels a store write half-way: a diverged slave stays halted with its data readable unless the caller passes `AcceptDataLoss`; a bootstrap abandoned by a repoint restarts from scratch against the new upstream. (Tests in `tests/repoint.rs`, Task 13; `repoint_during_bootstrap_restarts_it_against_the_new_upstream`, Task 15.)
+5. **A slave pointed at its own address** (or repointed at itself or its downstream) must halt with `LoopDetected` (rule 3), not loop or deadlock. (Tests `a_slave_pointed_at_itself_halts_loop_detected` in Task 10, `repoint_refuses_loops` in Task 13.)
+6. **Re-bootstrap while a reader holds a snapshot of a CF with the same physical name** (`u:{name}:{create_seq}` repeats when re-bootstrapping from the same origin): the snapshot keeps its old view, the new data is correct, and the live CF is never physically dropped afterwards. (Test `a_cf_held_by_a_snapshot_is_taken_over_without_disturbing_the_snapshot` in Task 7.)
+7. **Promotion or demotion while a `ReadSnapshot` is alive** keeps the DB open: it must fail cleanly and leave a directory that reopens. A refused plain `promote` shuts the slave down (not leak tasks holding the DB); a refused `promote_checked` or `demote` returns the node still running, and only failures after its shutdown began lose the handle. (Tests `promotion_is_refused_without_data_and_needs_released_snapshots`, `demote_is_refused_once_the_new_epoch_has_entries` in Task 11.)
+8. **A restarted slave whose bootstrap was interrupted** must never serve the partial data: reads answer `NotReady` until the bootstrap is redone from scratch, and the leftover physical CFs (whose comparators must be known at open) are dropped. (Test `crash_mid_bootstrap_restarts_the_bootstrap` in Task 15, store-level `crash_mid_bootstrap_reopens_and_the_next_reset_drops_leftovers` in Task 7.)
 
 ## Design deltas this plan introduces
 
 Each owning task updates DESIGN.md or PROTOCOL.md with the exact text given there.
 
 - **`MasterConfig.serve: Option<ServeConfig>`** (Task 5, amends DESIGN.md §16): `None` is an embedded, non-replicating master. `Master::serve_addr()` and `Slave::serve_addr()` return the bound address (tests bind port 0).
-- **`__meta.node_state` is text** `ready` | `bootstrapping` | `halted:<Reason>`, and **`__meta.bootstrap_cfs`** lists physical CFs created by an unfinished bootstrap so the next open knows their comparators (Task 6, DESIGN.md §3.2, §10, §16.3).
+- **`__meta.node_state` is text** `ready` | `bootstrapping` | `halted:<Reason>`, and **`__meta.bootstrap_cfs`** lists physical CFs created by an unfinished bootstrap so the next open knows their comparators (Task 7, DESIGN.md §3.2, §10, §16.3).
 - **A server treats its own `last_entry_crc` as the CRC of its entry `last_seq`** even when its log no longer holds that entry (right after a bootstrap, or after retention emptied the log), for handshake rules 9 and 12 and Tail's `prev_crc32c` check (Task 2, PROTOCOL.md §6.3 notes).
-- **`LogSource`** is the trait from the design notes (Task 2, replaces the sketch in DESIGN.md §11).
+- **`LogSource`** is the trait from the design notes (Task 2, replaces the sketch in DESIGN.md §11); Task 6 adds `node_state()` and `upstream()` with defaults for the `Status` RPC.
 - **Bootstrap decode limit** is `max(max_entry_bytes, 16 MiB) + 64 KiB` and servers keep `bootstrap_chunk_bytes` ≤ 16 MiB, because a client cannot know the server's chunk size (Task 4, PROTOCOL.md §11.4 and §12).
-- **Auth additions** (Task 4, DESIGN.md §14): `AllowMethods` (per-method restriction around any authenticator), `NoCredentials`, `ServeLimits::max_auth_failures_per_minute`; the mTLS peer id is the client certificate's subject CommonName.
-- **Slave config and status additions** (Task 6, DESIGN.md §16): `SlaveConfig::{heartbeat, connect_timeout, clock}`, `SlaveStatus::listener_failed`. `VerifyConfig`, `lag_ms`, `last_verify` and `replicas()` come with Plan 3.
+- **Auth additions** (Task 4, DESIGN.md §14): `AllowMethods` (per-method restriction around any authenticator), `NoCredentials`, `ServeLimits::max_auth_failures_per_minute`; the mTLS peer id is the client certificate's subject CommonName. Task 6 adds `Method::Status` (in `allow_all_methods`).
+- **Slave config and status additions** (Task 7, DESIGN.md §16): `SlaveConfig::{heartbeat, connect_timeout, clock, sync_writes}`, `SlaveStatus::listener_failed`. `VerifyConfig`, `lag_ms` and `last_verify` come with Plan 3.
 - **Bootstrap lease hand-over** (Task 5, PROTOCOL.md §7.2): the Tail that presents the lease takes it over and releases it once it has read the entries after the snapshot (or when it ends), instead of releasing it the moment the stream is established — otherwise `max_entries = 1` retention can trim `S + 1` before the producer's first read.
-- **Listener ordering** (Task 7, DESIGN.md §15): seqs are strictly increasing *between bootstraps*; after `on_bootstrap_complete(S)` delivery continues at `S + 1`. The listener is called before the new seq is published to `wait_for_seq`/`subscribe`, so whoever waits for a seq also sees the listener's effects.
-- **Refused promotion shuts the slave down** (Task 10, DESIGN.md §13.1): `promote(self)` consumes the slave, so on refusal it is shut down cleanly and its directory is unchanged. An outstanding `ReadSnapshot` is detected after shutdown (it still holds the shared `DbCore`) and reported as `Error::Config` naming the snapshot.
-- **Rulings from the Plan 1 final review:** upstream epoch histories are validated (Global Constraints); a failed commit on a slave halts it `Corrupt` instead of retrying; a `failpoints`-gated test covers the master's `bump_epoch` fence (point `master-bump-epoch-write`, Task 12).
-- **Test-only `Slave::kill`** behind feature `failpoints` (Task 12, DESIGN.md §16). The feature enables `fail/failpoints` as well (the design notes listed only `dep:fail`, but `fail` compiles every point to a no-op without its own feature). `futures-util` from the design notes is not added: nothing needs it.
-- **Pre-flight rulings:** shared helpers instead of duplicated blocks (`server::{start_for, end_stream}`, `background::{every, run_logged, blocking}`, `Store::delete_all_keys`); bootstrap jobs drop their snapshot before returning their permit and `ServerHandle::shutdown` waits (≤ 5 s) for all permits; the stream-ending send also gives up on reset; tests never use sleep as synchronisation and bound every wait (10 s); Plan 1 placeholder `allow`s are removed as their items get used, and the items Plan 2 does not use are deleted (Task 12). The server-test helpers (`test_client::{eventually, within, T0}`) duplicate the integration harness on purpose: unit tests cannot use `tests/support`.
+- **Bidirectional Tail with acks, replica status, `Status` RPC** (Task 6, addendum §1 and §4; PROTOCOL.md §2, §3.3, §6.5, §7, §7.1, §7.3, §7.6, §10, §11.2, §11.4, §12, §14; DESIGN.md §11, §14, §16, §17, §18, §19). Decisions: `ReplicaStatus::lag_ms` is `Option<u64>` — `None` when the first unacknowledged entry is no longer retained on the serving node, so no timestamp is known; `in_sync` also requires the replica to follow the node's current identity; `ServeLimits::replica_lag_time_max` (default 10 s) lives with the other server limits; the replica registry is owned by the node (`Inner.replicas`) and handed to `server::start`, so a node can report and wait on it; `Status.role` is the text `"master"`/`"slave"`, `node_state` is `__meta`'s text form, and `upstream` is empty on the master.
+- **Clean end of a Tail stream is transient** (Task 6, PROTOCOL.md §7.3, §11.2, §11.4): a stream that ends with no status is treated like a lost connection.
+- **Bootstrap jobs release their snapshot and slot before their final status** (Task 6 fix of Task 5's `server::bootstrap`): after a reset the job used to wait in `end_stream` for a stalled client while still holding its `ReadSnapshot` and permit.
+- **Listener ordering** (Task 8, DESIGN.md §15): seqs are strictly increasing *between bootstraps*; after `on_bootstrap_complete(S)` delivery continues at `S + 1`. The listener is called before the new seq is published to `wait_for_seq`/`subscribe`, so whoever waits for a seq also sees the listener's effects.
+- **Refused promotion shuts the slave down** (Task 11, DESIGN.md §13.1): `promote(self)` consumes the slave, so on refusal it is shut down cleanly and its directory is unchanged. An outstanding `ReadSnapshot` is detected after shutdown (it still holds the shared `DbCore`) and reported as `Error::Config` naming the snapshot. **Controller ruling (refuse by default, explicit API):** `promote_checked` and `Master::demote` do not shut down on refusal — they return `Err(PromoteRefused { error, slave: Option<Box<Slave>> })` / `Err(DemoteRefused { error, master: Option<Box<Master>> })` (`Debug`, `Display`, `std::error::Error`, `into_slave()` / `into_master()`) carrying the untouched running node; the handle is `None` only for a failure after the node started shutting down for the change (I/O error during shutdown, an open `ReadSnapshot`, a failure rewriting `__meta` or opening the new role), documented in their rustdoc. The handle is an `Option` because those late failures have no node to return, and boxed for clippy's `result_large_err`. The non-consuming `Slave::check_promotion` and `Master::can_demote` remain as pre-checks.
+- **Promotion tooling** (Task 11, addendum §4, DESIGN.md §13.1, §16, §20, §22): `admin::{NodeInfo, ReplicaSummary, compare, Comparison, Side, choose_promotion_candidate, Choice, node_status}`, `Slave::{promotion_info, check_promotion, promote_checked}`, `PromotionCheck`, `Master::{can_demote, demote}`, `Error::NotMostAdvanced`. Decisions: `compare` treats a node without data as behind every node with data; `Choice::diverged` is `Vec<(node_id, fork_seq)>`, `foreign` is node ids; unreachable peers do not block `promote_checked` (they are logged and listed in `PromotionCheck`).
+- **Write concern** (Task 12, addendum §2, DESIGN.md §1, §5.2, §16, §16.2, §18, §21, §22): `WriteConcern { min_insync_replicas, ack_timeout }` (`MasterConfig::write_concern`, `Master::{write_with, put_with}`), `Error::{NotEnoughReplicas, AckTimeout}`.
+- **Repoint** (Task 13, addendum §3, DESIGN.md §13, §13.1 including the failover runbook, §16, §16.2, §16.3, §22; PROTOCOL.md §6.4): `Slave::repoint`, `RepointOptions { on_divergence }`, `RepointDivergence`, `AcceptDataLoss`, `RepointOutcome`, `Error::{Diverged, Unsupported}`. Decisions: `RepointOutcome` adds `Retrying { last_error }` for a new upstream that cannot be used yet (unreachable, `STALE_EPOCH`, `NOT_READY`) — `repoint` returns at once and the slave keeps retrying it; `Repaired { discarded }` exists for Plan 3 and is never returned here; `Repair` returns `Error::Unsupported` and leaves the slave halted `Diverged`; `repoint` clears any halt first, and a loop halts `LoopDetected` (`Err(Halted(LoopDetected))`) until the next repoint; `RepointOptions` has no timeout — callers bound the wait with `tokio::time::timeout`, which does not undo the repoint; `fork_seq` for a same-epoch CRC mismatch is the mismatching (last) seq, since the true fork point needs Plan 3's repair.
+- **Rulings from the Plan 1 final review:** upstream epoch histories are validated (Global Constraints); a failed commit on a slave halts it `Corrupt` instead of retrying; a `failpoints`-gated test covers the master's `bump_epoch` fence (point `master-bump-epoch-write`, Task 15).
+- **Test-only `Slave::kill`** behind feature `failpoints` (Task 15, DESIGN.md §16). The feature enables `fail/failpoints` as well (the design notes listed only `dep:fail`, but `fail` compiles every point to a no-op without its own feature). `futures-util` from the design notes is not added: nothing needs it.
+- **Pre-flight rulings:** shared helpers instead of duplicated blocks (`server::{start_for, end_stream}`, `background::{every, run_logged, blocking}`, `Store::delete_all_keys`); bootstrap jobs drop their snapshot before returning their permit and `ServerHandle::shutdown` waits (≤ 5 s) for all permits; the stream-ending send also gives up on reset; tests never use sleep as synchronisation and bound every wait (10 s); Plan 1 placeholder `allow`s are removed as their items get used, and the items Plan 2 does not use are deleted (Task 15). The server-test helpers (`test_client::{eventually, within, T0}`) duplicate the integration harness on purpose: unit tests cannot use `tests/support`.
 
 ## File Structure
 
 ```
-Cargo.toml                    + tonic, tonic-prost, tonic-types, tokio-stream, subtle, async-trait, fail; rcgen (Task 1); [[test]] failpoints (Task 12)
+Cargo.toml                    + tonic, tonic-prost, tonic-types, tokio-stream, subtle, async-trait, fail; rcgen (Task 1); [[test]] failpoints (Task 15)
 build.rs                      server + client codegen (Task 1)
-src/lib.rs                    module tree and re-exports (Tasks 1, 2, 3, 4, 5, 6, 7)
+proto/replication.proto       bidirectional Tail (TailClientMessage, TailAck), Status RPC (Task 6)
+src/lib.rs                    module tree and re-exports (Tasks 1–7, 11, 12, 13)
 src/net/mod.rs                metadata keys, Reason <-> status with ErrorInfo, internal_status, decode limits (Task 1)
 src/net/convert.rs            DbIdentity / CfEntry / EpochStart / LogEntry <-> pb, checked_history (Task 1)
 src/store/meta.rs             + node_state, max_entry_bytes, bootstrap_cfs keys and fields (Task 2)
-src/store/mod.rs              + bootstrap_cfs in the known set at open; new modules (Tasks 2, 6, 10); drop unused Store::role (Task 12)
+src/store/mod.rs              + bootstrap_cfs in the known set at open; new modules (Tasks 2, 7, 11); drop unused Store::role (Task 15)
 src/store/repl.rs             entry_crc, read_entries, ReadSnapshot::{meta, phys, raw_ctx}, ReadCtx::iter_raw (Task 2)
-src/source.rs                 LogSource trait (Task 2)
-src/server/mod.rs             module list (Task 3); replaced by the full server (Task 5)
+src/source.rs                 LogSource trait (Task 2); node_state, upstream (Task 6)
+src/server/mod.rs             module list (Task 3); full server (Task 5); replica registry, bidi Tail, Status (Task 6)
 src/server/handshake.rs       pure decision table, one test per rule (Task 3)
-src/types.rs                  drop the stale allow on fork_after (Task 3) and epoch_for (Task 7)
-src/auth.rs                   Method, PeerInfo, Authenticator, tokens, mTLS allow-list, AllowMethods, limiter, CN parser (Task 4)
-src/config.rs                 + TLS configs, ServeLimits, ServeConfig (Task 4); MasterConfig.serve (Task 5)
-src/failpoint.rs              `fire(name)`: fail::eval behind feature `failpoints` (Task 5); `io_error(name)` (Task 12)
-src/server/tail.rs            Tail validation, fetch batching (§7.5) and producer (Task 5)
-src/server/bootstrap.rs       Bootstrap producer, digest, lease hand-over (Task 5)
-src/server/test_client.rs     bare protocol client and bounded-wait helpers for server unit tests (Task 5)
-src/server/tests.rs           server unit tests against a real master (Task 5)
+src/types.rs                  drop the stale allow on fork_after (Task 3) and epoch_for (Task 8)
+src/auth.rs                   Method, PeerInfo, Authenticator, tokens, mTLS allow-list, AllowMethods, limiter, CN parser (Task 4); Method::Status (Task 6)
+src/config.rs                 + TLS configs, ServeLimits, ServeConfig (Task 4); MasterConfig.serve (Task 5); replica_lag_time_max (Task 6); WriteConcern (Task 12)
+src/failpoint.rs              `fire(name)`: fail::eval behind feature `failpoints` (Task 5); `io_error(name)` (Task 15)
+src/server/tail.rs            Tail validation, fetch batching (§7.5) and producer (Task 5); start/ack messages, ack reader (Task 6)
+src/server/bootstrap.rs       Bootstrap producer, digest, lease hand-over (Task 5); release before the final status (Task 6)
+src/server/replicas.rs        replica registry: per-stream sent/acked seqs, in-sync, ReplicaStatus (Task 6; acks/wait_until used from Task 12)
+src/server/status.rs          the Status RPC's report (Task 6)
+src/server/test_client.rs     bare protocol client and bounded-wait helpers for server unit tests (Task 5); TailExt (Task 6)
+src/server/tests.rs           server unit tests against a real master (Tasks 5, 6)
 src/store/retention.rs        drop the stale allows on GuardSet, RetentionGuard, guard (Task 5)
 src/master/source.rs          LogSource for the master; slow-reader test (Task 5)
-src/master/writer.rs          + reset_tx, identity_and_history (Task 5); failpoint in bump_epoch (Task 12)
-src/master/mod.rs             + server start (start_for), serve_addr, shutdown waits for the DB (Task 5)
-src/error.rs                  + Error::Halted (Task 6)
-src/listener.rs               ReplicationListener (Task 6)
-src/store/bootstrap.rs        reset_for_bootstrap, begin_bootstrap_cf, write_bootstrap_records, finish_bootstrap, adopt_identity, delete_all_keys (Task 6)
-src/slave/mod.rs              module list (Task 6); Slave API, ReadApi, LogApi (Task 7); clear_halt (Task 8); serving (Task 9); promote module (Task 10); kill (Task 12)
-src/slave/config.rs           SlaveConfig, UpstreamConfig, FetchConfig, policies, Backoff (Task 6)
-src/slave/state.rs            HaltReason, SlaveState, HaltAction, NodeState, SlaveStatus (Task 6)
-src/slave/policy.rs           pure handshake/status → action table (Task 6)
-src/background.rs             every, run_logged, blocking: helpers for background and blocking work (Task 7)
-src/master/maintenance.rs     uses the background helpers (Task 7)
-src/slave/inner.rs            shared slave state (Task 7)
-src/slave/client.rs           upstream channel + metadata interceptor (Task 7)
-src/slave/driver.rs           connect → handshake → act loop, tail (Task 7)
-src/slave/apply.rs            per-entry checks and apply (Task 7)
-src/slave/bootstrap.rs        bootstrap install (Task 7)
-src/slave/maintenance.rs      retention and CF drops on slaves (Task 7)
-src/slave/source.rs           LogSource for slaves (Task 9)
-src/store/promote.rs          rebuild_ttl_index, promote_to_master (Task 10)
-src/slave/promote.rs          Slave::promote (Task 10)
-src/store/cfs.rs              drop unused pending_entries, push_pending (Task 12)
-src/codec/mod.rs              drop the unused decode_ops re-export (Task 12)
-tests/support/mod.rs          Cluster harness, dump, edge cases, RecordingListener (Task 7; serving in Task 9)
-tests/replication.rs          core replication (Task 7)
-tests/rebootstrap.rs          policies, re-bootstrap, restore, epoch bump (Task 8)
-tests/chain.rs                chains, loops, reset propagation (Task 9)
-tests/promotion.rs            promotion (Task 10)
-tests/security.rs             TLS, mTLS, tokens (Task 11)
-tests/failure_resume.rs       restarts, downstream ahead, persisted LogGap (Task 12)
-tests/failpoints.rs           fault injection, serial, --features failpoints (Task 12)
+src/master/writer.rs          + reset_tx, identity_and_history (Task 5); replicas (Task 6); failpoint in bump_epoch (Task 15)
+src/master/mod.rs             + server start (start_for), serve_addr, shutdown waits for the DB (Task 5); replicas (Task 6); can_demote, demote (Task 11); write_with, put_with (Task 12)
+src/master/write_concern.rs   commit_with: in-sync check, commit, wait for acks (Task 12)
+src/admin.rs                  NodeInfo (Task 6); compare, choose_promotion_candidate, node_status (Task 11)
+src/error.rs                  + Halted (Task 7); NotMostAdvanced (Task 11); NotEnoughReplicas, AckTimeout (Task 12); Diverged, Unsupported (Task 13)
+src/listener.rs               ReplicationListener (Task 7)
+src/store/bootstrap.rs        reset_for_bootstrap, begin_bootstrap_cf, write_bootstrap_records, finish_bootstrap, adopt_identity, delete_all_keys (Task 7)
+src/slave/mod.rs              module list (Task 7); Slave API, ReadApi, LogApi (Task 8); clear_halt (Task 9); serving, replicas (Task 10); promote module (Task 11); repoint module (Task 13); kill (Task 15)
+src/slave/config.rs           SlaveConfig, UpstreamConfig, FetchConfig, policies, Backoff, sync_writes (Task 7)
+src/slave/state.rs            HaltReason, SlaveState, HaltAction, NodeState, SlaveStatus (Task 7)
+src/slave/policy.rs           pure handshake/status → action table (Task 7)
+src/background.rs             every, run_logged, blocking: helpers for background and blocking work (Task 8)
+src/master/maintenance.rs     uses the background helpers (Task 8)
+src/slave/inner.rs            shared slave state (Task 8); replicas, upstream_uri (Task 10); current upstream, repoint state (Task 13)
+src/slave/client.rs           upstream channel + metadata interceptor (Task 8); connect_upstream used by admin (Task 11); connect to the current upstream (Task 13)
+src/slave/driver.rs           connect → handshake → act loop, tail with acks (Task 8); repoint cancellation and outcomes (Task 13)
+src/slave/apply.rs            per-entry checks and apply (Task 8)
+src/slave/bootstrap.rs        bootstrap install (Task 8); cancellable by a repoint (Task 13)
+src/slave/maintenance.rs      retention and CF drops on slaves (Task 8)
+src/slave/source.rs           LogSource for slaves (Task 10)
+src/store/promote.rs          rebuild_ttl_index, promote_to_master, demote_to_slave (Task 11)
+src/slave/promote.rs          promote, promotion_info, check_promotion, promote_checked (Task 11)
+src/slave/repoint.rs          repoint, RepointOptions, RepointOutcome, AcceptDataLoss (Task 13)
+src/store/cfs.rs              drop unused pending_entries, push_pending (Task 15)
+src/codec/mod.rs              drop the unused decode_ops re-export (Task 15)
+tests/support/mod.rs          Cluster harness, dump, edge cases, RecordingListener (Task 8; serving in Task 10)
+tests/replication.rs          core replication, acks, sync_writes (Task 8)
+tests/rebootstrap.rs          policies, re-bootstrap, restore, epoch bump (Task 9)
+tests/chain.rs                chains, loops, reset propagation, replicas per hop (Task 10)
+tests/promotion.rs            promotion, Status, promote_checked, demote (Task 11)
+tests/write_concern.rs        write concern end to end (Task 12)
+tests/repoint.rs              repoint, failover runbook (Task 13)
+tests/security.rs             TLS, mTLS, tokens (Task 14)
+tests/failure_resume.rs       restarts, downstream ahead, persisted LogGap (Task 15)
+tests/failpoints.rs           fault injection, serial, --features failpoints (Task 15)
 ```
 
 ---
+
+> **Split note:** this plan is stored in two files because of the repository 500 KiB file limit. Tasks 1–8 are here; Tasks 9–15 are in [2026-10-09-plan2b-replication.md](2026-10-09-plan2b-replication.md). Header, Global Constraints, Review Focus and File Structure apply to both parts.
 
 ### Task 1: Dependencies, gRPC codegen and wire helpers
 
@@ -3908,21 +3932,3232 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
-### Task 6: Slave foundations — configuration, states, policy table, listener, bootstrap store helpers
+
+### Task 6: Bidirectional Tail with acknowledgements, replica status and the `Status` RPC
 
 **Files:**
-- Create: `src/slave/config.rs`, `src/slave/state.rs`, `src/slave/policy.rs`, `src/listener.rs`, `src/store/bootstrap.rs`, `src/slave/mod.rs` (module list only, replaced in Task 7)
-- Modify: `src/error.rs`, `src/store/mod.rs`, `src/lib.rs`, `DESIGN.md` (§3.2, §10, §16, §16.3)
+- Create: `src/server/replicas.rs`, `src/server/status.rs`, `src/admin.rs`
+- Modify: `proto/replication.proto` (replace), `src/server/mod.rs` (replace), `src/server/tail.rs` (replace), `src/server/bootstrap.rs` (replace), `src/server/test_client.rs` (replace), `src/server/tests.rs` (replace), `src/source.rs` (replace), `src/master/source.rs` (tests), `src/auth.rs` (`Method::Status`), `src/config.rs` (`replica_lag_time_max`), `src/master/writer.rs`, `src/master/mod.rs`, `src/lib.rs`, `PROTOCOL.md` (§2, §3.3, §6.5, §7, §7.1, §7.3, §7.6, §10, §11.2, §11.4, §12, §14), `DESIGN.md` (§11, §14, §16, §17, §18, §19)
+
+Tasks 1–5 are implemented (commit `7bdd8fc`); their code under `src/` is the source of truth. The files this task replaces are given whole; they keep every Task 5 behaviour (validation, fetch batching, leases, shutdown and reset handling) and add the acks.
+
+**Interfaces:**
+- Consumes: Task 5 `ServerState`, `Svc`, `call_info`, `CallInfo::check_client_id`, `ServerState::{authorize, expire_leases, take_lease}`, `server::{start, start_for, end_stream, await_sole_owner, stopped}`, `tail::{validate, Fetch, Pending, framed_len, produce}`, `bootstrap::Job`, `test_client::{client, serving_master, tail_req, next_batch, stream_error, within, eventually}`; Task 2 `LogSource`, `Store::{position, read_entries}`; Task 4 `Method`, `PeerInfo`, `ServeLimits`; Plan 1 `master::writer::Inner`, `Master`.
+- Produces:
+  - Wire: `rpc Tail(stream TailClientMessage) returns (stream TailMessage)`, `TailClientMessage { oneof kind { TailRequest start = 1; TailAck ack = 2; } }`, `TailAck { applied_seq }`; `rpc Status(StatusRequest) returns (StatusResponse)` with `StatusRequest { client_id }`, `ReplicaSummary { node_id, applied_seq, in_sync }`, `StatusResponse { node_id, role, identity, epoch_history, last_seq, last_entry_crc, last_ts_ms, node_state, upstream, replicas }`.
+  - `pub struct FetchSettings { min_batch_bytes: u64, max_wait: Duration, max_batch_bytes: u64 }`, `pub struct ReplicaStatus { node_id, remote_addr, peer_verified, epoch, connected_since, sent_seq, applied_seq, lag_entries, lag_ms: Option<u64>, in_sync, fetch }` (both re-exported from the crate root).
+  - `server::replicas::{ReplicaRegistry (Default) { open(self: &Arc<Self>, NewReplica) -> ReplicaHandle, acks(&self, epoch, lag_max) -> Vec<(Seq, bool)>, wait_until(&self, timeout, impl FnMut(&Self) -> bool) -> bool, summary(&self, epoch, lag_max) -> Vec<(String, Seq, bool)>, status(&self, &dyn LogSource, now_ms, lag_max) -> Vec<ReplicaStatus> }, NewReplica { node_id, remote_addr, peer_verified, epoch, has_up_to, fetch }, ReplicaHandle::cell(&self) -> &Arc<ReplicaCell> (removes the stream on drop), ReplicaCell::{note_sent(seq), ack(applied_seq, node_last_seq) -> Result<(), String>}}`. `acks` and `wait_until` are first used by Task 12.
+  - `server::start(Weak<dyn LogSource>, ServeConfig, Arc<ReplicaRegistry>)`, `server::start_for(&Arc<S>, Option<ServeConfig>, Arc<ReplicaRegistry>)`, `ServerState.replicas`, `ServerHandle::replica_lag_time_max(&self) -> Duration`.
+  - `server::status::{node_info(&dyn LogSource, &ReplicaRegistry, lag_max) -> NodeInfo, to_pb(&NodeInfo) -> pb::StatusResponse}`; `pub mod admin` with `NodeInfo { node_id, role, identity, epoch_history, last_seq, last_entry_crc, last_ts_ms, node_state, upstream, replicas }` and `ReplicaSummary { node_id, applied_seq, in_sync }`.
+  - `LogSource::{node_state(&self) -> String (default "ready"), upstream(&self) -> Option<String> (default None)}`; `Method::Status` (included in `MtlsSubjectAllowList::allow_all_methods`); `ServeLimits::replica_lag_time_max: Duration` (default 10 s, must be positive).
+  - `master::writer::Inner.replicas: Arc<ReplicaRegistry>`; `Master::replicas(&self) -> Vec<ReplicaStatus>` (empty without `serve`).
+  - Test helpers: `test_client::{TailExt::{tail_start, tail_with_acks}, ack(seq) -> pb::TailClientMessage}`.
+
+- [ ] **Step 1: Write the replica registry's failing tests**
+
+Create `src/server/replicas.rs` with only its test module:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry() -> Arc<ReplicaRegistry> {
+        Arc::new(ReplicaRegistry::default())
+    }
+
+    fn new(has_up_to: Seq) -> NewReplica {
+        NewReplica {
+            node_id: "b".into(),
+            remote_addr: "127.0.0.1:1".parse().unwrap(),
+            peer_verified: false,
+            epoch: 1,
+            has_up_to,
+            fetch: FetchSettings { min_batch_bytes: 0, max_wait: Duration::ZERO, max_batch_bytes: 1 << 20 },
+        }
+    }
+
+    #[test]
+    fn acks_must_be_monotonic_and_not_above_what_was_sent() {
+        let reg = registry();
+        let h = reg.open(new(5));
+        h.cell().ack(5, 9).unwrap();
+        assert!(h.cell().ack(6, 9).unwrap_err().contains("above the last sent"));
+        h.cell().note_sent(9);
+        h.cell().ack(7, 9).unwrap();
+        assert!(h.cell().ack(6, 9).unwrap_err().contains("below the previous"));
+        assert_eq!(reg.acks(1, Duration::from_secs(10)), vec![(7, false)], "not caught up yet");
+        h.cell().ack(9, 9).unwrap();
+        assert_eq!(reg.acks(1, Duration::from_secs(10)), vec![(9, true)]);
+        assert_eq!(reg.acks(2, Duration::from_secs(10)), vec![(9, false)], "other epoch: not in sync");
+        drop(h);
+        assert!(reg.acks(1, Duration::from_secs(10)).is_empty(), "closed streams leave the registry");
+    }
+
+    #[test]
+    fn in_sync_expires_after_lag_time_max() {
+        let reg = registry();
+        let h = reg.open(new(3));
+        h.cell().ack(3, 3).unwrap();
+        assert_eq!(reg.acks(1, Duration::from_millis(50)), vec![(3, true)]);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(reg.acks(1, Duration::from_millis(50)), vec![(3, false)]);
+    }
+
+    #[test]
+    fn wait_until_wakes_on_acks_and_times_out() {
+        let reg = registry();
+        let h = reg.open(new(0));
+        h.cell().note_sent(4);
+        let cell = h.cell().clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            cell.ack(4, 4).unwrap();
+        });
+        assert!(reg.wait_until(Duration::from_secs(5), |r| r.acks(1, Duration::from_secs(10)).iter().any(|a| a.0 >= 4)));
+        t.join().unwrap();
+        let t0 = Instant::now();
+        assert!(!reg.wait_until(Duration::from_millis(50), |r| r.acks(1, Duration::from_secs(10)).iter().any(|a| a.0 >= 5)));
+        assert!(t0.elapsed() >= Duration::from_millis(50));
+    }
+}
+```
+
+Add to the module list in `src/server/mod.rs`:
+
+```rust
+pub(crate) mod replicas;
+```
+
+Run: `cargo test --lib server::replicas`
+Expected: FAIL to compile: `cannot find type ReplicaRegistry in this scope`, `cannot find struct NewReplica`, `cannot find struct FetchSettings`.
+
+- [ ] **Step 2: Implement the registry** (above the test module in `src/server/replicas.rs`)
+
+```rust
+//! Per-stream state of the replicas a node serves (addendum §1): what was sent, what the
+//! replica acknowledged, and whether it is in sync.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
+
+use crate::source::LogSource;
+use crate::types::Seq;
+
+/// The fetch settings of one Tail stream, after the server clamped them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FetchSettings {
+    pub min_batch_bytes: u64,
+    pub max_wait: Duration,
+    pub max_batch_bytes: u64,
+}
+
+/// A direct downstream replica, as its upstream sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaStatus {
+    /// The replica's `x-rrdb-node-id` (or certificate CommonName under mutual TLS).
+    pub node_id: String,
+    pub remote_addr: SocketAddr,
+    /// True when `node_id` comes from a verified client certificate.
+    pub peer_verified: bool,
+    /// The epoch of the identity the replica follows.
+    pub epoch: u64,
+    pub connected_since: SystemTime,
+    /// The last seq sent to the replica.
+    pub sent_seq: Seq,
+    /// The last seq the replica acknowledged as committed.
+    pub applied_seq: Seq,
+    /// This node's `last_seq` minus `applied_seq`.
+    pub lag_entries: u64,
+    /// Now minus `ts_ms` of the first unacknowledged entry; 0 when caught up, `None` when that
+    /// entry is no longer retained here.
+    pub lag_ms: Option<u64>,
+    /// Follows this node's current identity and was fully caught up within
+    /// `ServeLimits::replica_lag_time_max`.
+    pub in_sync: bool,
+    pub fetch: FetchSettings,
+}
+
+#[derive(Debug)]
+struct Progress {
+    sent_seq: Seq,
+    applied_seq: Seq,
+    /// The last time `applied_seq` reached this node's `last_seq`.
+    caught_up_at: Option<Instant>,
+}
+
+/// One open Tail stream.
+#[derive(Debug)]
+pub(crate) struct ReplicaCell {
+    node_id: String,
+    remote_addr: SocketAddr,
+    peer_verified: bool,
+    epoch: u64,
+    connected_since: SystemTime,
+    fetch: FetchSettings,
+    progress: Mutex<Progress>,
+    registry: Arc<ReplicaRegistry>,
+}
+
+impl ReplicaCell {
+    fn progress(&self) -> std::sync::MutexGuard<'_, Progress> {
+        self.progress.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records that entries up to `seq` were handed to the stream.
+    pub(crate) fn note_sent(&self, seq: Seq) {
+        let mut p = self.progress();
+        p.sent_seq = p.sent_seq.max(seq);
+    }
+
+    /// Records an ack. `node_last_seq` is this node's `last_seq` right now. An ack that goes
+    /// backwards or above the last sent seq is a protocol violation.
+    pub(crate) fn ack(&self, applied_seq: Seq, node_last_seq: Seq) -> Result<(), String> {
+        {
+            let mut p = self.progress();
+            if applied_seq < p.applied_seq {
+                return Err(format!("ack {applied_seq} is below the previous ack {}", p.applied_seq));
+            }
+            if applied_seq > p.sent_seq {
+                return Err(format!("ack {applied_seq} is above the last sent seq {}", p.sent_seq));
+            }
+            p.applied_seq = applied_seq;
+            if applied_seq >= node_last_seq {
+                p.caught_up_at = Some(Instant::now());
+            }
+        }
+        self.registry.notify();
+        Ok(())
+    }
+}
+
+/// Removes its stream from the registry when dropped (the Tail producer owns it).
+pub(crate) struct ReplicaHandle {
+    id: u64,
+    cell: Arc<ReplicaCell>,
+}
+
+impl ReplicaHandle {
+    pub(crate) fn cell(&self) -> &Arc<ReplicaCell> {
+        &self.cell
+    }
+}
+
+impl Drop for ReplicaHandle {
+    fn drop(&mut self) {
+        let reg = &self.cell.registry;
+        reg.streams().remove(&self.id);
+        reg.notify();
+    }
+}
+
+/// The replicas of one node. Shared by its server and (on the master) its writer.
+#[derive(Debug, Default)]
+pub(crate) struct ReplicaRegistry {
+    next_id: AtomicU64,
+    streams: Mutex<HashMap<u64, Arc<ReplicaCell>>>,
+    /// Bumped on every ack and every stream change; writers waiting for acks wait on it.
+    changes: Mutex<u64>,
+    changed: Condvar,
+}
+
+/// What a new stream registers.
+pub(crate) struct NewReplica {
+    pub node_id: String,
+    pub remote_addr: SocketAddr,
+    pub peer_verified: bool,
+    pub epoch: u64,
+    /// `from_seq - 1`: the replica already has everything up to here.
+    pub has_up_to: Seq,
+    pub fetch: FetchSettings,
+}
+
+impl ReplicaRegistry {
+    fn streams(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<ReplicaCell>>> {
+        self.streams.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn notify(&self) {
+        *self.changes.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn open(self: &Arc<Self>, r: NewReplica) -> ReplicaHandle {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let cell = Arc::new(ReplicaCell {
+            node_id: r.node_id,
+            remote_addr: r.remote_addr,
+            peer_verified: r.peer_verified,
+            epoch: r.epoch,
+            connected_since: SystemTime::now(),
+            fetch: r.fetch,
+            progress: Mutex::new(Progress { sent_seq: r.has_up_to, applied_seq: r.has_up_to, caught_up_at: None }),
+            registry: self.clone(),
+        });
+        self.streams().insert(id, cell.clone());
+        self.notify();
+        ReplicaHandle { id, cell }
+    }
+
+    /// `(applied_seq, in_sync)` of every open stream, for the given current epoch.
+    #[cfg_attr(not(test), allow(dead_code))] // used by the write concern (later Plan 2 task)
+    pub(crate) fn acks(&self, epoch: u64, lag_max: Duration) -> Vec<(Seq, bool)> {
+        self.streams()
+            .values()
+            .map(|c| {
+                let p = c.progress();
+                let in_sync = c.epoch == epoch && p.caught_up_at.is_some_and(|t| t.elapsed() <= lag_max);
+                (p.applied_seq, in_sync)
+            })
+            .collect()
+    }
+
+    /// Blocks until `done` holds for the current acks, or `timeout` passes. Returns whether
+    /// `done` held. For synchronous writers; never call it on an async worker thread.
+    #[cfg_attr(not(test), allow(dead_code))] // used by the write concern (later Plan 2 task)
+    pub(crate) fn wait_until(&self, timeout: Duration, mut done: impl FnMut(&Self) -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            // `done` takes the stream locks; never hold `changes` while calling it.
+            let seen = *changes;
+            drop(changes);
+            if done(self) {
+                return true;
+            }
+            changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
+            if *changes != seen {
+                continue;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            changes = self.changed.wait_timeout(changes, deadline - now).unwrap_or_else(PoisonError::into_inner).0;
+        }
+    }
+
+    /// `(node_id, applied_seq, in_sync)` of every open stream, for `Status`.
+    pub(crate) fn summary(&self, epoch: u64, lag_max: Duration) -> Vec<(String, Seq, bool)> {
+        let mut out: Vec<_> = self
+            .streams()
+            .values()
+            .map(|c| {
+                let p = c.progress();
+                (c.node_id.clone(), p.applied_seq, c.epoch == epoch && p.caught_up_at.is_some_and(|t| t.elapsed() <= lag_max))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The status of every open stream.
+    pub(crate) fn status(&self, src: &dyn LogSource, now_ms: u64, lag_max: Duration) -> Vec<ReplicaStatus> {
+        let epoch = src.identity().map_or(0, |(id, _)| id.epoch);
+        let last = src.store().position().last_seq;
+        let mut out: Vec<ReplicaStatus> = self
+            .streams()
+            .values()
+            .map(|c| {
+                let p = c.progress();
+                let lag_entries = last.saturating_sub(p.applied_seq);
+                let lag_ms = if lag_entries == 0 {
+                    Some(0)
+                } else {
+                    src.store()
+                        .read_entries(p.applied_seq + 1, 1, usize::MAX)
+                        .ok()
+                        .and_then(|v| v.first().map(|e| now_ms.saturating_sub(e.ts_ms)))
+                };
+                ReplicaStatus {
+                    node_id: c.node_id.clone(),
+                    remote_addr: c.remote_addr,
+                    peer_verified: c.peer_verified,
+                    epoch: c.epoch,
+                    connected_since: c.connected_since,
+                    sent_seq: p.sent_seq,
+                    applied_seq: p.applied_seq,
+                    lag_entries,
+                    lag_ms,
+                    in_sync: c.epoch == epoch && p.caught_up_at.is_some_and(|t| t.elapsed() <= lag_max),
+                    fetch: c.fetch,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.node_id.cmp(&b.node_id).then(a.connected_since.cmp(&b.connected_since)));
+        out
+    }
+}
+```
+
+`acks` and `wait_until` carry `#[cfg_attr(not(test), allow(dead_code))]` until the write concern uses them (Task 12 removes the attribute).
+
+Run: `cargo test --lib server::replicas`
+Expected: PASS, 3 tests: `acks_must_be_monotonic_and_not_above_what_was_sent`, `in_sync_expires_after_lag_time_max`, `wait_until_wakes_on_acks_and_times_out`.
+
+- [ ] **Step 3: Change the wire protocol and the server tests**
+
+Replace `proto/replication.proto` with:
+
+```proto
+syntax = "proto3";
+
+package rrdb.replication.v1;
+
+service Replication {
+  rpc Handshake  (HandshakeRequest)          returns (HandshakeResponse);
+  rpc Tail       (stream TailClientMessage)  returns (stream TailMessage);
+  rpc Bootstrap  (BootstrapRequest)          returns (stream BootstrapChunk);
+  rpc VerifyBegin(VerifyBeginRequest)        returns (VerifyBeginResponse);
+  rpc VerifyRange(stream VerifyRangeRequest) returns (stream VerifyRangeResponse);
+  rpc VerifyEnd  (VerifyEndRequest)          returns (VerifyEndResponse);
+  rpc Status     (StatusRequest)             returns (StatusResponse);
+}
+
+// ---------- shared ----------
+
+message Identity   { bytes db_uuid = 1; uint64 epoch = 2; }
+message CfSpec     { string name = 1; optional string comparator = 2; uint64 create_seq = 3; }
+message EpochStart { uint64 epoch = 1; uint64 start_seq = 2; }
+
+enum Reason {
+  REASON_UNSPECIFIED = 0;
+  NO_LOCAL_STATE     = 1;
+  IDENTITY_CHANGED   = 2;
+  LOG_GAP            = 3;
+  PROTOCOL_MISMATCH  = 4;   // frozen
+  ENVELOPE_MISMATCH  = 5;   // frozen
+  NOT_READY          = 6;
+  LOOP_DETECTED      = 7;
+  DIVERGED           = 8;
+  BUSY               = 9;
+  SESSION_NOT_FOUND  = 10;
+  UPSTREAM_RESET     = 11;
+  CORRUPT            = 12;
+  SHUTTING_DOWN      = 13;
+  EPOCH_ADVANCED     = 14;
+  STALE_EPOCH        = 15;
+}
+
+// ---------- log ----------
+
+message LogEntry {
+  uint64  seq    = 1;
+  uint64  epoch  = 2;
+  uint64  ts_ms  = 3;
+  bytes   ops    = 4;   // serialised OpList; never re-encoded
+  fixed32 crc32c = 5;   // CRC-32C(BE64(seq) ‖ BE64(epoch) ‖ BE64(ts_ms) ‖ ops)
+}
+
+message OpList { repeated Op ops = 1; }
+
+message Op {
+  oneof kind {
+    Put         put          = 1;
+    Delete      delete       = 2;
+    DeleteRange delete_range = 3;
+    CreateCf    create_cf    = 4;
+    DropCf      drop_cf      = 5;
+  }
+}
+message Put         { string cf = 1; bytes key = 2; bytes value = 3; optional uint64 expire_at_ms = 4; }
+message Delete      { string cf = 1; bytes key = 2; }
+message DeleteRange { string cf = 1; bytes start = 2; bytes end = 3; }
+message CreateCf    { string name = 1; optional string comparator = 2; }
+message DropCf      { string name = 1; }
+
+// ---------- handshake ----------
+
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  RESUME               = 1;
+  BOOTSTRAP            = 2;
+  REJECT               = 3;   // frozen
+}
+
+message HandshakeRequest {
+  uint32 protocol_version          = 1;   // frozen
+  uint32 envelope_version          = 2;   // frozen
+  string client_id                 = 3;   // frozen
+  optional Identity known_identity = 4;
+  uint64 last_seq                  = 5;
+  optional fixed32 last_crc32c     = 6;
+}
+
+message HandshakeResponse {
+  uint32   protocol_version        = 1;   // frozen
+  uint32   envelope_version        = 2;   // frozen
+  string   server_id               = 3;   // frozen
+  Decision decision                = 4;   // frozen
+  Reason   reason                  = 5;   // frozen
+  string   detail                  = 6;   // frozen
+  repeated string upstream_chain   = 7;
+  optional Identity identity       = 8;
+  repeated CfSpec cf_specs         = 9;
+  uint64   first_retained_seq      = 10;
+  uint64   last_seq                = 11;
+  uint64   origin_last_seq         = 12;
+  uint64   max_entry_bytes         = 13;
+  uint32   heartbeat_ms            = 14;
+  repeated EpochStart epoch_history = 15;
+}
+
+// ---------- tail ----------
+
+message TailRequest {
+  string   client_id               = 1;
+  Identity identity                = 2;
+  uint64   from_seq                = 3;
+  optional fixed32 prev_crc32c     = 4;
+  optional bytes bootstrap_lease   = 5;
+  uint32   min_batch_bytes         = 6;
+  uint32   max_wait_ms             = 7;
+  uint32   max_batch_bytes         = 8;
+}
+
+// The first client message is `start`; every later one is `ack`.
+message TailClientMessage { oneof kind { TailRequest start = 1; TailAck ack = 2; } }
+// Every entry with seq <= applied_seq is committed on the replica. Non-decreasing.
+message TailAck           { uint64 applied_seq = 1; }
+
+message TailMessage { oneof kind { EntryBatch batch = 1; Heartbeat heartbeat = 2; } }
+message EntryBatch  { repeated LogEntry entries = 1; }
+message Heartbeat   { uint64 upstream_last_seq = 1; uint64 origin_last_seq = 2; uint64 ts_ms = 3; }
+
+// ---------- bootstrap ----------
+
+message BootstrapRequest { string client_id = 1; }
+
+message BootstrapChunk {
+  oneof kind {
+    BootstrapHeader  header  = 1;
+    BootstrapRecords records = 2;
+    BootstrapFooter  footer  = 3;
+  }
+}
+
+message BootstrapHeader {
+  Identity identity                = 1;
+  uint64   snapshot_seq            = 2;
+  optional fixed32 snapshot_crc32c = 3;
+  repeated CfSpec cf_specs         = 4;
+  uint64   max_entry_bytes         = 5;
+  uint32   envelope_version        = 6;
+  bytes    lease_id                = 7;
+  uint64   lease_ttl_ms            = 8;
+  repeated EpochStart epoch_history = 9;
+}
+
+message Record           { bytes key = 1; bytes envelope = 2; }
+message BootstrapRecords { string cf = 1; repeated Record records = 2; }
+message BootstrapFooter  { uint64 record_count = 1; bytes digest = 2; }
+
+// ---------- verify ----------
+
+enum VerifyMode { VERIFY_MODE_UNSPECIFIED = 0; QUICK = 1; FULL = 2; }
+
+message VerifyBeginRequest  { string client_id = 1; VerifyMode mode = 2; }
+message VerifyBeginResponse {
+  bytes    session_id         = 1;
+  Identity identity           = 2;
+  uint64   snapshot_seq       = 3;
+  repeated CfSpec cf_specs    = 4;
+  uint64   session_timeout_ms = 5;
+}
+
+message KeyRange  { string cf = 1; optional bytes lower = 2; optional bytes upper = 3; }
+message HashRange { KeyRange range = 1; uint64 count = 2; bytes hash = 3; }
+message ListRange { KeyRange range = 1; uint32 limit = 2; }
+
+message VerifyRangeRequest {
+  bytes  session_id = 1;
+  uint64 request_id = 2;
+  oneof kind { HashRange hash = 3; ListRange list = 4; }
+}
+
+message VerifyRangeResponse {
+  uint64 request_id = 1;
+  oneof kind { HashResult hash = 2; ListResult list = 3; }
+}
+
+message HashResult { bool matched = 1; uint64 count = 2; bytes hash = 3; }
+message ListResult { repeated KeyDigest keys = 1; bool truncated = 2; }
+message KeyDigest  { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3; }
+
+message VerifyEndRequest  { bytes session_id = 1; }
+message VerifyEndResponse {}
+
+// ---------- status (operator tooling) ----------
+
+message StatusRequest  { string client_id = 1; }
+message ReplicaSummary { string node_id = 1; uint64 applied_seq = 2; bool in_sync = 3; }
+message StatusResponse {
+  string   node_id                  = 1;
+  string   role                     = 2;   // "master" or "slave"
+  optional Identity identity        = 3;
+  repeated EpochStart epoch_history = 4;
+  uint64   last_seq                 = 5;
+  optional fixed32 last_entry_crc   = 6;
+  uint64   last_ts_ms               = 7;   // ts of the entry at last_seq; 0 if unknown
+  string   node_state               = 8;   // "ready", "bootstrapping" or "halted:<Reason>"
+  string   upstream                 = 9;   // empty on the master
+  repeated ReplicaSummary replicas  = 10;
+}
+```
+
+In PROTOCOL.md §14, replace the contents of the code block (between ```` ```proto ```` and ```` ``` ````) with the new `proto/replication.proto`, byte for byte.
+
+Replace `src/server/test_client.rs` with (adds `TailExt` — every Tail opened by a test now starts with `start` — and `ack`):
+
+```rust
+//! A bare protocol client for server unit tests.
+
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tonic::metadata::AsciiMetadataValue;
+use tonic::service::interceptor::InterceptedService;
+use tonic::service::Interceptor;
+use tonic::transport::{Channel, Endpoint};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
+
+use crate::auth::AllowAll;
+use crate::clock::ManualClock;
+use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
+use crate::config::{MasterConfig, ServeConfig};
+use crate::master::Master;
+use crate::pb;
+use crate::net::convert::{entry_from_pb, identity_to_pb};
+use crate::pb::replication_client::ReplicationClient;
+use crate::pb::tail_client_message::Kind as ClientKind;
+use crate::pb::tail_message::Kind;
+use crate::types::{DbIdentity, LogEntry};
+
+pub(crate) const T0: u64 = 1_700_000_000_000;
+
+#[derive(Clone)]
+pub(crate) struct Meta {
+    pub node_id: &'static str,
+    pub token: Option<&'static str>,
+    pub version: Option<u32>,
+}
+
+impl Interceptor for Meta {
+    fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
+        let md = req.metadata_mut();
+        if let Some(v) = self.version {
+            md.insert("x-rrdb-protocol-version", AsciiMetadataValue::from(v));
+        }
+        md.insert("x-rrdb-node-id", AsciiMetadataValue::from_static(self.node_id));
+        if let Some(t) = self.token {
+            md.insert("authorization", AsciiMetadataValue::try_from(format!("Bearer {t}")).unwrap());
+        }
+        Ok(req)
+    }
+}
+
+pub(crate) type Client = ReplicationClient<InterceptedService<Channel, Meta>>;
+
+pub(crate) fn client_with(addr: SocketAddr, meta: Meta) -> Client {
+    let channel = Endpoint::from_shared(format!("http://{addr}")).unwrap().connect_lazy();
+    ReplicationClient::with_interceptor(channel, meta).max_decoding_message_size(64 << 20)
+}
+
+pub(crate) fn client(addr: SocketAddr, node_id: &'static str) -> Client {
+    client_with(addr, Meta { node_id, token: None, version: Some(PROTOCOL_VERSION) })
+}
+
+/// A real-time Tail request (`min_batch_bytes = 0`, server-default batch size).
+pub(crate) fn tail_req(id: &DbIdentity, from_seq: u64) -> pb::TailRequest {
+    pb::TailRequest {
+        client_id: "b".into(),
+        identity: Some(identity_to_pb(id)),
+        from_seq,
+        prev_crc32c: None,
+        bootstrap_lease: None,
+        min_batch_bytes: 0,
+        max_wait_ms: 0,
+        max_batch_bytes: 0,
+    }
+}
+
+/// Awaits `fut` for at most 10 s, so a regression fails the test instead of hanging it.
+pub(crate) async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(10), fut).await.unwrap_or_else(|_| panic!("timed out after 10 s: {what}"))
+}
+
+/// The next entry batch of a Tail stream, skipping heartbeats.
+pub(crate) async fn next_batch(s: &mut tonic::Streaming<pb::TailMessage>) -> Vec<LogEntry> {
+    within("the next entry batch", async {
+        loop {
+            match s.message().await.unwrap().unwrap().kind.unwrap() {
+                Kind::Batch(b) => return b.entries.into_iter().map(entry_from_pb).collect(),
+                Kind::Heartbeat(_) => {}
+            }
+        }
+    })
+    .await
+}
+
+/// The status a stream ends with, skipping its remaining messages.
+pub(crate) async fn stream_error<T>(s: &mut tonic::Streaming<T>) -> Status {
+    within("the stream to end with a status", async {
+        loop {
+            match s.message().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("stream ended without a status"),
+                Err(e) => return e,
+            }
+        }
+    })
+    .await
+}
+
+/// Opens Tail streams (PROTOCOL.md §7: the request stream starts with `start`).
+pub(crate) trait TailExt {
+    /// A Tail that sends only `start`, then half-closes its request stream (no acks).
+    async fn tail_start(&mut self, req: pb::TailRequest) -> Result<Response<tonic::Streaming<pb::TailMessage>>, Status>;
+    /// A Tail whose acks the test sends through the returned channel.
+    async fn tail_with_acks(
+        &mut self,
+        req: pb::TailRequest,
+    ) -> Result<(tonic::Streaming<pb::TailMessage>, mpsc::Sender<pb::TailClientMessage>), Status>;
+}
+
+impl TailExt for Client {
+    async fn tail_start(&mut self, req: pb::TailRequest) -> Result<Response<tonic::Streaming<pb::TailMessage>>, Status> {
+        let start = pb::TailClientMessage { kind: Some(ClientKind::Start(req)) };
+        self.tail(tokio_stream::iter([start])).await
+    }
+
+    async fn tail_with_acks(
+        &mut self,
+        req: pb::TailRequest,
+    ) -> Result<(tonic::Streaming<pb::TailMessage>, mpsc::Sender<pb::TailClientMessage>), Status> {
+        let (tx, rx) = mpsc::channel(16);
+        tx.send(pb::TailClientMessage { kind: Some(ClientKind::Start(req)) }).await.unwrap();
+        let s = self.tail(ReceiverStream::new(rx)).await?.into_inner();
+        Ok((s, tx))
+    }
+}
+
+/// An ack message.
+pub(crate) fn ack(applied_seq: u64) -> pb::TailClientMessage {
+    pb::TailClientMessage { kind: Some(ClientKind::Ack(pb::TailAck { applied_seq })) }
+}
+
+/// A handshake from a client with no data.
+pub(crate) fn hello(client_id: &str) -> pb::HandshakeRequest {
+    pb::HandshakeRequest {
+        protocol_version: PROTOCOL_VERSION,
+        envelope_version: u32::from(ENVELOPE_VERSION),
+        client_id: client_id.into(),
+        known_identity: None,
+        last_seq: 0,
+        last_crc32c: None,
+    }
+}
+
+/// A master serving on 127.0.0.1:0 with `AllowAll`, a manual clock and a 100 ms heartbeat.
+pub(crate) async fn serving_master(dir: &Path, tweak: impl FnOnce(&mut MasterConfig)) -> (Master, Arc<ManualClock>) {
+    let clock = Arc::new(ManualClock::new(T0));
+    let mut cfg = MasterConfig::new("a", dir);
+    cfg.clock = clock.clone();
+    cfg.heartbeat = Duration::from_millis(100);
+    cfg.retention.check_interval = Duration::from_secs(3600);
+    cfg.reaper.interval = Duration::from_secs(3600);
+    cfg.serve = Some(ServeConfig::new([127, 0, 0, 1].into(), 0, Arc::new(AllowAll)));
+    tweak(&mut cfg);
+    (Master::open(cfg).await.unwrap(), clock)
+}
+
+/// Polls `f` every 10 ms for up to 10 s.
+pub(crate) async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+```
+
+Replace `src/server/tests.rs` with (every `.tail(req)` becomes `.tail_start(req)`; four new tests at the end):
+
+```rust
+//! Server behaviour against a real master, through a bare protocol client.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tonic::Code;
+
+use super::test_client::{
+    ack,
+    client, client_with, eventually, hello, next_batch, serving_master, stream_error, tail_req, within, Meta, TailExt,
+};
+use crate::auth::{AllowMethods, Method, TokenAuthenticator};
+use crate::codec::digest::Digest;
+use crate::codec::{envelope, PROTOCOL_VERSION};
+use crate::log::LogApi;
+use crate::net::convert::identity_to_pb;
+use crate::net::reason_of;
+use crate::pb;
+use crate::pb::bootstrap_chunk::Kind as Chunk;
+use crate::pb::tail_message::Kind as Msg;
+use crate::types::{CfSpec, DbIdentity, LogEntry};
+
+/// The next entry of a real-time stream: one entry per batch when entries are written one
+/// at a time after the stream caught up.
+async fn next_entry(s: &mut tonic::Streaming<pb::TailMessage>) -> LogEntry {
+    let mut batch = next_batch(s).await;
+    assert_eq!(batch.len(), 1, "real-time batches carry the one entry that became available");
+    batch.remove(0)
+}
+
+#[tokio::test]
+async fn handshake_reports_the_master_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", b"k", b"v").unwrap();
+    let mut c = client(m.serve_addr().unwrap(), "b");
+    let r = c.handshake(hello("b")).await.unwrap().into_inner();
+    assert_eq!(r.server_id, "a");
+    assert_eq!((r.decision(), r.reason()), (pb::Decision::Bootstrap, pb::Reason::NoLocalState));
+    assert_eq!(r.identity, Some(identity_to_pb(&m.identity())));
+    assert_eq!(r.epoch_history, vec![pb::EpochStart { epoch: 1, start_seq: 1 }]);
+    assert_eq!((r.first_retained_seq, r.last_seq, r.origin_last_seq), (1, 2, 2));
+    assert_eq!((r.max_entry_bytes, r.heartbeat_ms), (16 << 20, 100));
+    assert!(r.upstream_chain.is_empty());
+    assert_eq!(r.cf_specs.len(), 1);
+
+    let mut known = hello("b");
+    known.known_identity = Some(identity_to_pb(&m.identity()));
+    known.last_seq = 2;
+    known.last_crc32c = m.entries_since(1).unwrap().next().unwrap().ok().map(|e| e.crc32c);
+    let r = c.handshake(known).await.unwrap().into_inner();
+    assert_eq!((r.decision(), r.reason()), (pb::Decision::Resume, pb::Reason::Unspecified));
+}
+
+#[tokio::test]
+async fn version_mismatch_is_answered_in_the_handshake_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    // No protocol metadata at all: Handshake still answers.
+    let mut c = client_with(m.serve_addr().unwrap(), Meta { node_id: "b", token: None, version: None });
+    let mut req = hello("b");
+    req.protocol_version = PROTOCOL_VERSION + 1;
+    let r = c.handshake(req).await.unwrap().into_inner();
+    assert_eq!((r.decision(), r.reason()), (pb::Decision::Reject, pb::Reason::ProtocolMismatch));
+    assert_eq!(r.protocol_version, PROTOCOL_VERSION);
+    // Every other RPC fails without the metadata.
+    let err = c.tail_start(tail_req(&m.identity(), 1)).await.unwrap_err();
+    assert_eq!((err.code(), reason_of(&err)), (Code::FailedPrecondition, Some(pb::Reason::ProtocolMismatch)));
+}
+
+#[tokio::test]
+async fn client_id_must_match_the_node_id_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    let err = client(m.serve_addr().unwrap(), "b").handshake(hello("someone-else")).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn malformed_handshake_input_is_invalid_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    let addr = m.serve_addr().unwrap();
+    let mut c = client(addr, "b");
+
+    let mut short_uuid = hello("b");
+    short_uuid.known_identity = Some(pb::Identity { db_uuid: vec![1; 15], epoch: 1 });
+    let e = c.handshake(short_uuid).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument, "15-byte db_uuid");
+    assert_eq!(reason_of(&e), Some(pb::Reason::Unspecified), "INVALID_ARGUMENT carries ErrorInfo");
+
+    // An empty client_id (the node-id metadata is "b", so it would also mismatch).
+    assert_eq!(c.handshake(hello("")).await.unwrap_err().code(), Code::InvalidArgument, "empty client_id");
+
+    // client_id and node id agree but are not valid ids.
+    let long: &'static str = Box::leak("x".repeat(129).into_boxed_str());
+    for bad in ["has space", "semi;colon", "a/b", long] {
+        let mut c = client(addr, bad);
+        let e = c.handshake(hello(bad)).await.unwrap_err();
+        assert_eq!(e.code(), Code::InvalidArgument, "client_id {bad:?}");
+    }
+
+    // The node-id metadata is checked on every RPC.
+    let mut c = client(addr, "bad id");
+    let e = c.tail_start(tail_req(&m.identity(), 1)).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument, "tail with a bad x-rrdb-node-id");
+    let e = c.bootstrap(pb::BootstrapRequest { client_id: "bad id".into() }).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument, "bootstrap with a bad x-rrdb-node-id");
+
+    // Tail and Bootstrap also require client_id to equal the metadata.
+    let mut c = client(addr, "b");
+    let mut req = tail_req(&m.identity(), 1);
+    req.client_id = "other".into();
+    assert_eq!(c.tail_start(req).await.unwrap_err().code(), Code::InvalidArgument, "tail client_id mismatch");
+    let e = c.bootstrap(pb::BootstrapRequest { client_id: "other".into() }).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument, "bootstrap client_id mismatch");
+}
+
+#[tokio::test]
+async fn tail_streams_entries_in_order_then_heartbeats_then_new_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", b"", b"").unwrap();
+    m.put("c", b"\0", b"\0").unwrap();
+    let mut c = client(m.serve_addr().unwrap(), "b");
+    let mut s = c.tail_start(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
+    // The backlog arrives as one batch.
+    let backlog = next_batch(&mut s).await;
+    assert_eq!(backlog.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+    backlog.iter().for_each(|e| e.verify_crc().unwrap());
+    // Idle: heartbeats only, carrying the server's position.
+    match within("a heartbeat", s.message()).await.unwrap().unwrap().kind.unwrap() {
+        Msg::Heartbeat(h) => assert_eq!((h.upstream_last_seq, h.origin_last_seq), (3, 3)),
+        Msg::Batch(b) => panic!("unexpected batch of {}", b.entries.len()),
+    }
+    m.put("c", b"k", b"v").unwrap();
+    assert_eq!(next_entry(&mut s).await.seq, 4);
+}
+
+#[tokio::test]
+async fn tail_validation_follows_the_spec() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| {
+        cfg.retention.max_entries = Some(1);
+        cfg.retention.check_interval = Duration::from_millis(20);
+    })
+    .await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..5u8 {
+        m.put("c", &[i], b"v").unwrap();
+    }
+    eventually("retention", || m.first_retained_seq() == 6).await;
+    let id = m.identity();
+    let mut c = client(m.serve_addr().unwrap(), "b");
+    let reason = |e: tonic::Status| (e.code(), reason_of(&e));
+
+    let other = DbIdentity { db_uuid: uuid::Uuid::new_v4(), epoch: 1 };
+    let e = c.tail_start(tail_req(&other, 6)).await.unwrap_err();
+    assert_eq!(reason(e), (Code::FailedPrecondition, Some(pb::Reason::IdentityChanged)));
+
+    let e = c.tail_start(tail_req(&id, 8)).await.unwrap_err();
+    assert_eq!(reason(e), (Code::FailedPrecondition, Some(pb::Reason::Diverged)), "past master last_seq + 1");
+
+    let mut bad_prev = tail_req(&id, 7);
+    bad_prev.prev_crc32c = Some(0xDEAD_BEEF);
+    let e = c.tail_start(bad_prev).await.unwrap_err();
+    assert_eq!(reason(e), (Code::FailedPrecondition, Some(pb::Reason::Diverged)));
+
+    let e = c.tail_start(tail_req(&id, 2)).await.unwrap_err();
+    assert_eq!(reason(e), (Code::OutOfRange, Some(pb::Reason::LogGap)));
+
+    let e = c.tail_start(tail_req(&id, 0)).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument);
+
+    // from_seq = last_seq + 1 is valid: the stream waits for the next write.
+    let mut s = c.tail_start(tail_req(&id, 7)).await.unwrap().into_inner();
+    m.put("c", b"x", b"v").unwrap();
+    assert_eq!(next_entry(&mut s).await.seq, 7);
+}
+
+#[tokio::test]
+async fn bump_epoch_ends_streams_with_upstream_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
+    assert_eq!(next_entry(&mut s).await.seq, 1);
+    m.bump_epoch().unwrap();
+    let err = stream_error(&mut s).await;
+    assert_eq!((err.code(), reason_of(&err)), (Code::Unavailable, Some(pb::Reason::UpstreamReset)));
+}
+
+#[tokio::test]
+async fn shutdown_ends_streams_and_releases_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
+    assert_eq!(next_entry(&mut s).await.seq, 1);
+    m.shutdown().await.unwrap();
+    let err = stream_error(&mut s).await;
+    assert_eq!((err.code(), reason_of(&err)), (Code::Unavailable, Some(pb::Reason::ShuttingDown)));
+    // The directory can be reopened immediately.
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    assert_eq!(m.last_seq(), 1);
+}
+
+#[tokio::test]
+async fn embedded_master_does_not_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| cfg.serve = None).await;
+    assert!(m.serve_addr().is_none());
+}
+
+#[tokio::test]
+async fn failed_authentications_are_rate_limited_per_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| {
+        let serve = cfg.serve.as_mut().unwrap();
+        serve.authenticator = Arc::new(TokenAuthenticator::new(["good"]));
+        serve.allow_plaintext_token = true;
+        serve.limits.max_auth_failures_per_minute = 3;
+    })
+    .await;
+    let addr = m.serve_addr().unwrap();
+    let meta = |token| Meta { node_id: "b", token: Some(token), version: Some(PROTOCOL_VERSION) };
+    client_with(addr, meta("good")).handshake(hello("b")).await.unwrap();
+    for _ in 0..3 {
+        let e = client_with(addr, meta("bad")).handshake(hello("b")).await.unwrap_err();
+        assert_eq!(e.code(), Code::Unauthenticated);
+        assert_eq!(reason_of(&e), None, "auth failures carry no ErrorInfo");
+    }
+    let e = client_with(addr, meta("good")).handshake(hello("b")).await.unwrap_err();
+    assert_eq!(e.code(), Code::Unauthenticated, "blocked without checking the token");
+}
+
+#[tokio::test]
+async fn methods_can_be_denied_per_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| {
+        let serve = cfg.serve.as_mut().unwrap();
+        let token = Arc::new(TokenAuthenticator::new(["t"]));
+        serve.authenticator = Arc::new(AllowMethods::new(token, &[Method::Handshake, Method::Tail]));
+        serve.allow_plaintext_token = true;
+    })
+    .await;
+    let mut c = client_with(m.serve_addr().unwrap(), Meta { node_id: "b", token: Some("t"), version: Some(PROTOCOL_VERSION) });
+    c.handshake(hello("b")).await.unwrap();
+    let e = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap_err();
+    assert_eq!(e.code(), Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn verify_is_not_implemented_yet() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    let e = client(m.serve_addr().unwrap(), "b").verify_begin(pb::VerifyBeginRequest::default()).await.unwrap_err();
+    assert_eq!(e.code(), Code::Unimplemented);
+    assert_eq!(reason_of(&e), Some(pb::Reason::Unspecified), "UNIMPLEMENTED carries ErrorInfo");
+}
+
+/// Reads a whole bootstrap stream: (header, records per message, footer).
+async fn read_bootstrap(
+    c: &mut super::test_client::Client,
+) -> (pb::BootstrapHeader, Vec<pb::BootstrapRecords>, pb::BootstrapFooter) {
+    within("a whole bootstrap stream", async {
+        let mut s = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
+        let Chunk::Header(h) = s.message().await.unwrap().unwrap().kind.unwrap() else { panic!("header first") };
+        let mut msgs = Vec::new();
+        loop {
+            match s.message().await.unwrap().unwrap().kind.unwrap() {
+                Chunk::Records(r) => msgs.push(r),
+                Chunk::Footer(f) => return (h, msgs, f),
+                Chunk::Header(_) => panic!("second header"),
+            }
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn bootstrap_streams_a_consistent_snapshot_with_a_valid_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, clock) = serving_master(dir.path(), |cfg| {
+        cfg.serve.as_mut().unwrap().limits.bootstrap_chunk_bytes = 40;
+    })
+    .await;
+    m.create_cf(CfSpec::new("b-empty")).unwrap();
+    m.create_cf(CfSpec::new("a")).unwrap();
+    m.put("a", b"", b"").unwrap();
+    m.put("a", b"\0", b"\0\0").unwrap();
+    m.put_with_ttl("a", b"ttl", b"gone", Duration::from_secs(1)).unwrap();
+    for i in 0..10u8 {
+        m.put("a", &[b'k', i], &[i; 20]).unwrap();
+    }
+    clock.advance(Duration::from_secs(5)); // "ttl" is expired but not reaped: still sent
+    let mut c = client(m.serve_addr().unwrap(), "b");
+    let (h, msgs, f) = read_bootstrap(&mut c).await;
+
+    assert_eq!(h.snapshot_seq, m.last_seq());
+    assert_eq!(h.snapshot_crc32c, m.entries_since(m.last_seq() - 1).unwrap().next().unwrap().ok().map(|e| e.crc32c));
+    assert_eq!(h.cf_specs.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["a", "b-empty"]);
+    assert_eq!(h.identity, Some(identity_to_pb(&m.identity())));
+    assert_eq!(h.lease_id.len(), 16);
+    assert_eq!(h.lease_ttl_ms, 15 * 60 * 1000);
+    assert!(msgs.len() > 1, "small chunk size splits the CF");
+    assert!(msgs.iter().all(|r| r.cf == "a" && !r.records.is_empty()));
+
+    let mut d = Digest::new();
+    for spec in &h.cf_specs {
+        d.cf_marker(&spec.name, spec.create_seq);
+        for r in msgs.iter().filter(|r| r.cf == spec.name) {
+            for rec in &r.records {
+                d.record(&rec.key, &rec.envelope);
+            }
+        }
+    }
+    let (count, digest) = d.finish_bootstrap(h.snapshot_seq);
+    assert_eq!((f.record_count, f.digest.as_slice()), (13, digest.as_slice()));
+    assert_eq!(count, 13);
+    let keys: Vec<Vec<u8>> = msgs.iter().flat_map(|r| r.records.iter().map(|x| x.key.clone())).collect();
+    assert!(keys.windows(2).all(|w| w[0] < w[1]), "strictly ascending");
+    let ttl = msgs.iter().flat_map(|r| &r.records).find(|x| x.key == b"ttl").expect("expired value is sent");
+    assert_eq!(envelope::decode(&ttl.envelope).unwrap().value, b"gone");
+}
+
+#[tokio::test]
+async fn bootstrap_lease_holds_retention_until_tail_presents_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| {
+        cfg.retention.max_entries = Some(1);
+        cfg.retention.check_interval = Duration::from_millis(20);
+    })
+    .await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", b"k", b"v").unwrap();
+    let mut c = client(m.serve_addr().unwrap(), "b");
+    let (h, _, _) = read_bootstrap(&mut c).await;
+    let s = h.snapshot_seq;
+    for i in 0..5u8 {
+        m.put("c", &[i], b"v").unwrap();
+    }
+    eventually("retention to trim up to the lease", || m.first_retained_seq() == s + 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await; // five more retention rounds
+    assert_eq!(m.first_retained_seq(), s + 1, "the lease keeps S + 1");
+
+    let mut req = tail_req(&m.identity(), s + 1);
+    req.bootstrap_lease = Some(h.lease_id.clone());
+    let mut stream = c.tail_start(req).await.unwrap().into_inner();
+    assert_eq!(next_batch(&mut stream).await[0].seq, s + 1);
+    eventually("retention after the lease is released", || m.first_retained_seq() == m.last_seq()).await;
+}
+
+#[tokio::test]
+async fn an_unclaimed_lease_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| {
+        cfg.retention.max_entries = Some(1);
+        cfg.retention.check_interval = Duration::from_millis(20);
+        cfg.serve.as_mut().unwrap().limits.bootstrap_lease_ttl = Duration::from_millis(1500);
+    })
+    .await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (h, _, _) = read_bootstrap(&mut client(m.serve_addr().unwrap(), "b")).await;
+    for i in 0..3u8 {
+        m.put("c", &[i], b"v").unwrap();
+    }
+    // Held by the unclaimed lease first, then released when it expires (1 s sweep).
+    eventually("retention to stop at the lease", || m.first_retained_seq() == h.snapshot_seq + 1).await;
+    eventually("lease expiry", || m.first_retained_seq() == m.last_seq()).await;
+}
+
+#[tokio::test]
+async fn concurrent_bootstraps_are_limited() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| {
+        let limits = &mut cfg.serve.as_mut().unwrap().limits;
+        limits.max_concurrent_bootstraps = 1;
+        limits.bootstrap_chunk_bytes = 1;
+    })
+    .await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    // 32 MiB, one record per message: far more than the channel, socket and HTTP/2 buffers
+    // hold, so the unread first bootstrap keeps its producer, and its permit, busy.
+    for i in 0..128u8 {
+        m.put("c", &[i], &vec![i; 256 << 10]).unwrap();
+    }
+    let mut c = client(m.serve_addr().unwrap(), "b");
+    let _held = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
+    let err = client(m.serve_addr().unwrap(), "c")
+        .bootstrap(pb::BootstrapRequest { client_id: "c".into() })
+        .await
+        .unwrap_err();
+    assert_eq!((err.code(), reason_of(&err)), (Code::ResourceExhausted, Some(pb::Reason::Busy)));
+}
+
+/// Clients that stop reading must not keep the server's producers, and so the database,
+/// alive: shutdown ends them and the directory can be reopened at once.
+#[tokio::test]
+async fn shutdown_with_unread_streams_releases_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    // 32 MiB of data: far more than socket and HTTP/2 buffers, so both producers block.
+    for i in 0..128u8 {
+        m.put("c", &[i], &vec![i; 256 << 10]).unwrap();
+    }
+    let mut c = client(m.serve_addr().unwrap(), "b");
+    let mut tail = c.tail_start(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
+    assert!(within("the first tail message", tail.message()).await.unwrap().is_some());
+    let mut boot = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
+    let first = within("the bootstrap header", boot.message()).await.unwrap().unwrap();
+    assert!(matches!(first.kind, Some(Chunk::Header(_))));
+    tokio::time::timeout(Duration::from_secs(20), m.shutdown()).await.expect("shutdown hangs").unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    assert_eq!(m.last_seq(), 129);
+}
+
+// ---------------- Fetch batching (PROTOCOL.md §7.5) ----------------
+
+fn fetch_req(id: &DbIdentity, from_seq: u64, min_batch_bytes: u32, max_wait_ms: u32, max_batch_bytes: u32) -> pb::TailRequest {
+    pb::TailRequest { min_batch_bytes, max_wait_ms, max_batch_bytes, ..tail_req(id, from_seq) }
+}
+
+fn batch_bytes(batch: &[LogEntry]) -> usize {
+    batch.iter().map(LogEntry::encoded_len).sum()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_time_mode_delivers_each_entry_promptly_one_batch_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_secs(1)).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(tail_req(&m.identity(), 2)).await.unwrap().into_inner();
+    for i in 0..5u8 {
+        let seq = m.put("c", &[i], b"v").unwrap();
+        let t0 = Instant::now(); // after the fsynced put returned
+        let batch = next_batch(&mut s).await;
+        let latency = t0.elapsed();
+        assert_eq!(batch.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![seq], "one entry per batch");
+        // Real time: nothing waits for more data (the generous bound only guards against a
+        // regression to the 1 s heartbeat or a max_wait; it is not a latency benchmark).
+        assert!(latency < Duration::from_millis(900), "entry {seq} took {latency:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn small_writes_wait_for_max_wait_and_arrive_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_secs(3)).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let req = fetch_req(&m.identity(), 2, 1 << 20, 1500, 0);
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(req).await.unwrap().into_inner();
+    m.put("c", &[0], b"v").unwrap();
+    let t0 = Instant::now(); // entry 2 became available no later than this
+    for i in 1..3u8 {
+        m.put("c", &[i], b"v").unwrap();
+    }
+    let batch = next_batch(&mut s).await;
+    let waited = t0.elapsed();
+    assert_eq!(batch.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3, 4], "one batch");
+    assert!(waited >= Duration::from_millis(1000), "sent before max_wait (1500 ms): {waited:?}");
+    assert!(waited < Duration::from_secs(6), "sent long after max_wait: {waited:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reaching_min_batch_bytes_sends_before_max_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_secs(30)).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", &[0], &[7; 100]).unwrap();
+    let one = m.entries_since(1).unwrap().next().unwrap().unwrap().encoded_len();
+    let req = fetch_req(&m.identity(), 3, u32::try_from(3 * one).unwrap(), 20_000, 0);
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(req).await.unwrap().into_inner();
+    for i in 1..=3u8 {
+        m.put("c", &[i], &[7; 100]).unwrap();
+    }
+    let t0 = Instant::now(); // min_batch_bytes is reached no later than this
+    let batch = next_batch(&mut s).await;
+    let waited = t0.elapsed();
+    assert_eq!(batch.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
+    assert!(batch_bytes(&batch) >= 3 * one);
+    assert!(waited < Duration::from_secs(5), "waited {waited:?} (max_wait is 20 s) although min_batch_bytes was reached");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catch_up_is_split_at_max_batch_bytes_without_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    // The server caps the client's 1 MiB request at 64 KiB.
+    let (m, _) = serving_master(dir.path(), |cfg| {
+        cfg.serve.as_mut().unwrap().limits.max_tail_batch_bytes = 64 << 10;
+    })
+    .await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..1000u32 {
+        m.put("c", &i.to_be_bytes(), &[1; 1024]).unwrap();
+    }
+    // min_batch_bytes is huge and max_wait long: catch-up must still not wait.
+    let req = fetch_req(&m.identity(), 1, u32::MAX, 100, 1 << 20);
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(req).await.unwrap().into_inner();
+    let mut batches = Vec::new();
+    let mut seqs = Vec::new();
+    while seqs.len() < 1001 {
+        let b = next_batch(&mut s).await;
+        assert!(batch_bytes(&b) <= 64 << 10, "a batch of {} bytes exceeds the cap", batch_bytes(&b));
+        seqs.extend(b.iter().map(|e| e.seq));
+        batches.push(b);
+    }
+    assert_eq!(seqs, (1..=1001).collect::<Vec<_>>(), "consecutive, no gaps or duplicates");
+    assert!(batches.len() >= 16, "1 MiB of backlog needs at least 16 batches of 64 KiB, got {}", batches.len());
+    // Catch-up is not paced by max_wait: with 100 ms per batch it would take over 1.6 s.
+    // (Each `next_batch` is bounded at 10 s; the shape assertions above carry the test.)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_entry_larger_than_max_batch_bytes_is_sent_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", b"small-1", b"v").unwrap();
+    let big = m.put("c", b"big", &[9; 4096]).unwrap();
+    m.put("c", b"small-2", b"v").unwrap();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(fetch_req(&m.identity(), 2, 0, 0, 1024)).await.unwrap().into_inner();
+    let mut got = Vec::new();
+    while got.iter().map(Vec::len).sum::<usize>() < 3 {
+        got.push(next_batch(&mut s).await);
+    }
+    let seqs: Vec<Vec<u64>> = got.iter().map(|b| b.iter().map(|e| e.seq).collect()).collect();
+    assert_eq!(seqs, vec![vec![2], vec![big], vec![4]]);
+    assert!(batch_bytes(&got[1]) > 1024);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn max_wait_is_clamped_to_the_heartbeat() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_millis(200)).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let req = fetch_req(&m.identity(), 2, 1 << 20, 30_000, 0);
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(req).await.unwrap().into_inner();
+    m.put("c", b"k", b"v").unwrap();
+    let t0 = Instant::now();
+    let batch = next_batch(&mut s).await;
+    let waited = t0.elapsed();
+    assert_eq!(batch.len(), 1);
+    assert!(waited >= Duration::from_millis(100), "sent before the clamped max_wait: {waited:?}");
+    assert!(waited < Duration::from_secs(5), "max_wait (30 s) was not clamped to the 200 ms heartbeat: {waited:?}");
+}
+
+/// Large log: both producers block on a client that does not read.
+async fn big_log(dir: &std::path::Path) -> crate::Master {
+    let (m, _) = serving_master(dir, |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..128u8 {
+        m.put("c", &[i], &vec![i; 256 << 10]).unwrap();
+    }
+    m
+}
+
+/// A reset while the channel is full must still reach the client as a status, not a clean EOF.
+#[tokio::test]
+async fn tail_reset_under_backpressure_ends_with_upstream_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = big_log(dir.path()).await;
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
+    assert!(within("the first tail message", s.message()).await.unwrap().is_some());
+    tokio::time::sleep(Duration::from_millis(300)).await; // the producer is blocked, channel full
+    m.bump_epoch().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let err = stream_error(&mut s).await;
+    assert_eq!((err.code(), reason_of(&err)), (Code::Unavailable, Some(pb::Reason::UpstreamReset)));
+}
+
+#[tokio::test]
+async fn bootstrap_reset_under_backpressure_ends_with_upstream_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = big_log(dir.path()).await;
+    let mut s = client(m.serve_addr().unwrap(), "b")
+        .bootstrap(pb::BootstrapRequest { client_id: "b".into() })
+        .await
+        .unwrap()
+        .into_inner();
+    let first = within("the bootstrap header", s.message()).await.unwrap().unwrap();
+    assert!(matches!(first.kind, Some(Chunk::Header(_))));
+    tokio::time::sleep(Duration::from_millis(300)).await; // the job is blocked, channel full
+    m.bump_epoch().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let err = stream_error(&mut s).await;
+    assert_eq!((err.code(), reason_of(&err)), (Code::Unavailable, Some(pb::Reason::UpstreamReset)));
+}
+
+/// A batch never exceeds `max_batch_bytes` on the wire, per-entry framing included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batches_fit_max_batch_bytes_including_framing() {
+    use prost::Message;
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..200u32 {
+        m.put("c", &i.to_be_bytes(), &[1; 60]).unwrap();
+    }
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(fetch_req(&m.identity(), 1, 0, 0, 1000)).await.unwrap().into_inner();
+    let mut seen = 0;
+    while seen < 201 {
+        let batch = next_batch(&mut s).await;
+        let wire = pb::EntryBatch { entries: batch.iter().cloned().map(crate::net::convert::entry_to_pb).collect() }.encoded_len();
+        assert!(wire <= 1000, "batch of {} entries is {wire} bytes on the wire", batch.len());
+        seen += batch.len();
+    }
+}
+
+// ---------------- Acks and replica status (addendum §1) ----------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acks_drive_replica_status_and_in_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..3u8 {
+        m.put("c", &[i], b"v").unwrap();
+    }
+    let mut c = client(m.serve_addr().unwrap(), "b");
+    let (mut s, acks) = c.tail_with_acks(tail_req(&m.identity(), 1)).await.unwrap();
+    let batch = next_batch(&mut s).await;
+    assert_eq!(batch.last().unwrap().seq, 4);
+    eventually("the replica is registered", || m.replicas().len() == 1).await;
+    let r = &m.replicas()[0];
+    assert_eq!((r.node_id.as_str(), r.sent_seq, r.applied_seq, r.lag_entries), ("b", 4, 0, 4));
+    assert!(!r.in_sync, "not caught up yet");
+    assert!(r.lag_ms.is_some());
+    assert_eq!(r.epoch, 1);
+    assert_eq!(r.fetch.max_batch_bytes, 1 << 20);
+
+    acks.send(ack(2)).await.unwrap();
+    eventually("the partial ack", || m.replicas()[0].applied_seq == 2).await;
+    assert_eq!(m.replicas()[0].lag_entries, 2);
+    assert!(!m.replicas()[0].in_sync);
+    acks.send(ack(4)).await.unwrap();
+    eventually("caught up and in sync", || m.replicas()[0].in_sync).await;
+    let r = &m.replicas()[0];
+    assert_eq!((r.applied_seq, r.lag_entries, r.lag_ms), (4, 0, Some(0)));
+
+    // A new write is sent but not acknowledged: lag grows, the replica stays in sync for
+    // replica_lag_time_max.
+    m.put("c", b"k", b"v").unwrap();
+    assert_eq!(next_batch(&mut s).await[0].seq, 5);
+    eventually("sent", || m.replicas()[0].sent_seq == 5).await;
+    let r = &m.replicas()[0];
+    assert_eq!((r.applied_seq, r.lag_entries), (4, 1));
+    assert!(r.in_sync);
+
+    drop(acks);
+    drop(s);
+    eventually("the closed stream leaves the registry", || m.replicas().is_empty()).await;
+}
+
+#[tokio::test]
+async fn ack_violations_end_the_stream_with_invalid_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", b"k", b"v").unwrap();
+    let mut c = client(m.serve_addr().unwrap(), "b");
+
+    // Above the last sent seq.
+    let (mut s, acks) = c.tail_with_acks(tail_req(&m.identity(), 3)).await.unwrap();
+    acks.send(ack(3)).await.unwrap();
+    let e = stream_error(&mut s).await;
+    assert_eq!(e.code(), Code::InvalidArgument, "{e:?}");
+
+    // Backwards.
+    let (mut s, acks) = c.tail_with_acks(tail_req(&m.identity(), 1)).await.unwrap();
+    next_batch(&mut s).await;
+    eventually("sent", || m.replicas().iter().any(|r| r.sent_seq == 2)).await;
+    acks.send(ack(2)).await.unwrap();
+    acks.send(ack(1)).await.unwrap();
+    assert_eq!(stream_error(&mut s).await.code(), Code::InvalidArgument);
+
+    // A second `start`.
+    let (mut s, acks) = c.tail_with_acks(tail_req(&m.identity(), 1)).await.unwrap();
+    acks.send(pb::TailClientMessage { kind: Some(pb::tail_client_message::Kind::Start(tail_req(&m.identity(), 1))) })
+        .await
+        .unwrap();
+    assert_eq!(stream_error(&mut s).await.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn the_first_tail_message_must_be_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    let mut c = client(m.serve_addr().unwrap(), "b");
+    let e = c.tail(tokio_stream::iter([super::test_client::ack(0)])).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument);
+    let e = c.tail(tokio_stream::iter(Vec::<pb::TailClientMessage>::new())).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument, "an empty request stream");
+}
+
+/// A reset while a bootstrap client has stopped reading: the job releases its snapshot and its
+/// bootstrap slot at once, and only then waits to deliver `UPSTREAM_RESET`.
+#[tokio::test]
+async fn a_reset_releases_a_stalled_bootstraps_snapshot_and_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| {
+        cfg.serve.as_mut().unwrap().limits.max_concurrent_bootstraps = 1;
+    })
+    .await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    // 32 MiB: far more than the channel and transport buffers hold.
+    for i in 0..128u8 {
+        m.put("c", &[i], &vec![i; 256 << 10]).unwrap();
+    }
+    let src = m.log_source();
+    let db_refs = Arc::strong_count(src.store().db());
+    let mut stalled = client(m.serve_addr().unwrap(), "b");
+    let mut boot = stalled.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
+    assert!(matches!(within("the header", boot.message()).await.unwrap().unwrap().kind, Some(Chunk::Header(_))));
+    assert!(Arc::strong_count(src.store().db()) > db_refs, "the job holds a snapshot");
+    m.bump_epoch().unwrap();
+    eventually("the snapshot is released", || Arc::strong_count(src.store().db()) == db_refs).await;
+    let mut other = client(m.serve_addr().unwrap(), "c");
+    let next = other.bootstrap(pb::BootstrapRequest { client_id: "c".into() }).await;
+    assert!(next.is_ok(), "the slot is free again: {:?}", next.err());
+}
+```
+
+In `src/master/source.rs` (test module), import `TailExt` and replace both `.tail(req)` calls with `.tail_start(req)`:
+
+```rust
+    use crate::server::test_client::{client, next_batch, serving_master, tail_req, within, TailExt};
+```
+
+Run: `cargo test --lib server`
+Expected: FAIL to compile: `Svc` does not implement `status`, and `tail` has the wrong request type (`expected Request<Streaming<TailClientMessage>>`).
+
+- [ ] **Step 4: Configuration, method and `LogSource` additions**
+
+In `src/config.rs`, in `ServeLimits`, after `pub max_tail_batch_bytes: usize,` add:
+
+```rust
+    /// A replica counts as in sync only if it was fully caught up within this long.
+    pub replica_lag_time_max: Duration,
+```
+
+in its `Default`, after `max_tail_batch_bytes: 4 << 20,` add:
+
+```rust
+            replica_lag_time_max: Duration::from_secs(10),
+```
+
+and in `ServeConfig::validate`, replace:
+
+```rust
+        if l.bootstrap_lease_ttl.is_zero() || l.verify_session_timeout.is_zero() {
+```
+
+with:
+
+```rust
+        if l.bootstrap_lease_ttl.is_zero() || l.verify_session_timeout.is_zero() || l.replica_lag_time_max.is_zero() {
+```
+
+In `src/auth.rs`, add the variant to `Method` (after `Verify,`):
+
+```rust
+    /// The read-only `Status` RPC (operator tooling).
+    Status,
+```
+
+and in `MtlsSubjectAllowList::allow_all_methods` replace the method list with:
+
+```rust
+        self.allow(subject, &[Method::Handshake, Method::Tail, Method::Bootstrap, Method::Verify, Method::Status])
+```
+
+Replace `src/source.rs` with (two methods with defaults; the slave overrides them in Task 10):
+
+```rust
+//! What the replication server needs from the node it runs on. Implemented by the master
+//! and by slaves that serve downstream replicas (DESIGN.md §11).
+
+use std::time::Duration;
+
+use tokio::sync::watch;
+
+use crate::store::Store;
+use crate::types::{DbIdentity, EpochStart, Role, Seq};
+
+pub(crate) trait LogSource: Send + Sync + 'static {
+    /// This node's configured identifier (`server_id` in the handshake).
+    fn node_id(&self) -> &str;
+    fn role(&self) -> Role;
+    /// False while this node is bootstrapping itself (it has no consistent state).
+    fn is_ready(&self) -> bool;
+    /// Origin identity and epoch history, read together.
+    fn identity(&self) -> Option<(DbIdentity, Vec<EpochStart>)>;
+    fn store(&self) -> &Store;
+    /// The highest master seq this node knows of. On the master, its `last_seq`.
+    fn origin_last_seq(&self) -> Seq;
+    /// Node ids between this node and the master, closest first. Empty on the master.
+    fn upstream_chain(&self) -> Vec<String>;
+    /// The master's `max_entry_bytes`, forwarded down the chain.
+    fn max_entry_bytes(&self) -> u64;
+    /// Interval of Tail heartbeats this node sends.
+    fn heartbeat(&self) -> Duration;
+    /// Receives this node's `last_seq` after each commit.
+    fn subscribe(&self) -> watch::Receiver<Seq>;
+    /// Bumped whenever every served stream must end with `UPSTREAM_RESET` (an epoch bump on
+    /// the master, an epoch adoption or a bootstrap on a slave).
+    fn resets(&self) -> watch::Receiver<u64>;
+    /// `ready`, `bootstrapping` or `halted:<Reason>` (the `Status` RPC).
+    fn node_state(&self) -> String {
+        "ready".into()
+    }
+    /// The upstream address; `None` on the master.
+    fn upstream(&self) -> Option<String> {
+        None
+    }
+}
+```
+
+- [ ] **Step 5: The `Status` report**
+
+Create `src/admin.rs` (Task 11 completes it with comparison and promotion tooling):
+
+```rust
+//! Operator tooling for failover (addendum §4). This task adds the node report served by the
+//! `Status` RPC; comparing nodes and choosing a promotion candidate follow with promotion.
+
+use crate::types::{DbIdentity, EpochStart, Role, Seq};
+
+/// What a node reports about itself (`Status` RPC, `Slave::promotion_info`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeInfo {
+    pub node_id: String,
+    pub role: Role,
+    /// `None` while the node has no data (fresh, or bootstrapping).
+    pub identity: Option<DbIdentity>,
+    pub epoch_history: Vec<EpochStart>,
+    pub last_seq: Seq,
+    pub last_entry_crc: Option<u32>,
+    /// `ts_ms` of the entry at `last_seq`; 0 if it is no longer retained.
+    pub last_ts_ms: u64,
+    /// `ready`, `bootstrapping` or `halted:<Reason>`.
+    pub node_state: String,
+    /// The upstream address; `None` on the master.
+    pub upstream: Option<String>,
+    pub replicas: Vec<ReplicaSummary>,
+}
+
+/// One direct downstream replica, as reported by `Status`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaSummary {
+    pub node_id: String,
+    pub applied_seq: Seq,
+    pub in_sync: bool,
+}
+```
+
+Create `src/server/status.rs`:
+
+```rust
+//! The read-only `Status` RPC (addendum §4) and the in-process equivalent.
+
+use std::time::Duration;
+
+use super::replicas::ReplicaRegistry;
+use crate::admin::{NodeInfo, ReplicaSummary};
+use crate::net::convert::{epochs_to_pb, identity_to_pb};
+use crate::pb;
+use crate::source::LogSource;
+use crate::types::Role;
+
+/// What this node reports about itself.
+pub(crate) fn node_info(src: &dyn LogSource, replicas: &ReplicaRegistry, lag_max: Duration) -> NodeInfo {
+    let ident = src.identity();
+    let pos = src.store().position();
+    let last_ts_ms = src
+        .store()
+        .read_entries(pos.last_seq, 1, usize::MAX)
+        .ok()
+        .and_then(|v| v.first().filter(|e| e.seq == pos.last_seq).map(|e| e.ts_ms))
+        .unwrap_or(0);
+    let epoch = ident.as_ref().map_or(0, |(id, _)| id.epoch);
+    NodeInfo {
+        node_id: src.node_id().to_string(),
+        role: src.role(),
+        identity: ident.as_ref().map(|(id, _)| *id),
+        epoch_history: ident.map(|(_, h)| h).unwrap_or_default(),
+        last_seq: pos.last_seq,
+        last_entry_crc: pos.last_entry_crc,
+        last_ts_ms,
+        node_state: src.node_state(),
+        upstream: src.upstream(),
+        replicas: replicas
+            .summary(epoch, lag_max)
+            .into_iter()
+            .map(|(node_id, applied_seq, in_sync)| ReplicaSummary { node_id, applied_seq, in_sync })
+            .collect(),
+    }
+}
+
+pub(crate) fn to_pb(i: &NodeInfo) -> pb::StatusResponse {
+    pb::StatusResponse {
+        node_id: i.node_id.clone(),
+        role: match i.role {
+            Role::Master => "master".into(),
+            Role::Slave => "slave".into(),
+        },
+        identity: i.identity.as_ref().map(identity_to_pb),
+        epoch_history: epochs_to_pb(&i.epoch_history),
+        last_seq: i.last_seq,
+        last_entry_crc: i.last_entry_crc,
+        last_ts_ms: i.last_ts_ms,
+        node_state: i.node_state.clone(),
+        upstream: i.upstream.clone().unwrap_or_default(),
+        replicas: i
+            .replicas
+            .iter()
+            .map(|r| pb::ReplicaSummary { node_id: r.node_id.clone(), applied_seq: r.applied_seq, in_sync: r.in_sync })
+            .collect(),
+    }
+}
+```
+
+- [ ] **Step 6: Bidirectional Tail with the ack reader**
+
+Replace `src/server/tail.rs` with:
+
+```rust
+//! Tail: validation (PROTOCOL.md §7.2) and the per-stream producer (§7.3).
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::Instant;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
+
+use super::replicas::{FetchSettings, NewReplica, ReplicaCell, ReplicaHandle};
+use super::{call_info, store_status, Lease, ServerState, TailStream};
+use crate::auth::Method;
+use crate::clock::{Clock, SystemClock};
+use crate::error::Error;
+use crate::failpoint;
+use crate::net::convert::{entry_to_pb, identity_from_pb};
+use crate::net::{internal_status, invalid_argument, reason_status};
+use crate::pb;
+use crate::pb::tail_client_message::Kind as ClientKind;
+use crate::pb::tail_message::Kind;
+use crate::source::LogSource;
+use crate::types::{LogEntry, Role, Seq};
+
+/// Entries read from the changelog per blocking read.
+pub(crate) const READ_BATCH: usize = 64;
+/// Messages buffered per stream before back-pressure applies.
+const CHANNEL: usize = 16;
+
+/// How long the server waits for the client's `start` message.
+const START_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(super) async fn tail(
+    state: &Arc<ServerState>,
+    req: Request<tonic::Streaming<pb::TailClientMessage>>,
+) -> Result<Response<TailStream>, Status> {
+    let call = call_info(&req, Method::Tail)?;
+    let src = state.authorize(&call, Method::Tail).await?;
+    let mut inbound = req.into_inner();
+    let r = match tokio::time::timeout(START_TIMEOUT, inbound.message()).await {
+        Ok(Ok(Some(pb::TailClientMessage { kind: Some(ClientKind::Start(r)) }))) => r,
+        Ok(Ok(_)) => return Err(invalid_argument("the first Tail message must be `start`")),
+        Ok(Err(status)) => return Err(status),
+        Err(_) => return Err(invalid_argument("no `start` message within 10 s")),
+    };
+    call.check_client_id(&r.client_id)?;
+    // Subscribe before validating, so a reset after validation is never missed.
+    let mut resets = src.resets();
+    resets.borrow_and_update();
+    validate(&*src, &r)?;
+    state.expire_leases(std::time::Instant::now());
+    let lease = r.bootstrap_lease.as_deref().and_then(|id| state.take_lease(id, &r.client_id, r.from_seq));
+    let (tx, rx) = mpsc::channel(CHANNEL);
+    let fetch = Fetch::clamp(&r, src.heartbeat(), state.cfg.limits.max_tail_batch_bytes);
+    // `validate` checked the identity, so this is the epoch the replica follows.
+    let epoch = r.identity.as_ref().map_or(0, |id| id.epoch);
+    let replica = state.replicas.open(NewReplica {
+        node_id: call.peer.peer_id.clone(),
+        remote_addr: call.peer.remote_addr,
+        peer_verified: call.peer.peer_id_verified,
+        epoch,
+        has_up_to: r.from_seq - 1,
+        fetch: fetch.settings(),
+    });
+    let (violation_tx, violation_rx) = oneshot::channel();
+    let (done_tx, done_rx) = oneshot::channel();
+    tokio::spawn(read_acks(inbound, replica.cell().clone(), src.subscribe(), violation_tx, done_rx));
+    let stream = Stream { replica, violation: Some(violation_rx), _done: done_tx };
+    let out = Out { tx, shutdown: state.shutdown.clone(), resets };
+    tokio::spawn(produce(src, out, r.from_seq, fetch, lease, stream));
+    Ok(Response::new(ReceiverStream::new(rx)))
+}
+
+fn validate(src: &dyn LogSource, r: &pb::TailRequest) -> Result<(), Status> {
+    let ident = src.identity().filter(|_| src.is_ready());
+    let Some((server_id, _)) = ident else {
+        return Err(reason_status(pb::Reason::NotReady, "server is bootstrapping"));
+    };
+    let want = r.identity.as_ref().ok_or_else(|| crate::net::invalid_argument("identity is required"))?;
+    let want = identity_from_pb(want).map_err(|e| crate::net::invalid_argument(e.to_string()))?;
+    if want != server_id {
+        return Err(reason_status(pb::Reason::IdentityChanged, format!("server identity is {server_id:?}")));
+    }
+    if r.from_seq == 0 {
+        return Err(crate::net::invalid_argument("from_seq starts at 1"));
+    }
+    let store = src.store();
+    let last = store.position().last_seq;
+    if src.role() == Role::Master && r.from_seq > last + 1 {
+        return Err(reason_status(pb::Reason::Diverged, format!("from_seq {} is past master last_seq {last}", r.from_seq)));
+    }
+    if let Some(prev) = r.prev_crc32c {
+        if let Some(have) = store.entry_crc(r.from_seq - 1).map_err(store_status)? {
+            if have != prev {
+                return Err(reason_status(pb::Reason::Diverged, format!("entry {} differs", r.from_seq - 1)));
+            }
+        }
+    }
+    let first = store.first_retained_seq();
+    if r.from_seq < first {
+        return Err(reason_status(pb::Reason::LogGap, format!("from_seq {} < first retained {first}", r.from_seq)));
+    }
+    Ok(())
+}
+
+fn heartbeat(src: &dyn LogSource) -> pb::TailMessage {
+    pb::TailMessage {
+        kind: Some(Kind::Heartbeat(pb::Heartbeat {
+            upstream_last_seq: src.store().position().last_seq,
+            origin_last_seq: src.origin_last_seq(),
+            ts_ms: SystemClock.now_ms(),
+        })),
+    }
+}
+
+type Tx = mpsc::Sender<Result<pb::TailMessage, Status>>;
+
+/// The producer's ties to its stream: its registry entry (removed when the producer ends),
+/// a protocol violation found by the ack reader, and `_done`, whose drop stops the reader.
+struct Stream {
+    replica: ReplicaHandle,
+    /// `None` once the ack reader has finished without a violation.
+    violation: Option<oneshot::Receiver<Status>>,
+    _done: oneshot::Sender<()>,
+}
+
+impl Stream {
+    /// A violation the ack reader reported, if any (non-blocking).
+    fn violation(&mut self) -> Option<Status> {
+        let rx = self.violation.as_mut()?;
+        match rx.try_recv() {
+            Ok(status) => Some(status),
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.violation = None;
+                None
+            }
+        }
+    }
+}
+
+/// Reads the client's acks (addendum §1) until the stream ends. It holds no reference to
+/// the node, only the stream's registry cell and the node's seq channel.
+async fn read_acks(
+    mut inbound: tonic::Streaming<pb::TailClientMessage>,
+    cell: Arc<ReplicaCell>,
+    seqs: watch::Receiver<Seq>,
+    violation: oneshot::Sender<Status>,
+    mut done: oneshot::Receiver<()>,
+) {
+    loop {
+        let msg = tokio::select! {
+            m = inbound.message() => m,
+            _ = &mut done => return,
+        };
+        let problem = match msg {
+            Ok(Some(pb::TailClientMessage { kind: Some(ClientKind::Ack(a)) })) => {
+                let node_last = *seqs.borrow();
+                match cell.ack(a.applied_seq, node_last) {
+                    Ok(()) => continue,
+                    Err(e) => e,
+                }
+            }
+            Ok(Some(_)) => "after `start`, only `ack` messages are allowed".to_string(),
+            // The client half-closed or went away; the producer notices on its own.
+            Ok(None) | Err(_) => return,
+        };
+        let _ = violation.send(invalid_argument(problem));
+        return;
+    }
+}
+
+/// The sending side of one stream. Every send also watches shutdown and resets, so a
+/// client that stops reading can never keep the producer (and the node's database) alive.
+struct Out {
+    tx: Tx,
+    shutdown: watch::Receiver<bool>,
+    resets: watch::Receiver<u64>,
+}
+
+enum Sent {
+    Ok,
+    /// The client went away.
+    Gone,
+    /// The stream must end with this status.
+    End(Status),
+}
+
+impl Out {
+    async fn send(&mut self, msg: pb::TailMessage) -> Sent {
+        tokio::select! {
+            biased;
+            _ = super::stopped(&mut self.shutdown) => Sent::End(shutting_down()),
+            _ = self.resets.changed() => Sent::End(upstream_reset()),
+            r = self.tx.send(Ok(msg)) => if r.is_ok() { Sent::Ok } else { Sent::Gone },
+        }
+    }
+
+    async fn end(&mut self, status: Status) {
+        super::end_stream(&self.tx, status, &mut self.shutdown, &mut self.resets).await;
+    }
+}
+
+fn shutting_down() -> Status {
+    reason_status(pb::Reason::ShuttingDown, "server is shutting down")
+}
+
+fn upstream_reset() -> Status {
+    reason_status(pb::Reason::UpstreamReset, "server state was replaced")
+}
+
+/// Fetch batching parameters of one stream, clamped to the server's limits (PROTOCOL.md §7.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Fetch {
+    pub min_bytes: usize,
+    pub max_wait: Duration,
+    pub max_bytes: usize,
+}
+
+/// `max_batch_bytes = 0` means this.
+pub(crate) const DEFAULT_MAX_BATCH_BYTES: usize = 1 << 20;
+
+impl Fetch {
+    fn settings(&self) -> FetchSettings {
+        FetchSettings {
+            min_batch_bytes: self.min_bytes as u64,
+            max_wait: self.max_wait,
+            max_batch_bytes: self.max_bytes as u64,
+        }
+    }
+
+    pub(crate) fn clamp(r: &pb::TailRequest, heartbeat: Duration, max_tail_batch_bytes: usize) -> Fetch {
+        let max_bytes = match r.max_batch_bytes {
+            0 => DEFAULT_MAX_BATCH_BYTES,
+            n => n as usize,
+        };
+        Fetch {
+            min_bytes: r.min_batch_bytes as usize,
+            max_wait: Duration::from_millis(u64::from(r.max_wait_ms)).min(heartbeat),
+            max_bytes: max_bytes.min(max_tail_batch_bytes).max(1),
+        }
+    }
+}
+
+/// Size of an entry inside an `EntryBatch`: its encoded length plus its framing (field tag
+/// and length varint), so a batch never exceeds `max_batch_bytes` on the wire.
+fn framed_len(entry_len: usize) -> usize {
+    let mut varint = 1;
+    let mut n = entry_len >> 7;
+    while n > 0 {
+        varint += 1;
+        n >>= 7;
+    }
+    entry_len + 1 + varint
+}
+
+/// Entries read but not yet sent.
+struct Pending {
+    entries: Vec<pb::LogEntry>,
+    bytes: usize,
+    /// When the oldest pending entry became available to this stream.
+    since: Option<Instant>,
+}
+
+impl Pending {
+    fn take(&mut self) -> pb::TailMessage {
+        self.bytes = 0;
+        self.since = None;
+        pb::TailMessage { kind: Some(Kind::Batch(pb::EntryBatch { entries: std::mem::take(&mut self.entries) })) }
+    }
+}
+
+/// Streams entries from `next` in order, in batches (PROTOCOL.md §7.5), with heartbeats,
+/// until the client goes away or the stream must end (reset, shutdown, gap, corruption).
+async fn produce(
+    src: Arc<dyn LogSource>,
+    mut out: Out,
+    mut next: Seq,
+    fetch: Fetch,
+    mut lease: Option<Lease>,
+    mut stream: Stream,
+) {
+    let hb: Duration = src.heartbeat();
+    let mut seqs = src.subscribe();
+    let mut ahead: VecDeque<LogEntry> = VecDeque::new();
+    let mut pending = Pending { entries: Vec::new(), bytes: 0, since: None };
+    // The first heartbeat goes out at once, so the client learns positions immediately.
+    let mut next_hb = Instant::now();
+    macro_rules! send {
+        ($msg:expr) => {
+            match out.send($msg).await {
+                Sent::Ok => {}
+                Sent::Gone => return,
+                Sent::End(status) => return out.end(status).await,
+            }
+        };
+    }
+    // The registry learns what was sent before the client can see it, so an ack is never
+    // ahead of `sent_seq`.
+    macro_rules! send_pending {
+        () => {{
+            if let Some(last) = pending.entries.last() {
+                stream.replica.cell().note_sent(last.seq);
+            }
+            send!(pending.take());
+        }};
+    }
+    macro_rules! flush {
+        () => {{
+            send_pending!();
+            if Instant::now() >= next_hb {
+                send!(heartbeat(&*src));
+                next_hb = Instant::now() + hb;
+            }
+        }};
+    }
+    loop {
+        if out.resets.has_changed().unwrap_or(true) {
+            // Mark the reset seen, so `end_stream` waits for room instead of dropping the status.
+            out.resets.borrow_and_update();
+            return out.end(upstream_reset()).await;
+        }
+        if *out.shutdown.borrow() {
+            return out.end(shutting_down()).await;
+        }
+        if let Some(status) = stream.violation() {
+            return out.end(status).await;
+        }
+        // Read ahead everything that is available (in blocks of READ_BATCH).
+        if ahead.is_empty() && next <= src.store().position().last_seq {
+            let s = src.clone();
+            let read = tokio::task::spawn_blocking(move || s.store().read_entries(next, READ_BATCH, fetch.max_bytes)).await;
+            let failure = match read {
+                Ok(Ok(entries)) => {
+                    // The lease only protects `S + 1`: release it once that entry is read.
+                    if lease.as_ref().is_some_and(|l| entries.last().is_some_and(|e| e.seq > l.snapshot_seq)) {
+                        lease = None;
+                        tracing::debug!("bootstrap lease released: the entries after the snapshot are read");
+                    }
+                    ahead.extend(entries);
+                    None
+                }
+                Ok(Err(e @ Error::Gap { .. })) => Some(reason_status(pb::Reason::LogGap, e.to_string())),
+                Ok(Err(e)) => Some(store_status(e)),
+                Err(e) => Some(internal_status(format!("log read failed: {e}"))),
+            };
+            if let Some(status) = failure {
+                // Entries already read are valid: deliver them before ending the stream.
+                if !pending.entries.is_empty() {
+                    send_pending!();
+                }
+                return out.end(status).await;
+            }
+        }
+        // Move available entries into the pending batch; flush when it is full or big enough.
+        if let Some(entry) = ahead.pop_front() {
+            if let Err(e) = entry.verify_crc() {
+                return out.end(store_status(e)).await;
+            }
+            let size = framed_len(entry.encoded_len());
+            if !pending.entries.is_empty() && pending.bytes + size > fetch.max_bytes {
+                flush!();
+            }
+            next = entry.seq + 1;
+            pending.since.get_or_insert_with(Instant::now);
+            pending.bytes += size;
+            pending.entries.push(entry_to_pb(entry));
+            if failpoint::fire("server-tail-after-entry") {
+                send_pending!();
+                return out.end(Status::unavailable("failpoint server-tail-after-entry")).await;
+            }
+            if pending.bytes >= fetch.max_bytes || (fetch.min_bytes > 0 && pending.bytes >= fetch.min_bytes) {
+                flush!();
+            }
+            continue;
+        }
+        // Everything available is pending: real-time mode sends it now, otherwise it waits
+        // for min_batch_bytes or until the oldest pending entry has waited max_wait.
+        let deadline = pending.since.map(|t| t + fetch.max_wait);
+        if !pending.entries.is_empty() && (fetch.min_bytes == 0 || deadline.is_some_and(|d| Instant::now() >= d)) {
+            flush!();
+            continue;
+        }
+        let wake = match deadline {
+            Some(d) if d < next_hb => d,
+            _ => next_hb,
+        };
+        tokio::select! {
+            r = seqs.changed() => if r.is_err() { return },
+            _ = out.resets.changed() => return out.end(upstream_reset()).await,
+            r = out.shutdown.changed() => if r.is_err() { return },
+            _ = out.tx.closed() => return,
+            v = async { stream.violation.as_mut().expect("guarded by the condition").await }, if stream.violation.is_some() => {
+                match v {
+                    Ok(status) => return out.end(status).await,
+                    Err(_) => stream.violation = None,
+                }
+            }
+            _ = tokio::time::sleep_until(wake) => {
+                if Instant::now() >= next_hb {
+                    send!(heartbeat(&*src));
+                    next_hb = Instant::now() + hb;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(min: u32, wait_ms: u32, max: u32) -> pb::TailRequest {
+        pb::TailRequest { min_batch_bytes: min, max_wait_ms: wait_ms, max_batch_bytes: max, ..Default::default() }
+    }
+
+    #[test]
+    fn fetch_parameters_are_clamped_to_server_limits() {
+        let hb = Duration::from_millis(500);
+        let f = Fetch::clamp(&req(10, 100, 2048), hb, 4 << 20);
+        assert_eq!(f, Fetch { min_bytes: 10, max_wait: Duration::from_millis(100), max_bytes: 2048 });
+        assert_eq!(Fetch::clamp(&req(0, 60_000, 0), hb, 4 << 20).max_wait, hb, "max_wait <= heartbeat");
+        assert_eq!(Fetch::clamp(&req(0, 0, 0), hb, 4 << 20).max_bytes, DEFAULT_MAX_BATCH_BYTES, "0 = 1 MiB");
+        assert_eq!(Fetch::clamp(&req(0, 0, u32::MAX), hb, 4 << 20).max_bytes, 4 << 20, "capped");
+        assert_eq!(Fetch::clamp(&req(0, 0, 0), hb, 1000).max_bytes, 1000, "default is capped too");
+    }
+
+    #[test]
+    fn framing_counts_tag_and_length_varint() {
+        assert_eq!(framed_len(0), 2);
+        assert_eq!(framed_len(127), 127 + 2);
+        assert_eq!(framed_len(128), 128 + 3);
+        assert_eq!(framed_len(16_383), 16_383 + 3);
+        assert_eq!(framed_len(16_384), 16_384 + 4);
+    }
+
+    /// A reset between validation and the first poll of the producer is not missed: the
+    /// receiver is subscribed (and marked seen) first, as the handler does.
+    #[tokio::test]
+    async fn a_reset_after_subscription_but_before_streaming_ends_the_stream() {
+        use crate::server::test_client::{serving_master, within};
+        use crate::types::CfSpec;
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(dir.path(), |cfg| cfg.serve = None).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        let src = m.log_source();
+        let mut resets = src.resets();
+        resets.borrow_and_update();
+        m.bump_epoch().unwrap();
+        let (tx, rx) = mpsc::channel(CHANNEL);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let fetch = Fetch::clamp(&req(0, 0, 0), Duration::from_secs(1), 1 << 20);
+        let registry = Arc::new(super::super::replicas::ReplicaRegistry::default());
+        let replica = registry.open(NewReplica {
+            node_id: "b".into(),
+            remote_addr: "127.0.0.1:1".parse().unwrap(),
+            peer_verified: false,
+            epoch: 1,
+            has_up_to: 0,
+            fetch: fetch.settings(),
+        });
+        let (_violation_tx, violation) = oneshot::channel();
+        let (done, _done_rx) = oneshot::channel();
+        let stream = Stream { replica, violation: Some(violation), _done: done };
+        tokio::spawn(produce(src, Out { tx, shutdown, resets }, 1, fetch, None, stream));
+        let mut rx = rx;
+        let err = within("the stream status", async {
+            loop {
+                match rx.recv().await {
+                    Some(Err(e)) => return e,
+                    Some(Ok(_)) => {}
+                    None => panic!("stream ended without a status"),
+                }
+            }
+        })
+        .await;
+        assert_eq!(crate::net::reason_of(&err), Some(pb::Reason::UpstreamReset));
+    }
+}
+```
+
+The first client message must be `start` (10 s); the stream then registers in the replica registry and a separate task reads acks (`read_acks`), checking each against the cell (`ReplicaCell::ack`). A violation is handed to the producer through a oneshot and ends the stream with `INVALID_ARGUMENT`; `send_pending!` records the last seq sent before it sends. `produce` takes the `Out` sender bundle (it had too many arguments for clippy otherwise).
+
+- [ ] **Step 7: Release a bootstrap's snapshot and slot before its final status**
+
+After a reset, Task 5's bootstrap job waited in `end_stream` for a client that might never read again, still holding its `ReadSnapshot` and its permit. Replace `src/server/bootstrap.rs` with (the job now returns its sender and final status; the blocking closure drops the snapshot and the permit, then spawns the final send):
+
+```rust
+//! Bootstrap: a consistent snapshot streamed as header, records and footer, with a
+//! retention guard kept as a lease until the client's Tail (PROTOCOL.md §8).
+
+use std::sync::Arc;
+
+use tokio::sync::{mpsc, watch, TryAcquireError};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
+
+use super::{call_info, store_status, BootstrapStream, ServerState};
+use crate::auth::Method;
+use crate::codec::digest::Digest;
+use crate::codec::ENVELOPE_VERSION;
+use crate::net::convert::{cf_to_pb, epochs_to_pb, identity_to_pb};
+use crate::net::reason_status;
+use crate::pb;
+use crate::pb::bootstrap_chunk::Kind;
+use crate::read::ReadSnapshot;
+use crate::store::meta::MetaSnapshot;
+use crate::store::retention::RetentionGuard;
+
+const CHANNEL: usize = 4;
+
+pub(super) async fn bootstrap(
+    state: &Arc<ServerState>,
+    req: Request<pb::BootstrapRequest>,
+) -> Result<Response<BootstrapStream>, Status> {
+    let call = call_info(&req, Method::Bootstrap)?;
+    let src = state.authorize(&call, Method::Bootstrap).await?;
+    let client_id = req.into_inner().client_id;
+    call.check_client_id(&client_id)?;
+    // Subscribe before anything else, so a reset after this point is never missed.
+    let mut resets = src.resets();
+    resets.borrow_and_update();
+    if state.is_shutting_down() {
+        return Err(reason_status(pb::Reason::ShuttingDown, "server is shutting down"));
+    }
+    state.expire_leases(std::time::Instant::now());
+    if !src.is_ready() {
+        return Err(reason_status(pb::Reason::NotReady, "server is bootstrapping"));
+    }
+    let permit = state
+        .bootstraps
+        .clone()
+        .try_acquire_owned()
+        .map_err(|e| match e {
+            TryAcquireError::Closed => reason_status(pb::Reason::ShuttingDown, "server is shutting down"),
+            TryAcquireError::NoPermits => reason_status(pb::Reason::Busy, "too many bootstraps in progress"),
+        })?;
+    let store = src.store();
+    // Guard first (at a seq no later than the snapshot's), so retention cannot remove
+    // entry S + 1 between taking the snapshot and registering the real guard.
+    let provisional = store.guard(store.position().last_seq);
+    let snap = store.read_snapshot(0).map_err(store_status)?;
+    let meta = snap.meta().map_err(store_status)?;
+    let guard = store.guard(meta.last_seq);
+    drop(provisional);
+    let Some(identity) = meta.identity else {
+        return Err(reason_status(pb::Reason::NotReady, "server has no data yet"));
+    };
+    let lease_id = *uuid::Uuid::new_v4().as_bytes();
+    let header = pb::BootstrapHeader {
+        identity: Some(identity_to_pb(&identity)),
+        snapshot_seq: meta.last_seq,
+        snapshot_crc32c: meta.last_entry_crc,
+        cf_specs: meta.cf_specs.iter().map(cf_to_pb).collect(),
+        max_entry_bytes: src.max_entry_bytes(),
+        envelope_version: u32::from(ENVELOPE_VERSION),
+        lease_id: lease_id.to_vec(),
+        lease_ttl_ms: u64::try_from(state.cfg.limits.bootstrap_lease_ttl.as_millis()).unwrap_or(u64::MAX),
+        epoch_history: epochs_to_pb(&meta.epoch_history),
+    };
+    tracing::info!(client = %client_id, snapshot_seq = meta.last_seq, cfs = meta.cf_specs.len(), "serving bootstrap");
+    let (tx, rx) = mpsc::channel(CHANNEL);
+    let job = Job {
+        state: state.clone(),
+        snap,
+        meta,
+        header,
+        guard,
+        lease_id,
+        client_id,
+        tx,
+        resets,
+        runtime: tokio::runtime::Handle::current(),
+    };
+    let (mut stop, mut reset) = (state.shutdown.clone(), job.resets.clone());
+    let runtime = job.runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let (tx, end) = job.run();
+        // The job, and with it the snapshot and (unless leased) the guard, is gone; only then
+        // is the permit returned (`ServerHandle::shutdown` waits for all permits). A final
+        // status may have to wait for a stalled client: that happens afterwards, holding
+        // nothing but the channel, so a reset never pins the snapshot or a bootstrap slot.
+        drop(permit);
+        if let Some(status) = end {
+            reset.borrow_and_update();
+            runtime.spawn(async move { super::end_stream(&tx, status, &mut stop, &mut reset).await });
+        }
+    });
+    Ok(Response::new(ReceiverStream::new(rx)))
+}
+
+type Tx = mpsc::Sender<Result<pb::BootstrapChunk, Status>>;
+
+struct Job {
+    state: Arc<ServerState>,
+    snap: ReadSnapshot,
+    meta: MetaSnapshot,
+    header: pb::BootstrapHeader,
+    guard: RetentionGuard,
+    lease_id: [u8; 16],
+    client_id: String,
+    tx: Tx,
+    resets: watch::Receiver<u64>,
+    runtime: tokio::runtime::Handle,
+}
+
+enum Sent {
+    Ok,
+    /// The client went away.
+    Gone,
+    /// The stream must end with this status.
+    End(Status),
+}
+
+fn chunk(kind: Kind) -> Result<pb::BootstrapChunk, Status> {
+    Ok(pb::BootstrapChunk { kind: Some(kind) })
+}
+
+impl Job {
+    /// Runs on a blocking thread and consumes the job: the snapshot and the guard are dropped
+    /// when it returns. Returns a sender and the status the stream must still end with, if
+    /// any; the caller delivers it after releasing the job's resources.
+    fn run(self) -> (Tx, Option<Status>) {
+        let Job { state, snap, meta, header, guard, lease_id, client_id, tx, resets, runtime } = self;
+        let out = tx.clone();
+        // A send also gives up on shutdown or reset, so a client that stops reading cannot
+        // keep this job (and the node's database) alive.
+        let mut stop = state.shutdown.clone();
+        let mut reset = resets.clone();
+        let mut send = |m: Result<pb::BootstrapChunk, Status>| {
+            runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = super::stopped(&mut stop) => Sent::End(reason_status(pb::Reason::ShuttingDown, "server is shutting down")),
+                    _ = reset.changed() => Sent::End(reason_status(pb::Reason::UpstreamReset, "server state was replaced")),
+                    r = tx.send(m) => if r.is_ok() { Sent::Ok } else { Sent::Gone },
+                }
+            })
+        };
+        // Sends a message; on a stop the stream ends with its status and the job returns.
+        macro_rules! send {
+            ($m:expr) => {
+                match send($m) {
+                    Sent::Ok => {}
+                    Sent::Gone => return (out, None),
+                    Sent::End(status) => return (out, Some(status)),
+                }
+            };
+        }
+        send!(chunk(Kind::Header(header)));
+        let chunk_bytes = state.cfg.limits.bootstrap_chunk_bytes;
+        let mut digest = Digest::new();
+        let ctx = snap.raw_ctx();
+        for cf in &meta.cf_specs {
+            digest.cf_marker(&cf.spec.name, cf.create_seq);
+            let Some(phys) = snap.phys(&cf.spec.name).filter(|p| p.entry == *cf) else {
+                return (out, Some(reason_status(pb::Reason::Corrupt, format!("CF {} is missing from the snapshot", cf.spec.name))));
+            };
+            let iter = match ctx.iter_raw(phys) {
+                Ok(iter) => iter,
+                Err(e) => {
+                    return (out, Some(store_status(e)));
+                }
+            };
+            let mut records = Vec::new();
+            let mut size = 0usize;
+            for item in iter {
+                if state.is_shutting_down() {
+                    return (out, Some(reason_status(pb::Reason::ShuttingDown, "server is shutting down")));
+                }
+                if resets.has_changed().unwrap_or(true) {
+                    return (out, Some(reason_status(pb::Reason::UpstreamReset, "server state was replaced")));
+                }
+                let (key, envelope) = match item {
+                    Ok(kv) => kv,
+                    Err(e) => {
+                        return (out, Some(store_status(e)));
+                    }
+                };
+                digest.record(&key, &envelope);
+                size += key.len() + envelope.len();
+                records.push(pb::Record { key: key.into_vec(), envelope: envelope.into_vec() });
+                if size >= chunk_bytes {
+                    let msg = pb::BootstrapRecords { cf: cf.spec.name.clone(), records: std::mem::take(&mut records) };
+                    send!(chunk(Kind::Records(msg)));
+                    size = 0;
+                }
+            }
+            if !records.is_empty() {
+                send!(chunk(Kind::Records(pb::BootstrapRecords { cf: cf.spec.name.clone(), records })));
+            }
+        }
+        let (record_count, digest) = digest.finish_bootstrap(meta.last_seq);
+        // The lease exists before the client can see the footer and call Tail.
+        state.insert_lease(lease_id, client_id, meta.last_seq, guard);
+        let footer = pb::BootstrapFooter { record_count, digest: digest.to_vec() };
+        match send(chunk(Kind::Footer(footer))) {
+            Sent::Ok => (out, None),
+            Sent::Gone => {
+                state.remove_lease(&lease_id);
+                (out, None)
+            }
+            Sent::End(status) => {
+                state.remove_lease(&lease_id);
+                (out, Some(status))
+            }
+        }
+    }
+}
+```
+
+- [ ] **Step 8: The server: registry, `Status`, new Tail signature**
+
+Replace `src/server/mod.rs` with:
+
+```rust
+//! The replication gRPC server (PROTOCOL.md §6–§8), shared by the master and by slaves that
+//! serve downstream replicas. It runs over a [`LogSource`] and holds it weakly, so a running
+//! server never keeps a closed node's database open.
+
+pub(crate) mod bootstrap;
+pub(crate) mod handshake;
+pub(crate) mod replicas;
+pub(crate) mod status;
+mod tail;
+#[cfg(test)]
+pub(crate) use tail::READ_BATCH;
+#[cfg(test)]
+pub(crate) mod test_client;
+#[cfg(test)]
+mod tests;
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::time::{Duration, Instant};
+
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tonic::transport::Server;
+use tonic::{Request, Response, Status};
+
+use crate::auth::{subject_common_name, AuthError, FailureLimiter, Method, PeerInfo};
+use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
+use crate::config::{validate_identifier, ServeConfig};
+use crate::error::{Error, Result};
+use crate::net::convert::{cf_to_pb, epochs_to_pb, identity_to_pb};
+use crate::net::{self, reason_status};
+use crate::pb;
+use crate::pb::replication_server::{Replication, ReplicationServer};
+use crate::source::LogSource;
+use crate::store::retention::RetentionGuard;
+use replicas::ReplicaRegistry;
+use crate::types::{Role, Seq};
+
+/// A bootstrap's retention guard, kept after the footer until the client's Tail presents
+/// the lease or the lease expires (PROTOCOL.md §8.4).
+pub(crate) struct Lease {
+    pub client_id: String,
+    pub snapshot_seq: Seq,
+    pub expires_at: Instant,
+    _guard: RetentionGuard,
+}
+
+pub(crate) struct ServerState {
+    source: Weak<dyn LogSource>,
+    pub(crate) cfg: ServeConfig,
+    leases: Mutex<HashMap<[u8; 16], Lease>>,
+    bootstraps: Arc<Semaphore>,
+    pub(crate) shutdown: watch::Receiver<bool>,
+    auth_failures: FailureLimiter,
+    /// The node's downstream replicas (shared with the node, which reports and waits on them).
+    pub(crate) replicas: Arc<ReplicaRegistry>,
+}
+
+impl ServerState {
+    fn source(&self) -> Result<Arc<dyn LogSource>, Status> {
+        self.source.upgrade().ok_or_else(|| reason_status(pb::Reason::ShuttingDown, "node is shutting down"))
+    }
+
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+
+    fn leases(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], Lease>> {
+        self.leases.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn insert_lease(&self, id: [u8; 16], client_id: String, snapshot_seq: Seq, guard: RetentionGuard) {
+        let expires_at = Instant::now() + self.cfg.limits.bootstrap_lease_ttl;
+        self.leases().insert(id, Lease { client_id, snapshot_seq, expires_at, _guard: guard });
+    }
+
+    pub(crate) fn remove_lease(&self, id: &[u8; 16]) {
+        self.leases().remove(id);
+    }
+
+    /// Takes the lease presented by `client_id`'s Tail from `from_seq` (PROTOCOL.md §7.2),
+    /// if it matches. The Tail producer keeps it until it has read the entries after the
+    /// snapshot, so aggressive retention cannot trim `S + 1` in between.
+    pub(crate) fn take_lease(&self, lease_id: &[u8], client_id: &str, from_seq: Seq) -> Option<Lease> {
+        let id = <[u8; 16]>::try_from(lease_id).ok()?;
+        let mut leases = self.leases();
+        let matches = leases.get(&id).is_some_and(|l| l.client_id == client_id && from_seq <= l.snapshot_seq + 1);
+        if matches { leases.remove(&id) } else { None }
+    }
+
+    pub(crate) fn expire_leases(&self, now: Instant) {
+        self.leases().retain(|_, l| l.expires_at > now);
+    }
+
+    /// Authenticates one call (PROTOCOL.md §3.3) and returns the node it may read.
+    async fn authorize(&self, call: &CallInfo, method: Method) -> Result<Arc<dyn LogSource>, Status> {
+        let ip = call.peer.remote_addr.ip();
+        if self.auth_failures.is_blocked(ip, Instant::now()) {
+            return Err(Status::unauthenticated("too many failed authentication attempts"));
+        }
+        match self.cfg.authenticator.authenticate(&call.peer, method, call.token.as_deref()).await {
+            Ok(()) => self.source(),
+            Err(AuthError::Unauthenticated) => {
+                self.auth_failures.record_failure(ip, Instant::now());
+                Err(Status::unauthenticated("authentication failed"))
+            }
+            Err(AuthError::PermissionDenied) => Err(Status::permission_denied(format!("{method:?} is not allowed"))),
+        }
+    }
+}
+
+/// What a handler extracts from the request before any `.await`.
+pub(crate) struct CallInfo {
+    pub peer: PeerInfo,
+    pub token: Option<Vec<u8>>,
+    /// `x-rrdb-node-id`, validated.
+    pub node_id: String,
+}
+
+impl CallInfo {
+    /// The request's `client_id` must be a valid id and equal the `x-rrdb-node-id` metadata.
+    pub(crate) fn check_client_id(&self, client_id: &str) -> Result<(), Status> {
+        validate_identifier(client_id).map_err(|e| net::invalid_argument(format!("client_id: {e}")))?;
+        if client_id != self.node_id {
+            return Err(net::invalid_argument("client_id must equal the x-rrdb-node-id metadata"));
+        }
+        Ok(())
+    }
+}
+
+/// Checks the protocol version metadata (except for Handshake), validates the node id
+/// metadata and collects peer info.
+pub(crate) fn call_info<T>(req: &Request<T>, method: Method) -> Result<CallInfo, Status> {
+    if method != Method::Handshake {
+        net::check_protocol_version(req.metadata())?;
+    }
+    let node_id = net::node_id(req.metadata()).ok_or_else(|| net::invalid_argument("x-rrdb-node-id is required"))?;
+    validate_identifier(&node_id).map_err(|e| net::invalid_argument(format!("x-rrdb-node-id: {e}")))?;
+    let remote_addr = req.remote_addr().unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+    let client_cert = req.peer_certs().and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()));
+    let peer = match client_cert.as_deref().and_then(subject_common_name) {
+        Some(cn) => PeerInfo { peer_id: cn, peer_id_verified: true, remote_addr, client_cert },
+        None => PeerInfo { peer_id: node_id.clone(), peer_id_verified: false, remote_addr, client_cert },
+    };
+    Ok(CallInfo { peer, token: net::bearer_token(req.metadata()), node_id })
+}
+
+/// Maps a store error to a status. Corruption and gaps keep their protocol reasons.
+pub(crate) fn store_status(e: Error) -> Status {
+    match e {
+        Error::Corrupt(m) => reason_status(pb::Reason::Corrupt, m),
+        e @ Error::Gap { .. } => reason_status(pb::Reason::LogGap, e.to_string()),
+        other => net::internal_status(other.to_string()),
+    }
+}
+
+struct Svc(Arc<ServerState>);
+
+pub(crate) type TailStream = ReceiverStream<Result<pb::TailMessage, Status>>;
+pub(crate) type BootstrapStream = ReceiverStream<Result<pb::BootstrapChunk, Status>>;
+pub(crate) type VerifyRangeStream = ReceiverStream<Result<pb::VerifyRangeResponse, Status>>;
+
+#[tonic::async_trait]
+impl Replication for Svc {
+    async fn handshake(&self, req: Request<pb::HandshakeRequest>) -> Result<Response<pb::HandshakeResponse>, Status> {
+        let call = call_info(&req, Method::Handshake)?;
+        let src = self.0.authorize(&call, Method::Handshake).await?;
+        let r = req.into_inner();
+        call.check_client_id(&r.client_id)?;
+        if let Some(known) = &r.known_identity {
+            crate::net::convert::identity_from_pb(known)
+                .map_err(|_| net::invalid_argument("known_identity.db_uuid must be 16 bytes"))?;
+        }
+        let view = server_view(&*src, r.last_seq)?;
+        let v = handshake::decide(&view, &r);
+        tracing::info!(
+            server = %view.server_id, client = %r.client_id, last_seq = r.last_seq,
+            decision = v.decision.as_str_name(), reason = v.reason.as_str_name(), detail = %v.detail,
+            "handshake"
+        );
+        let identity = view.identity.filter(|_| v.reason != pb::Reason::NotReady);
+        Ok(Response::new(pb::HandshakeResponse {
+            protocol_version: PROTOCOL_VERSION,
+            envelope_version: u32::from(ENVELOPE_VERSION),
+            server_id: view.server_id,
+            decision: v.decision as i32,
+            reason: v.reason as i32,
+            detail: v.detail,
+            upstream_chain: view.upstream_chain,
+            identity: identity.as_ref().map(identity_to_pb),
+            cf_specs: src.store().cfs.live_entries().iter().map(cf_to_pb).collect(),
+            first_retained_seq: view.first_retained_seq,
+            last_seq: view.last_seq,
+            origin_last_seq: src.origin_last_seq(),
+            max_entry_bytes: src.max_entry_bytes(),
+            heartbeat_ms: u32::try_from(src.heartbeat().as_millis()).unwrap_or(u32::MAX),
+            epoch_history: epochs_to_pb(&view.epoch_history),
+        }))
+    }
+
+    type TailStream = TailStream;
+
+    async fn tail(&self, req: Request<tonic::Streaming<pb::TailClientMessage>>) -> Result<Response<TailStream>, Status> {
+        tail::tail(&self.0, req).await
+    }
+
+    type BootstrapStream = BootstrapStream;
+
+    async fn bootstrap(&self, req: Request<pb::BootstrapRequest>) -> Result<Response<BootstrapStream>, Status> {
+        bootstrap::bootstrap(&self.0, req).await
+    }
+
+    async fn verify_begin(&self, _: Request<pb::VerifyBeginRequest>) -> Result<Response<pb::VerifyBeginResponse>, Status> {
+        Err(net::unimplemented("Verify is not implemented by this version"))
+    }
+
+    type VerifyRangeStream = VerifyRangeStream;
+
+    async fn verify_range(
+        &self,
+        _: Request<tonic::Streaming<pb::VerifyRangeRequest>>,
+    ) -> Result<Response<VerifyRangeStream>, Status> {
+        Err(net::unimplemented("Verify is not implemented by this version"))
+    }
+
+    async fn status(&self, req: Request<pb::StatusRequest>) -> Result<Response<pb::StatusResponse>, Status> {
+        let call = call_info(&req, Method::Status)?;
+        let src = self.0.authorize(&call, Method::Status).await?;
+        call.check_client_id(&req.get_ref().client_id)?;
+        let info = status::node_info(&*src, &self.0.replicas, self.0.cfg.limits.replica_lag_time_max);
+        Ok(Response::new(status::to_pb(&info)))
+    }
+
+    async fn verify_end(&self, _: Request<pb::VerifyEndRequest>) -> Result<Response<pb::VerifyEndResponse>, Status> {
+        Err(net::unimplemented("Verify is not implemented by this version"))
+    }
+}
+
+fn server_view(src: &dyn LogSource, client_last_seq: Seq) -> Result<handshake::ServerView, Status> {
+    let ident = src.identity();
+    let store = src.store();
+    Ok(handshake::ServerView {
+        server_id: src.node_id().to_string(),
+        is_master: src.role() == Role::Master,
+        ready: src.is_ready(),
+        identity: ident.as_ref().map(|(id, _)| *id),
+        epoch_history: ident.map(|(_, h)| h).unwrap_or_default(),
+        upstream_chain: src.upstream_chain(),
+        last_seq: store.position().last_seq,
+        first_retained_seq: store.first_retained_seq(),
+        crc_at_client_last: store.entry_crc(client_last_seq).map_err(store_status)?,
+    })
+}
+
+/// A running server. Dropping it signals shutdown without waiting.
+pub(crate) struct ServerHandle {
+    addr: SocketAddr,
+    state: Arc<ServerState>,
+    shutdown_tx: watch::Sender<bool>,
+    task: Option<JoinHandle<std::result::Result<(), tonic::transport::Error>>>,
+    sweep: Option<JoinHandle<()>>,
+}
+
+impl ServerHandle {
+    pub(crate) fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// How long a replica may go without being fully caught up and still count as in sync.
+    pub(crate) fn replica_lag_time_max(&self) -> Duration {
+        self.state.cfg.limits.replica_lag_time_max
+    }
+
+    /// Ends every stream with `SHUTTING_DOWN`, stops accepting calls, and waits (up to 5 s
+    /// each) until every bootstrap job has returned its permit (and dropped its snapshot)
+    /// and the server task has finished.
+    pub(crate) async fn shutdown(mut self) {
+        self.shutdown_tx.send_replace(true);
+        let all = u32::try_from(self.state.cfg.limits.max_concurrent_bootstraps).unwrap_or(u32::MAX);
+        if tokio::time::timeout(Duration::from_secs(5), self.state.bootstraps.acquire_many(all)).await.is_err() {
+            tracing::warn!(addr = %self.addr, "bootstrap jobs did not stop in 5 s");
+        }
+        // A Bootstrap that arrives later on an existing connection is refused.
+        self.state.bootstraps.close();
+        self.state.leases().clear();
+        if let Some(sweep) = self.sweep.take() {
+            let _ = sweep.await;
+        }
+        if let Some(mut task) = self.task.take() {
+            if tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_err() {
+                tracing::warn!(addr = %self.addr, "replication server did not stop in 5 s; aborting it");
+                task.abort();
+            }
+        }
+    }
+
+    /// Stops immediately, without waiting for anything (emulates a crash).
+    #[allow(dead_code)] // used by the slave crash tests (later Plan 2 task)
+    pub(crate) fn abort(mut self) {
+        self.shutdown_tx.send_replace(true);
+        self.state.leases().clear();
+        if let Some(t) = self.sweep.take() {
+            t.abort();
+        }
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        self.shutdown_tx.send_replace(true);
+    }
+}
+
+/// Binds `cfg.bind:cfg.port` (0 picks a free port) and serves `source`. Its Tail streams
+/// register in `replicas`.
+pub(crate) async fn start(source: Weak<dyn LogSource>, cfg: ServeConfig, replicas: Arc<ReplicaRegistry>) -> Result<ServerHandle> {
+    cfg.validate()?;
+    let listener = TcpListener::bind((cfg.bind, cfg.port)).await?;
+    let addr = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let state = Arc::new(ServerState {
+        source,
+        bootstraps: Arc::new(Semaphore::new(cfg.limits.max_concurrent_bootstraps)),
+        auth_failures: FailureLimiter::new(cfg.limits.max_auth_failures_per_minute),
+        leases: Mutex::new(HashMap::new()),
+        shutdown: shutdown_rx.clone(),
+        cfg,
+        replicas,
+    });
+    let mut builder = Server::builder()
+        .http2_keepalive_interval(Some(Duration::from_secs(30)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(10)));
+    if let Some(tls) = &state.cfg.tls {
+        builder = builder.tls_config(tls.to_tonic()).map_err(|e| Error::Config(format!("server TLS: {e}")))?;
+    }
+    let service = ReplicationServer::new(Svc(state.clone())).max_decoding_message_size(net::MAX_REQUEST_BYTES);
+    let mut signal = shutdown_rx.clone();
+    let task = tokio::spawn(builder.add_service(service).serve_with_incoming_shutdown(
+        TcpListenerStream::new(listener),
+        async move { stopped(&mut signal).await },
+    ));
+    let sweep = tokio::spawn(sweep_leases(state.clone(), shutdown_rx));
+    tracing::info!(%addr, "replication server listening");
+    Ok(ServerHandle { addr, state, shutdown_tx, task: Some(task), sweep: Some(sweep) })
+}
+
+async fn sweep_leases(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = tick.tick() => state.expire_leases(Instant::now()),
+            r = shutdown.changed() => if r.is_err() || *shutdown.borrow() { return },
+        }
+    }
+}
+
+/// Ends a stream with `status`. If the channel is full it waits for room, so a slow client
+/// still learns why (for example `LOG_GAP`), but gives up on shutdown or reset.
+pub(crate) async fn end_stream<T>(
+    tx: &mpsc::Sender<Result<T, Status>>,
+    status: Status,
+    shutdown: &mut watch::Receiver<bool>,
+    resets: &mut watch::Receiver<u64>,
+) {
+    if let Err(mpsc::error::TrySendError::Full(msg)) = tx.try_send(Err(status)) {
+        tokio::select! {
+            biased;
+            _ = tx.send(msg) => {}
+            _ = stopped(shutdown) => {}
+            _ = resets.changed() => {}
+        }
+    }
+}
+
+/// Starts serving `source` if `serve` is configured.
+pub(crate) async fn start_for<S: LogSource>(
+    source: &Arc<S>,
+    serve: Option<ServeConfig>,
+    replicas: Arc<ReplicaRegistry>,
+) -> Result<Option<ServerHandle>> {
+    match serve {
+        Some(cfg) => {
+            let weak: Weak<dyn LogSource> = Arc::downgrade(source) as Weak<dyn LogSource>;
+            Ok(Some(start(weak, cfg, replicas).await?))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Resolves once `rx` holds `true` (or its sender is gone).
+pub(crate) async fn stopped(rx: &mut watch::Receiver<bool>) {
+    let _ = rx.wait_for(|stop| *stop).await;
+}
+
+/// Waits until `arc` is the only strong reference left (background tasks that held a clone
+/// have finished), so the database it owns closes when the caller drops it.
+pub(crate) async fn await_sole_owner<T: ?Sized>(arc: &Arc<T>, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while Arc::strong_count(arc) > 1 {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    true
+}
+```
+
+In `src/master/writer.rs`, import `Arc` (`use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};`), add to `Inner` after `pub reset_tx: watch::Sender<u64>,`:
+
+```rust
+    /// Downstream replicas served by this master (acks, in-sync state).
+    pub(crate) replicas: Arc<crate::server::replicas::ReplicaRegistry>,
+```
+
+and initialise it in `Inner::new` after `reset_tx: watch::channel(0).0,`:
+
+```rust
+            replicas: Arc::default(),
+```
+
+In `src/master/mod.rs`, add `use crate::server::replicas::ReplicaStatus;`, pass the registry to the server in `Master::open`:
+
+```rust
+        let server = crate::server::start_for(&inner, inner.cfg.serve.clone(), inner.replicas.clone()).await?;
+```
+
+and add before `pub fn serve_addr`:
+
+```rust
+    /// Direct downstream replicas: what each was sent and acknowledged, its lag, and whether
+    /// it is in sync. Empty when the master does not serve replication.
+    pub fn replicas(&self) -> Vec<ReplicaStatus> {
+        match &self.server {
+            Some(s) => self.inner.replicas.status(&*self.inner, self.inner.now_ms(), s.replica_lag_time_max()),
+            None => Vec::new(),
+        }
+    }
+```
+
+In `src/lib.rs`, add `pub mod admin;` to the module list and, after `pub use log::{EntryIter, LogApi};`:
+
+```rust
+pub use server::replicas::{FetchSettings, ReplicaStatus};
+```
+
+- [ ] **Step 9: Run the tests**
+
+Run: `cargo test --lib server && cargo test --lib master`
+Expected: PASS, including the 4 new server tests: `acks_drive_replica_status_and_in_sync` (sent/applied seqs, `lag_entries`, `lag_ms`, `in_sync` follow the acks; the replica leaves the registry when its stream ends), `ack_violations_end_the_stream_with_invalid_argument` (an ack above the last sent seq, and one going backwards), `the_first_tail_message_must_be_start`, `a_reset_releases_a_stalled_bootstraps_snapshot_and_slot` (a client that stops reading a bootstrap + an epoch bump: a second Bootstrap is not `BUSY` within 10 s and the database is released).
+
+Run: `cargo test`
+Expected: PASS (every suite so far, including `tests/proto_sync.rs`).
+
+- [ ] **Step 10: Update PROTOCOL.md and DESIGN.md**
+
+In PROTOCOL.md §2, replace:
+
+```
+The service has six RPCs:
+```
+
+with:
+
+```
+The service has seven RPCs:
+```
+
+In PROTOCOL.md §2 (table), replace:
+
+```
+| `Tail` | server stream | Stream log entries from a given seq, with heartbeats. Does not end on its own. |
+```
+
+with:
+
+```
+| `Tail` | bidi stream | Stream log entries from a given seq, with heartbeats; the client acknowledges what it has committed. Does not end on its own. |
+```
+
+In PROTOCOL.md §2 (table), after:
+
+```
+| `VerifyEnd` | unary | Close a verify session. |
+```
+
+add:
+
+```
+| `Status` | unary | Report the server's identity, position and replicas. Read-only; for operators and promotion tooling. |
+```
+
+In PROTOCOL.md §3.3, after:
+
+```
+- A server SHOULD authorise per RPC. `Bootstrap` and `VerifyRange` with `ListRange` expose every key, and `Bootstrap` exposes every value. The method being called is available to the server's authenticator.
+```
+
+add:
+
+```
+- `Status` exposes node ids, positions and epoch histories, but no keys or values.
+```
+
+In PROTOCOL.md §6.4 (end), after:
+
+```
+The protocol cannot stop an operator from running two masters at once. If two nodes both start the same epoch number with different histories, rule 12 detects the divergence wherever the conflicting entry is still retained.
+```
+
+add:
+
+````
+### 6.5 Status
+
+```proto
+rpc Status(StatusRequest) returns (StatusResponse);
+```
+
+A read-only unary RPC for operators and promotion tooling. It is authenticated and authorised like every other call (the method is `Status`), `client_id` MUST equal `x-rrdb-node-id` (otherwise `INVALID_ARGUMENT`), and it changes nothing on the server.
+
+| Field | Meaning |
+|---|---|
+| `node_id`, `role` | The server's node id; `"master"` or `"slave"`. |
+| `identity`, `epoch_history` | As in the handshake. `identity` is absent while the node holds no consistent data. |
+| `last_seq`, `last_entry_crc` | The node's durable `last_seq` and the `crc32c` of the entry at `last_seq` (absent at seq 0). |
+| `last_ts_ms` | `ts_ms` of the entry at `last_seq`; 0 if it is not retained. |
+| `node_state` | `"ready"`, `"bootstrapping"` or `"halted:<Reason>"`. |
+| `upstream` | The address the node replicates from; empty on the master. |
+| `replicas` | One `ReplicaSummary { node_id, applied_seq, in_sync }` per open Tail stream (§7.6). |
+
+Comparing the `Status` of several replicas shows which one holds the most of the log (newest epoch, then highest `last_seq`) and which ones have diverged from it (they hold seqs at or past a point where the two epoch histories differ, or a different `last_entry_crc` at the same seq). Nothing in the protocol acts on it automatically.
+````
+
+In PROTOCOL.md §7, replace:
+
+````
+```proto
+rpc Tail(TailRequest) returns (stream TailMessage);
+```
+````
+
+with:
+
+````
+```proto
+rpc Tail(stream TailClientMessage) returns (stream TailMessage);
+```
+
+Tail is a bidirectional stream. The client's first message is `start`, carrying a `TailRequest` (§7.1); every later client message is an `ack` (§7.6). The server sends entry batches and heartbeats (§7.3).
+````
+
+In PROTOCOL.md §7.1, after:
+
+```
+### 7.1 Request
+```
+
+add:
+
+````
+```proto
+message TailClientMessage { oneof kind { TailRequest start = 1; TailAck ack = 2; } }
+```
+
+The first client message MUST be `start`. The server ends the call with `INVALID_ARGUMENT` if it is anything else, and SHOULD do so if it has not arrived within 10 s. The fields of `start`:
+````
+
+In PROTOCOL.md §7.3, replace:
+
+```
+  - with `DATA_LOSS` / `CORRUPT` if a stored entry fails its CRC.
+```
+
+with:
+
+```
+  - with `DATA_LOSS` / `CORRUPT` if a stored entry fails its CRC;
+  - with `INVALID_ARGUMENT` if a client message breaks the rules of §7.6.
+- A stream that ends without a status (a clean end of stream) carries no decision. The client MUST treat it as transient: back off and handshake again (§11.4).
+```
+
+In PROTOCOL.md §7.5 (end), after:
+
+```
+The server clamps the client's values to its own limits: `max_wait_ms` to at most `heartbeat_ms`, and `max_batch_bytes` to at most `max_tail_batch_bytes` (RECOMMENDED default 4 MiB). If `max_batch_bytes` is 0, it uses 1 MiB. Heartbeats are unaffected: a stream with nothing pending still gets one every `heartbeat_ms`.
+```
+
+add:
+
+````
+### 7.6 Acknowledgements
+
+```proto
+message TailAck { uint64 applied_seq = 1; }
+```
+
+After `start`, the client sends `ack` messages on the same stream. `applied_seq` means: every entry with seq ≤ `applied_seq` is committed in the client's store (written to its write-ahead log; also fsynced if the client fsyncs its writes). Until the first ack the server assumes `applied_seq = from_seq − 1`.
+
+- The client SHOULD send an ack after applying each `EntryBatch`, coalescing acks that back up (only the latest `applied_seq` matters), and MUST send one at least once per `heartbeat_ms`, so that a replica with nothing to apply stays in sync.
+- `applied_seq` MUST NOT decrease and MUST NOT exceed the last seq the server sent on this stream. A second `start` is not allowed either. The server ends a stream that breaks one of these rules with `INVALID_ARGUMENT`.
+- Acks never change what the server sends: it does not resend or skip entries because of them. On a reconnect the client's position is still its own durable `last_seq` (§7).
+- Per open stream the server tracks the client's node id and address, whether the id was verified (mutual TLS), the epoch the client follows, when the stream opened, the last seq sent, the last seq acknowledged, the last time `applied_seq` reached the server's `last_seq`, and the stream's fetch settings.
+- A replica is **in sync** while its stream is open, it follows the server's current identity, and its `applied_seq` reached the server's `last_seq` within the last `replica_lag_time_max` (RECOMMENDED 10 s). A master MAY make a write wait until a number of in-sync replicas have acknowledged it.
+````
+
+In PROTOCOL.md §10, replace:
+
+```
+Authentication failures use `UNAUTHENTICATED` or `PERMISSION_DENIED` without `ErrorInfo` (§3.3). A malformed request uses `INVALID_ARGUMENT`.
+```
+
+with:
+
+```
+Authentication failures use `UNAUTHENTICATED` or `PERMISSION_DENIED` without `ErrorInfo` (§3.3). A malformed request uses `INVALID_ARGUMENT`, and so does a Tail client that breaks the message order or the ack rules (§7.1, §7.6).
+```
+
+In PROTOCOL.md §11.2 (table), replace:
+
+```
+| A stream ends with a retryable error, or the connection is lost | Back off and handshake again. |
+```
+
+with:
+
+```
+| A stream ends with a retryable error or without any status, or the connection is lost | Back off and handshake again. |
+```
+
+In PROTOCOL.md §11.4, after:
+
+```
+- If no `TailMessage` arrives for `3 × heartbeat_ms`, the client MUST cancel the stream and reconnect.
+```
+
+add:
+
+```
+- A Tail stream that ends cleanly (end of stream without a status) MUST be treated like a lost connection: back off and handshake again. It never means that the server has nothing more to send.
+```
+
+In PROTOCOL.md §12 (table), after:
+
+```
+| `max_tail_batch_bytes` (cap on the client's `max_batch_bytes`) | server | 4 MiB |
+```
+
+add:
+
+```
+| Tail acks | client | after each batch, and at least every `heartbeat_ms` |
+| `replica_lag_time_max` (in-sync window, §7.6) | server | 10 000 ms |
+```
+
+In DESIGN.md §11 (LogSource), after:
+
+```
+    fn resets(&self) -> watch::Receiver<u64>;                   // bumped when served streams must end
+```
+
+add:
+
+```
+    fn node_state(&self) -> String { "ready".into() }          // Status RPC: ready | bootstrapping | halted:<Reason>
+    fn upstream(&self) -> Option<String> { None }               // Status RPC: upstream address (slaves)
+```
+
+In DESIGN.md §11, after:
+
+```
+- Heartbeats carry `upstream_last_seq` and `origin_last_seq`, so every node can report its true lag behind the origin.
+```
+
+add:
+
+```
+- **Acks and replica status.** Tail is bidirectional: after `start`, the replica acknowledges the last seq it has committed, after each applied batch (coalesced) and at least once per heartbeat (PROTOCOL.md §7.6). The serving node keeps per-stream state (sent and acknowledged seqs, lag, in sync or not) in a replica registry shared by its server and the node. `Master::replicas()` and `Slave::replicas()` report it for direct downstream replicas, and the read-only `Status` RPC (PROTOCOL.md §6.5) reports a summary of it with the node's own position.
+```
+
+In DESIGN.md §14, replace:
+
+```
+pub enum Method { Handshake, Tail, Bootstrap, Verify }
+```
+
+with:
+
+```
+pub enum Method { Handshake, Tail, Bootstrap, Verify, Status }   // Status: read-only positions, no data
+```
+
+In DESIGN.md §16 (ServeConfig), replace:
+
+```
+                               //   max_auth_failures_per_minute: 10, max_tail_batch_bytes: 4 MiB }
+}
+```
+
+with:
+
+```
+                               //   max_auth_failures_per_minute: 10, max_tail_batch_bytes: 4 MiB,
+                               //   replica_lag_time_max: 10 s }
+}
+
+pub struct ReplicaStatus {          // one direct downstream replica (Master/Slave::replicas)
+    pub node_id: String,            // x-rrdb-node-id, or the certificate CommonName under mTLS
+    pub remote_addr: SocketAddr,
+    pub peer_verified: bool,
+    pub epoch: u64,                 // epoch of the identity the replica follows
+    pub connected_since: SystemTime,
+    pub sent_seq: Seq,
+    pub applied_seq: Seq,           // last acknowledged (PROTOCOL.md §7.6)
+    pub lag_entries: u64,           // this node's last_seq − applied_seq
+    pub lag_ms: Option<u64>,        // now − ts_ms of the first unacknowledged entry; 0 when caught
+                                    // up; None when that entry is no longer retained here
+    pub in_sync: bool,              // current identity, fully caught up within replica_lag_time_max
+    pub fetch: FetchSettings,       // the stream's batching, as clamped by the server
+}
+```
+
+In DESIGN.md §17 (table), replace:
+
+```
+| `Tail` | server stream | entry batches from `from_seq` (client-chosen `min_batch_bytes` / `max_wait_ms` / `max_batch_bytes`), plus heartbeats |
+```
+
+with:
+
+```
+| `Tail` | bidi stream | client: `start`, then acks of its committed seq; server: entry batches from `from_seq` (client-chosen `min_batch_bytes` / `max_wait_ms` / `max_batch_bytes`), plus heartbeats |
+```
+
+In DESIGN.md §17 (table), after:
+
+```
+| `VerifyBegin` / `VerifyRange` / `VerifyEnd` | unary / bidi / unary | snapshot-pinned range digests and key listings |
+```
+
+add:
+
+```
+| `Status` | unary | read-only identity, position, node state, upstream and replicas (operator tooling) |
+```
+
+In DESIGN.md §17, replace:
+
+```
+- A Tail stream with no message for `3 × heartbeat` is cancelled and reconnected.
+```
+
+with:
+
+```
+- A Tail stream with no message for `3 × heartbeat` is cancelled and reconnected; one that ends without a status is treated the same way.
+```
+
+In DESIGN.md §18 (table), after:
+
+```
+| Tail fetch batching (slave) | `min_batch_bytes` 0 (real-time), `max_wait` 100 ms, `max_batch_bytes` 1 MiB; server cap 4 MiB |
+```
+
+add:
+
+```
+| In-sync window (`ServeLimits::replica_lag_time_max`) | 10 s |
+```
+
+In DESIGN.md §19, replace:
+
+```
+- **Status APIs** (`Slave::status`, `Master::replicas`, `ReplicaStatus`) are the source for metrics.
+```
+
+with:
+
+```
+- **Status APIs** (`Slave::status`, `Master::replicas`, `Slave::replicas`, `ReplicaStatus`, the `Status` RPC) are the source for metrics.
+```
+
+Run: `cargo test --test proto_sync`
+Expected: PASS.
+
+- [ ] **Step 11: Lint and commit**
+
+Run: `cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features failpoints -- -D warnings`
+Expected: no warnings.
+
+```bash
+git add proto src DESIGN.md PROTOCOL.md
+git commit -m "feat: bidirectional tail with replica acks, replica status and the Status RPC
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 7: Slave foundations — configuration, states, policy table, listener, bootstrap store helpers
+
+**Files:**
+- Create: `src/slave/config.rs`, `src/slave/state.rs`, `src/slave/policy.rs`, `src/listener.rs`, `src/store/bootstrap.rs`, `src/slave/mod.rs` (module list only, replaced in Task 8)
+- Modify: `src/error.rs`, `src/store/mod.rs`, `src/lib.rs`, `DESIGN.md` (§3.2, §6, §10, §16, §16.3, §18), `PROTOCOL.md` (§10, §11.2)
 
 **Interfaces:**
 - Consumes: Task 2 meta keys and fields; Task 4 `ServeConfig`, `TlsClientConfig`, `CredentialsProvider`, `NoCredentials`; Task 1 `net::reason_of`, `net::reason_status`; Plan 1 `validate_identifier`, `Retention`, `RocksTuning`, `Clock`, `Store::{cfs, write_meta, load_meta, drop_unreferenced_cfs, set_position, set_first_retained_seq, tuning, retain_cf_options}`, `PhysCf::new`, `meta::{encode_*}`.
 - Produces:
-  - `slave::config::{UpstreamConfig { server, port, tls, credentials } (new, from_addr, pub(crate) uri), IdentityPolicy { Refuse (default), Rebootstrap }, DivergencePolicy { Halt (default), Rebootstrap }, GapPolicy { Rebootstrap (default), Halt }, FetchConfig { min_batch_bytes: u32, max_wait: Duration, max_batch_bytes: u32 } (Default 0 / 100 ms / 1 MiB), Backoff { initial, max, factor }, BackoffState { new, reset, next_delay }, SlaveConfig { identifier, path, upstream, serve, retention, listener, on_identity_change, on_divergence, on_log_gap, reconnect, fetch, heartbeat, connect_timeout, rocksdb, clock } (new, pub(crate) validate)}`.
+  - `slave::config::{UpstreamConfig { server, port, tls, credentials } (new, from_addr, pub(crate) uri), IdentityPolicy { Refuse (default), Rebootstrap }, DivergencePolicy { Halt (default), Rebootstrap }, GapPolicy { Rebootstrap (default), Halt }, FetchConfig { min_batch_bytes: u32, max_wait: Duration, max_batch_bytes: u32 } (Default 0 / 100 ms / 1 MiB), Backoff { initial, max, factor }, BackoffState { new, reset, next_delay }, SlaveConfig { identifier, path, upstream, serve, retention, listener, on_identity_change, on_divergence, on_log_gap, reconnect, fetch, heartbeat, connect_timeout, sync_writes (default false: an ack means "in the replica's WAL"), rocksdb, clock } (new, pub(crate) validate)}`.
   - `slave::state::{HaltReason (is_persisted, pub(crate) name, pub(crate) from_name), SlaveState { Connecting, Bootstrapping { target_seq, records }, Streaming, Halted(HaltReason) }, HaltAction { Retry, Rebootstrap }, NodeState { Ready, Bootstrapping, Halted } (encode, decode), SlaveStatus { state, origin_identity, applied_seq, first_retained_seq, upstream_last_seq, origin_last_seq, upstream_chain, last_contact, last_error, listener_failed }}`.
   - `slave::policy::{Policies { identity, divergence, gap }, Action { Tail, AdoptEpochThenTail, Bootstrap, Halt(HaltReason), Retry(String), Again }, after_handshake(&pb::HandshakeResponse, &Policies, force_bootstrap: bool) -> Action, after_status(&Status, &Policies) -> Action}`.
   - `pub trait ReplicationListener: Send + Sync + 'static { on_entry, on_bootstrap_begin, on_bootstrap_complete, on_state_change }` (all default no-ops).
   - `Error::Halted(HaltReason)`.
-  - `store::bootstrap::{NODE_READY = b"ready", NODE_BOOTSTRAPPING = b"bootstrapping", BootstrapFinish { identity, epoch_history, cf_specs, snapshot_seq, snapshot_crc, max_entry_bytes }}`, `Store::{reset_for_bootstrap(&self) -> Result<()>, begin_bootstrap_cf(&self, &CfEntry) -> Result<()>, write_bootstrap_records(&self, &CfEntry, &[(Vec<u8>, Vec<u8>)]) -> Result<()>, finish_bootstrap(&self, &BootstrapFinish) -> Result<()>, adopt_identity(&self, &DbIdentity, &[EpochStart]) -> Result<()>, delete_all_keys(&self, &impl AsColumnFamilyRef) -> Result<()>}` (unsynced batches of 1 000; also used by Task 10).
+  - `store::bootstrap::{NODE_READY = b"ready", NODE_BOOTSTRAPPING = b"bootstrapping", BootstrapFinish { identity, epoch_history, cf_specs, snapshot_seq, snapshot_crc, max_entry_bytes }}`, `Store::{reset_for_bootstrap(&self) -> Result<()>, begin_bootstrap_cf(&self, &CfEntry) -> Result<()>, write_bootstrap_records(&self, &CfEntry, &[(Vec<u8>, Vec<u8>)]) -> Result<()>, finish_bootstrap(&self, &BootstrapFinish) -> Result<()>, adopt_identity(&self, &DbIdentity, &[EpochStart]) -> Result<()>, delete_all_keys(&self, &impl AsColumnFamilyRef) -> Result<()>}` (unsynced batches of 1 000; also used by Task 11).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4457,6 +7692,9 @@ pub struct SlaveConfig {
     pub reconnect: Backoff,
     /// Tail fetch batching. Default: real-time push.
     pub fetch: FetchConfig,
+    /// Fsync every applied entry before acknowledging it. Default `false`: an ack then means
+    /// "in the replica's WAL", which survives a process crash but not a machine crash.
+    pub sync_writes: bool,
     /// Heartbeat interval when serving downstream replicas. Default 5 s.
     pub heartbeat: Duration,
     /// TCP connect timeout to the upstream. Default 5 s.
@@ -4480,6 +7718,7 @@ impl SlaveConfig {
             on_log_gap: GapPolicy::default(),
             reconnect: Backoff::default(),
             fetch: FetchConfig::default(),
+            sync_writes: false,
             heartbeat: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(5),
             rocksdb: RocksTuning::default(),
@@ -5049,6 +8288,42 @@ and in `SlaveStatus`, after `pub last_error: Option<String>, …` add:
     pub listener_failed: bool,               // the listener panicked; disabled until restart
 ```
 
+In DESIGN.md §6, replace:
+
+```
+- Writes are not synced on slaves. A slave that crashes resumes from its durable `last_seq` and fetches the rest again from upstream.
+```
+
+with:
+
+```
+- Writes are not synced on slaves by default (`SlaveConfig::sync_writes = false`). A slave that crashes resumes from its durable `last_seq` and fetches the rest again from upstream. Its acks (§11) then promise that an entry is in its write-ahead log, which survives a process crash but not a power loss. With `sync_writes = true` every applied entry is fsynced, so an acknowledged entry survives a power loss of the replica too.
+```
+
+In DESIGN.md §16 (SlaveConfig), after:
+
+```
+    pub connect_timeout: Duration,           // default 5 s
+```
+
+add:
+
+```
+    pub sync_writes: bool,                   // fsync each applied entry; default false
+```
+
+In DESIGN.md §18 (table), replace:
+
+```
+| Slave fsync | off |
+```
+
+with:
+
+```
+| Slave fsync | off (`SlaveConfig::sync_writes`) |
+```
+
 - [ ] **Step 11: Commit**
 
 ```bash
@@ -5058,21 +8333,20 @@ git commit -m "feat: slave config, persisted states, policy table and crash-safe
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
----
-
-### Task 7: Slave runtime — driver, apply, bootstrap install, read API, harness and core end-to-end tests
+### Task 8: Slave runtime — driver, apply, bootstrap install, read API, harness and core end-to-end tests
 
 **Files:**
 - Create: `src/slave/inner.rs`, `src/slave/client.rs`, `src/slave/driver.rs`, `src/slave/apply.rs`, `src/slave/bootstrap.rs`, `src/slave/maintenance.rs`, `tests/support/mod.rs`, `tests/replication.rs`
-- Modify: `src/slave/mod.rs` (replace), `src/lib.rs`, `DESIGN.md` (§15)
+- Modify: `src/slave/mod.rs` (replace), `src/lib.rs`, `src/master/maintenance.rs` (replace), `src/types.rs`, `src/net/mod.rs`, `src/net/convert.rs`, `src/config.rs` (stale `allow`s), `DESIGN.md` (§6, §15), `PROTOCOL.md` (§11.2)
 
 **Interfaces:**
-- Consumes: Task 6 everything; Task 5 `server::await_sole_owner`, `ServerHandle`, `failpoint::fire`; Task 2 `Store::{entry_crc}`, meta fields; Task 1 `net::{DECODE_SLACK, MD_*}`, conversions including `checked_history` (an invalid history in an `EPOCH_ADVANCED` answer or a bootstrap header halts `Corrupt`); Plan 1 `Store::{open, prepare, commit, position, live_cf, live_ctx, read_snapshot, entries_after, trim_changelog, drop_unreferenced_cfs}`, `epoch_for`, `Digest`, `envelope::decode`, `validate_cf_name`.
+- Consumes: Task 7 everything; Task 6 `pb::{TailClientMessage, TailAck}` (the bidirectional Tail), `Master::replicas` (tests); Task 5 `server::await_sole_owner`, `ServerHandle`, `failpoint::fire`; Task 2 `Store::{entry_crc}`, meta fields; Task 1 `net::{DECODE_SLACK, MD_*}`, conversions including `checked_history` (an invalid history in an `EPOCH_ADVANCED` answer or a bootstrap header halts `Corrupt`); Plan 1 `Store::{open, prepare, commit, position, live_cf, live_ctx, read_snapshot, entries_after, trim_changelog, drop_unreferenced_cfs}`, `epoch_for`, `Digest`, `envelope::decode`, `validate_cf_name`.
 - Produces:
-  - Tail requests carry `SlaveConfig::fetch` (`min_batch_bytes`, `max_wait_ms`, `max_batch_bytes`); each `EntryBatch` is applied entry by entry, each its own atomic write; Tail decode limit `max(max_entry_bytes, fetch.max_batch_bytes) + 64 KiB`.
+  - Tail requests carry `SlaveConfig::fetch` (`min_batch_bytes`, `max_wait_ms`, `max_batch_bytes`); each `EntryBatch` is applied entry by entry, each its own atomic write (`commit(sync = cfg.sync_writes)`); Tail decode limit `max(max_entry_bytes, fetch.max_batch_bytes) + 64 KiB`.
+  - The Tail request stream is `start`, then `ack { applied_seq }` whenever a `watch::Sender<Seq>` changes: after each applied batch and on every heartbeat (`send_replace` of the current `last_seq`), so acks that back up coalesce to the latest. A stream that ends without a status is a `Retry` (back off, handshake again).
   - `pub struct Slave` with `async open(SlaveConfig) -> Result<Slave>`, `status() -> SlaveStatus`, `applied_seq() -> Seq`, `async wait_for_seq(seq, timeout) -> Result<()>` (`Err(Halted(r))`, `Err(Timeout)`), `watch_state() -> watch::Receiver<SlaveState>`, `snapshot() -> Result<ReadSnapshot>` (`Err(NotReady)` without data), `async shutdown(self) -> Result<()>`; `impl ReadApi for Slave` (all reads `Err(NotReady)` without data), `impl LogApi for Slave`.
   - `slave::inner::Inner` with `pub store, pub cfg, pub state_tx, pub seq_tx, pub reset_tx, pub shutdown_tx, pub origin_last_seq, pub upstream_last_seq, pub max_entry_bytes, pub force_bootstrap, pub halt_cleared` and `new(Store, SlaveConfig, &MetaSnapshot)`, `policies()`, `ident()`, `set_ident(..)`, `is_ready()`, `now_ms()`, `state()`, `set_state(SlaveState)`, `halt(HaltReason)` (a synced write: called through `background::blocking`), `reset_downstream()`, `upstream_chain()`, `note_upstream(&pb::HandshakeResponse) -> Option<u64>` (the changed `max_entry_bytes`, persisted by the driver on a blocking thread), `note_positions(upstream, origin)`, `note_contact()`, `set_last_error(Option<String>)`, `notify(impl FnOnce(&dyn ReplicationListener))`, `status()`.
-  - `slave::client::{Client, connect(&SlaveConfig) -> Result<Client>}`; `slave::driver::{SessionEnd { Retry(String), Again, Halt(HaltReason) }, spawn(&Arc<Inner>) -> JoinHandle<()>, end_for, status_end}` (the driver holds `Weak<Inner>` while waiting; `Inner.halt_cleared` is an `Arc<Notify>` it shares); `slave::maintenance::spawn(&Arc<Inner>) -> JoinHandle<()>` (Weak, upgraded per tick); `slave::apply::{Applied, apply(&Arc<Inner>, LogEntry)}`; `slave::bootstrap::install(&Arc<Inner>, &Client, &pb::HandshakeResponse) -> Result<Vec<u8> /* lease */, SessionEnd>`.
+  - `slave::client::{Client, connect(&SlaveConfig) -> Result<Client>, connect_upstream(&UpstreamConfig, identifier, connect_timeout) -> Result<Client>}`; `slave::driver::{SessionEnd { Retry(String), Again, Halt(HaltReason) }, spawn(&Arc<Inner>) -> JoinHandle<()>, end_for, status_end}` (the driver holds `Weak<Inner>` while waiting; `Inner.halt_cleared` is an `Arc<Notify>` it shares); `slave::maintenance::spawn(&Arc<Inner>) -> JoinHandle<()>` (Weak, upgraded per tick); `slave::apply::{Applied, apply(&Arc<Inner>, LogEntry)}`; `slave::bootstrap::install(&Arc<Inner>, &Client, &pb::HandshakeResponse) -> Result<Vec<u8> /* lease */, SessionEnd>`.
   - Harness (`tests/support/mod.rs`): `Cluster { clock } (new, path, serve, master_config, master, restart_master, restart_master_after_backup, slave_config, slave)`, `wait_until`, `wait_state`, `Node`, `Dump`, `dump`, `assert_same`, `assert_converged`, `edge_cases`, `write_edge_cases`, `check_edge_cases`, `copy_dir`, `restore_dir`, `RecordingListener`, constants `T0`, `HEARTBEAT`, `WAIT`.
 
 - [ ] **Step 1: Write the harness**
@@ -5516,6 +8790,13 @@ async fn status_and_wait_for_seq() {
     assert_eq!(s.last_error, None);
     assert!(!s.listener_failed);
     assert!(matches!(b.wait_for_seq(3, Duration::from_millis(100)).await, Err(Error::Timeout)));
+    // The master sees B's acknowledgements (addendum §1).
+    wait_until("b acknowledged 2", || m.replicas().iter().any(|r| r.applied_seq == 2 && r.in_sync)).await;
+    let r = m.replicas();
+    assert_eq!(r.len(), 1);
+    assert_eq!((r[0].node_id.as_str(), r[0].sent_seq, r[0].lag_entries, r[0].lag_ms), ("b", 2, 0, Some(0)));
+    assert_eq!((r[0].epoch, r[0].peer_verified), (1, false));
+    assert!(r[0].remote_addr.ip().is_loopback());
     let states = listener.states();
     assert!(states.contains(&SlaveState::Bootstrapping { target_seq: 1, records: 0 }), "{states:?}");
     assert_eq!(states.last(), Some(&SlaveState::Streaming));
@@ -5554,6 +8835,30 @@ async fn a_batching_slave_applies_every_entry_on_its_own() {
     assert_eq!(listener.entries(), (first..=m.last_seq()).collect::<Vec<_>>());
     check_edge_cases(&b, "edge");
     listener.assert_no_violations();
+    let fetch = m.replicas()[0].fetch;
+    assert_eq!((fetch.min_batch_bytes, fetch.max_wait, fetch.max_batch_bytes), (64 << 10, Duration::from_millis(150), 16 << 10));
+}
+
+/// `sync_writes = true` fsyncs every applied entry; replication and resume are unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sync_writes_slave_replicates_and_resumes() {
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    cfg.sync_writes = true;
+    let b = Slave::open(cfg.clone()).await.unwrap();
+    for i in 0..20u8 {
+        m.put("c", &[i], b"v").unwrap();
+    }
+    assert_converged(&m, &[("b", &b)]).await;
+    b.shutdown().await.unwrap();
+    m.put("c", b"later", b"v").unwrap();
+    let (mut cfg, listener) = c.slave_config("b", m.serve_addr().unwrap());
+    cfg.sync_writes = true;
+    let b = Slave::open(cfg).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    assert_eq!(listener.bootstraps(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5668,7 +8973,7 @@ pub(crate) fn spawn(inner: &Arc<Inner>) -> JoinHandle<()> {
 }
 ```
 
-`epoch_for` is now used by the slave: in `src/types.rs`, delete the line `#[allow(dead_code)] // used by the replication server (Plan 2)` above `pub(crate) fn epoch_for`.
+`epoch_for` is now used by the slave: in `src/types.rs`, delete the line `#[allow(dead_code)] // used by the replication server (Plan 2)` above `pub(crate) fn epoch_for`. The client below uses the wire helpers Task 1 kept behind `allow`s: delete every line `#[allow(dead_code)] // used by the replication client (later Plan 2 task)` (two in `src/net/mod.rs`, above `DECODE_SLACK` and `reason_of`; four in `src/net/convert.rs`, above `cf_from_pb`, `epochs_from_pb`, `checked_history` and `entry_from_pb`) and the indented one above `TlsClientConfig::to_tonic` in `src/config.rs`.
 
 Create `src/slave/inner.rs`:
 
@@ -5891,7 +9196,7 @@ use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
-use super::config::SlaveConfig;
+use super::config::{SlaveConfig, UpstreamConfig};
 use crate::auth::CredentialsProvider;
 use crate::codec::PROTOCOL_VERSION;
 use crate::error::{Error, Result};
@@ -5935,10 +9240,14 @@ pub(crate) type Client = ReplicationClient<InterceptedService<Channel, CallMeta>
 
 /// A client for the configured upstream. Connects on first use and reconnects by itself.
 pub(crate) fn connect(cfg: &SlaveConfig) -> Result<Client> {
-    let up = &cfg.upstream;
+    connect_upstream(&cfg.upstream, &cfg.identifier, cfg.connect_timeout)
+}
+
+/// A client for `up`, identifying itself as `identifier`.
+pub(crate) fn connect_upstream(up: &UpstreamConfig, identifier: &str, connect_timeout: Duration) -> Result<Client> {
     let mut endpoint = Endpoint::from_shared(up.uri())
         .map_err(|e| Error::Config(format!("upstream address {}: {e}", up.uri())))?
-        .connect_timeout(cfg.connect_timeout)
+        .connect_timeout(connect_timeout)
         .http2_keep_alive_interval(Duration::from_secs(30))
         .keep_alive_timeout(Duration::from_secs(10))
         .keep_alive_while_idle(true);
@@ -5947,7 +9256,8 @@ pub(crate) fn connect(cfg: &SlaveConfig) -> Result<Client> {
             .tls_config(tls.to_tonic(&up.server))
             .map_err(|e| Error::Config(format!("upstream TLS: {e}")))?;
     }
-    let node_id = AsciiMetadataValue::try_from(cfg.identifier.as_str())
+    crate::config::validate_identifier(identifier)?;
+    let node_id = AsciiMetadataValue::try_from(identifier)
         .map_err(|_| Error::Config("identifier is not valid header text".into()))?;
     let meta = CallMeta { node_id, credentials: up.credentials.clone() };
     Ok(ReplicationClient::with_interceptor(endpoint.connect_lazy(), meta))
@@ -6039,7 +9349,7 @@ pub(crate) async fn apply(inner: &Arc<Inner>, entry: LogEntry) -> Applied {
     let e = entry.clone();
     let result = tokio::task::spawn_blocking(move || {
         let prepared = i.store.prepare(&e, &ops).map_err(Failure::Prepare)?;
-        i.store.commit(prepared, false).map_err(Failure::Commit)
+        i.store.commit(prepared, i.cfg.sync_writes).map_err(Failure::Commit)
     })
     .await;
     match result {
@@ -6296,7 +9606,7 @@ pub(crate) async fn install(
 
 - [ ] **Step 8: Implement the driver**
 
-Create `src/slave/driver.rs`:
+Create `src/slave/driver.rs` (the Tail request stream is `start` chained with a `WatchStream` of acks; `tokio_stream::wrappers::WatchStream::from_changes` yields only values sent after it was created):
 
 ```rust
 //! The replication driver: one task per slave that connects, handshakes and acts on the
@@ -6308,6 +9618,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::WatchStream;
+use tokio_stream::StreamExt;
 
 use tonic::Status;
 
@@ -6323,6 +9635,7 @@ use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 use crate::net::convert::{checked_history, entry_from_pb, identity_from_pb, identity_to_pb};
 use crate::net::DECODE_SLACK;
 use crate::pb;
+use crate::pb::tail_client_message::Kind as ClientKind;
 use crate::pb::tail_message::Kind;
 use crate::store::meta::key;
 
@@ -6514,7 +9827,14 @@ async fn tail(
         max_wait_ms: u32::try_from(fetch.max_wait.as_millis()).unwrap_or(u32::MAX),
         max_batch_bytes: fetch.max_batch_bytes,
     };
-    let mut stream = match c.clone().max_decoding_message_size(limit).tail(req).await {
+    // The request stream: `start`, then an ack whenever `acks` changes. A watch coalesces
+    // acks that back up: the upstream always gets the latest applied seq.
+    let (acks, ack_rx) = watch::channel(pos.last_seq);
+    let start = pb::TailClientMessage { kind: Some(ClientKind::Start(req)) };
+    let ack_stream = WatchStream::from_changes(ack_rx)
+        .map(|applied_seq| pb::TailClientMessage { kind: Some(ClientKind::Ack(pb::TailAck { applied_seq })) });
+    let outbound = tokio_stream::iter([start]).chain(ack_stream);
+    let mut stream = match c.clone().max_decoding_message_size(limit).tail(outbound).await {
         Ok(r) => r.into_inner(),
         Err(s) => return status_end(inner, &s),
     };
@@ -6534,7 +9854,11 @@ async fn tail(
             backoff.reset();
         }
         match msg.kind {
-            Some(Kind::Heartbeat(h)) => inner.note_positions(h.upstream_last_seq, h.origin_last_seq),
+            Some(Kind::Heartbeat(h)) => {
+                inner.note_positions(h.upstream_last_seq, h.origin_last_seq);
+                // At least one ack per heartbeat interval keeps this replica in sync upstream.
+                acks.send_replace(inner.store.position().last_seq);
+            }
             Some(Kind::Batch(batch)) => {
                 if batch.entries.is_empty() {
                     return SessionEnd::Retry("empty entry batch from upstream".into());
@@ -6546,6 +9870,7 @@ async fn tail(
                         Applied::End(end) => return end,
                     }
                 }
+                acks.send_replace(inner.store.position().last_seq);
             }
             None => return SessionEnd::Retry("tail message without content".into()),
         }
@@ -6772,7 +10097,7 @@ pub use slave::{
 - [ ] **Step 10: Run the tests**
 
 Run: `cargo test --lib slave::client && cargo test --test replication`
-Expected: PASS: `b64token_rules`, and 9 tests in `replication` (`slave_bootstraps_then_tails_every_kind_of_write`, `read_api_on_a_slave`, `ttl_values_replicate_and_the_reapers_delete_replicates`, `edge_case_data_through_tail_and_bootstrap`, `restart_resumes_without_bootstrap`, `status_and_wait_for_seq`, `a_slave_without_data_is_not_ready_and_reports_the_connection_error`, `a_batching_slave_applies_every_entry_on_its_own` (fetch batching on; each entry still its own write and listener call), `a_panicking_listener_is_disabled_and_replication_goes_on`). The edge-case test moves a ~16 MiB value through Tail and Bootstrap; allow it a few seconds in debug builds.
+Expected: PASS: `b64token_rules`, and 10 tests in `replication` (`slave_bootstraps_then_tails_every_kind_of_write`, `read_api_on_a_slave`, `ttl_values_replicate_and_the_reapers_delete_replicates`, `edge_case_data_through_tail_and_bootstrap`, `restart_resumes_without_bootstrap`, `status_and_wait_for_seq` (also: the master's `replicas()` shows the slave's acknowledged seq, zero lag and `in_sync`), `a_slave_without_data_is_not_ready_and_reports_the_connection_error`, `a_batching_slave_applies_every_entry_on_its_own` (fetch batching on; each entry still its own write and listener call; the master reports the clamped fetch settings), `a_sync_writes_slave_replicates_and_resumes`, `a_panicking_listener_is_disabled_and_replication_goes_on`). The edge-case test moves a ~16 MiB value through Tail and Bootstrap; allow it a few seconds in debug builds.
 
 Run: `cargo test`
 Expected: PASS (all unit and integration tests so far).
@@ -6812,10 +10137,13 @@ with:
          ops with envelopes (write_seq = entry.seq)
          __changelog[seq] = entry (unchanged)
          __meta.last_seq = seq, last_entry_crc = entry.crc32c
-  db.write(wb)          (sync = false by default)      failure → Halted(Corrupt), never retried in-process
+  db.write(wb)          (sync = SlaveConfig::sync_writes, default false)
+                                                       failure → Halted(Corrupt), never retried in-process
   if a verify capture is requested at this seq: take the snapshot now (§12)
   listener.on_entry(&entry)
   publish seq to wait_for_seq and downstream tail subscribers
+after each batch (coalesced), and at least once per heartbeat:
+  ack applied_seq = last_seq to the upstream (PROTOCOL.md §7.6)
 ```
 
 and after the bullet that starts with `- **One entry is one WriteBatch, and an entry is never split.**` add:
@@ -6830,6 +10158,9 @@ In the PROTOCOL.md §11.2 table, after the row that starts with `` | `RESUME` / 
 | An epoch history (handshake or bootstrap header) that is empty, does not start with `{1, 1}`, has non-increasing epochs or decreasing start seqs, or does not end with the identity's epoch; or a local failure to apply or commit a received entry | Halt with `Corrupt` (persisted). The entry is never retried in the same process. |
 ```
 
+Run: `cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features failpoints -- -D warnings`
+Expected: no warnings.
+
 - [ ] **Step 12: Commit**
 
 ```bash
@@ -6840,1699 +10171,4 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
-### Task 8: Halt recovery and re-bootstrap policies end to end
 
-**Files:**
-- Modify: `src/slave/mod.rs` (`clear_halt`)
-- Create: `tests/rebootstrap.rs`
-
-**Interfaces:**
-- Consumes: Task 7 `Slave`, `Inner::{state, set_state, set_last_error, force_bootstrap, halt_cleared}`, harness; Task 6 `NodeState`, `HaltAction`; Task 2 `meta::key::NODE_STATE`.
-- Produces: `Slave::clear_halt(&self, action: HaltAction) -> Result<()>` (async): persists `node_state = ready`, sets `force_bootstrap` for `Rebootstrap`, returns the slave to `Connecting` and wakes the driver; `Err(Config)` if not halted.
-
-- [ ] **Step 1: Write the failing tests**
-
-Create `tests/rebootstrap.rs`:
-
-```rust
-//! Policies and re-bootstrap, end to end: retention gaps, identity changes, divergence,
-//! restores from backup and epoch bumps.
-
-mod support;
-
-use std::time::Duration;
-
-use replicated_rocksdb::{
-    CfSpec, DivergencePolicy, Error, HaltAction, HaltReason, IdentityPolicy, LogApi, Master, ReadApi, RocksTuning,
-    Slave, SlaveState,
-};
-use support::{assert_converged, restore_dir, wait_state, wait_until, Cluster, WAIT};
-
-fn halted(r: HaltReason) -> impl Fn(&SlaveState) -> bool {
-    move |s| *s == SlaveState::Halted(r)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn retention_gap_triggers_a_rebootstrap_that_converges() {
-    let c = Cluster::new();
-    let mut mcfg = c.master_config("a");
-    mcfg.retention.max_entries = Some(2);
-    mcfg.retention.check_interval = Duration::from_millis(20);
-    let m = Master::open(mcfg).await.unwrap();
-    m.create_cf(CfSpec::new("c")).unwrap();
-    let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
-    assert_converged(&m, &[("b", &b)]).await;
-    // Wait for the Tail that presents the bootstrap lease; until then the lease holds retention.
-    wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
-    let behind = b.last_seq();
-    b.shutdown().await.unwrap();
-
-    for i in 0..20u8 {
-        m.put("c", &[i], &[i]).unwrap();
-    }
-    wait_until("master retention", || m.first_retained_seq() > behind + 1).await;
-    let (b, listener) = c.slave("b", m.serve_addr().unwrap()).await;
-    assert_converged(&m, &[("b", &b)]).await;
-    assert_eq!(listener.bootstraps(), 1, "LOG_GAP with GapPolicy::Rebootstrap");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn identity_change_is_refused_persistently_until_clear_halt_rebootstraps() {
-    let c = Cluster::new();
-    let m1 = c.master("a1").await;
-    let port = m1.serve_addr().unwrap().port();
-    m1.create_cf(CfSpec::new("old")).unwrap();
-    let (cfg, _) = c.slave_config("b", m1.serve_addr().unwrap());
-    let b = Slave::open(cfg).await.unwrap();
-    assert_converged(&m1, &[("b", &b)]).await;
-    m1.shutdown().await.unwrap();
-
-    // A different database appears at the same address.
-    let mut cfg2 = c.master_config("a2");
-    cfg2.serve.as_mut().unwrap().port = port;
-    let m2 = Master::open(cfg2).await.unwrap();
-    m2.create_cf(CfSpec::new("new")).unwrap();
-    for i in 0..3u8 {
-        m2.put("new", &[i], b"v").unwrap();
-    }
-    wait_state(&b, "IdentityChanged halt", halted(HaltReason::IdentityChanged)).await;
-    assert!(matches!(b.wait_for_seq(99, WAIT).await, Err(Error::Halted(HaltReason::IdentityChanged))));
-    assert_eq!(b.get("old", b"k").unwrap(), None, "reads keep working while halted");
-    assert_eq!(b.list_cfs(), vec![CfSpec::new("old")]);
-
-    // The halt survives a restart: the reopened slave does not contact its upstream.
-    let (cfg, listener) = c.slave_config("b", m2.serve_addr().unwrap());
-    b.shutdown().await.unwrap();
-    let b = Slave::open(cfg).await.unwrap();
-    assert_eq!(b.status().state, SlaveState::Halted(HaltReason::IdentityChanged));
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(b.status().state, SlaveState::Halted(HaltReason::IdentityChanged));
-    assert_eq!(listener.bootstraps(), 0);
-
-    b.clear_halt(HaltAction::Rebootstrap).await.unwrap();
-    // Seqs of different databases can coincide: wait for the bootstrap before comparing.
-    wait_until("the bootstrap from the new database", || listener.bootstraps() == 1).await;
-    assert_converged(&m2, &[("b", &b)]).await;
-    assert_eq!(listener.bootstraps(), 1);
-    assert_eq!(b.status().origin_identity, Some(m2.identity()));
-    assert!(matches!(b.clear_halt(HaltAction::Retry).await, Err(Error::Config(_))), "not halted any more");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn identity_change_with_rebootstrap_policy_converges_directly() {
-    let c = Cluster::new();
-    let m1 = c.master("a1").await;
-    let port = m1.serve_addr().unwrap().port();
-    m1.create_cf(CfSpec::new("old")).unwrap();
-    let (mut cfg, listener) = c.slave_config("b", m1.serve_addr().unwrap());
-    cfg.on_identity_change = IdentityPolicy::Rebootstrap;
-    let b = Slave::open(cfg).await.unwrap();
-    assert_converged(&m1, &[("b", &b)]).await;
-    m1.shutdown().await.unwrap();
-
-    let mut cfg2 = c.master_config("a2");
-    cfg2.serve.as_mut().unwrap().port = port;
-    let m2 = Master::open(cfg2).await.unwrap();
-    m2.create_cf(CfSpec::new("new")).unwrap();
-    m2.put("new", b"k", b"v").unwrap();
-    wait_until("the bootstrap from the new database", || listener.bootstraps() == 2).await;
-    assert_converged(&m2, &[("b", &b)]).await;
-    assert!(b.list_cfs().iter().all(|s| s.name != "old"));
-}
-
-/// A master restored from an older backup without an epoch bump: a slave that is ahead is
-/// DIVERGED (rule 11) and halts by default, or re-bootstraps with `DivergencePolicy::Rebootstrap`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn master_restored_without_epoch_bump_makes_ahead_slaves_diverge() {
-    let c = Cluster::new();
-    let m = c.master("a").await;
-    m.create_cf(CfSpec::new("c")).unwrap();
-    m.put("c", b"k", b"1").unwrap();
-    let m = c.restart_master_after_backup(m, "a", "a-backup").await;
-    for i in 0..3u8 {
-        m.put("c", &[i], b"after backup").unwrap();
-    }
-    let (halting, _) = c.slave("halting", m.serve_addr().unwrap()).await;
-    let (mut cfg, rebooted_listener) = c.slave_config("rebooting", m.serve_addr().unwrap());
-    cfg.on_divergence = DivergencePolicy::Rebootstrap;
-    let rebooting = Slave::open(cfg).await.unwrap();
-    assert_converged(&m, &[("halting", &halting), ("rebooting", &rebooting)]).await;
-    let ahead = m.last_seq();
-
-    let port = m.serve_addr().unwrap().port();
-    m.shutdown().await.unwrap();
-    restore_dir(&c.path("a-backup"), &c.path("a"));
-    let mut mcfg = c.master_config("a");
-    mcfg.serve.as_mut().unwrap().port = port;
-    let m = Master::open(mcfg).await.unwrap();
-    assert!(m.last_seq() < ahead);
-    m.put("c", b"new history", b"x").unwrap();
-
-    wait_state(&halting, "Diverged halt", halted(HaltReason::Diverged)).await;
-    assert_eq!(halting.last_seq(), ahead, "a halted slave keeps its data");
-    wait_until("the re-bootstrap after DIVERGED", || rebooted_listener.bootstraps() == 2).await;
-    assert_converged(&m, &[("rebooting", &rebooting)]).await;
-}
-
-/// Restoring a backup with `bump_epoch_on_open`: a slave at or behind the restore point with
-/// matching entries continues without a bootstrap (EPOCH_ADVANCED); one past it is DIVERGED.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn restored_master_with_epoch_bump_keeps_behind_slaves_and_rejects_ahead_ones() {
-    let c = Cluster::new();
-    let m = c.master("a").await;
-    m.create_cf(CfSpec::new("c")).unwrap();
-    m.put("c", b"k", b"1").unwrap();
-    let (behind_cfg, _) = c.slave_config("behind", m.serve_addr().unwrap());
-    let behind = Slave::open(behind_cfg).await.unwrap();
-    assert_converged(&m, &[("behind", &behind)]).await;
-    behind.shutdown().await.unwrap();
-
-    let m = c.restart_master_after_backup(m, "a", "a-backup").await;
-    m.put("c", b"lost", b"x").unwrap();
-    let (ahead, _) = c.slave("ahead", m.serve_addr().unwrap()).await;
-    assert_converged(&m, &[("ahead", &ahead)]).await;
-
-    let port = m.serve_addr().unwrap().port();
-    m.shutdown().await.unwrap();
-    restore_dir(&c.path("a-backup"), &c.path("a"));
-    let mut mcfg = c.master_config("a");
-    mcfg.serve.as_mut().unwrap().port = port;
-    mcfg.bump_epoch_on_open = true;
-    let m = Master::open(mcfg).await.unwrap();
-    assert_eq!(m.identity().epoch, 2);
-    m.put("c", b"after restore", b"y").unwrap();
-
-    let (cfg, listener) = c.slave_config("behind", m.serve_addr().unwrap());
-    let behind = Slave::open(cfg).await.unwrap();
-    assert_converged(&m, &[("behind", &behind)]).await;
-    assert_eq!(listener.bootstraps(), 0, "EPOCH_ADVANCED: no bootstrap");
-    assert_eq!(behind.status().origin_identity.unwrap().epoch, 2);
-    wait_state(&ahead, "Diverged halt", halted(HaltReason::Diverged)).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn live_epoch_bump_resets_streams_and_slaves_continue() {
-    let c = Cluster::new();
-    let m = c.master("a").await;
-    m.create_cf(CfSpec::new("c")).unwrap();
-    let (b, listener) = c.slave("b", m.serve_addr().unwrap()).await;
-    assert_converged(&m, &[("b", &b)]).await;
-    wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
-    let id = m.bump_epoch().unwrap();
-    m.put("c", b"k", b"v").unwrap();
-    assert_converged(&m, &[("b", &b)]).await;
-    assert_eq!(b.status().origin_identity, Some(id));
-    assert_eq!(listener.bootstraps(), 1, "only the initial bootstrap");
-    let states = listener.states();
-    let streaming = states.iter().filter(|s| **s == SlaveState::Streaming).count();
-    assert!(streaming >= 2, "the stream was reset and re-established: {states:?}");
-}
-
-/// A slave without a CF's comparator halts with SpecMismatch (persisted); after the
-/// comparator is registered and the halt cleared with Retry, it applies the entry.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn missing_comparator_halts_until_registered_and_cleared() {
-    let reverse = |t: &mut RocksTuning| {
-        t.comparators.register("reverse", |a: &[u8], b: &[u8]| b.cmp(a));
-    };
-    let c = Cluster::new();
-    let mut mcfg = c.master_config("a");
-    reverse(&mut mcfg.rocksdb);
-    let m = Master::open(mcfg).await.unwrap();
-    m.create_cf(CfSpec::new("plain")).unwrap();
-    let (cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
-    let b = Slave::open(cfg).await.unwrap();
-    assert_converged(&m, &[("b", &b)]).await;
-    m.create_cf(CfSpec::new("rev").with_comparator("reverse")).unwrap();
-    m.put("rev", b"a", b"1").unwrap();
-    m.put("rev", b"b", b"2").unwrap();
-    wait_state(&b, "SpecMismatch halt", halted(HaltReason::SpecMismatch)).await;
-
-    let (mut cfg, listener) = c.slave_config("b", m.serve_addr().unwrap());
-    reverse(&mut cfg.rocksdb);
-    b.shutdown().await.unwrap();
-    let b = Slave::open(cfg).await.unwrap();
-    assert_eq!(b.status().state, SlaveState::Halted(HaltReason::SpecMismatch), "persisted");
-    b.clear_halt(HaltAction::Retry).await.unwrap();
-    assert_converged(&m, &[("b", &b)]).await;
-    assert_eq!(listener.bootstraps(), 0);
-    let keys: Vec<Vec<u8>> = b.iter("rev", replicated_rocksdb::IterMode::Start).unwrap().map(|r| r.unwrap().0).collect();
-    assert_eq!(keys, vec![b"b".to_vec(), b"a".to_vec()], "reverse order on the slave too");
-}
-```
-
-- [ ] **Step 2: Run them to confirm they fail**
-
-Run: `cargo test --test rebootstrap`
-Expected: FAIL to compile: `no method named clear_halt found for struct Slave`.
-
-- [ ] **Step 3: Implement `clear_halt`**
-
-In `src/slave/mod.rs`, add these imports:
-
-```rust
-use std::sync::atomic::Ordering;
-
-use crate::store::meta::key;
-use state::NodeState;
-```
-
-and add to `impl Slave`, before `pub fn snapshot`:
-
-```rust
-    /// Operator action: leaves a halt. `Retry` handshakes again with the current data (after
-    /// fixing the cause, for example registering a missing comparator and reopening);
-    /// `Rebootstrap` discards local data and bootstraps — the only way out of `Diverged`, or
-    /// of `IdentityChanged` under `IdentityPolicy::Refuse`. `Err(Config)` if not halted.
-    pub async fn clear_halt(&self, action: HaltAction) -> Result<()> {
-        let SlaveState::Halted(reason) = self.inner.state() else {
-            return Err(Error::Config("the slave is not halted".into()));
-        };
-        let i = self.inner.clone();
-        crate::background::blocking(move || i.store.write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true))
-            .await?;
-        if action == HaltAction::Rebootstrap {
-            self.inner.force_bootstrap.store(true, Ordering::SeqCst);
-        }
-        tracing::info!(node = %self.inner.cfg.identifier, reason = reason.name(), ?action, "halt cleared");
-        self.inner.set_last_error(None);
-        self.inner.set_state(SlaveState::Connecting);
-        self.inner.halt_cleared.notify_one();
-        Ok(())
-    }
-```
-
-- [ ] **Step 4: Run the tests**
-
-Run: `cargo test --test rebootstrap`
-Expected: PASS, 7 tests:
-- `retention_gap_triggers_a_rebootstrap_that_converges` (LOG_GAP, default `GapPolicy::Rebootstrap`, one new bootstrap, exact dump equality);
-- `identity_change_is_refused_persistently_until_clear_halt_rebootstraps` (`IdentityChanged` halt survives restart, the slave does not contact its upstream, `clear_halt(Rebootstrap)` converges);
-- `identity_change_with_rebootstrap_policy_converges_directly`;
-- `master_restored_without_epoch_bump_makes_ahead_slaves_diverge` (rule 11; `Halt` keeps data, `Rebootstrap` converges);
-- `restored_master_with_epoch_bump_keeps_behind_slaves_and_rejects_ahead_ones` (`EPOCH_ADVANCED` without bootstrap; past the fork `DIVERGED`);
-- `live_epoch_bump_resets_streams_and_slaves_continue`;
-- `missing_comparator_halts_until_registered_and_cleared` (`SpecMismatch` persisted; `clear_halt(Retry)` after registering the comparator).
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src tests
-git commit -m "feat: clear_halt and end-to-end re-bootstrap, divergence and epoch tests
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-```
-
----
-
-### Task 9: Chained replication — slaves serve downstream replicas
-
-**Files:**
-- Create: `src/slave/source.rs`, `tests/chain.rs`
-- Modify: `src/slave/mod.rs` (serve, `serve_addr`), `tests/support/mod.rs` (serving slaves, `restart_slave`), `DESIGN.md` (§16)
-
-**Interfaces:**
-- Consumes: Task 5 `server::start`, `ServerHandle`; Task 2 `LogSource`; Task 7 `Inner::{ident, is_ready, upstream_chain, origin_last_seq, max_entry_bytes, seq_tx, reset_tx}`.
-- Produces: `impl LogSource for slave::inner::Inner`; `Slave::open` starts a server when `cfg.serve` is `Some`; `Slave::serve_addr(&self) -> Option<SocketAddr>`; harness `Cluster::restart_slave(&self, Slave, SlaveConfig) -> Slave` and serving slaves by default.
-
-- [ ] **Step 1: Make harness slaves serve**
-
-In `tests/support/mod.rs`, in `Cluster::slave_config`, replace:
-
-```rust
-        cfg.listener = Some(listener.clone());
-```
-
-with:
-
-```rust
-        cfg.serve = Some(self.serve());
-        cfg.listener = Some(listener.clone());
-```
-
-and add to `impl Cluster`:
-
-```rust
-    /// Reopens a slave on the port it served before, so its downstream finds it again.
-    pub async fn restart_slave(&self, s: Slave, cfg: SlaveConfig) -> Slave {
-        let port = s.serve_addr().map(|a| a.port());
-        s.shutdown().await.unwrap();
-        let mut cfg = cfg;
-        if let (Some(port), Some(serve)) = (port, cfg.serve.as_mut()) {
-            serve.port = port;
-        }
-        Slave::open(cfg).await.unwrap()
-    }
-}
-```
-
-(Insert it before the closing `}` of `impl Cluster`.)
-
-- [ ] **Step 2: Write the failing tests**
-
-Create `tests/chain.rs`:
-
-```rust
-//! Chained replication, end to end: A (master) → B (slave serving) → C.
-
-mod support;
-
-use std::time::Duration;
-
-use replicated_rocksdb::{CfSpec, HaltReason, IdentityPolicy, LogApi, Master, ReadApi, Slave, SlaveState};
-use support::{assert_converged, check_edge_cases, wait_state, wait_until, write_edge_cases, Cluster};
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_chain_replicates_everything_and_bootstraps_from_the_middle() {
-    let c = Cluster::new();
-    let a = c.master("a").await;
-    a.create_cf(CfSpec::new("c")).unwrap();
-    for i in 0..50u8 {
-        a.put("c", &[i], &[i; 100]).unwrap();
-    }
-    let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
-    assert_converged(&a, &[("b", &b)]).await;
-
-    // C bootstraps from B while A keeps writing.
-    let writer = {
-        let a = &a;
-        async move {
-            for i in 0..50u8 {
-                a.put("c", &[b'w', i], b"during").unwrap();
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        }
-    };
-    let ((cn, lc), ()) = tokio::join!(c.slave("c", b.serve_addr().unwrap()), writer);
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-    assert_eq!(lc.bootstraps(), 1);
-
-    a.create_cf(CfSpec::new("tmp")).unwrap();
-    a.put_with_ttl("tmp", b"t", b"v", Duration::from_secs(5)).unwrap();
-    a.drop_cf("c").unwrap();
-    write_edge_cases(&a, "edge");
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-    check_edge_cases(&cn, "edge");
-    lc.assert_no_violations();
-
-    let s = cn.status();
-    assert_eq!(s.upstream_chain, vec!["b".to_string(), "a".to_string()]);
-    assert_eq!(s.origin_identity, Some(a.identity()));
-    wait_until("origin position reaches the leaf", || cn.status().origin_last_seq == a.last_seq()).await;
-    // C's log is A's log, byte for byte.
-    let from = cn.first_retained_seq() - 1;
-    let ours: Vec<_> = cn.entries_since(from).unwrap().map(Result::unwrap).collect();
-    let origin: Vec<_> = a.entries_since(from).unwrap().map(Result::unwrap).collect();
-    assert_eq!(ours, origin);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_loop_is_detected_and_the_halt_is_not_persisted() {
-    let c = Cluster::new();
-    let a = c.master("a").await;
-    a.create_cf(CfSpec::new("c")).unwrap();
-    let (b_cfg, _) = c.slave_config("b", a.serve_addr().unwrap());
-    let b = Slave::open(b_cfg.clone()).await.unwrap();
-    let (cn, _) = c.slave("c", b.serve_addr().unwrap()).await;
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-
-    // Point B at C, which is downstream of B.
-    let mut looped = b_cfg.clone();
-    looped.upstream = replicated_rocksdb::UpstreamConfig::from_addr(cn.serve_addr().unwrap());
-    let b = c.restart_slave(b, looped).await;
-    wait_state(&b, "LoopDetected halt", |s| *s == SlaveState::Halted(HaltReason::LoopDetected)).await;
-
-    // Configuration halts are re-evaluated on restart: pointed back at A, B resumes.
-    let b = c.restart_slave(b, b_cfg).await;
-    a.put("c", b"k", b"v").unwrap();
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-}
-
-/// Rule 3 also catches a slave pointed at its own address (`client_id == server_id`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_slave_pointed_at_itself_halts_loop_detected() {
-    let c = Cluster::new();
-    let a = c.master("a").await;
-    a.create_cf(CfSpec::new("c")).unwrap();
-    let (b_cfg, _) = c.slave_config("b", a.serve_addr().unwrap());
-    let b = Slave::open(b_cfg.clone()).await.unwrap();
-    assert_converged(&a, &[("b", &b)]).await;
-    let mut own = b_cfg;
-    own.upstream = replicated_rocksdb::UpstreamConfig::from_addr(b.serve_addr().unwrap());
-    let b = c.restart_slave(b, own).await;
-    wait_state(&b, "LoopDetected halt", |s| *s == SlaveState::Halted(HaltReason::LoopDetected)).await;
-    assert_eq!(b.get("c", b"k").unwrap(), None, "still readable while halted");
-}
-
-/// When B re-bootstraps, it ends C's streams with UPSTREAM_RESET; C reconnects and follows.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_upstream_rebootstrap_resets_downstream_streams() {
-    let c = Cluster::new();
-    let a = c.master("a").await;
-    let port = a.serve_addr().unwrap().port();
-    a.create_cf(CfSpec::new("old")).unwrap();
-    let (mut b_cfg, lb) = c.slave_config("b", a.serve_addr().unwrap());
-    b_cfg.on_identity_change = IdentityPolicy::Rebootstrap;
-    let b = Slave::open(b_cfg).await.unwrap();
-    let (mut c_cfg, lc) = c.slave_config("c", b.serve_addr().unwrap());
-    c_cfg.on_identity_change = IdentityPolicy::Rebootstrap;
-    let cn = Slave::open(c_cfg).await.unwrap();
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-    wait_state(&cn, "C streaming", |s| *s == SlaveState::Streaming).await;
-    let streaming = || lc.states().iter().filter(|s| **s == SlaveState::Streaming).count();
-    let streams_before = streaming();
-
-    // B's upstream is replaced by a different database: B re-bootstraps while serving C.
-    a.shutdown().await.unwrap();
-    let mut cfg2 = c.master_config("a2");
-    cfg2.serve.as_mut().unwrap().port = port;
-    let a2 = Master::open(cfg2).await.unwrap();
-    a2.create_cf(CfSpec::new("new")).unwrap();
-    a2.put("new", b"k", b"v").unwrap();
-
-    assert_converged(&a2, &[("b", &b), ("c", &cn)]).await;
-    assert_eq!(lb.bootstraps(), 2);
-    assert_eq!(lc.bootstraps(), 2, "C followed B's new identity");
-    wait_until("C's stream reset and re-established", || streaming() > streams_before).await;
-}
-```
-
-- [ ] **Step 3: Run them to confirm they fail**
-
-Run: `cargo test --test chain`
-Expected: FAIL to compile: `no method named serve_addr found for struct Slave`.
-
-- [ ] **Step 4: Implement serving from a slave**
-
-Create `src/slave/source.rs`:
-
-```rust
-//! A slave as a replication source for downstream replicas (chaining, DESIGN.md §11).
-
-use std::sync::atomic::Ordering;
-use std::time::Duration;
-
-use tokio::sync::watch;
-
-use super::inner::Inner;
-use crate::source::LogSource;
-use crate::store::Store;
-use crate::types::{DbIdentity, EpochStart, Role, Seq};
-
-impl LogSource for Inner {
-    fn node_id(&self) -> &str {
-        &self.cfg.identifier
-    }
-
-    fn role(&self) -> Role {
-        Role::Slave
-    }
-
-    fn is_ready(&self) -> bool {
-        Inner::is_ready(self)
-    }
-
-    fn identity(&self) -> Option<(DbIdentity, Vec<EpochStart>)> {
-        self.ident()
-    }
-
-    fn store(&self) -> &Store {
-        &self.store
-    }
-
-    fn origin_last_seq(&self) -> Seq {
-        self.origin_last_seq.load(Ordering::SeqCst).max(self.store.position().last_seq)
-    }
-
-    fn upstream_chain(&self) -> Vec<String> {
-        Inner::upstream_chain(self)
-    }
-
-    fn max_entry_bytes(&self) -> u64 {
-        self.max_entry_bytes.load(Ordering::SeqCst)
-    }
-
-    fn heartbeat(&self) -> Duration {
-        self.cfg.heartbeat
-    }
-
-    fn subscribe(&self) -> watch::Receiver<Seq> {
-        self.seq_tx.subscribe()
-    }
-
-    fn resets(&self) -> watch::Receiver<u64> {
-        self.reset_tx.subscribe()
-    }
-}
-```
-
-In `src/slave/mod.rs`, add `mod source;` to the module list and `use std::net::SocketAddr;` to the imports. In `Slave::open`, replace these lines (as Task 7 wrote them):
-
-```rust
-        let driver = driver::spawn(&inner);
-        let maintenance = maintenance::spawn(&inner);
-        Ok(Slave { inner, driver: Some(driver), maintenance: Some(maintenance), server: None })
-    }
-```
-
-with:
-
-```rust
-        let server = crate::server::start_for(&inner, inner.cfg.serve.clone()).await?;
-        let driver = driver::spawn(&inner);
-        let maintenance = maintenance::spawn(&inner);
-        Ok(Slave { inner, driver: Some(driver), maintenance: Some(maintenance), server })
-    }
-
-    /// The address this slave serves downstream replicas on, if `serve` is configured.
-    pub fn serve_addr(&self) -> Option<SocketAddr> {
-        self.server.as_ref().map(ServerHandle::addr)
-    }
-```
-
-- [ ] **Step 5: Run the tests**
-
-Run: `cargo test --test chain`
-Expected: PASS, 4 tests: `a_chain_replicates_everything_and_bootstraps_from_the_middle` (C bootstraps from B while A writes; CF create/drop, TTL and the edge-case dataset reach C; C's log equals A's byte for byte; `upstream_chain == ["b", "a"]`), `a_loop_is_detected_and_the_halt_is_not_persisted`, `a_slave_pointed_at_itself_halts_loop_detected`, `an_upstream_rebootstrap_resets_downstream_streams`.
-
-Run: `cargo test`
-Expected: PASS (the earlier suites now run with serving slaves).
-
-- [ ] **Step 6: Update DESIGN.md §16**
-
-In `impl Slave`, after `pub fn applied_seq(&self) -> Seq;` add:
-
-```
-    pub fn serve_addr(&self) -> Option<SocketAddr>;     // when serve is configured
-```
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src tests DESIGN.md
-git commit -m "feat: slaves serve downstream replicas; chain, loop and reset tests
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-```
-
----
-
-### Task 10: Promotion
-
-**Files:**
-- Create: `src/store/promote.rs`, `src/slave/promote.rs`, `tests/promotion.rs`
-- Modify: `src/store/mod.rs`, `src/slave/mod.rs`, `DESIGN.md` (§13.1)
-
-**Interfaces:**
-- Consumes: Task 6 `Store::delete_all_keys`; Task 7 `background::blocking`; Plan 1 `ttl::index_key`, `Store::{ttl_due, handle, cfs}`, `Master::open`, `MasterConfig::validate`; Task 6 `Store::finish_bootstrap` (tests); Task 7 `Slave::shutdown`, `Inner::{state, is_ready, reset_downstream}`.
-- Produces: `Store::rebuild_ttl_index(&self) -> Result<u64>`, `Store::promote_to_master(&self) -> Result<DbIdentity>`, `Slave::promote(self, cfg: MasterConfig) -> Result<Master>` (async; `Err(Config)` naming the `ReadSnapshot` if one still holds the database after the slave shut down).
-
-- [ ] **Step 1: Write the failing tests**
-
-Create `src/store/promote.rs` with only its tests:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::store::bootstrap::BootstrapFinish;
-    use crate::store::test_support::apply;
-    use crate::types::{CfEntry, CfSpec, Op};
-
-    #[test]
-    fn promotion_rewrites_meta_and_rebuilds_the_ttl_index() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let store = Store::open(dir.path(), Role::Slave, Default::default()).unwrap().0;
-            let id = DbIdentity { db_uuid: uuid::Uuid::from_u128(5), epoch: 2 };
-            let history = vec![EpochStart { epoch: 1, start_seq: 1 }, EpochStart { epoch: 2, start_seq: 1 }];
-            store
-                .finish_bootstrap(&BootstrapFinish {
-                    identity: id,
-                    epoch_history: history,
-                    cf_specs: vec![],
-                    snapshot_seq: 0,
-                    snapshot_crc: None,
-                    max_entry_bytes: 1 << 20,
-                })
-                .unwrap();
-            apply(&store, vec![Op::CreateCf { spec: CfSpec::new("c") }]).unwrap();
-            let put = |k: &[u8], at| Op::Put { cf: "c".into(), key: k.to_vec(), value: vec![], expire_at_ms: at };
-            apply(&store, vec![put(b"a", Some(50)), put(b"", None), put(b"\0", Some(70))]).unwrap();
-            assert_eq!(store.rebuild_ttl_index().unwrap(), 2);
-            assert_eq!(store.rebuild_ttl_index().unwrap(), 2, "idempotent");
-            let due = store.ttl_due(60, 10, None).unwrap();
-            assert_eq!(due.iter().map(|e| e.key.clone()).collect::<Vec<_>>(), vec![b"a".to_vec()]);
-            let c = CfEntry { spec: CfSpec::new("c"), create_seq: 1 };
-            assert!(due.iter().all(|e| e.cf_name == c.spec.name && e.create_seq == c.create_seq));
-
-            let promoted = store.promote_to_master().unwrap();
-            assert_eq!(promoted, DbIdentity { db_uuid: id.db_uuid, epoch: 3 });
-        }
-        let (_, m) = Store::open(dir.path(), Role::Master, Default::default()).unwrap();
-        assert_eq!(m.role, Role::Master);
-        assert_eq!(m.identity.unwrap().epoch, 3);
-        assert_eq!(m.epoch_history.last(), Some(&EpochStart { epoch: 3, start_seq: 3 }));
-        assert_eq!(m.last_ts, 2_000, "ts of entry 2 (test_support stamps 1000 × seq)");
-        assert_eq!((m.node_state, m.max_entry_bytes), (None, None));
-    }
-
-    #[test]
-    fn a_slave_without_data_cannot_be_promoted() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), Role::Slave, Default::default()).unwrap().0;
-        assert!(matches!(store.promote_to_master(), Err(Error::Config(_))));
-    }
-}
-```
-
-Add `pub(crate) mod promote;` to the `src/store/mod.rs` module list.
-
-Create `tests/promotion.rs`:
-
-```rust
-//! Promotion of a slave to master, end to end (DESIGN.md §13.1, PROTOCOL.md §6.4).
-
-mod support;
-
-use std::net::SocketAddr;
-use std::time::Duration;
-
-use replicated_rocksdb::{
-    CfSpec, DivergencePolicy, EpochStart, Error, HaltReason, LogApi, Master, Op, ReadApi, Slave, SlaveState,
-};
-use support::{assert_converged, check_edge_cases, wait_state, wait_until, write_edge_cases, Cluster};
-
-/// Reopens slave `name` (shut down by the caller) pointed at `upstream`.
-async fn reopen(c: &Cluster, name: &str, upstream: SocketAddr, tweak: impl FnOnce(&mut replicated_rocksdb::SlaveConfig)) -> (Slave, std::sync::Arc<support::RecordingListener>) {
-    let (mut cfg, listener) = c.slave_config(name, upstream);
-    tweak(&mut cfg);
-    (Slave::open(cfg).await.unwrap(), listener)
-}
-
-/// A → {B, C, D, E}. C stops early (behind B), D and E keep following A past B.
-/// A stops; B is promoted. C continues without a bootstrap (EPOCH_ADVANCED); D (default
-/// policy) halts Diverged; E (Rebootstrap) re-bootstraps and converges. Writes, TTL reaping
-/// and the edge-case dataset all replicate from the new master, through tail and bootstrap.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn promotion_end_to_end() {
-    let c = Cluster::new();
-    let a = c.master("a").await;
-    let a_addr = a.serve_addr().unwrap();
-    a.create_cf(CfSpec::new("c")).unwrap();
-    // The replicas bootstrap now, so every later entry reaches them through Tail and stays in
-    // their logs: a promoted node proves continuity with the CRC of an entry it holds.
-    let (b, _) = c.slave("b", a_addr).await;
-    let (cn, _) = c.slave("c", a_addr).await;
-    let (d, _) = c.slave("d", a_addr).await;
-    let (e, _) = c.slave("e", a_addr).await;
-    for (name, s) in [("b", &b), ("c", &cn), ("d", &d), ("e", &e)] {
-        wait_state(s, name, |st| *st == SlaveState::Streaming).await;
-    }
-    a.put_with_ttl("c", b"session", b"s", Duration::from_secs(60)).unwrap();
-    for i in 0..5u8 {
-        a.put("c", &[i], &[i]).unwrap();
-    }
-    assert_converged(&a, &[("b", &b), ("c", &cn), ("d", &d), ("e", &e)]).await;
-    cn.shutdown().await.unwrap(); // C stays behind
-    a.put("c", b"seen by b", b"1").unwrap();
-    assert_converged(&a, &[("b", &b), ("d", &d), ("e", &e)]).await;
-    b.shutdown().await.unwrap(); // B stops at the fork point
-    a.put("c", b"never seen by b", b"2").unwrap();
-    assert_converged(&a, &[("d", &d), ("e", &e)]).await;
-    let ahead = a.last_seq();
-    a.shutdown().await.unwrap(); // the operator stops the old master
-
-    // Promote B. It must be a running slave: reopen it (its upstream is gone) and promote.
-    let (b, _) = reopen(&c, "b", a_addr, |_| {}).await;
-    let fork = b.last_seq() + 1;
-    let mut mcfg = c.master_config("b");
-    mcfg.identifier = "b".into();
-    let b = b.promote(mcfg).await.unwrap();
-    assert_eq!(b.identity().epoch, 2);
-    assert_eq!(b.epoch_history(), vec![EpochStart { epoch: 1, start_seq: 1 }, EpochStart { epoch: 2, start_seq: fork }]);
-    let b_addr = b.serve_addr().unwrap();
-
-    // C (behind the fork) continues without a bootstrap.
-    let (cn, lc) = reopen(&c, "c", b_addr, |_| {}).await;
-    assert_converged(&b, &[("c", &cn)]).await;
-    assert_eq!(lc.bootstraps(), 0);
-    assert_eq!(cn.status().origin_identity, Some(b.identity()));
-
-    // D and E (past the fork) are DIVERGED; D halts, E re-bootstraps.
-    d.shutdown().await.unwrap();
-    e.shutdown().await.unwrap();
-    let (d, _) = reopen(&c, "d", b_addr, |_| {}).await;
-    let (e, le) = reopen(&c, "e", b_addr, |cfg| cfg.on_divergence = DivergencePolicy::Rebootstrap).await;
-    wait_state(&d, "Diverged halt", |s| *s == SlaveState::Halted(HaltReason::Diverged)).await;
-    assert_eq!(d.last_seq(), ahead, "D keeps its data");
-    wait_until("E re-bootstraps after DIVERGED", || le.bootstraps() == 1).await;
-    assert_converged(&b, &[("c", &cn), ("e", &e)]).await;
-
-    // Writes on the new master replicate; the TTL written on A before promotion is reaped by B.
-    b.put("c", b"after promotion", b"3").unwrap();
-    c.clock.advance(Duration::from_secs(60));
-    let before_reap = b.last_seq();
-    assert_eq!(b.reap_expired().unwrap().deleted, 1);
-    write_edge_cases(&b, "edge");
-    assert_converged(&b, &[("c", &cn), ("e", &e)]).await;
-    // The new master's reaper Delete itself reached C through the log.
-    let reaped: Vec<Op> = cn.entries_since(before_reap).unwrap().flat_map(|e| e.unwrap().decode_ops().unwrap()).collect();
-    assert!(reaped.contains(&Op::Delete { cf: "c".into(), key: b"session".to_vec() }), "{reaped:?}");
-    check_edge_cases(&cn, "edge");
-    check_edge_cases(&e, "edge");
-
-    // A fresh replica of the new master gets the edge cases through Bootstrap.
-    let (f, lf) = c.slave("f", b_addr).await;
-    assert_converged(&b, &[("f", &f)]).await;
-    assert_eq!(lf.bootstraps(), 1);
-    check_edge_cases(&f, "edge");
-}
-
-/// The old master, restarted, is refused by new-epoch replicas with STALE_EPOCH; they keep
-/// retrying (not halted) and follow the new master again once re-pointed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_old_master_is_refused_with_stale_epoch_and_the_client_retries() {
-    let c = Cluster::new();
-    let a = c.master("a").await;
-    let a_addr = a.serve_addr().unwrap();
-    a.create_cf(CfSpec::new("c")).unwrap();
-    let (b, _) = c.slave("b", a_addr).await;
-    let (cn, _) = c.slave("c", a_addr).await;
-    // Bootstrapped and tailing before the write, so entry 2 reaches both through Tail.
-    wait_state(&b, "b streaming", |st| *st == SlaveState::Streaming).await;
-    wait_state(&cn, "c streaming", |st| *st == SlaveState::Streaming).await;
-    a.put("c", b"through tail", b"0").unwrap();
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-    let a_cfg = c.master_config("a");
-    a.shutdown().await.unwrap();
-
-    let b = b.promote(c.master_config("b")).await.unwrap();
-    cn.shutdown().await.unwrap();
-    let (cn, _) = reopen(&c, "c", b.serve_addr().unwrap(), |_| {}).await;
-    b.put("c", b"k", b"v").unwrap();
-    assert_converged(&b, &[("c", &cn)]).await;
-    assert_eq!(cn.status().origin_identity.unwrap().epoch, 2);
-
-    // The old master comes back at its old address; C is (wrongly) pointed at it.
-    let mut a_cfg = a_cfg;
-    a_cfg.serve.as_mut().unwrap().port = a_addr.port();
-    let old = Master::open(a_cfg).await.unwrap();
-    old.put("c", b"split brain", b"x").unwrap();
-    cn.shutdown().await.unwrap();
-    let (cn, _) = reopen(&c, "c", a_addr, |_| {}).await;
-    wait_until("STALE_EPOCH reported", || cn.status().last_error.as_deref().is_some_and(|e| e.contains("STALE_EPOCH"))).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let s = cn.status();
-    assert_eq!(s.state, SlaveState::Connecting, "retrying, not halted");
-    assert!(s.last_error.unwrap().contains("STALE_EPOCH"));
-    assert_eq!(cn.get("c", b"split brain").unwrap(), None);
-
-    // Re-pointed at the new master, it continues.
-    cn.shutdown().await.unwrap();
-    let (cn, lc) = reopen(&c, "c", b.serve_addr().unwrap(), |_| {}).await;
-    b.put("c", b"k2", b"v2").unwrap();
-    assert_converged(&b, &[("c", &cn)]).await;
-    assert_eq!(lc.bootstraps(), 0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn promotion_is_refused_without_data_and_needs_released_snapshots() {
-    let c = Cluster::new();
-    let nobody = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-    let (empty, _) = c.slave("empty", nobody).await;
-    assert!(matches!(empty.promote(c.master_config("empty")).await, Err(Error::Config(_))));
-
-    let a = c.master("a").await;
-    a.create_cf(CfSpec::new("c")).unwrap();
-    let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
-    assert_converged(&a, &[("b", &b)]).await;
-    assert!(matches!(b.promote(c.master_config("elsewhere")).await, Err(Error::Config(_))), "path must match");
-
-    let (b, _) = reopen(&c, "b", a.serve_addr().unwrap(), |_| {}).await;
-    b.wait_for_seq(1, support::WAIT).await.unwrap();
-    let snap = b.snapshot().unwrap();
-    let err = b.promote(c.master_config("b")).await.err().expect("an open snapshot keeps the database open");
-    assert!(matches!(&err, Error::Config(m) if m.contains("ReadSnapshot")), "{err}");
-    drop(snap);
-    // Nothing was changed: the directory is still a slave that resumes.
-    let (b, lb) = reopen(&c, "b", a.serve_addr().unwrap(), |_| {}).await;
-    a.put("c", b"k", b"v").unwrap();
-    assert_converged(&a, &[("b", &b)]).await;
-    assert_eq!(lb.bootstraps(), 0);
-}
-```
-
-- [ ] **Step 2: Run them to confirm they fail**
-
-Run: `cargo test --lib store::promote`
-Expected: FAIL to compile: `no method named rebuild_ttl_index`, `no method named promote_to_master`.
-
-- [ ] **Step 3: Implement the store side** (above the test module in `src/store/promote.rs`)
-
-```rust
-//! Store side of promoting a slave to master (DESIGN.md §13.1).
-
-use rocksdb::{IteratorMode, WriteBatch, WriteOptions};
-
-use super::meta::{self, key, CF_CHANGELOG, CF_META, CF_TTL_INDEX};
-use super::ttl::index_key;
-use super::Store;
-use crate::codec::envelope;
-use crate::error::{Error, Result};
-use crate::types::{DbIdentity, EpochStart, LogEntry, Role};
-
-const BATCH: usize = 1_000;
-
-impl Store {
-    /// Rebuilds the derived `__ttl_index` from a full scan of the envelopes: cleared, then one
-    /// entry per stored value that has an expiry. Returns how many entries were added.
-    pub(crate) fn rebuild_ttl_index(&self) -> Result<u64> {
-        let ttl = self.cf(CF_TTL_INDEX);
-        self.delete_all_keys(&ttl)?;
-        let mut batch = WriteBatch::default();
-        let mut added = 0u64;
-        let live: Vec<_> = self.cfs.read().values().cloned().collect();
-        for phys in live {
-            let handle = self.handle(&phys)?;
-            for item in self.db().iterator_cf(&handle, IteratorMode::Start) {
-                let (k, v) = item?;
-                if let Some(at) = envelope::decode(&v)?.meta.expire_at_ms {
-                    batch.put_cf(&ttl, index_key(at, &phys.entry, &k), []);
-                    added += 1;
-                    if batch.len() >= BATCH {
-                        self.db().write(std::mem::take(&mut batch))?;
-                    }
-                }
-            }
-        }
-        let mut wo = WriteOptions::default();
-        wo.set_sync(true);
-        self.db().write_opt(batch, &wo)?;
-        Ok(added)
-    }
-
-    /// One synced batch: role = master, a new epoch starting at `last_seq + 1`, `last_ts`
-    /// from the entry at `last_seq` (0 if it is no longer retained), slave-only keys removed.
-    pub(crate) fn promote_to_master(&self) -> Result<DbIdentity> {
-        let m = self.load_meta()?.ok_or_else(|| Error::corrupt("__meta is empty"))?;
-        let old = m.identity.ok_or_else(|| Error::Config("this slave has no data to promote".into()))?;
-        let mut history = m.epoch_history;
-        let epoch = history.iter().map(|e| e.epoch).max().unwrap_or(old.epoch).max(old.epoch) + 1;
-        history.push(EpochStart { epoch, start_seq: m.last_seq + 1 });
-        let identity = DbIdentity { db_uuid: old.db_uuid, epoch };
-        let last_ts = match self.db().get_cf(&self.cf(CF_CHANGELOG), m.last_seq.to_be_bytes())? {
-            Some(v) => LogEntry::decode(&v)?.ts_ms,
-            None => 0,
-        };
-        let meta_cf = self.cf(CF_META);
-        let mut batch = WriteBatch::default();
-        batch.put_cf(&meta_cf, key::ROLE, Role::Master.as_bytes());
-        batch.put_cf(&meta_cf, key::ORIGIN_IDENTITY, meta::encode_identity(&identity));
-        batch.put_cf(&meta_cf, key::EPOCH_HISTORY, meta::encode_epoch_history(&history));
-        batch.put_cf(&meta_cf, key::LAST_TS, last_ts.to_be_bytes());
-        for k in [key::NODE_STATE, key::MAX_ENTRY_BYTES, key::BOOTSTRAP_CFS] {
-            batch.delete_cf(&meta_cf, k);
-        }
-        let mut wo = WriteOptions::default();
-        wo.set_sync(true);
-        self.db().write_opt(batch, &wo)?;
-        Ok(identity)
-    }
-}
-```
-
-Run: `cargo test --lib store::promote`
-Expected: PASS, 2 tests.
-
-- [ ] **Step 4: Implement `Slave::promote`**
-
-Create `src/slave/promote.rs`:
-
-```rust
-//! Promotion of a slave to master (DESIGN.md §13.1).
-
-use std::sync::Arc;
-
-use super::state::{HaltReason, SlaveState};
-use super::Slave;
-use crate::config::MasterConfig;
-use crate::error::{Error, Result};
-use crate::master::Master;
-use crate::store::Store;
-use crate::types::Role;
-
-impl Slave {
-    /// Turns this slave into the master. **Operator action: stop or fence the old master
-    /// first** — the crate cannot detect two live masters, only the divergence they cause.
-    ///
-    /// Refused with `Error::Config` while bootstrapping, without data, when halted with
-    /// `Corrupt` or `SpecMismatch`, or if `cfg.path` is not this slave's path. Every
-    /// `ReadSnapshot` taken from this slave must be dropped first: one that is alive keeps
-    /// the database open and the promotion fails. In every failure case the slave has been
-    /// shut down and its directory is unchanged, so it can be reopened as a slave (after the
-    /// last snapshot is dropped).
-    ///
-    /// Downstream streams end with `UPSTREAM_RESET`. The new master starts epoch
-    /// `1 + max(epoch history)` at `applied_seq() + 1` and rebuilds its TTL index, so values
-    /// written with a TTL before the promotion are reaped by it.
-    pub async fn promote(self, cfg: MasterConfig) -> Result<Master> {
-        let refusal = match self.inner.state() {
-            SlaveState::Bootstrapping { .. } => Some("cannot promote while bootstrapping".to_string()),
-            SlaveState::Halted(r @ (HaltReason::Corrupt | HaltReason::SpecMismatch)) => {
-                Some(format!("cannot promote a slave halted with {r:?}"))
-            }
-            _ if !self.inner.is_ready() => Some("this slave has no consistent data to promote".to_string()),
-            _ if cfg.path != self.inner.cfg.path => Some("MasterConfig.path must be the slave's path".to_string()),
-            _ => cfg.validate().err().map(|e| e.to_string()),
-        };
-        if let Some(msg) = refusal {
-            self.shutdown().await?;
-            return Err(Error::Config(msg));
-        }
-        let path = cfg.path.clone();
-        let tuning = cfg.rocksdb.clone();
-        // Snapshots share the database handle; one that outlives the slave keeps the DB open.
-        let db = Arc::downgrade(self.inner.store.db());
-        self.inner.reset_downstream();
-        self.shutdown().await?;
-        if db.strong_count() > 0 {
-            return Err(Error::Config(
-                "a ReadSnapshot of this slave is still open and keeps the database open; drop it and reopen the slave"
-                    .into(),
-            ));
-        }
-        crate::background::blocking(move || {
-            let (store, _) = Store::open(&path, Role::Slave, tuning)?;
-            let indexed = store.rebuild_ttl_index()?;
-            let identity = store.promote_to_master()?;
-            tracing::info!(epoch = identity.epoch, ttl_entries = indexed, "slave promoted to master");
-            Ok(())
-        })
-        .await?;
-        Master::open(cfg).await
-    }
-}
-```
-
-Add `mod promote;` to the module list in `src/slave/mod.rs`.
-
-- [ ] **Step 5: Run the end-to-end tests**
-
-Run: `cargo test --test promotion`
-Expected: PASS, 3 tests: `promotion_end_to_end` (including that the new master's reaper `Delete` reaches C through `entries_since`), `the_old_master_is_refused_with_stale_epoch_and_the_client_retries`, `promotion_is_refused_without_data_and_needs_released_snapshots` (`Error::Config` naming the open `ReadSnapshot`; the directory reopens as a slave afterwards).
-
-- [ ] **Step 6: Update DESIGN.md §13.1**
-
-After step 5 of §13.1 (`5. Open with Master::open(cfg). …`), add:
-
-```
-`promote(self)` consumes the slave. If it is refused (bootstrapping, no data, halted `Corrupt`/`SpecMismatch`, wrong `cfg.path`, invalid `cfg`) or fails (for example because a `ReadSnapshot` of the slave is still alive and keeps the database open), the slave has been shut down cleanly and its directory is unchanged, so it can be reopened as a slave.
-```
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src tests DESIGN.md
-git commit -m "feat: Slave::promote with TTL index rebuild and end-to-end promotion tests
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-```
-
----
-
-### Task 11: TLS, mutual TLS and token authentication end to end
-
-**Files:**
-- Create: `tests/security.rs`
-
-**Interfaces:**
-- Consumes: Task 4 `TlsServerConfig`, `TlsClientConfig`, `TlsIdentity`, `TokenAuthenticator`, `TokenCredentials`, `AllowMethods`, `MtlsSubjectAllowList`, `Method`; Task 7/9 harness; rcgen 0.14 (`KeyPair::generate`, `CertificateParams::{new, self_signed, signed_by}`, `Issuer::new`, `DnType::CommonName`, `IsCa::Ca(BasicConstraints::Unconstrained)`).
-- Produces: nothing new in `src/` — this task proves the Task 4/5/7 code end to end. If a test fails, fix the code it points at (`src/server/mod.rs::call_info`/`authorize`, `src/slave/client.rs`, `src/config.rs::to_tonic`).
-
-- [ ] **Step 1: Write the tests**
-
-Create `tests/security.rs`:
-
-```rust
-//! TLS, mutual TLS and token authentication, end to end, with certificates made by rcgen.
-
-mod support;
-
-use std::sync::Arc;
-
-use replicated_rocksdb::{
-    AllowMethods, CfSpec, Error, HaltReason, Master, Method, MtlsSubjectAllowList, Slave, SlaveState,
-    TlsClientConfig, TlsIdentity, TlsServerConfig, TokenAuthenticator, TokenCredentials,
-};
-use support::{assert_converged, wait_state, wait_until, Cluster};
-
-/// A CA and the certificates it signs.
-struct Pki {
-    ca_pem: Vec<u8>,
-    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
-}
-
-impl Pki {
-    fn new() -> Self {
-        let key = rcgen::KeyPair::generate().unwrap();
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params.distinguished_name.push(rcgen::DnType::CommonName, "rrdb test CA");
-        let cert = params.self_signed(&key).unwrap();
-        Pki { ca_pem: cert.pem().into_bytes(), issuer: rcgen::Issuer::new(params, key) }
-    }
-
-    /// A certificate for `localhost` (server) or with subject CN `cn` (client).
-    fn identity(&self, sans: &[&str], cn: &str) -> TlsIdentity {
-        let key = rcgen::KeyPair::generate().unwrap();
-        let mut params = rcgen::CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
-        params.distinguished_name.push(rcgen::DnType::CommonName, cn);
-        let cert = params.signed_by(&key, &self.issuer).unwrap();
-        TlsIdentity { cert_pem: cert.pem().into_bytes(), key_pem: key.serialize_pem().into_bytes() }
-    }
-
-    fn server(&self, mutual: bool) -> TlsServerConfig {
-        TlsServerConfig {
-            identity: self.identity(&["localhost"], "localhost"),
-            client_ca_pem: mutual.then(|| self.ca_pem.clone()),
-        }
-    }
-
-    fn client(&self, identity: Option<TlsIdentity>) -> TlsClientConfig {
-        TlsClientConfig { ca_pem: self.ca_pem.clone(), domain_name: Some("localhost".into()), identity }
-    }
-}
-
-async fn tls_master(c: &Cluster, pki: &Pki, mutual: bool, auth: Arc<dyn replicated_rocksdb::Authenticator>) -> Master {
-    let mut cfg = c.master_config("a");
-    let serve = cfg.serve.as_mut().unwrap();
-    serve.tls = Some(pki.server(mutual));
-    serve.authenticator = auth;
-    let m = Master::open(cfg).await.unwrap();
-    m.create_cf(CfSpec::new("c")).unwrap();
-    m.put("c", b"k", b"v").unwrap();
-    m
-}
-
-async fn tls_slave(
-    c: &Cluster,
-    m: &Master,
-    name: &str,
-    tls: TlsClientConfig,
-    token: Option<&str>,
-) -> Slave {
-    let (mut cfg, _) = c.slave_config(name, m.serve_addr().unwrap());
-    cfg.serve = None;
-    cfg.upstream.tls = Some(tls);
-    if let Some(t) = token {
-        cfg.upstream.credentials = Arc::new(TokenCredentials::new(t));
-    }
-    Slave::open(cfg).await.unwrap()
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tokens_over_tls_accept_any_valid_secret_and_reject_others() {
-    let c = Cluster::new();
-    let pki = Pki::new();
-    let auth = Arc::new(TokenAuthenticator::new(["old-token", "new-token"]));
-    let m = tls_master(&c, &pki, false, auth).await;
-    let old = tls_slave(&c, &m, "old", pki.client(None), Some("old-token")).await;
-    let new = tls_slave(&c, &m, "new", pki.client(None), Some("new-token")).await;
-    assert_converged(&m, &[("old", &old), ("new", &new)]).await;
-
-    let bad = tls_slave(&c, &m, "bad", pki.client(None), Some("wrong-token")).await;
-    wait_state(&bad, "AuthRejected", |s| *s == SlaveState::Halted(HaltReason::AuthRejected)).await;
-    let none = tls_slave(&c, &m, "none", pki.client(None), None).await;
-    wait_state(&none, "AuthRejected", |s| *s == SlaveState::Halted(HaltReason::AuthRejected)).await;
-    assert!(matches!(bad.wait_for_seq(1, support::WAIT).await, Err(Error::Halted(HaltReason::AuthRejected))));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bootstrap_can_be_denied_per_method() {
-    let c = Cluster::new();
-    let pki = Pki::new();
-    let token = Arc::new(TokenAuthenticator::new(["t"]));
-    let auth = Arc::new(AllowMethods::new(token, &[Method::Handshake, Method::Tail]));
-    let m = tls_master(&c, &pki, false, auth).await;
-    let s = tls_slave(&c, &m, "b", pki.client(None), Some("t")).await;
-    wait_state(&s, "AuthRejected", |st| *st == SlaveState::Halted(HaltReason::AuthRejected)).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn token_authentication_on_plaintext_is_refused_unless_allowed() {
-    let c = Cluster::new();
-    let mut cfg = c.master_config("a");
-    cfg.serve.as_mut().unwrap().authenticator = Arc::new(TokenAuthenticator::new(["t"]));
-    assert!(matches!(Master::open(cfg.clone()).await, Err(Error::Config(_))));
-
-    cfg.serve.as_mut().unwrap().allow_plaintext_token = true;
-    let m = Master::open(cfg).await.unwrap();
-    m.create_cf(CfSpec::new("c")).unwrap();
-    let (mut scfg, _) = c.slave_config("b", m.serve_addr().unwrap());
-    scfg.serve = None;
-    scfg.upstream.credentials = Arc::new(TokenCredentials::new("t"));
-    let s = Slave::open(scfg).await.unwrap();
-    assert_converged(&m, &[("b", &s)]).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mutual_tls_allow_list_by_certificate_subject() {
-    let c = Cluster::new();
-    let pki = Pki::new();
-    let allow = MtlsSubjectAllowList::new().allow_all_methods("node-b").allow("node-ro", &[Method::Handshake, Method::Tail]);
-    let m = tls_master(&c, &pki, true, Arc::new(allow)).await;
-
-    let b = tls_slave(&c, &m, "b", pki.client(Some(pki.identity(&[], "node-b"))), None).await;
-    assert_converged(&m, &[("b", &b)]).await;
-
-    let intruder = tls_slave(&c, &m, "x", pki.client(Some(pki.identity(&[], "intruder"))), None).await;
-    wait_state(&intruder, "AuthRejected", |s| *s == SlaveState::Halted(HaltReason::AuthRejected)).await;
-
-    let read_only = tls_slave(&c, &m, "ro", pki.client(Some(pki.identity(&[], "node-ro"))), None).await;
-    wait_state(&read_only, "AuthRejected on Bootstrap", |s| *s == SlaveState::Halted(HaltReason::AuthRejected)).await;
-
-    // Without a client certificate the TLS handshake itself fails: a transport error, retried.
-    let anonymous = tls_slave(&c, &m, "anon", pki.client(None), None).await;
-    wait_until("a transport error", || anonymous.status().last_error.is_some()).await;
-    assert_eq!(anonymous.status().state, SlaveState::Connecting);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_wrong_ca_is_a_retried_transport_error() {
-    let c = Cluster::new();
-    let pki = Pki::new();
-    let other = Pki::new();
-    let m = tls_master(&c, &pki, false, Arc::new(replicated_rocksdb::AllowAll)).await;
-    let s = tls_slave(&c, &m, "b", other.client(None), None).await;
-    wait_until("a transport error", || s.status().last_error.is_some()).await;
-    assert_eq!(s.status().state, SlaveState::Connecting);
-    let ok = tls_slave(&c, &m, "ok", pki.client(None), None).await;
-    assert_converged(&m, &[("ok", &ok)]).await;
-}
-```
-
-- [ ] **Step 2: Run them**
-
-Run: `cargo test --test security`
-Expected: PASS, 5 tests:
-- `tokens_over_tls_accept_any_valid_secret_and_reject_others` (two rotated secrets converge; a wrong or missing token halts `AuthRejected`);
-- `bootstrap_can_be_denied_per_method` (`PERMISSION_DENIED` on Bootstrap → `AuthRejected`);
-- `token_authentication_on_plaintext_is_refused_unless_allowed`;
-- `mutual_tls_allow_list_by_certificate_subject` (CN `node-b` converges; CN `intruder` and a Handshake/Tail-only CN halt `AuthRejected`; no client certificate is a retried transport error);
-- `a_wrong_ca_is_a_retried_transport_error`.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add tests
-git commit -m "test: tls, mutual tls and token authentication end to end
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-```
-
----
-
-### Task 12: Failure and resume, with fault injection
-
-**Files:**
-- Create: `tests/failure_resume.rs`, `tests/failpoints.rs`
-- Modify: `src/slave/mod.rs` (`kill`), `src/failpoint.rs` (`io_error`), `src/master/writer.rs` (failpoint in `bump_epoch`), `src/store/cfs.rs`, `src/store/mod.rs`, `src/codec/mod.rs` (unused Plan 1 placeholders), `Cargo.toml` (`[[test]]`), `DESIGN.md` (§16)
-
-**Interfaces:**
-- Consumes: Task 5 `failpoint::fire` points `server-tail-after-entry`; Task 7 points `slave-after-apply`, `slave-bootstrap-after-chunk`; Task 5 `ServerHandle::abort`, `await_sole_owner`; Plan 1 `Inner::bump_epoch` (fences the writer when its synced write fails); harness (`restart_master`, `restart_slave`, `copy_dir`, `restore_dir`).
-- Produces: `#[cfg(feature = "failpoints")] Slave::kill(self) -> Result<()>` (async): aborts every task without graceful steps and waits until the database is closed; `failpoint::io_error(name) -> Result<()>`; point `master-bump-epoch-write`.
-
-- [ ] **Step 1: Write the failure/resume tests (no fault injection)**
-
-Create `tests/failure_resume.rs`:
-
-```rust
-//! Failure and resume without fault injection: restarts anywhere in a chain, a downstream
-//! that is ahead of its upstream, and a persisted LogGap halt.
-
-mod support;
-
-use std::time::Duration;
-
-use replicated_rocksdb::{CfSpec, GapPolicy, HaltAction, HaltReason, LogApi, Master, ReadApi, Slave, SlaveState};
-use support::{assert_converged, copy_dir, restore_dir, wait_state, wait_until, Cluster};
-
-/// A → B → C with writes between every restart: master, mid-chain and leaf restarts all
-/// resume from the durable position, with no bootstrap, gap or duplicate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn restarts_of_master_mid_chain_and_leaf_resume_without_bootstrap() {
-    let c = Cluster::new();
-    let a = c.master("a").await;
-    a.create_cf(CfSpec::new("c")).unwrap();
-    let (b_cfg, lb) = c.slave_config("b", a.serve_addr().unwrap());
-    let b = Slave::open(b_cfg.clone()).await.unwrap();
-    let (c_cfg, lc) = c.slave_config("c", b.serve_addr().unwrap());
-    let cn = Slave::open(c_cfg.clone()).await.unwrap();
-    let mut n = 0u32;
-    let mut write = |m: &Master, count: u32| {
-        for _ in 0..count {
-            n += 1;
-            m.put("c", &n.to_be_bytes(), &n.to_le_bytes()).unwrap();
-        }
-    };
-    write(&a, 10);
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-
-    let a = c.restart_master(a, c.master_config("a")).await;
-    write(&a, 10);
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-
-    let b = c.restart_slave(b, b_cfg).await;
-    write(&a, 10);
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-
-    let cn = c.restart_slave(cn, c_cfg.clone()).await;
-    write(&a, 10);
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-
-    assert_eq!((lb.bootstraps(), lc.bootstraps()), (1, 1), "only the initial bootstraps");
-    lb.assert_no_violations();
-    lc.assert_no_violations();
-}
-
-/// B crashes after forwarding entries it had not flushed, so C is ahead of B. B answers
-/// RESUME; C's Tail waits with heartbeats until B has caught up from A, then continues.
-/// (A restored copy of B's directory stands in for the unflushed tail of B's log.)
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_downstream_ahead_of_its_upstream_waits_and_converges() {
-    let c = Cluster::new();
-    let a = c.master("a").await;
-    a.create_cf(CfSpec::new("c")).unwrap();
-    let (b_cfg, _) = c.slave_config("b", a.serve_addr().unwrap());
-    let b = Slave::open(b_cfg.clone()).await.unwrap();
-    assert_converged(&a, &[("b", &b)]).await;
-    let b_port = b.serve_addr().unwrap().port();
-    b.shutdown().await.unwrap();
-    copy_dir(&c.path("b"), &c.path("b-old"));
-    let b = Slave::open({
-        let mut cfg = b_cfg.clone();
-        cfg.serve.as_mut().unwrap().port = b_port;
-        cfg
-    })
-    .await
-    .unwrap();
-
-    let (c_cfg, lc) = c.slave_config("c", b.serve_addr().unwrap());
-    let cn = Slave::open(c_cfg).await.unwrap();
-    for i in 0..10u8 {
-        a.put("c", &[i], b"v").unwrap();
-    }
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-    let c_seq = cn.last_seq();
-
-    // B loses everything after the old copy; A is stopped so B cannot catch up yet.
-    let a_port = a.serve_addr().unwrap().port();
-    a.shutdown().await.unwrap();
-    b.shutdown().await.unwrap();
-    restore_dir(&c.path("b-old"), &c.path("b"));
-    let mut cfg = b_cfg.clone();
-    cfg.serve.as_mut().unwrap().port = b_port;
-    let b = Slave::open(cfg).await.unwrap();
-    assert!(b.last_seq() < c_seq);
-
-    // C resumes against B without a bootstrap and waits (heartbeats only).
-    wait_state(&cn, "C streaming from B", |s| *s == SlaveState::Streaming).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(cn.last_seq(), c_seq);
-    assert_eq!(cn.status().state, SlaveState::Streaming);
-
-    // A comes back; B catches up and passes C; C continues.
-    let mut a_cfg = c.master_config("a");
-    a_cfg.serve.as_mut().unwrap().port = a_port;
-    let a = Master::open(a_cfg).await.unwrap();
-    a.put("c", b"after", b"v").unwrap();
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-    assert_eq!(lc.bootstraps(), 1, "only C's initial bootstrap");
-    lc.assert_no_violations();
-}
-
-/// GapPolicy::Halt: a slave that fell behind retention halts with LogGap, the halt survives
-/// a restart, and clear_halt(Rebootstrap) recovers it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_log_gap_halt_persists_across_restart_until_cleared() {
-    let c = Cluster::new();
-    let mut mcfg = c.master_config("a");
-    mcfg.retention.max_entries = Some(2);
-    mcfg.retention.check_interval = Duration::from_millis(20);
-    let m = Master::open(mcfg).await.unwrap();
-    m.create_cf(CfSpec::new("c")).unwrap();
-    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
-    cfg.on_log_gap = GapPolicy::Halt;
-    let b = Slave::open(cfg.clone()).await.unwrap();
-    assert_converged(&m, &[("b", &b)]).await;
-    // Wait for the Tail that presents the bootstrap lease; until then the lease holds retention.
-    wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
-    let behind = b.last_seq();
-    b.shutdown().await.unwrap();
-
-    for i in 0..20u8 {
-        m.put("c", &[i], b"v").unwrap();
-    }
-    wait_until("master retention", || m.first_retained_seq() > behind + 1).await;
-    let b = Slave::open(cfg.clone()).await.unwrap();
-    wait_state(&b, "LogGap halt", |s| *s == SlaveState::Halted(HaltReason::LogGap)).await;
-    assert_eq!(b.last_seq(), behind);
-    assert_eq!(b.list_cfs(), vec![CfSpec::new("c")], "reads keep working");
-
-    b.shutdown().await.unwrap();
-    let (mut cfg2, listener) = c.slave_config("b", m.serve_addr().unwrap());
-    cfg2.on_log_gap = GapPolicy::Halt;
-    let b = Slave::open(cfg2).await.unwrap();
-    assert_eq!(b.status().state, SlaveState::Halted(HaltReason::LogGap), "persisted across restart");
-    b.clear_halt(HaltAction::Rebootstrap).await.unwrap();
-    assert_converged(&m, &[("b", &b)]).await;
-    assert_eq!(listener.bootstraps(), 1);
-}
-```
-
-- [ ] **Step 2: Run them**
-
-Run: `cargo test --test failure_resume`
-Expected: PASS, 3 tests: `restarts_of_master_mid_chain_and_leaf_resume_without_bootstrap`, `a_downstream_ahead_of_its_upstream_waits_and_converges`, `a_log_gap_halt_persists_across_restart_until_cleared`. (These exercise code from Tasks 5–9; if one fails, the bug is there.)
-
-- [ ] **Step 3: Write the failing fault-injection tests**
-
-Create `tests/failpoints.rs`:
-
-```rust
-//! Fault injection, end to end. Needs `--features failpoints`. The tests share the global
-//! failpoint registry, so they run one at a time (a file-level mutex plus `FailScenario`).
-
-mod support;
-
-use std::time::Duration;
-
-use tokio::sync::{Mutex, MutexGuard};
-
-use replicated_rocksdb::{CfSpec, LogApi, Master, ReadApi, Slave, SlaveState};
-use support::{assert_converged, wait_until, Cluster};
-
-static SERIAL: Mutex<()> = Mutex::const_new(());
-
-async fn serial() -> (MutexGuard<'static, ()>, fail::FailScenario<'static>) {
-    let guard = SERIAL.lock().await;
-    (guard, fail::FailScenario::setup())
-}
-
-/// A slave killed in the middle of a bootstrap restarts it from scratch on reopen and
-/// converges; the server's guard of the abandoned bootstrap is released.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn crash_mid_bootstrap_restarts_the_bootstrap() {
-    let (_serial, scenario) = serial().await;
-    let c = Cluster::new();
-    let mut mcfg = c.master_config("a");
-    mcfg.serve.as_mut().unwrap().limits.bootstrap_chunk_bytes = 64;
-    mcfg.retention.max_entries = Some(1);
-    mcfg.retention.check_interval = Duration::from_millis(20);
-    // The server may finish streaming before the slave is killed; its lease then holds the
-    // guard until it expires.
-    mcfg.serve.as_mut().unwrap().limits.bootstrap_lease_ttl = Duration::from_millis(500);
-    let m = Master::open(mcfg).await.unwrap();
-    m.create_cf(CfSpec::new("c")).unwrap();
-    for i in 0..100u8 {
-        m.put("c", &[i], &[i; 100]).unwrap();
-    }
-    fail::cfg("slave-bootstrap-after-chunk", "1*return").unwrap();
-    let (cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
-    let b = Slave::open(cfg).await.unwrap();
-    wait_until("frozen after the first chunk", || {
-        matches!(b.status().state, SlaveState::Bootstrapping { records, .. } if records > 0)
-    })
-    .await;
-    b.kill().await.unwrap();
-    fail::remove("slave-bootstrap-after-chunk");
-    // The abandoned bootstrap's guard is released (the job ends when the client is gone, or
-    // its unclaimed lease expires): retention runs past its S again.
-    for i in 0..3u8 {
-        m.put("c", &[b'x', i], b"v").unwrap();
-    }
-    wait_until("the abandoned guard is released", || m.first_retained_seq() == m.last_seq()).await;
-
-    let (cfg, listener) = c.slave_config("b", m.serve_addr().unwrap());
-    let b = Slave::open(cfg).await.unwrap();
-    // The interrupted bootstrap left no readable state: reads are not ready until it is redone.
-    match b.get("c", &[0]) {
-        Err(replicated_rocksdb::Error::NotReady) => {}
-        Ok(v) => assert_eq!(v, Some(vec![0; 100]), "only a completed bootstrap is readable"),
-        Err(e) => panic!("unexpected error {e}"),
-    }
-    assert_converged(&m, &[("b", &b)]).await;
-    assert_eq!(listener.bootstraps(), 1);
-    scenario.teardown();
-}
-
-/// A crash between commit and listener: the entry is durable and is not delivered again
-/// (at-most-once); replication resumes after it with no gap or duplicate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn crash_after_apply_resumes_without_gap_or_duplicate() {
-    let (_serial, scenario) = serial().await;
-    let c = Cluster::new();
-    let m = c.master("a").await;
-    m.create_cf(CfSpec::new("c")).unwrap();
-    let (cfg, first) = c.slave_config("b", m.serve_addr().unwrap());
-    let b = Slave::open(cfg).await.unwrap();
-    m.put("c", b"1", b"v").unwrap();
-    assert_converged(&m, &[("b", &b)]).await;
-
-    fail::cfg("slave-after-apply", "1*return").unwrap();
-    let crashed = m.put("c", b"2", b"v").unwrap();
-    wait_until("entry committed", || b.last_seq() == crashed).await;
-    b.kill().await.unwrap();
-    fail::remove("slave-after-apply");
-    assert!(!first.entries().contains(&crashed), "the listener never saw the crashed entry");
-
-    for k in [&b"3"[..], b"4"] {
-        m.put("c", k, b"v").unwrap();
-    }
-    let (cfg, second) = c.slave_config("b", m.serve_addr().unwrap());
-    let b = Slave::open(cfg).await.unwrap();
-    assert_eq!(b.get("c", b"2").unwrap(), Some(b"v".to_vec()), "durable before the crash");
-    assert_converged(&m, &[("b", &b)]).await;
-    assert_eq!(second.entries(), vec![crashed + 1, crashed + 2]);
-    assert_eq!(second.bootstraps(), 0);
-    scenario.teardown();
-}
-
-/// The connection drops mid-tail: the slave reconnects and resumes, no bootstrap, no
-/// duplicate or missing entry.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn connection_drop_mid_tail_resumes() {
-    let (_serial, scenario) = serial().await;
-    let c = Cluster::new();
-    let m = c.master("a").await;
-    m.create_cf(CfSpec::new("c")).unwrap();
-    let (b, listener) = c.slave("b", m.serve_addr().unwrap()).await;
-    assert_converged(&m, &[("b", &b)]).await;
-    let start = b.last_seq();
-    fail::cfg("server-tail-after-entry", "3*return").unwrap();
-    for i in 0..20u8 {
-        m.put("c", &[i], b"v").unwrap();
-    }
-    assert_converged(&m, &[("b", &b)]).await;
-    fail::remove("server-tail-after-entry");
-    assert_eq!(listener.entries(), ((start + 1)..=m.last_seq()).collect::<Vec<_>>());
-    assert_eq!(listener.bootstraps(), 1, "only the initial bootstrap");
-    let reconnects = listener.states().iter().filter(|s| **s == SlaveState::Streaming).count();
-    assert!(reconnects >= 4, "three drops, three reconnects: {:?}", listener.states());
-    scenario.teardown();
-}
-
-/// Aggressive retention (`max_entries = 1`) while a bootstrap is slow: the lease keeps entry
-/// S + 1, so the slave tails from S + 1 without a second bootstrap.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bootstrap_lease_survives_aggressive_retention() {
-    let (_serial, scenario) = serial().await;
-    let c = Cluster::new();
-    let mut mcfg = c.master_config("a");
-    mcfg.retention.max_entries = Some(1);
-    mcfg.retention.check_interval = Duration::from_millis(10);
-    mcfg.serve.as_mut().unwrap().limits.bootstrap_chunk_bytes = 64;
-    let m = Master::open(mcfg).await.unwrap();
-    m.create_cf(CfSpec::new("c")).unwrap();
-    for i in 0..20u8 {
-        m.put("c", &[i], &[i; 100]).unwrap();
-    }
-    let s = m.last_seq();
-    // The slave pauses after its first chunk (until the point is removed) while the master
-    // writes on and retention runs.
-    fail::cfg("slave-bootstrap-after-chunk", "pause").unwrap();
-    let (b, listener) = c.slave("b", m.serve_addr().unwrap()).await;
-    wait_until("bootstrap paused", || matches!(b.status().state, SlaveState::Bootstrapping { records, .. } if records > 0)).await;
-    for i in 0..10u8 {
-        m.put("c", &[b'x', i], b"v").unwrap();
-    }
-    wait_until("retention trims up to the bootstrap guard", || m.first_retained_seq() == s + 1).await;
-    tokio::time::sleep(Duration::from_millis(100)).await; // ten more retention rounds
-    assert_eq!(m.first_retained_seq(), s + 1, "the bootstrap guard keeps S + 1");
-    fail::remove("slave-bootstrap-after-chunk"); // unpauses the slave
-    assert_converged(&m, &[("b", &b)]).await;
-    assert_eq!(listener.bootstraps(), 1, "tailed from S + 1 with the lease: no second bootstrap");
-    wait_until("retention resumes after the lease", || m.first_retained_seq() == m.last_seq()).await;
-    scenario.teardown();
-}
-
-/// A failed epoch bump fences the master's writer until reopen (the durability of the bump
-/// is unknown); the reopened master is at the old epoch and accepts writes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_epoch_bump_fences_the_master_writer() {
-    let (_serial, scenario) = serial().await;
-    let c = Cluster::new();
-    let m = c.master("a").await;
-    m.create_cf(CfSpec::new("c")).unwrap();
-    fail::cfg("master-bump-epoch-write", "1*return").unwrap();
-    assert!(m.bump_epoch().is_err());
-    fail::remove("master-bump-epoch-write");
-    assert!(matches!(m.put("c", b"k", b"v"), Err(replicated_rocksdb::Error::WriterFenced)));
-    assert_eq!(m.identity().epoch, 1);
-    m.shutdown().await.unwrap();
-    let m = Master::open(c.master_config("a")).await.unwrap();
-    assert_eq!(m.identity().epoch, 1);
-    assert_eq!(m.put("c", b"k", b"v").unwrap(), 2);
-    scenario.teardown();
-}
-```
-
-Append to `Cargo.toml`:
-
-```toml
-[[test]]
-name = "failpoints"
-required-features = ["failpoints"]
-```
-
-- [ ] **Step 4: Run them to confirm they fail**
-
-Run: `cargo test --features failpoints --test failpoints`
-Expected: FAIL to compile: `no method named kill found for struct Slave`.
-
-Run: `cargo test`
-Expected: PASS; `failpoints` is skipped without the feature.
-
-- [ ] **Step 5: Implement `Slave::kill`**
-
-In `src/slave/mod.rs`, before `impl Drop for Slave`, add:
-
-```rust
-#[cfg(feature = "failpoints")]
-impl Slave {
-    /// Test-only (feature `failpoints`): stops every task at once without any graceful step
-    /// and waits until the database is closed, emulating a process crash.
-    pub async fn kill(mut self) -> Result<()> {
-        self.inner.shutdown_tx.send_replace(true);
-        if let Some(server) = self.server.take() {
-            server.abort();
-        }
-        for task in [self.driver.take(), self.maintenance.take()].into_iter().flatten() {
-            task.abort();
-            let _ = task.await;
-        }
-        if await_sole_owner(&self.inner, Duration::from_secs(10)).await { Ok(()) } else { Err(Error::Timeout) }
-    }
-}
-```
-
-Append to `src/failpoint.rs`:
-
-```rust
-/// `Err(Io)` when the named point fires: injects a storage failure.
-pub(crate) fn io_error(name: &str) -> crate::Result<()> {
-    if fire(name) { Err(crate::Error::Io(std::io::Error::other(format!("failpoint {name}")))) } else { Ok(()) }
-}
-```
-
-In `src/master/writer.rs`, in `Inner::bump_epoch`, replace:
-
-```rust
-        if let Err(e) = self.store.write_meta(
-            &[
-                (key::ORIGIN_IDENTITY, &meta::encode_identity(&id)),
-                (key::EPOCH_HISTORY, &meta::encode_epoch_history(&history)),
-            ],
-            true,
-        ) {
-```
-
-with:
-
-```rust
-        let written = crate::failpoint::io_error("master-bump-epoch-write").and_then(|()| {
-            self.store.write_meta(
-                &[
-                    (key::ORIGIN_IDENTITY, &meta::encode_identity(&id)),
-                    (key::EPOCH_HISTORY, &meta::encode_epoch_history(&history)),
-                ],
-                true,
-            )
-        });
-        if let Err(e) = written {
-```
-
-- [ ] **Step 6: Run the fault-injection tests**
-
-Run: `cargo test --features failpoints --test failpoints`
-Expected: PASS, 5 tests (run one at a time through the file-level mutex): `crash_mid_bootstrap_restarts_the_bootstrap` (also asserts the abandoned bootstrap's guard is released: retention passes its `S` again), `crash_after_apply_resumes_without_gap_or_duplicate`, `connection_drop_mid_tail_resumes`, `bootstrap_lease_survives_aggressive_retention` (the slave is held with the `pause` action — no sleeps as synchronisation, no blocked timing windows — and released with `fail::remove`), `a_failed_epoch_bump_fences_the_master_writer`.
-
-- [ ] **Step 7: Remove Plan 1 placeholders Plan 2 does not use**
-
-These items were kept for Plan 2 behind `allow`s, but Plan 2 uses `cfs.pending.lock()`, `LogEntry::decode_ops()` and `LogSource::role()` instead. Delete them:
-- in `src/store/cfs.rs`: the methods `pending_entries` and `push_pending`, each with its `#[allow(dead_code)] // used by bootstrap (Plan 2)` line;
-- in `src/store/mod.rs`: the method `role(&self) -> Role` with its `#[allow(dead_code)] // used by the slave (later task)` line (the `role` field stays; `initialise_meta` uses it);
-- in `src/codec/mod.rs`: the lines `#[allow(unused_imports)] // used by the replication client (Plan 2)` and `pub(crate) use entry::decode_ops;`.
-
-Run: `grep -rn "Plan 2)" src`
-Expected: no output.
-
-- [ ] **Step 8: Run everything, lint and document**
-
-Run: `cargo test && cargo test --features failpoints`
-Expected: PASS: every unit, integration and doc test, with and without the feature.
-
-Run: `cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features failpoints -- -D warnings && cargo doc --no-deps`
-Expected: no warnings; docs build. Fix anything flagged (typically an import left unused by an earlier stage).
-
-- [ ] **Step 9: Update DESIGN.md §16**
-
-In `impl Slave` (the block that ends `pub fn replicas(&self) -> Vec<ReplicaStatus>;` followed by `pub async fn shutdown(self) -> Result<()>;` — `impl Master` has a `shutdown` line too), replace:
-
-```
-    pub fn replicas(&self) -> Vec<ReplicaStatus>;
-    pub async fn shutdown(self) -> Result<()>;
-}
-impl ReadApi for Slave {}  impl LogApi for Slave {}
-```
-
-with:
-
-```
-    pub fn replicas(&self) -> Vec<ReplicaStatus>;
-    pub async fn shutdown(self) -> Result<()>;
-    #[cfg(feature = "failpoints")]
-    pub async fn kill(self) -> Result<()>;   // test-only: abort every task, emulating a crash
-}
-impl ReadApi for Slave {}  impl LogApi for Slave {}
-```
-
-- [ ] **Step 10: Commit**
-
-```bash
-git add Cargo.toml src tests DESIGN.md
-git commit -m "test: failure and resume, with failpoints for crashes and dropped connections
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-```
-
----
-
-## Out of scope for this plan (Plan 3)
-
-| Spec item | Foundation built here |
-|---|---|
-| `VerifyBegin` / `VerifyRange` / `VerifyEnd`, `VerifyConfig`, `Slave::verify_now`, `MismatchPolicy`, `on_verify_complete` | Generated service with `UNIMPLEMENTED` stubs, `ReadSnapshot::{meta, raw_ctx}`, `ReadCtx::iter_raw`, `Digest`, `force_bootstrap` |
-| `Master::replicas()`, `Slave::replicas()`, `ReplicaStatus` | Tail producers in `src/server/tail.rs` |
-| `SlaveStatus::{lag_ms, last_verify}`, tracing spans per handshake/bootstrap/verify | `SlaveStatus`, `tracing` events already emitted |
