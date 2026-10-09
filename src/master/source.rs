@@ -66,7 +66,7 @@ mod tests {
     use crate::net::reason_of;
     use crate::pb;
     use crate::pb::tail_message::Kind;
-    use crate::server::test_client::{client, next_batch, serving_master, tail_req, within};
+    use crate::server::test_client::{client, next_batch, serving_master, tail_req, within, TailExt};
     use crate::types::CfSpec;
 
     /// Retention overtakes a reader that stopped consuming: the stream ends with LOG_GAP
@@ -81,7 +81,7 @@ mod tests {
             m.put("c", &[i], &vec![i; 256 << 10]).unwrap();
         }
         let req = tail_req(&m.identity(), 1);
-        let mut s = client(m.serve_addr().unwrap(), "b").tail(req).await.unwrap().into_inner();
+        let mut s = client(m.serve_addr().unwrap(), "b").tail_start(req).await.unwrap().into_inner();
         // The producer has read ahead once the first batch arrives.
         let first = next_batch(&mut s).await;
         let mut last = first.last().unwrap().seq;
@@ -143,7 +143,7 @@ mod tests {
         }
         let mut req = tail_req(&m.identity(), 1);
         req.bootstrap_lease = Some(lease);
-        let mut s = client(m.serve_addr().unwrap(), "b").tail(req).await.unwrap().into_inner();
+        let mut s = client(m.serve_addr().unwrap(), "b").tail_start(req).await.unwrap().into_inner();
         next_batch(&mut s).await; // the first block is read; entry S + 1 is not
         tokio::time::sleep(Duration::from_millis(200)).await;
         let keep_one = Retention { max_age: None, max_entries: Some(1), check_interval: Duration::from_secs(1) };

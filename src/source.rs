@@ -30,4 +30,12 @@ pub(crate) trait LogSource: Send + Sync + 'static {
     /// Bumped whenever every served stream must end with `UPSTREAM_RESET` (an epoch bump on
     /// the master, an epoch adoption or a bootstrap on a slave).
     fn resets(&self) -> watch::Receiver<u64>;
+    /// `ready`, `bootstrapping` or `halted:<Reason>` (the `Status` RPC).
+    fn node_state(&self) -> String {
+        "ready".into()
+    }
+    /// The upstream address; `None` on the master.
+    fn upstream(&self) -> Option<String> {
+        None
+    }
 }

@@ -1,6 +1,6 @@
 //! The gated writer: one entry at a time, always fsynced (DESIGN.md §5).
 
-use std::sync::{Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use rocksdb::WriteBatch;
 use tokio::sync::watch;
@@ -28,6 +28,8 @@ pub(crate) struct Inner {
     pub shutdown_tx: watch::Sender<bool>,
     /// Bumped by `bump_epoch`: every served replication stream ends with `UPSTREAM_RESET`.
     pub reset_tx: watch::Sender<u64>,
+    /// Downstream replicas served by this master (acks, in-sync state).
+    pub(crate) replicas: Arc<crate::server::replicas::ReplicaRegistry>,
 }
 
 impl Inner {
@@ -47,6 +49,7 @@ impl Inner {
             seq_tx: watch::channel(last_seq).0,
             shutdown_tx: watch::channel(false).0,
             reset_tx: watch::channel(0).0,
+            replicas: Arc::default(),
         }
     }
 

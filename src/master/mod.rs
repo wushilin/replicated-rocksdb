@@ -19,6 +19,7 @@ use crate::config::MasterConfig;
 use crate::error::Result;
 use crate::log::{EntryIter, LogApi};
 use crate::read::{ReadApi, ReadSnapshot};
+use crate::server::replicas::ReplicaStatus;
 use crate::server::ServerHandle;
 use crate::store::meta::{self, key};
 use crate::store::read::DbIter;
@@ -76,7 +77,7 @@ impl Master {
             inner.bump_epoch()?;
         }
         // The epoch bump above happens before the replication port opens (DESIGN.md §13).
-        let server = crate::server::start_for(&inner, inner.cfg.serve.clone()).await?;
+        let server = crate::server::start_for(&inner, inner.cfg.serve.clone(), inner.replicas.clone()).await?;
         let task = maintenance::spawn(&inner);
         Ok(Master { inner, task: Some(task), server })
     }
@@ -188,6 +189,15 @@ impl Master {
     #[cfg(test)]
     pub(crate) fn log_source(&self) -> Arc<dyn crate::source::LogSource> {
         self.inner.clone()
+    }
+
+    /// Direct downstream replicas: what each was sent and acknowledged, its lag, and whether
+    /// it is in sync. Empty when the master does not serve replication.
+    pub fn replicas(&self) -> Vec<ReplicaStatus> {
+        match &self.server {
+            Some(s) => self.inner.replicas.status(&*self.inner, self.inner.now_ms(), s.replica_lag_time_max()),
+            None => Vec::new(),
+        }
     }
 
     /// The address the replication server listens on, if this master serves replication.

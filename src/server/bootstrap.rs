@@ -84,14 +84,24 @@ pub(super) async fn bootstrap(
         resets,
         runtime: tokio::runtime::Handle::current(),
     };
-    // The permit is returned only after the job, and with it the snapshot, is gone:
-    // `ServerHandle::shutdown` waits for all permits, so no snapshot outlives a shutdown.
+    let (mut stop, mut reset) = (state.shutdown.clone(), job.resets.clone());
+    let runtime = job.runtime.clone();
     tokio::task::spawn_blocking(move || {
-        job.run();
+        let (tx, end) = job.run();
+        // The job, and with it the snapshot and (unless leased) the guard, is gone; only then
+        // is the permit returned (`ServerHandle::shutdown` waits for all permits). A final
+        // status may have to wait for a stalled client: that happens afterwards, holding
+        // nothing but the channel, so a reset never pins the snapshot or a bootstrap slot.
         drop(permit);
+        if let Some(status) = end {
+            reset.borrow_and_update();
+            runtime.spawn(async move { super::end_stream(&tx, status, &mut stop, &mut reset).await });
+        }
     });
     Ok(Response::new(ReceiverStream::new(rx)))
 }
+
+type Tx = mpsc::Sender<Result<pb::BootstrapChunk, Status>>;
 
 struct Job {
     state: Arc<ServerState>,
@@ -101,7 +111,7 @@ struct Job {
     guard: RetentionGuard,
     lease_id: [u8; 16],
     client_id: String,
-    tx: mpsc::Sender<Result<pb::BootstrapChunk, Status>>,
+    tx: Tx,
     resets: watch::Receiver<u64>,
     runtime: tokio::runtime::Handle,
 }
@@ -120,12 +130,13 @@ fn chunk(kind: Kind) -> Result<pb::BootstrapChunk, Status> {
 
 impl Job {
     /// Runs on a blocking thread and consumes the job: the snapshot and the guard are dropped
-    /// when it returns. Any send failure means the client went away.
-    fn run(self) {
+    /// when it returns. Returns a sender and the status the stream must still end with, if
+    /// any; the caller delivers it after releasing the job's resources.
+    fn run(self) -> (Tx, Option<Status>) {
         let Job { state, snap, meta, header, guard, lease_id, client_id, tx, resets, runtime } = self;
+        let out = tx.clone();
         // A send also gives up on shutdown or reset, so a client that stops reading cannot
-        // keep this job (and the node's database) alive. It then ends the stream with the
-        // matching status (see `end_stream`).
+        // keep this job (and the node's database) alive.
         let mut stop = state.shutdown.clone();
         let mut reset = resets.clone();
         let mut send = |m: Result<pb::BootstrapChunk, Status>| {
@@ -138,22 +149,13 @@ impl Job {
                 }
             })
         };
-        let (mut stop_end, mut reset_end) = (state.shutdown.clone(), resets.clone());
-        let mut end = |status: Status| {
-            // A reset the job has seen must not make `end_stream` drop the status.
-            reset_end.borrow_and_update();
-            runtime.block_on(super::end_stream(&tx, status, &mut stop_end, &mut reset_end));
-        };
         // Sends a message; on a stop the stream ends with its status and the job returns.
         macro_rules! send {
             ($m:expr) => {
                 match send($m) {
                     Sent::Ok => {}
-                    Sent::Gone => return,
-                    Sent::End(status) => {
-                        end(status);
-                        return;
-                    }
+                    Sent::Gone => return (out, None),
+                    Sent::End(status) => return (out, Some(status)),
                 }
             };
         }
@@ -164,32 +166,27 @@ impl Job {
         for cf in &meta.cf_specs {
             digest.cf_marker(&cf.spec.name, cf.create_seq);
             let Some(phys) = snap.phys(&cf.spec.name).filter(|p| p.entry == *cf) else {
-                end(reason_status(pb::Reason::Corrupt, format!("CF {} is missing from the snapshot", cf.spec.name)));
-                return;
+                return (out, Some(reason_status(pb::Reason::Corrupt, format!("CF {} is missing from the snapshot", cf.spec.name))));
             };
             let iter = match ctx.iter_raw(phys) {
                 Ok(iter) => iter,
                 Err(e) => {
-                    end(store_status(e));
-                    return;
+                    return (out, Some(store_status(e)));
                 }
             };
             let mut records = Vec::new();
             let mut size = 0usize;
             for item in iter {
                 if state.is_shutting_down() {
-                    end(reason_status(pb::Reason::ShuttingDown, "server is shutting down"));
-                    return;
+                    return (out, Some(reason_status(pb::Reason::ShuttingDown, "server is shutting down")));
                 }
                 if resets.has_changed().unwrap_or(true) {
-                    end(reason_status(pb::Reason::UpstreamReset, "server state was replaced"));
-                    return;
+                    return (out, Some(reason_status(pb::Reason::UpstreamReset, "server state was replaced")));
                 }
                 let (key, envelope) = match item {
                     Ok(kv) => kv,
                     Err(e) => {
-                        end(store_status(e));
-                        return;
+                        return (out, Some(store_status(e)));
                     }
                 };
                 digest.record(&key, &envelope);
@@ -210,11 +207,14 @@ impl Job {
         state.insert_lease(lease_id, client_id, meta.last_seq, guard);
         let footer = pb::BootstrapFooter { record_count, digest: digest.to_vec() };
         match send(chunk(Kind::Footer(footer))) {
-            Sent::Ok => {}
-            Sent::Gone => state.remove_lease(&lease_id),
+            Sent::Ok => (out, None),
+            Sent::Gone => {
+                state.remove_lease(&lease_id);
+                (out, None)
+            }
             Sent::End(status) => {
                 state.remove_lease(&lease_id);
-                end(status);
+                (out, Some(status))
             }
         }
     }

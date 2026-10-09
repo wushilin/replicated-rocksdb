@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use tonic::Code;
 
 use super::test_client::{
-    client, client_with, eventually, hello, next_batch, serving_master, stream_error, tail_req, within, Meta,
+    ack,
+    client, client_with, eventually, hello, next_batch, serving_master, stream_error, tail_req, within, Meta, TailExt,
 };
 use crate::auth::{AllowMethods, Method, TokenAuthenticator};
 use crate::codec::digest::Digest;
@@ -64,7 +65,7 @@ async fn version_mismatch_is_answered_in_the_handshake_body() {
     assert_eq!((r.decision(), r.reason()), (pb::Decision::Reject, pb::Reason::ProtocolMismatch));
     assert_eq!(r.protocol_version, PROTOCOL_VERSION);
     // Every other RPC fails without the metadata.
-    let err = c.tail(tail_req(&m.identity(), 1)).await.unwrap_err();
+    let err = c.tail_start(tail_req(&m.identity(), 1)).await.unwrap_err();
     assert_eq!((err.code(), reason_of(&err)), (Code::FailedPrecondition, Some(pb::Reason::ProtocolMismatch)));
 }
 
@@ -102,7 +103,7 @@ async fn malformed_handshake_input_is_invalid_argument() {
 
     // The node-id metadata is checked on every RPC.
     let mut c = client(addr, "bad id");
-    let e = c.tail(tail_req(&m.identity(), 1)).await.unwrap_err();
+    let e = c.tail_start(tail_req(&m.identity(), 1)).await.unwrap_err();
     assert_eq!(e.code(), Code::InvalidArgument, "tail with a bad x-rrdb-node-id");
     let e = c.bootstrap(pb::BootstrapRequest { client_id: "bad id".into() }).await.unwrap_err();
     assert_eq!(e.code(), Code::InvalidArgument, "bootstrap with a bad x-rrdb-node-id");
@@ -111,7 +112,7 @@ async fn malformed_handshake_input_is_invalid_argument() {
     let mut c = client(addr, "b");
     let mut req = tail_req(&m.identity(), 1);
     req.client_id = "other".into();
-    assert_eq!(c.tail(req).await.unwrap_err().code(), Code::InvalidArgument, "tail client_id mismatch");
+    assert_eq!(c.tail_start(req).await.unwrap_err().code(), Code::InvalidArgument, "tail client_id mismatch");
     let e = c.bootstrap(pb::BootstrapRequest { client_id: "other".into() }).await.unwrap_err();
     assert_eq!(e.code(), Code::InvalidArgument, "bootstrap client_id mismatch");
 }
@@ -124,7 +125,7 @@ async fn tail_streams_entries_in_order_then_heartbeats_then_new_entries() {
     m.put("c", b"", b"").unwrap();
     m.put("c", b"\0", b"\0").unwrap();
     let mut c = client(m.serve_addr().unwrap(), "b");
-    let mut s = c.tail(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
+    let mut s = c.tail_start(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
     // The backlog arrives as one batch.
     let backlog = next_batch(&mut s).await;
     assert_eq!(backlog.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
@@ -156,25 +157,25 @@ async fn tail_validation_follows_the_spec() {
     let reason = |e: tonic::Status| (e.code(), reason_of(&e));
 
     let other = DbIdentity { db_uuid: uuid::Uuid::new_v4(), epoch: 1 };
-    let e = c.tail(tail_req(&other, 6)).await.unwrap_err();
+    let e = c.tail_start(tail_req(&other, 6)).await.unwrap_err();
     assert_eq!(reason(e), (Code::FailedPrecondition, Some(pb::Reason::IdentityChanged)));
 
-    let e = c.tail(tail_req(&id, 8)).await.unwrap_err();
+    let e = c.tail_start(tail_req(&id, 8)).await.unwrap_err();
     assert_eq!(reason(e), (Code::FailedPrecondition, Some(pb::Reason::Diverged)), "past master last_seq + 1");
 
     let mut bad_prev = tail_req(&id, 7);
     bad_prev.prev_crc32c = Some(0xDEAD_BEEF);
-    let e = c.tail(bad_prev).await.unwrap_err();
+    let e = c.tail_start(bad_prev).await.unwrap_err();
     assert_eq!(reason(e), (Code::FailedPrecondition, Some(pb::Reason::Diverged)));
 
-    let e = c.tail(tail_req(&id, 2)).await.unwrap_err();
+    let e = c.tail_start(tail_req(&id, 2)).await.unwrap_err();
     assert_eq!(reason(e), (Code::OutOfRange, Some(pb::Reason::LogGap)));
 
-    let e = c.tail(tail_req(&id, 0)).await.unwrap_err();
+    let e = c.tail_start(tail_req(&id, 0)).await.unwrap_err();
     assert_eq!(e.code(), Code::InvalidArgument);
 
     // from_seq = last_seq + 1 is valid: the stream waits for the next write.
-    let mut s = c.tail(tail_req(&id, 7)).await.unwrap().into_inner();
+    let mut s = c.tail_start(tail_req(&id, 7)).await.unwrap().into_inner();
     m.put("c", b"x", b"v").unwrap();
     assert_eq!(next_entry(&mut s).await.seq, 7);
 }
@@ -184,7 +185,7 @@ async fn bump_epoch_ends_streams_with_upstream_reset() {
     let dir = tempfile::tempdir().unwrap();
     let (m, _) = serving_master(dir.path(), |_| {}).await;
     m.create_cf(CfSpec::new("c")).unwrap();
-    let mut s = client(m.serve_addr().unwrap(), "b").tail(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
     assert_eq!(next_entry(&mut s).await.seq, 1);
     m.bump_epoch().unwrap();
     let err = stream_error(&mut s).await;
@@ -196,7 +197,7 @@ async fn shutdown_ends_streams_and_releases_the_database() {
     let dir = tempfile::tempdir().unwrap();
     let (m, _) = serving_master(dir.path(), |_| {}).await;
     m.create_cf(CfSpec::new("c")).unwrap();
-    let mut s = client(m.serve_addr().unwrap(), "b").tail(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
     assert_eq!(next_entry(&mut s).await.seq, 1);
     m.shutdown().await.unwrap();
     let err = stream_error(&mut s).await;
@@ -249,6 +250,22 @@ async fn methods_can_be_denied_per_credential() {
     c.handshake(hello("b")).await.unwrap();
     let e = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap_err();
     assert_eq!(e.code(), Code::PermissionDenied);
+    let e = c.status(pb::StatusRequest { client_id: "b".into(), probe_seq: None }).await.unwrap_err();
+    assert_eq!(e.code(), Code::PermissionDenied, "Status is a method of its own");
+}
+
+#[tokio::test]
+async fn status_and_tail_reject_a_client_id_that_differs_from_the_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    let mut c = client(m.serve_addr().unwrap(), "b");
+    let e = c.status(pb::StatusRequest { client_id: "x".into(), probe_seq: None }).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument);
+    let mut req = tail_req(&m.identity(), 1);
+    req.client_id = "x".into();
+    let e = c.tail_start(req).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument);
+    assert_eq!(c.status(pb::StatusRequest { client_id: "b".into(), probe_seq: None }).await.unwrap().into_inner().node_id, "a");
 }
 
 #[tokio::test]
@@ -347,7 +364,7 @@ async fn bootstrap_lease_holds_retention_until_tail_presents_it() {
 
     let mut req = tail_req(&m.identity(), s + 1);
     req.bootstrap_lease = Some(h.lease_id.clone());
-    let mut stream = c.tail(req).await.unwrap().into_inner();
+    let mut stream = c.tail_start(req).await.unwrap().into_inner();
     assert_eq!(next_batch(&mut stream).await[0].seq, s + 1);
     eventually("retention after the lease is released", || m.first_retained_seq() == m.last_seq()).await;
 }
@@ -407,12 +424,20 @@ async fn shutdown_with_unread_streams_releases_the_database() {
         m.put("c", &[i], &vec![i; 256 << 10]).unwrap();
     }
     let mut c = client(m.serve_addr().unwrap(), "b");
-    let mut tail = c.tail(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
+    let mut tail = c.tail_start(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
     assert!(within("the first tail message", tail.message()).await.unwrap().is_some());
     let mut boot = c.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
     let first = within("the bootstrap header", boot.message()).await.unwrap().unwrap();
     assert!(matches!(first.kind, Some(Chunk::Header(_))));
+    // A Tail that never sends `start`: its handler holds the source while it waits.
+    let base = Arc::strong_count(&m.log_source());
+    let (_silent_tx, silent_rx) = tokio::sync::mpsc::channel::<pb::TailClientMessage>(1);
+    let mut c2 = c.clone();
+    let silent = tokio::spawn(async move { c2.tail(tokio_stream::wrappers::ReceiverStream::new(silent_rx)).await });
+    eventually("the silent Tail holds the source", || Arc::strong_count(&m.log_source()) > base).await;
     tokio::time::timeout(Duration::from_secs(20), m.shutdown()).await.expect("shutdown hangs").unwrap();
+    let silent = within("the silent Tail's answer", silent).await.unwrap();
+    assert_eq!(silent.err().map(|s| reason_of(&s)), Some(Some(pb::Reason::ShuttingDown)));
     let (m, _) = serving_master(dir.path(), |_| {}).await;
     assert_eq!(m.last_seq(), 129);
 }
@@ -432,7 +457,7 @@ async fn real_time_mode_delivers_each_entry_promptly_one_batch_at_a_time() {
     let dir = tempfile::tempdir().unwrap();
     let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_secs(1)).await;
     m.create_cf(CfSpec::new("c")).unwrap();
-    let mut s = client(m.serve_addr().unwrap(), "b").tail(tail_req(&m.identity(), 2)).await.unwrap().into_inner();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(tail_req(&m.identity(), 2)).await.unwrap().into_inner();
     for i in 0..5u8 {
         let seq = m.put("c", &[i], b"v").unwrap();
         let t0 = Instant::now(); // after the fsynced put returned
@@ -451,7 +476,7 @@ async fn small_writes_wait_for_max_wait_and_arrive_together() {
     let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_secs(3)).await;
     m.create_cf(CfSpec::new("c")).unwrap();
     let req = fetch_req(&m.identity(), 2, 1 << 20, 1500, 0);
-    let mut s = client(m.serve_addr().unwrap(), "b").tail(req).await.unwrap().into_inner();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(req).await.unwrap().into_inner();
     m.put("c", &[0], b"v").unwrap();
     let t0 = Instant::now(); // entry 2 became available no later than this
     for i in 1..3u8 {
@@ -472,7 +497,7 @@ async fn reaching_min_batch_bytes_sends_before_max_wait() {
     m.put("c", &[0], &[7; 100]).unwrap();
     let one = m.entries_since(1).unwrap().next().unwrap().unwrap().encoded_len();
     let req = fetch_req(&m.identity(), 3, u32::try_from(3 * one).unwrap(), 20_000, 0);
-    let mut s = client(m.serve_addr().unwrap(), "b").tail(req).await.unwrap().into_inner();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(req).await.unwrap().into_inner();
     for i in 1..=3u8 {
         m.put("c", &[i], &[7; 100]).unwrap();
     }
@@ -498,7 +523,7 @@ async fn catch_up_is_split_at_max_batch_bytes_without_gaps() {
     }
     // min_batch_bytes is huge and max_wait long: catch-up must still not wait.
     let req = fetch_req(&m.identity(), 1, u32::MAX, 100, 1 << 20);
-    let mut s = client(m.serve_addr().unwrap(), "b").tail(req).await.unwrap().into_inner();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(req).await.unwrap().into_inner();
     let mut batches = Vec::new();
     let mut seqs = Vec::new();
     while seqs.len() < 1001 {
@@ -521,7 +546,7 @@ async fn an_entry_larger_than_max_batch_bytes_is_sent_alone() {
     m.put("c", b"small-1", b"v").unwrap();
     let big = m.put("c", b"big", &[9; 4096]).unwrap();
     m.put("c", b"small-2", b"v").unwrap();
-    let mut s = client(m.serve_addr().unwrap(), "b").tail(fetch_req(&m.identity(), 2, 0, 0, 1024)).await.unwrap().into_inner();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(fetch_req(&m.identity(), 2, 0, 0, 1024)).await.unwrap().into_inner();
     let mut got = Vec::new();
     while got.iter().map(Vec::len).sum::<usize>() < 3 {
         got.push(next_batch(&mut s).await);
@@ -537,7 +562,7 @@ async fn max_wait_is_clamped_to_the_heartbeat() {
     let (m, _) = serving_master(dir.path(), |cfg| cfg.heartbeat = Duration::from_millis(200)).await;
     m.create_cf(CfSpec::new("c")).unwrap();
     let req = fetch_req(&m.identity(), 2, 1 << 20, 30_000, 0);
-    let mut s = client(m.serve_addr().unwrap(), "b").tail(req).await.unwrap().into_inner();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(req).await.unwrap().into_inner();
     m.put("c", b"k", b"v").unwrap();
     let t0 = Instant::now();
     let batch = next_batch(&mut s).await;
@@ -562,7 +587,7 @@ async fn big_log(dir: &std::path::Path) -> crate::Master {
 async fn tail_reset_under_backpressure_ends_with_upstream_reset() {
     let dir = tempfile::tempdir().unwrap();
     let m = big_log(dir.path()).await;
-    let mut s = client(m.serve_addr().unwrap(), "b").tail(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(tail_req(&m.identity(), 1)).await.unwrap().into_inner();
     assert!(within("the first tail message", s.message()).await.unwrap().is_some());
     tokio::time::sleep(Duration::from_millis(300)).await; // the producer is blocked, channel full
     m.bump_epoch().unwrap();
@@ -599,7 +624,7 @@ async fn batches_fit_max_batch_bytes_including_framing() {
     for i in 0..200u32 {
         m.put("c", &i.to_be_bytes(), &[1; 60]).unwrap();
     }
-    let mut s = client(m.serve_addr().unwrap(), "b").tail(fetch_req(&m.identity(), 1, 0, 0, 1000)).await.unwrap().into_inner();
+    let mut s = client(m.serve_addr().unwrap(), "b").tail_start(fetch_req(&m.identity(), 1, 0, 0, 1000)).await.unwrap().into_inner();
     let mut seen = 0;
     while seen < 201 {
         let batch = next_batch(&mut s).await;
@@ -607,4 +632,125 @@ async fn batches_fit_max_batch_bytes_including_framing() {
         assert!(wire <= 1000, "batch of {} entries is {wire} bytes on the wire", batch.len());
         seen += batch.len();
     }
+}
+
+// ---------------- Acks and replica status (addendum §1) ----------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acks_drive_replica_status_and_in_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, clock) = serving_master(dir.path(), |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..3u8 {
+        m.put("c", &[i], b"v").unwrap();
+    }
+    let mut c = client(m.serve_addr().unwrap(), "b");
+    let (mut s, acks) = c.tail_with_acks(tail_req(&m.identity(), 1)).await.unwrap();
+    let batch = next_batch(&mut s).await;
+    assert_eq!(batch.last().unwrap().seq, 4);
+    eventually("the replica is registered", || m.replicas().len() == 1).await;
+    let r = &m.replicas()[0];
+    assert_eq!((r.node_id.as_str(), r.sent_seq, r.applied_seq, r.lag_entries), ("b", 4, 0, 4));
+    assert!(!r.in_sync, "not caught up yet");
+    assert!(r.lag_ms.is_some());
+    assert_eq!(r.epoch, 1);
+    assert_eq!(r.fetch.max_batch_bytes, 1 << 20);
+
+    acks.send(ack(2)).await.unwrap();
+    eventually("the partial ack", || m.replicas()[0].applied_seq == 2).await;
+    assert_eq!(m.replicas()[0].lag_entries, 2);
+    assert!(!m.replicas()[0].in_sync);
+    // lag_ms is now − ts_ms of the first unacknowledged entry (3, written at T0)...
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(m.replicas()[0].lag_ms, Some(1000));
+    // ...and None once that entry is no longer retained here.
+    let keep_one = crate::config::Retention { max_age: None, max_entries: Some(1), check_interval: Duration::from_secs(1) };
+    m.log_source().store().trim_changelog(0, &keep_one).unwrap();
+    assert_eq!(m.first_retained_seq(), 4);
+    assert_eq!(m.replicas()[0].lag_ms, None);
+    acks.send(ack(4)).await.unwrap();
+    eventually("caught up and in sync", || m.replicas()[0].in_sync).await;
+    let r = &m.replicas()[0];
+    assert_eq!((r.applied_seq, r.lag_entries, r.lag_ms), (4, 0, Some(0)));
+
+    // A new write is sent but not acknowledged: lag grows, the replica stays in sync for
+    // replica_lag_time_max.
+    m.put("c", b"k", b"v").unwrap();
+    assert_eq!(next_batch(&mut s).await[0].seq, 5);
+    eventually("sent", || m.replicas()[0].sent_seq == 5).await;
+    let r = &m.replicas()[0];
+    assert_eq!((r.applied_seq, r.lag_entries), (4, 1));
+    assert!(r.in_sync);
+
+    drop(acks);
+    drop(s);
+    eventually("the closed stream leaves the registry", || m.replicas().is_empty()).await;
+}
+
+#[tokio::test]
+async fn ack_violations_end_the_stream_with_invalid_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", b"k", b"v").unwrap();
+    let mut c = client(m.serve_addr().unwrap(), "b");
+
+    // Above the last sent seq.
+    let (mut s, acks) = c.tail_with_acks(tail_req(&m.identity(), 3)).await.unwrap();
+    acks.send(ack(3)).await.unwrap();
+    let e = stream_error(&mut s).await;
+    assert_eq!(e.code(), Code::InvalidArgument, "{e:?}");
+
+    // Backwards.
+    let (mut s, acks) = c.tail_with_acks(tail_req(&m.identity(), 1)).await.unwrap();
+    next_batch(&mut s).await;
+    eventually("sent", || m.replicas().iter().any(|r| r.sent_seq == 2)).await;
+    acks.send(ack(2)).await.unwrap();
+    acks.send(ack(1)).await.unwrap();
+    assert_eq!(stream_error(&mut s).await.code(), Code::InvalidArgument);
+
+    // A second `start`.
+    let (mut s, acks) = c.tail_with_acks(tail_req(&m.identity(), 1)).await.unwrap();
+    acks.send(pb::TailClientMessage { kind: Some(pb::tail_client_message::Kind::Start(tail_req(&m.identity(), 1))) })
+        .await
+        .unwrap();
+    assert_eq!(stream_error(&mut s).await.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn the_first_tail_message_must_be_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |_| {}).await;
+    let mut c = client(m.serve_addr().unwrap(), "b");
+    let e = c.tail(tokio_stream::iter([super::test_client::ack(0)])).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument);
+    let e = c.tail(tokio_stream::iter(Vec::<pb::TailClientMessage>::new())).await.unwrap_err();
+    assert_eq!(e.code(), Code::InvalidArgument, "an empty request stream");
+}
+
+/// A reset while a bootstrap client has stopped reading: the job releases its snapshot and its
+/// bootstrap slot at once, and only then waits to deliver `UPSTREAM_RESET`.
+#[tokio::test]
+async fn a_reset_releases_a_stalled_bootstraps_snapshot_and_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| {
+        cfg.serve.as_mut().unwrap().limits.max_concurrent_bootstraps = 1;
+    })
+    .await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    // 32 MiB: far more than the channel and transport buffers hold.
+    for i in 0..128u8 {
+        m.put("c", &[i], &vec![i; 256 << 10]).unwrap();
+    }
+    let src = m.log_source();
+    let db_refs = Arc::strong_count(src.store().db());
+    let mut stalled = client(m.serve_addr().unwrap(), "b");
+    let mut boot = stalled.bootstrap(pb::BootstrapRequest { client_id: "b".into() }).await.unwrap().into_inner();
+    assert!(matches!(within("the header", boot.message()).await.unwrap().unwrap().kind, Some(Chunk::Header(_))));
+    assert!(Arc::strong_count(src.store().db()) > db_refs, "the job holds a snapshot");
+    m.bump_epoch().unwrap();
+    eventually("the snapshot is released", || Arc::strong_count(src.store().db()) == db_refs).await;
+    let mut other = client(m.serve_addr().unwrap(), "c");
+    let next = other.bootstrap(pb::BootstrapRequest { client_id: "c".into() }).await;
+    assert!(next.is_ok(), "the slot is free again: {:?}", next.err());
 }

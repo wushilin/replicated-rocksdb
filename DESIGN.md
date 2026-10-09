@@ -287,6 +287,8 @@ pub(crate) trait LogSource: Send + Sync + 'static {
     fn heartbeat(&self) -> Duration;
     fn subscribe(&self) -> watch::Receiver<Seq>;
     fn resets(&self) -> watch::Receiver<u64>;                   // bumped when served streams must end
+    fn node_state(&self) -> String { "ready".into() }          // Status RPC: ready | bootstrapping | halted:<Reason>
+    fn upstream(&self) -> Option<String> { None }               // Status RPC: upstream address (slaves)
 }
 ```
 
@@ -295,6 +297,7 @@ pub(crate) trait LogSource: Send + Sync + 'static {
 - **What happens after the handshake** follows the decision table in PROTOCOL.md §6.3, which the server evaluates in order: version checks, loop detection, readiness, identity, divergence, retention gap, resume. `Tail`, `Bootstrap` and `VerifyBegin` repeat the checks they depend on, so a server whose state changed after the handshake cannot serve the wrong data.
 - **Loop detection:** the handshake response includes `server_id` and `upstream_chain`. The server rejects with `LOOP_DETECTED` if the client's `identifier` appears in either.
 - Heartbeats carry `upstream_last_seq` and `origin_last_seq`, so every node can report its true lag behind the origin.
+- **Acks and replica status.** Tail is bidirectional: after `start`, the replica acknowledges the last seq it has committed, after each applied batch (coalesced) and at least once per heartbeat (PROTOCOL.md §7.6). The serving node keeps per-stream state (sent and acknowledged seqs, lag, in sync or not) in a replica registry shared by its server and the node. `Master::replicas()` and `Slave::replicas()` report it for direct downstream replicas, and the read-only `Status` RPC (PROTOCOL.md §6.5) reports a summary of it with the node's own position.
 - If the upstream is `Halted`, it still serves its data, which stays consistent but stops advancing. If the upstream bootstraps again, it ends its downstream streams with `UPSTREAM_RESET`, and they reconnect and handshake again.
 
 ## 12. Integrity verification (slave-initiated)
@@ -349,7 +352,7 @@ After promotion:
 ## 14. Auth and TLS
 
 ```rust
-pub enum Method { Handshake, Tail, Bootstrap, Verify }
+pub enum Method { Handshake, Tail, Bootstrap, Verify, Status }   // Status: read-only positions, no data
 
 pub struct PeerInfo {
     pub peer_id: String,              // mTLS certificate subject CommonName if present, else x-rrdb-node-id
@@ -436,8 +439,26 @@ pub struct ServeConfig {
     pub limits: ServeLimits,   // { max_concurrent_bootstraps: 2, max_verify_sessions: 4,
                                //   bootstrap_chunk_bytes: 1 MiB (at most 16 MiB),
                                //   bootstrap_lease_ttl: 15 min, verify_session_timeout: 5 min,
-                               //   max_auth_failures_per_minute: 10, max_tail_batch_bytes: 4 MiB }
+                               //   max_auth_failures_per_minute: 10, max_tail_batch_bytes: 4 MiB,
+                               //   replica_lag_time_max: 10 s }
 }
+
+pub struct ReplicaStatus {          // one direct downstream replica (Master/Slave::replicas)
+    pub node_id: String,            // x-rrdb-node-id, or the certificate CommonName under mTLS
+    pub remote_addr: SocketAddr,
+    pub peer_verified: bool,
+    pub epoch: u64,                 // epoch of the identity the replica follows
+    pub connected_since: SystemTime,
+    pub sent_seq: Seq,
+    pub applied_seq: Seq,           // last acknowledged (PROTOCOL.md §7.6)
+    pub lag_entries: u64,           // this node's last_seq − applied_seq
+    pub lag_ms: Option<u64>,        // now − ts_ms of the first unacknowledged entry; 0 when caught
+                                    // up; None when that entry is no longer retained here
+    pub in_sync: bool,              // current identity, caught up within replica_lag_time_max
+                                    // (acked a batch that drained this node's log; PROTOCOL §7.6)
+    pub fetch: FetchSettings,       // the stream's batching, as clamped by the server
+}
+pub struct FetchSettings { pub min_batch_bytes: u64, pub max_wait: Duration, pub max_batch_bytes: u64 }
 
 // ---------------- Master ----------------
 pub struct MasterConfig {
@@ -577,14 +598,15 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 | RPC | Shape | Summary |
 |---|---|---|
 | `Handshake` | unary | versions, identity and position → `RESUME` / `BOOTSTRAP` / `REJECT` with a reason |
-| `Tail` | server stream | entry batches from `from_seq` (client-chosen `min_batch_bytes` / `max_wait_ms` / `max_batch_bytes`), plus heartbeats |
+| `Tail` | bidi stream | client: `start`, then acks of its committed seq; server: entry batches from `from_seq` (client-chosen `min_batch_bytes` / `max_wait_ms` / `max_batch_bytes`), plus heartbeats |
 | `Bootstrap` | server stream | header, records, footer with digest and lease |
 | `VerifyBegin` / `VerifyRange` / `VerifyEnd` | unary / bidi / unary | snapshot-pinned range digests and key listings |
+| `Status` | unary | read-only identity, position, node state, upstream and replicas (operator tooling) |
 
 - Every call carries `x-rrdb-protocol-version`, `x-rrdb-node-id` and, with token auth, `authorization`.
 - Failures carry a gRPC status plus `google.rpc.ErrorInfo { domain: "rrdb.replication.v1", reason }`.
 - The client sets the Tail decode limit to `max(max_entry_bytes, max_batch_bytes) + 64 KiB` (`max_entry_bytes` from the handshake) and the Bootstrap decode limit to `max(max_entry_bytes, 16 MiB) + 64 KiB`; servers keep `bootstrap_chunk_bytes` at most 16 MiB. Only the master enforces the size limit; downstream nodes accept what arrives.
-- A Tail stream with no message for `3 × heartbeat` is cancelled and reconnected.
+- A Tail stream with no message for `3 × heartbeat` is cancelled and reconnected; one that ends without a status is treated the same way.
 
 ## 18. Defaults
 
@@ -603,6 +625,7 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 | Max concurrent bootstraps / verify sessions served | 2 / 4 |
 | Bootstrap chunk size | 1 MiB |
 | Tail fetch batching (slave) | `min_batch_bytes` 0 (real-time), `max_wait` 100 ms, `max_batch_bytes` 1 MiB; server cap 4 MiB |
+| In-sync window (`ServeLimits::replica_lag_time_max`) | 10 s |
 | Verify | off by default; `Quick` when enabled |
 | Verify session timeout | 5 min |
 | Mismatch policy | Report |
@@ -611,7 +634,7 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 ## 19. Observability
 
 - **`tracing` spans** for each handshake, bootstrap, verify session and reaper round, with `node_id`, `upstream`, `seq` and `epoch` fields. Each applied entry is logged at `trace` level only.
-- **Status APIs** (`Slave::status`, `Master::replicas`, `ReplicaStatus`) are the source for metrics. The crate does not depend on a metrics library. A recommended set for applications to export:
+- **Status APIs** (`Slave::status`, `Master::replicas`, `Slave::replicas`, `ReplicaStatus`, the `Status` RPC) are the source for metrics. The crate does not depend on a metrics library. A recommended set for applications to export:
   - `applied_seq`, `origin_last_seq`, lag in seqs and `lag_ms`;
   - state (with halt reason), reconnects, bootstraps;
   - entries and bytes applied and served;

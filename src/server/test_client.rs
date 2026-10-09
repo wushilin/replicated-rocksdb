@@ -9,7 +9,9 @@ use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
-use tonic::{Request, Status};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 
 use crate::auth::AllowAll;
 use crate::clock::ManualClock;
@@ -19,6 +21,7 @@ use crate::master::Master;
 use crate::pb;
 use crate::net::convert::{entry_from_pb, identity_to_pb};
 use crate::pb::replication_client::ReplicationClient;
+use crate::pb::tail_client_message::Kind as ClientKind;
 use crate::pb::tail_message::Kind;
 use crate::types::{DbIdentity, LogEntry};
 
@@ -100,6 +103,39 @@ pub(crate) async fn stream_error<T>(s: &mut tonic::Streaming<T>) -> Status {
         }
     })
     .await
+}
+
+/// Opens Tail streams (PROTOCOL.md §7: the request stream starts with `start`).
+pub(crate) trait TailExt {
+    /// A Tail that sends only `start`, then half-closes its request stream (no acks).
+    async fn tail_start(&mut self, req: pb::TailRequest) -> Result<Response<tonic::Streaming<pb::TailMessage>>, Status>;
+    /// A Tail whose acks the test sends through the returned channel.
+    async fn tail_with_acks(
+        &mut self,
+        req: pb::TailRequest,
+    ) -> Result<(tonic::Streaming<pb::TailMessage>, mpsc::Sender<pb::TailClientMessage>), Status>;
+}
+
+impl TailExt for Client {
+    async fn tail_start(&mut self, req: pb::TailRequest) -> Result<Response<tonic::Streaming<pb::TailMessage>>, Status> {
+        let start = pb::TailClientMessage { kind: Some(ClientKind::Start(req)) };
+        self.tail(tokio_stream::iter([start])).await
+    }
+
+    async fn tail_with_acks(
+        &mut self,
+        req: pb::TailRequest,
+    ) -> Result<(tonic::Streaming<pb::TailMessage>, mpsc::Sender<pb::TailClientMessage>), Status> {
+        let (tx, rx) = mpsc::channel(16);
+        tx.send(pb::TailClientMessage { kind: Some(ClientKind::Start(req)) }).await.unwrap();
+        let s = self.tail(ReceiverStream::new(rx)).await?.into_inner();
+        Ok((s, tx))
+    }
+}
+
+/// An ack message.
+pub(crate) fn ack(applied_seq: u64) -> pb::TailClientMessage {
+    pb::TailClientMessage { kind: Some(ClientKind::Ack(pb::TailAck { applied_seq })) }
 }
 
 /// A handshake from a client with no data.

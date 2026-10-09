@@ -20,6 +20,8 @@ pub enum Method {
     Tail,
     Bootstrap,
     Verify,
+    /// The read-only `Status` RPC (operator tooling).
+    Status,
 }
 
 /// Who is calling.
@@ -197,7 +199,7 @@ impl MtlsSubjectAllowList {
 
     /// Allows `subject` to call every method.
     pub fn allow_all_methods(self, subject: impl Into<String>) -> Self {
-        self.allow(subject, &[Method::Handshake, Method::Tail, Method::Bootstrap, Method::Verify])
+        self.allow(subject, &[Method::Handshake, Method::Tail, Method::Bootstrap, Method::Verify, Method::Status])
     }
 }
 

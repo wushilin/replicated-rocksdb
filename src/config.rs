@@ -178,6 +178,8 @@ pub struct ServeLimits {
     pub max_auth_failures_per_minute: u32,
     /// Cap on a Tail client's `max_batch_bytes` (PROTOCOL.md §7.5).
     pub max_tail_batch_bytes: usize,
+    /// A replica counts as in sync only if it was fully caught up within this long.
+    pub replica_lag_time_max: Duration,
 }
 
 /// Upper bound for `bootstrap_chunk_bytes`; clients size their Bootstrap decode limit with it.
@@ -193,6 +195,7 @@ impl Default for ServeLimits {
             verify_session_timeout: Duration::from_secs(5 * 60),
             max_auth_failures_per_minute: 10,
             max_tail_batch_bytes: 4 << 20,
+            replica_lag_time_max: Duration::from_secs(10),
         }
     }
 }
@@ -236,7 +239,7 @@ impl ServeConfig {
         if l.bootstrap_chunk_bytes == 0 || l.bootstrap_chunk_bytes > MAX_BOOTSTRAP_CHUNK_BYTES {
             return Err(Error::Config(format!("bootstrap_chunk_bytes must be 1..={MAX_BOOTSTRAP_CHUNK_BYTES}")));
         }
-        if l.bootstrap_lease_ttl.is_zero() || l.verify_session_timeout.is_zero() {
+        if l.bootstrap_lease_ttl.is_zero() || l.verify_session_timeout.is_zero() || l.replica_lag_time_max.is_zero() {
             return Err(Error::Config("serve timeouts must be positive".into()));
         }
         Ok(())

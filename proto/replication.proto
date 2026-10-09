@@ -4,11 +4,12 @@ package rrdb.replication.v1;
 
 service Replication {
   rpc Handshake  (HandshakeRequest)          returns (HandshakeResponse);
-  rpc Tail       (TailRequest)               returns (stream TailMessage);
+  rpc Tail       (stream TailClientMessage)  returns (stream TailMessage);
   rpc Bootstrap  (BootstrapRequest)          returns (stream BootstrapChunk);
   rpc VerifyBegin(VerifyBeginRequest)        returns (VerifyBeginResponse);
   rpc VerifyRange(stream VerifyRangeRequest) returns (stream VerifyRangeResponse);
   rpc VerifyEnd  (VerifyEndRequest)          returns (VerifyEndResponse);
+  rpc Status     (StatusRequest)             returns (StatusResponse);
 }
 
 // ---------- shared ----------
@@ -112,6 +113,11 @@ message TailRequest {
   uint32   max_batch_bytes         = 8;
 }
 
+// The first client message is `start`; every later one is `ack`.
+message TailClientMessage { oneof kind { TailRequest start = 1; TailAck ack = 2; } }
+// Every entry with seq <= applied_seq is committed on the replica. Non-decreasing.
+message TailAck           { uint64 applied_seq = 1; }
+
 message TailMessage { oneof kind { EntryBatch batch = 1; Heartbeat heartbeat = 2; } }
 message EntryBatch  { repeated LogEntry entries = 1; }
 message Heartbeat   { uint64 upstream_last_seq = 1; uint64 origin_last_seq = 2; uint64 ts_ms = 3; }
@@ -178,3 +184,22 @@ message KeyDigest  { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3
 
 message VerifyEndRequest  { bytes session_id = 1; }
 message VerifyEndResponse {}
+
+// ---------- status (operator tooling) ----------
+
+// probe_seq: also report the crc32c of the server's entry at this seq (probe_crc).
+message StatusRequest  { string client_id = 1; optional uint64 probe_seq = 2; }
+message ReplicaSummary { string node_id = 1; uint64 applied_seq = 2; bool in_sync = 3; }
+message StatusResponse {
+  string   node_id                  = 1;
+  string   role                     = 2;   // "master" or "slave"
+  optional Identity identity        = 3;
+  repeated EpochStart epoch_history = 4;
+  uint64   last_seq                 = 5;
+  optional fixed32 last_entry_crc   = 6;
+  uint64   last_ts_ms               = 7;   // ts of the entry at last_seq; 0 if unknown
+  string   node_state               = 8;   // "ready", "bootstrapping" or "halted:<Reason>"
+  string   upstream                 = 9;   // empty on the master
+  repeated ReplicaSummary replicas  = 10;
+  optional fixed32 probe_crc        = 11;  // crc32c of the entry at probe_seq, if held
+}

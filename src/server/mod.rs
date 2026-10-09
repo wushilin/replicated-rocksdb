@@ -4,6 +4,8 @@
 
 pub(crate) mod bootstrap;
 pub(crate) mod handshake;
+pub(crate) mod replicas;
+pub(crate) mod status;
 mod tail;
 #[cfg(test)]
 pub(crate) use tail::READ_BATCH;
@@ -34,6 +36,7 @@ use crate::pb;
 use crate::pb::replication_server::{Replication, ReplicationServer};
 use crate::source::LogSource;
 use crate::store::retention::RetentionGuard;
+use replicas::ReplicaRegistry;
 use crate::types::{Role, Seq};
 
 /// A bootstrap's retention guard, kept after the footer until the client's Tail presents
@@ -52,6 +55,8 @@ pub(crate) struct ServerState {
     bootstraps: Arc<Semaphore>,
     pub(crate) shutdown: watch::Receiver<bool>,
     auth_failures: FailureLimiter,
+    /// The node's downstream replicas (shared with the node, which reports and waits on them).
+    pub(crate) replicas: Arc<ReplicaRegistry>,
 }
 
 impl ServerState {
@@ -198,7 +203,7 @@ impl Replication for Svc {
 
     type TailStream = TailStream;
 
-    async fn tail(&self, req: Request<pb::TailRequest>) -> Result<Response<TailStream>, Status> {
+    async fn tail(&self, req: Request<tonic::Streaming<pb::TailClientMessage>>) -> Result<Response<TailStream>, Status> {
         tail::tail(&self.0, req).await
     }
 
@@ -219,6 +224,16 @@ impl Replication for Svc {
         _: Request<tonic::Streaming<pb::VerifyRangeRequest>>,
     ) -> Result<Response<VerifyRangeStream>, Status> {
         Err(net::unimplemented("Verify is not implemented by this version"))
+    }
+
+    async fn status(&self, req: Request<pb::StatusRequest>) -> Result<Response<pb::StatusResponse>, Status> {
+        let call = call_info(&req, Method::Status)?;
+        let src = self.0.authorize(&call, Method::Status).await?;
+        let r = req.into_inner();
+        call.check_client_id(&r.client_id)?;
+        let probes: Vec<Seq> = r.probe_seq.into_iter().collect();
+        let info = status::node_info(&*src, &self.0.replicas, self.0.cfg.limits.replica_lag_time_max, &probes);
+        Ok(Response::new(status::to_pb(&info, r.probe_seq)))
     }
 
     async fn verify_end(&self, _: Request<pb::VerifyEndRequest>) -> Result<Response<pb::VerifyEndResponse>, Status> {
@@ -254,6 +269,11 @@ pub(crate) struct ServerHandle {
 impl ServerHandle {
     pub(crate) fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// How long a replica may go without being fully caught up and still count as in sync.
+    pub(crate) fn replica_lag_time_max(&self) -> Duration {
+        self.state.cfg.limits.replica_lag_time_max
     }
 
     /// Ends every stream with `SHUTTING_DOWN`, stops accepting calls, and waits (up to 5 s
@@ -299,8 +319,9 @@ impl Drop for ServerHandle {
     }
 }
 
-/// Binds `cfg.bind:cfg.port` (0 picks a free port) and serves `source`.
-pub(crate) async fn start(source: Weak<dyn LogSource>, cfg: ServeConfig) -> Result<ServerHandle> {
+/// Binds `cfg.bind:cfg.port` (0 picks a free port) and serves `source`. Its Tail streams
+/// register in `replicas`.
+pub(crate) async fn start(source: Weak<dyn LogSource>, cfg: ServeConfig, replicas: Arc<ReplicaRegistry>) -> Result<ServerHandle> {
     cfg.validate()?;
     let listener = TcpListener::bind((cfg.bind, cfg.port)).await?;
     let addr = listener.local_addr()?;
@@ -312,6 +333,7 @@ pub(crate) async fn start(source: Weak<dyn LogSource>, cfg: ServeConfig) -> Resu
         leases: Mutex::new(HashMap::new()),
         shutdown: shutdown_rx.clone(),
         cfg,
+        replicas,
     });
     let mut builder = Server::builder()
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
@@ -359,11 +381,15 @@ pub(crate) async fn end_stream<T>(
 }
 
 /// Starts serving `source` if `serve` is configured.
-pub(crate) async fn start_for<S: LogSource>(source: &Arc<S>, serve: Option<ServeConfig>) -> Result<Option<ServerHandle>> {
+pub(crate) async fn start_for<S: LogSource>(
+    source: &Arc<S>,
+    serve: Option<ServeConfig>,
+    replicas: Arc<ReplicaRegistry>,
+) -> Result<Option<ServerHandle>> {
     match serve {
         Some(cfg) => {
             let weak: Weak<dyn LogSource> = Arc::downgrade(source) as Weak<dyn LogSource>;
-            Ok(Some(start(weak, cfg).await?))
+            Ok(Some(start(weak, cfg, replicas).await?))
         }
         None => Ok(None),
     }

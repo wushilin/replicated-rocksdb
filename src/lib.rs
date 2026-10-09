@@ -33,6 +33,7 @@ pub(crate) mod net;
 
 pub(crate) use proto::replication::v1 as pb;
 
+pub mod admin;
 pub mod auth;
 pub mod clock;
 pub mod config;
@@ -65,6 +66,7 @@ pub use config::{
     MAX_BOOTSTRAP_CHUNK_BYTES,
 };
 pub use log::{EntryIter, LogApi};
+pub use server::replicas::{FetchSettings, ReplicaStatus};
 pub use master::{Master, ReapStats};
 pub(crate) mod server;
 pub(crate) mod failpoint;

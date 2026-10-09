@@ -70,16 +70,17 @@ All integers in this document are unsigned. All timestamps are milliseconds sinc
                   VerifyBegin ► VerifyRange* ► VerifyEnd
 ```
 
-The service has six RPCs:
+The service has seven RPCs:
 
 | RPC | Shape | Purpose |
 |---|---|---|
 | `Handshake` | unary | Compare versions, identity and position, and tell the client what to do next. |
-| `Tail` | server stream | Stream log entries from a given seq, with heartbeats. Does not end on its own. |
+| `Tail` | bidi stream | Stream log entries from a given seq, with heartbeats; the client acknowledges what it has committed. Does not end on its own. |
 | `Bootstrap` | server stream | Stream a consistent full snapshot of user data at a seq `S`. |
 | `VerifyBegin` | unary | Open a verify session pinned to a snapshot at seq `S`. |
 | `VerifyRange` | bidi stream | Compare digests of key ranges and list keys in ranges that differ. |
 | `VerifyEnd` | unary | Close a verify session. |
+| `Status` | unary | Report the server's identity, position and replicas. Read-only; for operators and promotion tooling. |
 
 Properties the protocol relies on:
 
@@ -114,6 +115,7 @@ A token MUST consist only of characters allowed by `b64token` in [RFC 6750] §2.
 - Token comparison MUST run in constant time. A server MAY accept several tokens at once so they can be rotated.
 - With mutual TLS, the peer's identity is taken from the client certificate. Otherwise `x-rrdb-node-id` is only a label for logs and status. It MUST NOT be used as the sole basis for authorisation.
 - A server SHOULD authorise per RPC. `Bootstrap` and `VerifyRange` with `ListRange` expose every key, and `Bootstrap` exposes every value. The method being called is available to the server's authenticator.
+- `Status` exposes node ids, positions and epoch histories, but no keys or values.
 - Failures: missing or invalid credentials → `UNAUTHENTICATED`. Valid credentials that are not allowed this RPC → `PERMISSION_DENIED`. The server MUST NOT say which part of the credentials was wrong.
 
 ## 4. Versioning and compatibility
@@ -321,11 +323,34 @@ Other replicas are then pointed at the new master, directly or through a chain. 
 
 The protocol cannot stop an operator from running two masters at once. If two nodes both start the same epoch number with different histories, rule 12 detects the divergence wherever the conflicting entry is still retained.
 
+### 6.5 Status
+
+```proto
+rpc Status(StatusRequest) returns (StatusResponse);
+```
+
+A read-only unary RPC for operators and promotion tooling. It is authenticated and authorised like every other call (the method is `Status`), `client_id` MUST equal `x-rrdb-node-id` (otherwise `INVALID_ARGUMENT`), and it changes nothing on the server.
+
+| Field | Meaning |
+|---|---|
+| `node_id`, `role` | The server's node id; `"master"` or `"slave"`. |
+| `identity`, `epoch_history` | As in the handshake. `identity` is absent while the node holds no consistent data. |
+| `last_seq`, `last_entry_crc` | The node's durable `last_seq` and the `crc32c` of the entry at `last_seq` (absent at seq 0). |
+| `last_ts_ms` | `ts_ms` of the entry at `last_seq`; 0 if it is not retained. |
+| `node_state` | `"ready"`, `"bootstrapping"` or `"halted:<Reason>"`. |
+| `upstream` | The address the node replicates from; empty on the master. |
+| `replicas` | One `ReplicaSummary { node_id, applied_seq, in_sync }` per open Tail stream (§7.6). |
+| `probe_crc` | Present only if the request set `probe_seq`: the `crc32c` of the server's entry at `probe_seq`, if it holds it (its own `last_entry_crc` counts for `probe_seq = last_seq`, as in §6.3). Absent when the entry is not held (trimmed, before the server's bootstrap, or past its `last_seq`). |
+
+Comparing the `Status` of several replicas shows which one holds the most of the log (newest epoch, then highest `last_seq`) and which ones have diverged from it. Two nodes are compatible only if no seq both hold lies at or past a point where their epoch histories differ, **and** the longer node holds the shorter node's last entry with the same `crc32c` — which a tool learns by asking the longer node with `probe_seq` = the shorter node's `last_seq`. Only a proven CRC mismatch shows divergence; when the longer node no longer holds that entry (no `probe_crc`), compatibility is *unverifiable*, and tools SHOULD NOT treat such a node as safe to ignore. Nothing in the protocol acts on it automatically.
+
 ## 7. Tail
 
 ```proto
-rpc Tail(TailRequest) returns (stream TailMessage);
+rpc Tail(stream TailClientMessage) returns (stream TailMessage);
 ```
+
+Tail is a bidirectional stream. The client's first message is `start`, carrying a `TailRequest` (§7.1); every later client message is an `ack` (§7.6). The server sends entry batches and heartbeats (§7.3).
 
 **The client owns its position.** The server keeps no per-client cursor, offset or session between calls. Every resume, whether after a restart, a dropped connection or a bootstrap, is the client stating where it is:
 
@@ -335,6 +360,12 @@ rpc Tail(TailRequest) returns (stream TailMessage);
 Because the client reads `last_seq` from durable storage, which is written atomically with each applied entry, a resume never skips an entry. If it re-receives entries, they are discarded by the `entry.seq ≤ last_seq` check (§7.4). After a bootstrap at `S`, the client's `last_seq` is `S`, so the same rule gives `from_seq = S + 1`.
 
 ### 7.1 Request
+
+```proto
+message TailClientMessage { oneof kind { TailRequest start = 1; TailAck ack = 2; } }
+```
+
+The first client message MUST be `start`. The server ends the call with `INVALID_ARGUMENT` if it is anything else, and SHOULD do so if it has not arrived within 10 s. The fields of `start`:
 
 | Field | Meaning |
 |---|---|
@@ -377,7 +408,9 @@ message Heartbeat   { uint64 upstream_last_seq = 1; uint64 origin_last_seq = 2; 
   - with `OUT_OF_RANGE` / `LOG_GAP` if the next entry to send has been removed by retention (slow consumer);
   - with `UNAVAILABLE` / `UPSTREAM_RESET` if the server starts bootstrapping itself or its identity changes (for example an epoch bump on the master);
   - with `UNAVAILABLE` / `SHUTTING_DOWN` on a graceful shutdown;
-  - with `DATA_LOSS` / `CORRUPT` if a stored entry fails its CRC.
+  - with `DATA_LOSS` / `CORRUPT` if a stored entry fails its CRC;
+  - with `INVALID_ARGUMENT` if a client message breaks the rules of §7.6.
+- A stream that ends without a status (a clean end of stream) carries no decision. The client MUST treat it as transient: back off and handshake again (§11.4).
 - Flow control is HTTP/2 flow control. A server MUST NOT drop entries to keep up with a slow consumer. It applies back-pressure until retention forces `LOG_GAP`.
 
 ### 7.4 Client checks on each entry
@@ -406,6 +439,21 @@ The server keeps a *pending* batch of entries that are available (committed on t
 A batch never exceeds `max_batch_bytes`, except that a single entry larger than it is sent alone. When the client is far behind, every available entry is "ready" immediately, so batches are full-size and catch-up is not slowed by `max_wait_ms`.
 
 The server clamps the client's values to its own limits: `max_wait_ms` to at most `heartbeat_ms`, and `max_batch_bytes` to at most `max_tail_batch_bytes` (RECOMMENDED default 4 MiB). If `max_batch_bytes` is 0, it uses 1 MiB. Heartbeats are unaffected: a stream with nothing pending still gets one every `heartbeat_ms`.
+
+### 7.6 Acknowledgements
+
+```proto
+message TailAck { uint64 applied_seq = 1; }
+```
+
+After `start`, the client sends `ack` messages on the same stream. `applied_seq` means: every entry with seq ≤ `applied_seq` is committed in the client's store (written to its write-ahead log; also fsynced if the client fsyncs its writes). Until the first ack the server assumes `applied_seq = from_seq − 1`.
+
+- The client SHOULD send an ack after applying each `EntryBatch`, coalescing acks that back up (only the latest `applied_seq` matters), and MUST send one at least once per `heartbeat_ms`, so that a replica with nothing to apply stays in sync.
+- `applied_seq` MUST NOT decrease and MUST NOT exceed the last seq the server sent on this stream. A second `start` is not allowed either. The server ends a stream that breaks one of these rules with `INVALID_ARGUMENT`.
+- Acks never change what the server sends: it does not resend or skip entries because of them. On a reconnect the client's position is still its own durable `last_seq` (§7).
+- Per open stream the server tracks the client's node id and address, whether the id was verified (mutual TLS), the epoch the client follows, when the stream opened, the last seq sent, the last seq acknowledged, the last time `applied_seq` reached the server's `last_seq`, and the stream's fetch settings.
+- A replica is **caught up** as of the moment the server sent it a batch that held everything the server had (the batch ended at the server's `last_seq` when it was sent), once an ack covers that batch; also when an ack reaches the server's `last_seq` directly. This is Kafka's "caught up to the end offset at fetch time": a replica that keeps acknowledging what it is sent stays caught up even while writes keep the server ahead of its latest ack.
+- A replica is **in sync** while its stream is open, it follows the server's current identity, and it was caught up within the last `replica_lag_time_max` (RECOMMENDED 10 s). A master MAY make a write wait until a number of in-sync replicas have acknowledged it.
 
 ## 8. Bootstrap
 
@@ -554,7 +602,7 @@ RPC failures use standard gRPC status codes. The status MUST carry a `google.rpc
 | `SHUTTING_DOWN` | `UNAVAILABLE` | yes, with backoff | Graceful shutdown. |
 | `CORRUPT` | `DATA_LOSS` | no | Stored data failed an integrity check. |
 
-Authentication failures use `UNAUTHENTICATED` or `PERMISSION_DENIED` without `ErrorInfo` (§3.3). A malformed request uses `INVALID_ARGUMENT`.
+Authentication failures use `UNAUTHENTICATED` or `PERMISSION_DENIED` without `ErrorInfo` (§3.3). A malformed request uses `INVALID_ARGUMENT`, and so does a Tail client that breaks the message order or the ack rules (§7.1, §7.6).
 
 ## 11. Client behaviour
 
@@ -580,7 +628,7 @@ A conforming client keeps, and updates atomically with every applied entry or co
 | `REJECT` / `STALE_EPOCH` | Back off and retry the handshake. An upstream replica may still be catching up; a demoted master never will, and the operator must re-point the replica. The client SHOULD surface the condition in its status. |
 | `REJECT` / `PROTOCOL_MISMATCH`, `ENVELOPE_MISMATCH`, `LOOP_DETECTED` | Halt with that reason. Not persisted: re-evaluated on restart. |
 | `REJECT` / `NOT_READY` | Back off and retry the handshake. |
-| A stream ends with a retryable error, or the connection is lost | Back off and handshake again. |
+| A stream ends with a retryable error or without any status, or the connection is lost | Back off and handshake again. |
 
 A halted client keeps serving its last consistent data to readers and to downstream replicas. Halts caused by data (`IdentityChanged`, `Diverged`, `LogGap`, `Corrupt`, `SpecMismatch`) MUST be persisted and survive a restart until an operator clears them.
 
@@ -600,6 +648,7 @@ A failed bootstrap (bad footer, lost connection) also returns to `Connecting` th
 ### 11.4 Idle detection and reconnection
 
 - If no `TailMessage` arrives for `3 × heartbeat_ms`, the client MUST cancel the stream and reconnect.
+- A Tail stream that ends cleanly (end of stream without a status) MUST be treated like a lost connection: back off and handshake again. It never means that the server has nothing more to send.
 - Reconnect backoff SHOULD be exponential with full jitter (RECOMMENDED: initial 100 ms, factor 2, maximum 30 s), reset after 60 s of successful streaming.
 - The client sets its maximum decode size for `Tail` to `max(max_entry_bytes, max_batch_bytes) + 64 KiB`, and for `Bootstrap` to `max(max_entry_bytes, 16 MiB) + 64 KiB`. The client does not know the server's `bootstrap_chunk_bytes`, so servers MUST keep it at most 16 MiB.
 
@@ -613,6 +662,8 @@ A failed bootstrap (bad footer, lost connection) also returns to `Connecting` th
 | `bootstrap_chunk_bytes` | server | 1 MiB (at most 16 MiB) |
 | `min_batch_bytes` / `max_wait_ms` / `max_batch_bytes` (Tail) | client, per stream | 0 / 100 / 1 MiB |
 | `max_tail_batch_bytes` (cap on the client's `max_batch_bytes`) | server | 4 MiB |
+| Tail acks | client | after each batch, and at least every `heartbeat_ms` |
+| `replica_lag_time_max` (in-sync window, §7.6) | server | 10 000 ms |
 | `lease_ttl_ms` | server | 900 000 (15 min) |
 | `max_concurrent_bootstraps` | server | 2 |
 | `max_verify_sessions` | server | 4 |
@@ -643,11 +694,12 @@ package rrdb.replication.v1;
 
 service Replication {
   rpc Handshake  (HandshakeRequest)          returns (HandshakeResponse);
-  rpc Tail       (TailRequest)               returns (stream TailMessage);
+  rpc Tail       (stream TailClientMessage)  returns (stream TailMessage);
   rpc Bootstrap  (BootstrapRequest)          returns (stream BootstrapChunk);
   rpc VerifyBegin(VerifyBeginRequest)        returns (VerifyBeginResponse);
   rpc VerifyRange(stream VerifyRangeRequest) returns (stream VerifyRangeResponse);
   rpc VerifyEnd  (VerifyEndRequest)          returns (VerifyEndResponse);
+  rpc Status     (StatusRequest)             returns (StatusResponse);
 }
 
 // ---------- shared ----------
@@ -751,6 +803,11 @@ message TailRequest {
   uint32   max_batch_bytes         = 8;
 }
 
+// The first client message is `start`; every later one is `ack`.
+message TailClientMessage { oneof kind { TailRequest start = 1; TailAck ack = 2; } }
+// Every entry with seq <= applied_seq is committed on the replica. Non-decreasing.
+message TailAck           { uint64 applied_seq = 1; }
+
 message TailMessage { oneof kind { EntryBatch batch = 1; Heartbeat heartbeat = 2; } }
 message EntryBatch  { repeated LogEntry entries = 1; }
 message Heartbeat   { uint64 upstream_last_seq = 1; uint64 origin_last_seq = 2; uint64 ts_ms = 3; }
@@ -817,6 +874,25 @@ message KeyDigest  { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3
 
 message VerifyEndRequest  { bytes session_id = 1; }
 message VerifyEndResponse {}
+
+// ---------- status (operator tooling) ----------
+
+// probe_seq: also report the crc32c of the server's entry at this seq (probe_crc).
+message StatusRequest  { string client_id = 1; optional uint64 probe_seq = 2; }
+message ReplicaSummary { string node_id = 1; uint64 applied_seq = 2; bool in_sync = 3; }
+message StatusResponse {
+  string   node_id                  = 1;
+  string   role                     = 2;   // "master" or "slave"
+  optional Identity identity        = 3;
+  repeated EpochStart epoch_history = 4;
+  uint64   last_seq                 = 5;
+  optional fixed32 last_entry_crc   = 6;
+  uint64   last_ts_ms               = 7;   // ts of the entry at last_seq; 0 if unknown
+  string   node_state               = 8;   // "ready", "bootstrapping" or "halted:<Reason>"
+  string   upstream                 = 9;   // empty on the master
+  repeated ReplicaSummary replicas  = 10;
+  optional fixed32 probe_crc        = 11;  // crc32c of the entry at probe_seq, if held
+}
 ```
 
 ## 15. Test vectors
@@ -856,8 +932,10 @@ B → C  {decision: BOOTSTRAP, reason: NO_LOCAL_STATE, identity: (U,1), upstream
 C → B  Bootstrap{client_id:"C"}
 B → C  Header{S: 4210, cf_specs:[…], lease_id: L} · Records… · Footer{count, digest}
 C      verify footer, commit last_seq = 4210
-C → B  Tail{identity:(U,1), from_seq: 4211, bootstrap_lease: L}
-B → C  entry 4211 · entry 4212 · heartbeat · …           (B releases the guard for L)
+C → B  Tail start{identity:(U,1), from_seq: 4211, bootstrap_lease: L}
+B → C  batch[4211, 4212] · heartbeat · …                  (B releases the guard for L)
+C → B  ack{applied_seq: 4212}                             (after applying the batch; again
+                                                          at least once per heartbeat)
 ```
 
 **Replica restarts ahead of its upstream.** B crashed before flushing entries it had already forwarded to C.
@@ -865,7 +943,7 @@ B → C  entry 4211 · entry 4212 · heartbeat · …           (B releases the 
 ```
 C → B  Handshake{last_seq: 900, last_crc32c: X}           B.last_seq = 880
 B → C  {decision: RESUME}                                  (rule 14; B is not the master)
-C → B  Tail{from_seq: 901}
+C → B  Tail start{from_seq: 901} · ack{applied_seq: 900} …
 B → C  heartbeat · heartbeat · …                           (B re-fetches 881–900 from A)
 B → C  entry 901 · …
 ```
