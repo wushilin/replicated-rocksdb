@@ -121,6 +121,8 @@ impl Store {
                         pending.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, c)| c.entry.clone()).collect();
                     p.batch.put_cf(&self.cf(CF_META), key::PENDING_CF_DROPS, meta::encode_cf_list(&list));
                 }
+                // Note: `delete_all_keys` below runs under the registry write lock; reuse is rare
+                // (a snapshot-held CF re-created at the same seq) and reads stall meanwhile.
                 // Record the intent durably first: a crash after create_cf leaves a CF whose
                 // comparator would otherwise be unknown at the next open.
                 self.write_meta(&[(key::CF_CREATE_INTENT, &meta::encode_cf_entry(&entry))], true)?;

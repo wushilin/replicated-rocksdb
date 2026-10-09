@@ -270,3 +270,38 @@ async fn an_invalid_token_halts_auth_rejected_without_persisting() {
     let b = Slave::open(cfg).await.unwrap();
     assert_converged(&m, &[("b", &b)]).await;
 }
+
+/// Ruling (d), through the driver: a re-bootstrap needs a CF that a reader's snapshot still
+/// holds with another spec. The slave backs off, reports it in `last_error`, never halts, and
+/// converges once the snapshot is released. (Triggered with a replacement master of another
+/// identity whose "c" has the same name and create_seq but a different comparator.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cf_held_by_a_snapshot_is_retried_not_halted() {
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", b"old", b"1").unwrap();
+    let port = m.serve_addr().unwrap().port();
+    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    cfg.on_identity_change = replicated_rocksdb::IdentityPolicy::Rebootstrap;
+    cfg.rocksdb.comparators.register("rev", |a: &[u8], b: &[u8]| b.cmp(a));
+    let b = Slave::open(cfg).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    let snap = b.snapshot().unwrap();
+    m.shutdown().await.unwrap();
+
+    let mut mcfg = c.master_config("a2");
+    mcfg.serve.as_mut().unwrap().port = port;
+    mcfg.rocksdb.comparators.register("rev", |a: &[u8], b: &[u8]| b.cmp(a));
+    let m2 = replicated_rocksdb::Master::open(mcfg).await.unwrap();
+    m2.create_cf(CfSpec::new("c").with_comparator("rev")).unwrap();
+    m2.put("c", b"new", b"2").unwrap();
+
+    wait_until("a CfInUse error", || b.status().last_error.is_some_and(|e| e.contains("still referenced by a snapshot"))).await;
+    assert!(!matches!(b.status().state, SlaveState::Halted(_)));
+    assert_eq!(snap.get("c", b"old").unwrap(), Some(b"1".to_vec()), "the snapshot keeps its view");
+    drop(snap);
+    assert_converged(&m2, &[("b", &b)]).await;
+    assert_eq!(b.get("c", b"new").unwrap(), Some(b"2".to_vec()));
+    assert_eq!(b.get("c", b"old").unwrap(), None);
+}

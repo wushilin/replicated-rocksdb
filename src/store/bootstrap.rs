@@ -210,7 +210,7 @@ impl Store {
         // CFs this bootstrap created that the final spec does not use are dropped later too.
         for e in created {
             let physical = e.physical_name();
-            let used = f.cf_specs.contains(&e);
+            let used = f.cf_specs.contains(&e) || new_live.values().any(|p| p.physical == physical);
             let tracked = new_pending.iter().any(|p| p.physical == physical) || held.iter().any(|p| p.physical == physical);
             if !used && !tracked && self.db().cf_handle(&physical).is_some() {
                 new_pending.push(PhysCf::new(e));

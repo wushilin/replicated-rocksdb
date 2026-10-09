@@ -192,7 +192,10 @@ for each LogEntry received (in order):
          __changelog[seq] = entry (unchanged)
          __meta.last_seq = seq, last_entry_crc = entry.crc32c
   db.write(wb)          (sync = SlaveConfig::sync_writes, default false)
-                                                       failure → Halted(Corrupt), never retried in-process
+                                                       failure → Halted(Corrupt), never retried in-process;
+                                                       except CfInUse (a reader's snapshot still holds a CF with that
+                                                       physical name and a different spec; nothing was written):
+                                                       back off, retry, report in SlaveStatus.last_error
   if a verify capture is requested at this seq: take the snapshot now (§12)
   listener.on_entry(&entry)
   publish seq to wait_for_seq and downstream tail subscribers

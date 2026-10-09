@@ -228,8 +228,8 @@ async fn tail(
         Err(s) => return status_end(inner, &s),
     };
     inner.set_state(SlaveState::Streaming);
-    inner.set_last_error(None);
-    let idle = Duration::from_millis(u64::from(hs.heartbeat_ms.max(1)) * 3);
+    let idle = (Duration::from_millis(u64::from(hs.heartbeat_ms)) * 3).max(inner.cfg.heartbeat);
+    let mut cleared = false;
     let started = Instant::now();
     loop {
         let msg = match tokio::time::timeout(idle, stream.message()).await {
@@ -239,6 +239,10 @@ async fn tail(
             Ok(Ok(Some(m))) => m,
         };
         inner.note_contact();
+        if !cleared && matches!(msg.kind, Some(Kind::Heartbeat(_))) {
+            inner.set_last_error(None);
+            cleared = true;
+        }
         if started.elapsed() >= STABLE_STREAMING {
             backoff.reset();
         }
@@ -255,7 +259,13 @@ async fn tail(
                 // Each entry is its own atomic write, so a crash mid-batch leaves a clean boundary.
                 for e in batch.entries {
                     match apply::apply(inner, entry_from_pb(e)).await {
-                        Applied::Committed | Applied::Skipped => {}
+                        Applied::Committed => {
+                            if !cleared {
+                                inner.set_last_error(None);
+                                cleared = true;
+                            }
+                        }
+                        Applied::Skipped => {}
                         Applied::End(end) => return end,
                     }
                 }

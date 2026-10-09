@@ -621,7 +621,7 @@ A conforming client keeps, and updates atomically with every applied entry or co
 |---|---|
 | `RESUME` | `Tail(from_seq = last_seq + 1)`. |
 | `RESUME` / `EPOCH_ADVANCED` | Persist the server's identity and epoch history atomically, then `Tail(from_seq = last_seq + 1)`. |
-| An epoch history (handshake or bootstrap header) that is empty, does not start with `{1, 1}`, has non-increasing epochs or decreasing start seqs, or does not end with the identity's epoch; or a local failure to apply or commit a received entry | Halt with `Corrupt` (persisted). The entry is never retried in the same process. |
+| An epoch history (handshake or bootstrap header) that is empty, does not start with `{1, 1}`, has non-increasing epochs or decreasing start seqs, or does not end with the identity's epoch; or a local failure to apply or commit a received entry (an unknown comparator → `SpecMismatch`) | Halt with `Corrupt` (persisted). The entry is never retried in the same process. Exception: `CfInUse` (a reader's snapshot still holds a CF with that physical name and a different spec; nothing was written): back off, retry, report in `last_error`. |
 | `BOOTSTRAP` / `NO_LOCAL_STATE` | Bootstrap (§8.3). |
 | `BOOTSTRAP` / `IDENTITY_CHANGED` | Identity policy *Refuse* (default) → halt `IdentityChanged`. *Rebootstrap* → bootstrap. |
 | `BOOTSTRAP` / `LOG_GAP` | Gap policy *Rebootstrap* (default) → bootstrap. *Halt* → halt `LogGap`. |

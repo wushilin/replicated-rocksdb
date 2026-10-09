@@ -93,6 +93,14 @@ impl Slave {
         self.inner.store.read_snapshot(self.inner.now_ms())
     }
 
+    /// A missing CF on a node that stopped being ready (a bootstrap began) is `NotReady`.
+    fn live_cf(&self, cf: &str) -> Result<Arc<crate::store::cfs::PhysCf>> {
+        match self.inner.store.live_cf(cf) {
+            Err(Error::NoSuchCf(_)) if !self.inner.is_ready() => Err(Error::NotReady),
+            r => r,
+        }
+    }
+
     fn check_ready(&self) -> Result<()> {
         if self.inner.is_ready() { Ok(()) } else { Err(Error::NotReady) }
     }
@@ -121,19 +129,19 @@ impl Drop for Slave {
 impl ReadApi for Slave {
     fn get_with_meta(&self, cf: &str, key: &[u8]) -> Result<Option<(Vec<u8>, ValueMeta)>> {
         self.check_ready()?;
-        let cf = self.inner.store.live_cf(cf)?;
+        let cf = self.live_cf(cf)?;
         self.inner.store.live_ctx(self.inner.now_ms()).get(&cf, key)
     }
 
     fn iter(&self, cf: &str, mode: IterMode<'_>) -> Result<DbIter<'_>> {
         self.check_ready()?;
-        let cf = self.inner.store.live_cf(cf)?;
+        let cf = self.live_cf(cf)?;
         self.inner.store.live_ctx(self.inner.now_ms()).iter(cf, mode, None)
     }
 
     fn prefix_iter(&self, cf: &str, prefix: &[u8]) -> Result<DbIter<'_>> {
         self.check_ready()?;
-        let cf = self.inner.store.live_cf(cf)?;
+        let cf = self.live_cf(cf)?;
         self.inner.store.live_ctx(self.inner.now_ms()).iter(cf, IterMode::From(prefix, Direction::Forward), Some(prefix))
     }
 
