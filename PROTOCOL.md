@@ -600,7 +600,7 @@ RPC failures use standard gRPC status codes. The status MUST carry a `google.rpc
 | `SESSION_NOT_FOUND` | `NOT_FOUND` | start a new session | Unknown or expired verify session. |
 | `UPSTREAM_RESET` | `UNAVAILABLE` | after a new handshake | The server's state was replaced. |
 | `SHUTTING_DOWN` | `UNAVAILABLE` | yes, with backoff | Graceful shutdown. |
-| `CORRUPT` | `DATA_LOSS` | no | Stored data failed an integrity check. |
+| `CORRUPT` | `DATA_LOSS` | client: yes, with backoff | Stored data failed an integrity check on the server. The client's own data is intact, so it backs off and retries; the server's operator must repair it. |
 
 Authentication failures use `UNAUTHENTICATED` or `PERMISSION_DENIED` without `ErrorInfo` (§3.3). A malformed request uses `INVALID_ARGUMENT`, and so does a Tail client that breaks the message order or the ack rules (§7.1, §7.6).
 
@@ -628,6 +628,7 @@ A conforming client keeps, and updates atomically with every applied entry or co
 | `REJECT` / `STALE_EPOCH` | Back off and retry the handshake. An upstream replica may still be catching up; a demoted master never will, and the operator must re-point the replica. The client SHOULD surface the condition in its status. |
 | `REJECT` / `PROTOCOL_MISMATCH`, `ENVELOPE_MISMATCH`, `LOOP_DETECTED` | Halt with that reason. Not persisted: re-evaluated on restart. |
 | `REJECT` / `NOT_READY` | Back off and retry the handshake. |
+| A call or stream fails with `CORRUPT` (the server's stored data) | Back off and retry. The client's data is not affected. |
 | A stream ends with a retryable error or without any status, or the connection is lost | Back off and handshake again. |
 
 A halted client keeps serving its last consistent data to readers and to downstream replicas. Halts caused by data (`IdentityChanged`, `Diverged`, `LogGap`, `Corrupt`, `SpecMismatch`) MUST be persisted and survive a restart until an operator clears them.

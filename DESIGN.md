@@ -62,7 +62,8 @@ Master(A) ──► Slave(B) ──► Slave(C)
 | `last_ts` | master | last `ts_ms` issued (keeps timestamps monotonic) |
 | `epoch_history` | all | `Vec<EpochStart { epoch, start_seq }>`, sorted by epoch; first is `{1, 1}` (PROTOCOL.md §5.5). Written atomically with `origin_identity`. |
 | `max_entry_bytes` | slave | the master's value, as received in the handshake; forwarded downstream |
-| `node_state` | slave | `Ready` / `Bootstrapping { target_seq }` / `Halted(reason)`, persisted (see §16.3) |
+| `node_state` | slave | text: `ready`, `bootstrapping` or `halted:<Reason>` (data-related reasons only); absent means `ready`. Persisted, see §16.3 |
+| `bootstrap_cfs` | slave | physical CFs created by a bootstrap that has not finished, written (synced) before each is created; part of the known CF set at open, dropped by the next bootstrap reset |
 | `cf_specs` | all | live user CFs: `Vec<CfSpec>` plus `create_seq`, sorted by name |
 | `pending_cf_drops` | all | physical CFs logically dropped, awaiting physical drop |
 | `cf_create_intent` | all | the `CfEntry` being created; written with fsync before the physical CF is created, cleared in the `CreateCf` commit batch |
@@ -197,7 +198,7 @@ for each LogEntry received (in order):
 ```
 
 - **One entry is one WriteBatch, and an entry is never split.** That makes every RocksDB snapshot on a slave a consistent state at some seq.
-- Writes are not synced on slaves. A slave that crashes resumes from its durable `last_seq` and fetches the rest again from upstream.
+- Writes are not synced on slaves by default (`SlaveConfig::sync_writes = false`). A slave that crashes resumes from its durable `last_seq` and fetches the rest again from upstream. Its acks (§11) then promise that an entry is in its write-ahead log, which survives a process crash but not a power loss. With `sync_writes = true` every applied entry is fsynced, so an acknowledged entry survives a power loss of the replica too.
 - **A downstream replica can be ahead of its upstream slave.** If upstream B crashes unsynced after forwarding to C, C's `last_seq` can exceed B's. On handshake B replies `RESUME`, and the Tail stream sends only heartbeats until B passes C's seq. The content is identical because seqs come from the same origin log. This is allowed only when the upstream is a slave. The master rejects it (§13).
 - **Divergence check on connect.** The slave sends `last_entry_crc` in the handshake and `prev_crc32c` in `Tail`. If the upstream still holds that entry and its CRC differs, the upstream answers `DIVERGED` and the slave halts instead of applying a different history.
 
@@ -261,11 +262,11 @@ Used when a slave has no data, is behind the retention window, or (by policy) af
 6. Keep the guard until the client's `Tail` that presents the lease has read the entries after `S` (or ends), or the lease expires (default 15 min), or the stream fails before the footer. Without this, retention could remove `S + 1` between the end of the bootstrap and the tail's first read, and the slave would loop through bootstraps.
 
 **Receiving slave:**
-1. Persist `node_state = Bootstrapping { target_seq }`. Reads return `NotReady`. A crash in this state restarts the bootstrap from scratch.
+1. Persist `node_state = bootstrapping` together with the removal of identity, history, position and CF list (one synced batch). Reads return `NotReady`. A crash in this state restarts the bootstrap from scratch.
 2. **End all outgoing Tail, Bootstrap and Verify streams** it serves (`UPSTREAM_RESET`), then drop every user CF (including `pending_cf_drops`, once their references are released) and clear `__changelog`.
 3. Create the physical CFs listed in `cf_specs` and apply the chunks in batches, checking key order and each envelope.
 4. Check the footer (`record_count` and digest, PROTOCOL.md §5.4). On a mismatch, start again.
-5. Write the final batch: `origin_identity`, `cf_specs`, `last_seq = S`, `last_entry_crc`, `max_entry_bytes`, `node_state = Ready`.
+5. Write the final batch (synced): `origin_identity`, `epoch_history`, `cf_specs`, `last_seq = S`, `last_entry_crc`, `max_entry_bytes`, `node_state = ready`, and clear `bootstrap_cfs`.
 6. Tail from `S + 1`, presenting the lease.
 
 Since `S`, `cf_specs` and the data all come from the same snapshot, a bootstrap from any node in a chain gives identical data, and an identical digest, for the same `S`.
@@ -523,7 +524,11 @@ pub struct SlaveConfig {
     pub reconnect: Backoff,                  // default 100 ms → 30 s, ×2, full jitter
     pub fetch: FetchConfig,                  // { min_batch_bytes: 0, max_wait: 100 ms, max_batch_bytes: 1 MiB }
                                              // 0 = real-time push; larger = batch like Kafka fetch.min.bytes
+    pub heartbeat: Duration,                 // when serving downstream; default 5 s
+    pub connect_timeout: Duration,           // default 5 s
+    pub sync_writes: bool,                   // fsync each applied entry; default false
     pub rocksdb: RocksTuning,
+    pub clock: Arc<dyn Clock>,               // TTL read filtering and retention
 }
 
 pub enum SlaveState {
@@ -554,6 +559,7 @@ pub struct SlaveStatus {
     pub last_contact: Option<SystemTime>,
     pub last_verify: Option<VerifyReport>,
     pub last_error: Option<String>,          // last connection/handshake problem, e.g. STALE_EPOCH
+    pub listener_failed: bool,               // the listener panicked; disabled until restart
 }
 
 impl Slave {
@@ -585,9 +591,9 @@ See §5.1. `Master::get`, `Master::put`, `Master::write` and the crate-level doc
 
 | `__meta.node_state` (persisted) | `SlaveState` (runtime) |
 |---|---|
-| `Ready` | `Connecting` or `Streaming` |
-| `Bootstrapping { target_seq }` | `Bootstrapping { .. }`. After a restart, the bootstrap starts over. |
-| `Halted(reason)`, data-related reasons only | `Halted(reason)`. The slave does not contact its upstream until `clear_halt`. |
+| `ready` (or absent) | `Connecting` or `Streaming` |
+| `bootstrapping` | `Bootstrapping { .. }`. After a restart, the bootstrap starts over. |
+| `halted:<Reason>`, data-related reasons only | `Halted(reason)`. The slave does not contact its upstream until `clear_halt`. |
 
 `clear_halt(Retry)` returns to `Connecting` (useful after fixing a missing comparator, or after `LogGap` with `GapPolicy::Halt` once the operator chooses to wait). `clear_halt(Rebootstrap)` starts a fresh bootstrap. It is the only way out of `Diverged` or `IdentityChanged` under `Refuse`.
 
@@ -616,7 +622,7 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 | Retention check interval | 10 min |
 | `max_entry_bytes` | 16 MiB |
 | Master fsync | always (not configurable) |
-| Slave fsync | off |
+| Slave fsync | off (`SlaveConfig::sync_writes`) |
 | Heartbeat / idle timeout | 5 s / 15 s |
 | Reconnect backoff | 100 ms → 30 s, ×2, full jitter |
 | Identity change policy | Refuse |

@@ -45,6 +45,9 @@ pub enum Error {
     /// An operation did not finish within its deadline.
     #[error("timed out")]
     Timeout,
+    /// The slave stopped advancing; see `SlaveStatus` and `Slave::clear_halt`.
+    #[error("replication is halted: {0:?}")]
+    Halted(crate::slave::HaltReason),
     #[error(transparent)]
     RocksDb(#[from] rocksdb::Error),
     #[error(transparent)]

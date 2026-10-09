@@ -1,6 +1,7 @@
 //! Crate-private RocksDB wrapper shared by master and slave.
 
 pub(crate) mod apply;
+pub(crate) mod bootstrap;
 pub(crate) mod cfs;
 pub(crate) mod log;
 pub(crate) mod meta;
