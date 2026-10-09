@@ -4,6 +4,7 @@ mod maintenance;
 mod reaper;
 mod source;
 pub(crate) mod writer;
+mod write_concern;
 
 pub use reaper::ReapStats;
 
@@ -15,7 +16,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::codec::validate_cf_name;
-use crate::config::MasterConfig;
+use crate::config::{MasterConfig, WriteConcern};
 use crate::error::Result;
 use crate::log::{EntryIter, LogApi};
 use crate::read::{ReadApi, ReadSnapshot};
@@ -101,7 +102,7 @@ impl Master {
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     pub fn put(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<Seq> {
         let op = Op::Put { cf: cf.into(), key: key.into(), value: value.into(), expire_at_ms: None };
-        self.inner.commit_ops(|_| Ok(vec![op]))
+        self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
     }
 
     /// Like [`put`](Self::put), with an expiry of commit time + `ttl`. Expired values are
@@ -110,7 +111,7 @@ impl Master {
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     pub fn put_with_ttl(&self, cf: &str, key: &[u8], value: &[u8], ttl: Duration) -> Result<Seq> {
         let (cf, key, value) = (cf.to_string(), key.to_vec(), value.to_vec());
-        self.inner.commit_ops(|ts| Ok(vec![Op::Put { cf, key, value, expire_at_ms: Some(expire_at(ts, ttl)) }]))
+        self.inner.commit_with(&self.inner.cfg.write_concern, |ts| Ok(vec![Op::Put { cf, key, value, expire_at_ms: Some(expire_at(ts, ttl)) }]))
     }
 
     /// Deletes `key`. A no-op delete is still logged as an entry.
@@ -118,7 +119,7 @@ impl Master {
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     pub fn delete(&self, cf: &str, key: &[u8]) -> Result<Seq> {
         let op = Op::Delete { cf: cf.into(), key: key.into() };
-        self.inner.commit_ops(|_| Ok(vec![op]))
+        self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
     }
 
     /// Deletes keys in `[start, end)` under the CF's comparator. `start` must sort before `end`.
@@ -126,7 +127,7 @@ impl Master {
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     pub fn delete_range(&self, cf: &str, start: &[u8], end: &[u8]) -> Result<Seq> {
         let op = Op::DeleteRange { cf: cf.into(), start: start.into(), end: end.into() };
-        self.inner.commit_ops(|_| Ok(vec![op]))
+        self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
     }
 
     /// Commits all operations in `batch` atomically, as one log entry.
@@ -137,7 +138,27 @@ impl Master {
     ///
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     pub fn write(&self, batch: Batch) -> Result<Seq> {
-        self.inner.commit_ops(|ts| Ok(batch.into_ops(ts)))
+        self.inner.commit_with(&self.inner.cfg.write_concern, |ts| Ok(batch.into_ops(ts)))
+    }
+
+    /// Like [`write`](Self::write), with an explicit write concern instead of
+    /// `MasterConfig::write_concern`. With `min_insync_replicas = N > 0` it refuses with
+    /// `NotEnoughReplicas` when fewer than N replicas are in sync (nothing written), and
+    /// otherwise returns once N in-sync replicas acknowledged the entry. **On
+    /// `Error::AckTimeout` the entry is committed and keeps replicating**; see
+    /// [`WriteConcern`](crate::WriteConcern).
+    ///
+    /// The read-modify-write caveat of [`write`](Self::write) applies unchanged. Blocks while
+    /// waiting for acknowledgements (without holding the writer lock); async callers should
+    /// use `spawn_blocking`.
+    pub fn write_with(&self, batch: Batch, concern: WriteConcern) -> Result<Seq> {
+        self.inner.commit_with(&concern, |ts| Ok(batch.into_ops(ts)))
+    }
+
+    /// Like [`put`](Self::put), with an explicit write concern; see [`write_with`](Self::write_with).
+    pub fn put_with(&self, cf: &str, key: &[u8], value: &[u8], concern: WriteConcern) -> Result<Seq> {
+        let op = Op::Put { cf: cf.into(), key: key.into(), value: value.into(), expire_at_ms: None };
+        self.inner.commit_with(&concern, |_| Ok(vec![op]))
     }
 
     /// Runs one reaper round now: logs `Delete`s for expired keys, in entries of at most
@@ -152,7 +173,7 @@ impl Master {
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     pub fn create_cf(&self, spec: CfSpec) -> Result<Seq> {
         validate_cf_name(&spec.name)?;
-        self.inner.commit_ops(|_| Ok(vec![Op::CreateCf { spec }]))
+        self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![Op::CreateCf { spec }]))
     }
 
     /// Logically drops a column family. The physical drop is deferred while any snapshot or
@@ -162,7 +183,7 @@ impl Master {
     pub fn drop_cf(&self, name: &str) -> Result<Seq> {
         validate_cf_name(name)?;
         let op = Op::DropCf { name: name.into() };
-        self.inner.commit_ops(|_| Ok(vec![op]))
+        self.inner.commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
     }
 
     /// Reads the current value of `key`, or `None` if absent or expired.

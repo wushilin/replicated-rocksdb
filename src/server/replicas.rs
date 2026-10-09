@@ -199,7 +199,6 @@ impl ReplicaRegistry {
     }
 
     /// `(applied_seq, in_sync)` of every open stream, for the given current epoch.
-    #[cfg_attr(not(test), allow(dead_code))] // used by the write concern (later Plan 2 task)
     pub(crate) fn acks(&self, epoch: u64, lag_max: Duration) -> Vec<(Seq, bool)> {
         self.streams()
             .values()
@@ -212,7 +211,6 @@ impl ReplicaRegistry {
 
     /// Blocks until `done` holds for the current acks, or `timeout` passes. Returns whether
     /// `done` held. For synchronous writers; never call it on an async worker thread.
-    #[cfg_attr(not(test), allow(dead_code))] // used by the write concern (later Plan 2 task)
     pub(crate) fn wait_until(&self, timeout: Duration, mut done: impl FnMut(&Self) -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         let mut changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);

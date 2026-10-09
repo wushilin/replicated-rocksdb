@@ -53,6 +53,14 @@ pub enum Error {
     /// The slave stopped advancing; see `SlaveStatus` and `Slave::clear_halt`.
     #[error("replication is halted: {0:?}")]
     Halted(crate::slave::HaltReason),
+    /// Fewer replicas are in sync than the write concern requires; nothing was written.
+    #[error("{in_sync} replicas in sync, the write concern requires {required}; nothing was written")]
+    NotEnoughReplicas { required: usize, in_sync: usize },
+    /// The write is committed on the master (and keeps replicating), but `required` in-sync
+    /// acknowledgements were not seen within the write concern's `ack_timeout`. Retrying the
+    /// write would apply it a second time.
+    #[error("entry {seq} is committed but only {acked} of {required} in-sync replicas acknowledged it in time")]
+    AckTimeout { seq: Seq, acked: usize, required: usize },
     /// `promote_checked` found a reachable peer that holds more of the log. `diverged` lists
     /// the peers proven to hold different entries (`node_id`, fork), for the operator.
     #[error("{leader} is more advanced (last_seq {seq}); promote it instead (diverged peers: {diverged:?})")]

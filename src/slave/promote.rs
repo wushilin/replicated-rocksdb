@@ -99,7 +99,9 @@ impl Slave {
     /// Asks every reachable peer for its `Status` and **refuses by default** (addendum §4):
     /// `Error::NotMostAdvanced` if a peer is proven to hold more of the log, and
     /// `Error::PromotionUnverifiable` if a peer is at least as far by position but its history
-    /// cannot be verified (the entry that would prove it is trimmed or before its bootstrap).
+    /// cannot be verified (the entry that would prove it is trimmed or before its bootstrap),
+    /// `Error::MasterReachable` if a peer reports `role == Master`, and
+    /// `Error::PromotionWouldDiscard` (below).
     /// Each peer is probed at this slave's `last_seq`, and this slave's entry at the peer's
     /// `last_seq` is read locally, so [`admin::compare`] can check the shorter node's last
     /// entry. A peer whose history forks from this slave's at `fork` and that holds entries at
@@ -171,7 +173,9 @@ impl Slave {
     /// ([`PromoteRefused::into_slave`]): the checks of `promote` (bootstrapping, no data,
     /// halted `Corrupt`/`SpecMismatch`, wrong `cfg.path`, invalid `cfg`), a later reachable peer
     /// (`Error::NotMostAdvanced`), a peer at least as far whose history cannot be verified
-    /// (`Error::PromotionUnverifiable`), or a peer check that could not run.
+    /// (`Error::PromotionUnverifiable`), a peer that reports itself a master
+    /// (`Error::MasterReachable`), a peer holding entries at or past a fork with this slave
+    /// (`Error::PromotionWouldDiscard`), or a peer check that could not run.
     ///
     /// Only a failure after the slave has started shutting down for the promotion loses the
     /// handle (`PromoteRefused::slave` is `None`): an I/O error during shutdown, a

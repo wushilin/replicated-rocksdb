@@ -40,6 +40,38 @@ impl Default for ReaperConfig {
     }
 }
 
+/// How many in-sync replicas must acknowledge a write before it returns (addendum §2).
+///
+/// A direct replica of the master is *in sync* while its Tail stream is open, it follows the
+/// master's current identity, and it has been fully caught up within
+/// `ServeLimits::replica_lag_time_max` (default 10 s).
+///
+/// With `min_insync_replicas = N > 0` a write is refused with `Error::NotEnoughReplicas`
+/// (nothing written, no seq consumed) if fewer than N replicas are in sync. Otherwise it is
+/// committed and fsynced on the master as usual, and the call then waits for N in-sync replicas
+/// to acknowledge it. **`Error::AckTimeout` does not undo the write**: the entry is committed
+/// on the master and keeps replicating; the error only says that N acknowledgements were not
+/// seen within `ack_timeout` (Kafka semantics).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteConcern {
+    /// 0 = asynchronous replication (the default).
+    pub min_insync_replicas: usize,
+    pub ack_timeout: Duration,
+}
+
+impl Default for WriteConcern {
+    fn default() -> Self {
+        WriteConcern { min_insync_replicas: 0, ack_timeout: Duration::from_secs(5) }
+    }
+}
+
+impl WriteConcern {
+    /// Wait for `n` in-sync replicas, with the default 5 s timeout.
+    pub fn in_sync(n: usize) -> Self {
+        WriteConcern { min_insync_replicas: n, ..Self::default() }
+    }
+}
+
 #[derive(Clone)]
 pub struct MasterConfig {
     /// Unique within the topology: 1–128 characters of `[A-Za-z0-9._-]`.
@@ -56,6 +88,8 @@ pub struct MasterConfig {
     pub clock: Arc<dyn Clock>,
     /// Replication server. `None` runs an embedded, non-replicating master.
     pub serve: Option<ServeConfig>,
+    /// Default write concern of every write method. Default: asynchronous (no acks awaited).
+    pub write_concern: WriteConcern,
 }
 
 impl MasterConfig {
@@ -71,6 +105,7 @@ impl MasterConfig {
             rocksdb: RocksTuning::default(),
             clock: Arc::new(SystemClock),
             serve: None,
+            write_concern: WriteConcern::default(),
         }
     }
 
@@ -90,6 +125,9 @@ impl MasterConfig {
         }
         if let Some(serve) = &self.serve {
             serve.validate()?;
+        }
+        if self.write_concern.min_insync_replicas > 0 && self.write_concern.ack_timeout.is_zero() {
+            return Err(Error::Config("write_concern.ack_timeout must be positive".into()));
         }
         Ok(())
     }

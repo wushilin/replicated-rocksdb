@@ -64,7 +64,7 @@ pub use auth::{
 };
 pub use config::{
     MasterConfig, ReaperConfig, Retention, ServeConfig, ServeLimits, TlsClientConfig, TlsIdentity, TlsServerConfig,
-    MAX_BOOTSTRAP_CHUNK_BYTES,
+    WriteConcern, MAX_BOOTSTRAP_CHUNK_BYTES,
 };
 pub use log::{EntryIter, LogApi};
 pub use server::replicas::{FetchSettings, ReplicaStatus};

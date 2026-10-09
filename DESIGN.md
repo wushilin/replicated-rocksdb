@@ -14,7 +14,7 @@ Wire protocol: [PROTOCOL.md](PROTOCOL.md) is the normative specification. This d
 - Built-in integrity verification between a slave and its upstream.
 
 **Non-goals (v1)**
-- Strong / synchronous consistency. Replication is **async**, designed for **low update frequency**.
+- Strong consistency or consensus. Replication is **async** by default, designed for **low update frequency**. A write concern can make a write wait for acknowledgements from in-sync replicas (§5.2), but there is no quorum commit and no automatic failover.
 - Automatic failover / leader election. Promotion of a slave to master is **manual** (§13.1); the operator decides when the old master is gone.
 - Relative operations of any kind (`merge`, counters, appends). Not supported, not configurable.
 - Network query API for application clients. The network port is replication-only; applications read in-process via `ReadApi`.
@@ -177,6 +177,18 @@ Rules for that lock:
 **Interaction with TTL reaping (safe; no app action needed).** The reaper does not take the application's lock. Suppose a key expires between your `get` (which returns `None`, because expired values are hidden) and your `put`. The reaper deletes a key only if its current `expire_at` still matches the index entry, and your `put` has replaced that value. So the reaper skips it, and your new value is not deleted.
 
 The same rules are in the rustdoc for `Master::put`, `Master::write` and `Master::get`, and in the crate-level docs.
+
+### 5.2 Write concern (in-sync replicas)
+
+`MasterConfig::write_concern: WriteConcern { min_insync_replicas, ack_timeout }` (default `0` = asynchronous, `5 s`) applies to every write method; `Master::write_with(batch, concern)` and `Master::put_with(cf, key, value, concern)` override it per call. A direct replica of the master is **in sync** while its Tail stream is open, it follows the master's current identity, and its acknowledged seq reached the master's `last_seq` within `ServeLimits::replica_lag_time_max` (default 10 s; PROTOCOL.md §7.6). Replicas of replicas do not count.
+
+With `min_insync_replicas = N > 0`:
+1. Before taking the writer lock: if fewer than N replicas are in sync → `Error::NotEnoughReplicas { required, in_sync }`. Nothing is written and no seq is consumed.
+2. Commit and fsync as usual (§5), then release the writer lock.
+3. Wait, without the writer lock, until N in-sync replicas have acknowledged `seq` → `Ok(seq)`.
+4. After `ack_timeout` → `Error::AckTimeout { seq, acked, required }`. **The entry is committed on the master and keeps replicating**; the error only says that N acknowledgements were not seen in time (Kafka semantics). Retrying the write would write it twice.
+
+Write methods stay synchronous; async callers use `spawn_blocking`. Concurrent writers pipeline: each waits for its own acknowledgements while the next commits. With `N ≥ 1`, the most advanced in-sync replica holds every acknowledged write, which is what the failover runbook (§13.1) relies on.
 
 ## 6. Slave apply path
 
@@ -495,6 +507,7 @@ pub struct MasterConfig {
     pub bump_epoch_on_open: bool,       // set when opening a restored backup (§13)
     pub rocksdb: RocksTuning,           // comparator registry + callback over a restricted
                                         // `Tunable` (no merge/filter/TTL setters exist)
+    pub write_concern: WriteConcern,    // { min_insync_replicas: 0 (async), ack_timeout: 5 s } (§5.2)
 }
 
 impl Master {
@@ -507,6 +520,8 @@ impl Master {
     pub fn delete(&self, cf: &str, k: &[u8]) -> Result<Seq>;
     pub fn delete_range(&self, cf: &str, start: &[u8], end: &[u8]) -> Result<Seq>;
     pub fn write(&self, batch: Batch) -> Result<Seq>;
+    pub fn write_with(&self, batch: Batch, concern: WriteConcern) -> Result<Seq>;   // §5.2
+    pub fn put_with(&self, cf: &str, k: &[u8], v: &[u8], concern: WriteConcern) -> Result<Seq>;
     pub fn create_cf(&self, spec: CfSpec) -> Result<Seq>;
     pub fn drop_cf(&self, name: &str) -> Result<Seq>;
 
@@ -631,7 +646,7 @@ See §5.1. `Master::get`, `Master::put`, `Master::write` and the crate-level doc
 
 ### 16.2 Errors
 
-`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }` `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
+`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }`, `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
 
 ### 16.3 Persisted vs runtime slave state
 
@@ -668,6 +683,7 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 | Retention check interval | 10 min |
 | `max_entry_bytes` | 16 MiB |
 | Master fsync | always (not configurable) |
+| Write concern | `min_insync_replicas` 0 (asynchronous), `ack_timeout` 5 s |
 | Slave fsync | off (`SlaveConfig::sync_writes`) |
 | Heartbeat / idle timeout | 5 s / 15 s |
 | Reconnect backoff | 100 ms → 30 s, ×2, full jitter |
@@ -728,6 +744,7 @@ Dependencies: `rocksdb`, `tokio`, `tonic` (tls), `prost`, `tonic-types` (ErrorIn
 - C ahead of B after B crashes unsynced: C waits and then converges.
 - Retention trims the log past a stopped slave; the slave bootstraps again on restart.
 - **Bootstrap lease:** aggressive retention (`max_entries = 1`) during a slow bootstrap; the slave still tails from `S + 1` without bootstrapping again.
+- **Acks and write concern:** `replicas()` follows a replica's acknowledged seq and lag; an ack that goes backwards or past what was sent ends the stream. `min_insync_replicas = 1` without a replica → `NotEnoughReplicas` (no seq consumed); with one → returns after its ack; a replica that stops acknowledging → `AckTimeout`, the entry still replicates; master lost after an acknowledged write → `promote_checked` on the in-sync replica → the write is there.
 - Quiet master with every changelog entry expired: `last_seq` is preserved and slaves resume.
 - TTL: expiry is visible on reads before reaping; the reaper `Delete` replicates; overwrite clears the TTL; stale index entries are cleaned; reaping more than `max_deletes_per_entry` keys produces several entries.
 - **Divergence:** master restored from an older backup without an epoch bump → slaves halt `Diverged`; with `bump_epoch_on_open` → slaves at or behind the restore point continue (`EPOCH_ADVANCED`), slaves past it are `DIVERGED` and follow `on_divergence`.
@@ -755,7 +772,7 @@ Dependencies: `rocksdb`, `tokio`, `tonic` (tls), `prost`, `tonic-types` (ErrorIn
 - Data-related halts are persisted and need operator action; configuration halts are not persisted.
 - Epoch history with fork points lets replicas keep their data across epoch bumps and promotions when their history is a proven prefix.
 - Promotion is manual (`Slave::promote`). Fencing the old master is the operator's job; `STALE_EPOCH` and the CRC checks are backstops. `promote_checked`, `admin::choose_promotion_candidate` and `Master::demote` help the operator pick the right node; they never act on their own.
+- Optional write concern (`min_insync_replicas`, `ack_timeout`) with Kafka semantics: `AckTimeout` never undoes the write.
 
 **Future**
 - Automatic range repair after a verify mismatch.
-- Semi-sync writes (wait for N replica acks).
