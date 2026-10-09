@@ -33,6 +33,11 @@ impl Drop for RetentionGuard {
 }
 
 impl Store {
+    /// Keeps entries with seq greater than `seq` while the returned guard is held.
+    ///
+    /// A guard only protects entries that are still present: callers must check
+    /// `first_retained_seq()` AFTER acquiring the guard (`trim_changelog` holds the same
+    /// lock for its whole critical section, so taking a guard serialises against a trim).
     #[allow(dead_code)] // used by the replication server (Plan 2)
     pub(crate) fn guard(&self, seq: Seq) -> RetentionGuard {
         let mut set = self.guards.lock().unwrap_or_else(PoisonError::into_inner);
@@ -45,6 +50,12 @@ impl Store {
     /// Deletes entries from the front of the changelog that are older than `max_age`
     /// (by the master's `ts_ms`) or beyond `max_entries`, never past a guard.
     /// `last_seq` is untouched. Returns how many entries were removed.
+    ///
+    /// Intended to be called only by the maintenance task. The `guards` lock is held for
+    /// the whole decide-delete-publish section so a concurrent `guard()` cannot slip in
+    /// between the limit computation and the delete. `first_retained` is published after
+    /// the delete; a momentarily stale (too low) value is harmless because
+    /// `entries_after` checks continuity and yields `Err(Gap)` rather than skipping entries.
     pub(crate) fn trim_changelog(&self, now_ms: u64, r: &Retention) -> Result<u64> {
         let first = self.first_retained_seq();
         let last = self.position().last_seq;
@@ -52,10 +63,8 @@ impl Store {
             return Ok(0);
         }
         // Entries in [first, cut) are deleted.
-        let guard_limit = self
-            .guards
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        let guards = self.guards.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard_limit = guards
             .held
             .values()
             .min()
@@ -85,6 +94,7 @@ impl Store {
         batch.delete_range_cf(&cf, first.to_be_bytes(), cut.to_be_bytes());
         self.db().write_opt(batch, &WriteOptions::default())?;
         self.set_first_retained_seq(cut);
+        drop(guards);
         self.db().compact_range_cf(&cf, None::<&[u8]>, Some(cut.to_be_bytes()));
         Ok(cut - first)
     }
@@ -155,6 +165,27 @@ mod tests {
         assert_eq!(store.first_retained_seq(), 3);
         drop(g);
         assert_eq!(store.trim_changelog(u64::MAX, &retention(Some(1), None)).unwrap(), 3);
+    }
+
+    #[test]
+    fn max_entries_zero_trims_everything_and_writes_continue() {
+        let (_d, store) = store_with(3);
+        assert_eq!(store.trim_changelog(0, &retention(None, Some(0))).unwrap(), 4);
+        assert_eq!(store.position().last_seq, 4);
+        assert_eq!(store.first_retained_seq(), 5);
+        assert_eq!(apply(&store, put(9)).unwrap(), 5);
+        assert_eq!(store.entries_after(4).unwrap().next().unwrap().unwrap().seq, 5);
+    }
+
+    #[test]
+    fn larger_of_age_and_count_cut_wins() {
+        // seqs 1..=5, ts 1000..=5000. Age cut (now 3500+HOUR) removes 1..=3; count keeps 4.
+        let (_d, store) = store_with(4);
+        assert_eq!(store.trim_changelog(3_500 + HOUR, &retention(Some(HOUR), Some(4))).unwrap(), 3);
+        assert_eq!(store.first_retained_seq(), 4);
+        // Count keeps only 1, age (nothing old at now=0) would remove none: count wins.
+        assert_eq!(store.trim_changelog(0, &retention(Some(HOUR), Some(1))).unwrap(), 1);
+        assert_eq!(store.first_retained_seq(), 5);
     }
 
     #[test]
