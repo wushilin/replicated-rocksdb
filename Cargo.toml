@@ -9,15 +9,26 @@ description = "Single-master, async log-shipping replication for RocksDB"
 rocksdb = { version = "0.25.0", default-features = false, features = ["lz4", "zstd", "bindgen-runtime", "multi-threaded-cf"] }
 prost = "0.14.4"
 bytes = "1.12"
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 uuid = { version = "1.27", features = ["v4"] }
 blake3 = "1.8"
 crc32c = "0.6.8"
 thiserror = "2.0"
 tracing = "0.1.44"
+tonic = { version = "0.14.6", features = ["tls-ring"] }
+tonic-prost = "0.14.6"
+tonic-types = "0.14.6"
+tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
+subtle = "2.6.1"
+async-trait = "0.1.92"
+fail = { version = "0.5.1", optional = true }
+
+[features]
+failpoints = ["dep:fail", "fail/failpoints"]
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
 tempfile = "3.27"
+rcgen = "0.14.10"
