@@ -3,11 +3,13 @@
 mod apply;
 mod bootstrap;
 mod client;
+pub(crate) use client::connect_upstream;
 mod config;
 mod driver;
 mod inner;
 mod maintenance;
 mod policy;
+mod promote;
 mod source;
 mod state;
 
@@ -32,6 +34,7 @@ use inner::Inner;
 use state::NodeState;
 
 pub use config::{Backoff, DivergencePolicy, FetchConfig, GapPolicy, IdentityPolicy, SlaveConfig, UpstreamConfig};
+pub use promote::{PromoteRefused, PromotionCheck};
 pub use state::{HaltAction, HaltReason, SlaveState, SlaveStatus};
 
 /// A read-only replica. It has no write methods: writing to a slave is a compile error.

@@ -205,6 +205,65 @@ impl Master {
         self.server.as_ref().map(ServerHandle::addr)
     }
 
+    /// Whether [`demote`](Self::demote) would be allowed now: the newest epoch has no entries
+    /// yet (`last_seq < its start_seq`) and there is an earlier epoch to return to.
+    /// `Err(Config)` says why not. The master keeps running either way.
+    pub fn can_demote(&self) -> Result<()> {
+        let history = self.epoch_history();
+        let last = self.last_seq();
+        match history.last() {
+            _ if history.len() < 2 => Err(crate::Error::Config("nothing to undo: this is the database's first epoch".into())),
+            Some(newest) if last >= newest.start_seq => Err(crate::Error::Config(format!(
+                "epoch {} already has entries ({}..={last}); demoting would discard them",
+                newest.epoch, newest.start_seq
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Undoes a promotion of the wrong node (addendum §4): allowed only while the newest epoch
+    /// has no entries, so nothing is lost. Persists role = slave, restores the identity and
+    /// epoch history from before the promotion, and opens the directory as a slave with `cfg`
+    /// (`cfg.path` must be this master's path).
+    ///
+    /// **Refused by default:** when [`can_demote`](Self::can_demote) fails or `cfg.path`
+    /// differs, the master is handed back untouched and still running
+    /// ([`DemoteRefused::into_master`]). Only a failure after the master has started shutting
+    /// down for the demotion loses the handle (`DemoteRefused::master` is `None`): an I/O
+    /// error during shutdown, a `ReadSnapshot` that still holds the database (`Error::Config`;
+    /// drop it and reopen the directory, which is unchanged, as the master), or a failure
+    /// while rewriting it or opening the slave.
+    pub async fn demote(self, cfg: crate::slave::SlaveConfig) -> Result<crate::slave::Slave, DemoteRefused> {
+        let refusal = match self.can_demote() {
+            Err(e) => Some(e),
+            Ok(()) if cfg.path != self.inner.cfg.path => {
+                Some(crate::Error::Config("SlaveConfig.path must be the master's path".into()))
+            }
+            Ok(()) => None,
+        };
+        if let Some(error) = refusal {
+            return Err(DemoteRefused { error, master: Some(Box::new(self)) });
+        }
+        let lost = |error| DemoteRefused { error, master: None };
+        let (path, tuning) = (cfg.path.clone(), cfg.rocksdb.clone());
+        let db = Arc::downgrade(self.inner.store.db());
+        self.shutdown().await.map_err(lost)?;
+        if db.strong_count() > 0 {
+            return Err(lost(crate::Error::Config(
+                "a ReadSnapshot of this master is still open and keeps the database open; drop it first".into(),
+            )));
+        }
+        crate::background::blocking(move || {
+            let (store, _) = Store::open(&path, Role::Master, tuning)?;
+            let identity = store.demote_to_slave()?;
+            tracing::info!(epoch = identity.epoch, "master demoted to slave");
+            Ok(())
+        })
+        .await
+        .map_err(lost)?;
+        crate::slave::Slave::open(cfg).await.map_err(lost)
+    }
+
     /// Ends every replication stream with `SHUTTING_DOWN`, stops background work, and waits
     /// until the server and maintenance tasks are gone and every internal holder of the
     /// database has released it. `Err(Timeout)` if one still holds it after 10 s.
@@ -231,6 +290,40 @@ impl Master {
 impl Drop for Master {
     fn drop(&mut self) {
         self.inner.shutdown_tx.send_replace(true);
+    }
+}
+
+/// A refused or failed [`Master::demote`]. `master` is the untouched, still-running master
+/// for every refusal; it is `None` only when the demotion failed after the master had started
+/// shutting down.
+pub struct DemoteRefused {
+    pub error: crate::Error,
+    /// Boxed to keep the `Err` variant small.
+    pub master: Option<Box<Master>>,
+}
+
+impl DemoteRefused {
+    /// The master, still running, if the demotion was refused before it changed anything.
+    pub fn into_master(self) -> Option<Master> {
+        self.master.map(|m| *m)
+    }
+}
+
+impl std::fmt::Debug for DemoteRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DemoteRefused").field("error", &self.error).field("master_returned", &self.master.is_some()).finish()
+    }
+}
+
+impl std::fmt::Display for DemoteRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "demotion refused: {}", self.error)
+    }
+}
+
+impl std::error::Error for DemoteRefused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 

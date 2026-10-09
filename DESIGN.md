@@ -354,6 +354,17 @@ Normative messages: PROTOCOL.md §9.
 4. In one synced batch: `role = master`; `epoch' = 1 + max epoch in history`; append `{epoch', last_seq + 1}` to the history; set `origin_identity = (db_uuid, epoch')`; set `last_ts = max(ts_ms of the entry at last_seq, if retained)`, so the new master's timestamps never go backwards; clear `node_state`.
 5. Open with `Master::open(cfg)`. `cfg.path` must be the slave's path. Writes start at `last_seq + 1`. The master serves replication as usual.
 
+`promote(self)` consumes the slave. If it is refused (bootstrapping, no data, halted `Corrupt`/`SpecMismatch`, wrong `cfg.path`, invalid `cfg`) or fails (for example because a `ReadSnapshot` of the slave is still alive and keeps the database open), the slave has been shut down cleanly and its directory is unchanged, so it can be reopened as a slave.
+
+**Promotion tooling.**
+- `Slave::promotion_info()` returns the same `NodeInfo` as the `Status` RPC (PROTOCOL.md §6.5); `admin::node_status(upstream, client_id)` fetches it over the network.
+- `admin::compare(a, b)` → `Later(A | B)`, `Equal`, `Diverged { fork }` or `DifferentDatabase`. Two nodes are compatible when no seq both hold lies at or past a point where their epoch histories differ **and** the longer node holds the shorter node's last entry with the same CRC (`NodeInfo::probes`, filled by asking the longer node's `Status` with `probe_seq`; equal positions compare `last_entry_crc`). Then the node with the newer epoch is later, then the one with the higher `last_seq`. A proven CRC mismatch is `Diverged`, so same-epoch divergence (a restore without an epoch bump, two masters in one epoch) is caught. When the longer node no longer holds the probed entry (trimmed, or bootstrapped past it), the result is `Unverifiable { later }`: the order by position is still reported, compatibility is not. A node without data is behind every node with data.
+- `admin::gather(&[UpstreamConfig], client_id)` reads every node's `Status` and probes each node at the `last_seq` of every node behind it; `admin::node_status` waits at most `admin::STATUS_TIMEOUT` (5 s), after which a peer is unreachable.
+- `admin::choose_promotion_candidate(&[NodeInfo])` picks the most advanced node holding data (newest epoch, then highest `last_seq`, then lowest node id) and lists the others as compatible, diverged (`(node_id, fork)`), unverifiable or foreign.
+- `Slave::promote_checked(cfg, peers)` reads every peer's `Status` first (probing it at this slave's `last_seq`, and reading its own entry at the peer's `last_seq`) and **refuses by default**: `Error::NotMostAdvanced { leader, seq, diverged }` if a reachable peer is proven later, `Error::PromotionUnverifiable { peer, seq, diverged }` if a reachable peer is at least as far by position but its history cannot be verified. Both name the proven-diverged peers. Unreachable, diverged, foreign and behind-but-unverifiable peers are reported and do not block; plain `promote` remains the explicit way to override. `Slave::check_promotion(peers)` runs the same check without promoting.
+- `Master::demote(cfg: SlaveConfig)` undoes a promotion of the wrong node. It is allowed only while the newest epoch has no entries (`last_seq < its start_seq`), so nothing is lost: it removes that epoch record, restores the previous identity, persists `role = slave` and opens the directory as a slave. `Master::can_demote()` checks this without consuming the master.
+- `promote_checked` and `demote` refuse by default and **hand the untouched, still-running node back**: `Err(PromoteRefused { error, slave })` / `Err(DemoteRefused { error, master })`, with `into_slave()` / `into_master()`. Only a failure after the node has started shutting down for the change (an I/O error during shutdown, a `ReadSnapshot` that still holds the database, a failure while rewriting `__meta`) loses the handle (`None`); the directory is then reopened by the application. Plain `promote` keeps its behaviour: a refusal shuts the slave down with its directory unchanged.
+
 After promotion:
 - Former siblings and downstream slaves re-pointed at the new master continue if they are at or behind its `last_seq` with matching entries. Those that received entries it never saw are `DIVERGED` and follow their divergence policy.
 - The old master can never rejoin as master. Replicas of the new epoch refuse to follow it (`STALE_EPOCH`, retried and reported). To reuse the machine, wipe its directory and start it as a new slave, which bootstraps.
@@ -500,6 +511,9 @@ impl Master {
     pub fn snapshot(&self) -> Result<ReadSnapshot>;
     pub fn replicas(&self) -> Vec<ReplicaStatus>;      // direct downstream only
     pub fn bump_epoch(&self) -> Result<DbIdentity>;
+    pub fn can_demote(&self) -> Result<()>;           // Err(Config) says why demote would be refused
+    pub async fn demote(self, cfg: SlaveConfig) -> Result<Slave, DemoteRefused>;  // undo an unused promotion (§13.1);
+                                                      // a refusal returns the running master
     pub fn epoch_history(&self) -> Vec<EpochStart>;
     pub fn reap_expired(&self) -> Result<ReapStats>;      // one reaper round now
     pub async fn shutdown(self) -> Result<()>;
@@ -581,12 +595,32 @@ impl Slave {
     pub async fn verify_now(&self, mode: VerifyMode) -> Result<VerifyReport>;
     pub async fn clear_halt(&self, action: HaltAction) -> Result<()>;   // operator action
     pub async fn promote(self, cfg: MasterConfig) -> Result<Master>;    // operator action (§13.1)
+    pub async fn promote_checked(self, cfg: MasterConfig, peers: &[UpstreamConfig]) -> Result<Master, PromoteRefused>;
+                                             // refuses if a reachable peer is later; a refusal returns
+                                             // the running slave (§13.1)
+    pub async fn check_promotion(&self, peers: &[UpstreamConfig]) -> Result<PromotionCheck>;
+    pub fn promotion_info(&self) -> NodeInfo;   // what the Status RPC reports
     pub fn snapshot(&self) -> Result<ReadSnapshot>;
     pub fn replicas(&self) -> Vec<ReplicaStatus>;
     pub async fn shutdown(self) -> Result<()>;
 }
 impl ReadApi for Slave {}  impl LogApi for Slave {}
 // A Slave has no write methods. Writing to it is a compile error.
+
+// ---------------- admin: failover tooling (§13.1) ----------------
+pub struct NodeInfo {
+    pub node_id: String, pub role: Role, pub identity: Option<DbIdentity>,
+    pub epoch_history: Vec<EpochStart>, pub last_seq: Seq, pub last_entry_crc: Option<u32>,
+    pub last_ts_ms: u64, pub node_state: String, pub upstream: Option<String>,
+    pub replicas: Vec<ReplicaSummary>,          // { node_id, applied_seq, in_sync }
+    pub probes: BTreeMap<Seq, Option<u32>>,     // CRCs at probed seqs (Status.probe_seq)
+}
+pub fn compare(a: &NodeInfo, b: &NodeInfo) -> Comparison;  // Later(Side) | Equal | Diverged { fork } | DifferentDatabase
+                                                            // | Unverifiable { later: Option<Side> }
+pub fn choose_promotion_candidate(nodes: &[NodeInfo]) -> Result<Choice>; // { candidate, compatible, diverged, foreign, unverifiable }
+pub async fn node_status(upstream: &UpstreamConfig, client_id: &str) -> Result<NodeInfo>;  // 5 s timeout
+pub async fn node_status_probed(upstream: &UpstreamConfig, client_id: &str, probe_seq: Option<Seq>) -> Result<NodeInfo>;
+pub async fn gather(nodes: &[UpstreamConfig], client_id: &str) -> Gathered;   // { nodes (probed), unreachable }
 ```
 
 ### 16.1 Read-modify-write
@@ -595,7 +629,7 @@ See §5.1. `Master::get`, `Master::put`, `Master::write` and the crate-level doc
 
 ### 16.2 Errors
 
-`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
+`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }` and `PromotionUnverifiable { peer, seq, diverged }` (`promote_checked`), `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
 
 ### 16.3 Persisted vs runtime slave state
 
@@ -676,6 +710,7 @@ replicated-rocksdb/
     master/           writer, reaper, open/identity/epoch
     slave/            upstream client, applier, bootstrap install, verifier, halt handling
     auth.rs           traits + Token/AllowAll/Mtls impls, auth-failure rate limit
+    admin.rs          failover tooling: NodeInfo, compare, choose_promotion_candidate, node_status
     listener.rs  config.rs  error.rs
   tests/
     vectors.rs        PROTOCOL.md §15 test vectors
@@ -717,7 +752,7 @@ Dependencies: `rocksdb`, `tokio`, `tonic` (tls), `prost`, `tonic-types` (ErrorIn
 - Verify ranges are half-open and contiguous; leaf mismatches are resolved by listing keys.
 - Data-related halts are persisted and need operator action; configuration halts are not persisted.
 - Epoch history with fork points lets replicas keep their data across epoch bumps and promotions when their history is a proven prefix.
-- Promotion is manual (`Slave::promote`). Fencing the old master is the operator's job; `STALE_EPOCH` and the CRC checks are backstops.
+- Promotion is manual (`Slave::promote`). Fencing the old master is the operator's job; `STALE_EPOCH` and the CRC checks are backstops. `promote_checked`, `admin::choose_promotion_candidate` and `Master::demote` help the operator pick the right node; they never act on their own.
 
 **Future**
 - Automatic range repair after a verify mismatch.

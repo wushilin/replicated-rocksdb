@@ -9,6 +9,7 @@ pub(crate) mod read;
 pub(crate) mod repl;
 pub(crate) mod retention;
 pub(crate) mod snapshot;
+pub(crate) mod promote;
 pub(crate) mod ttl;
 #[cfg(test)]
 pub(crate) mod test_support;

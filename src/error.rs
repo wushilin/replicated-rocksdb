@@ -53,6 +53,16 @@ pub enum Error {
     /// The slave stopped advancing; see `SlaveStatus` and `Slave::clear_halt`.
     #[error("replication is halted: {0:?}")]
     Halted(crate::slave::HaltReason),
+    /// `promote_checked` found a reachable peer that holds more of the log. `diverged` lists
+    /// the peers proven to hold different entries (`node_id`, fork), for the operator.
+    #[error("{leader} is more advanced (last_seq {seq}); promote it instead (diverged peers: {diverged:?})")]
+    NotMostAdvanced { leader: String, seq: Seq, diverged: Vec<(String, Seq)> },
+    /// `promote_checked` found a reachable peer that is at least as far by position (newest
+    /// epoch, then `last_seq`) but whose compatibility cannot be proven, because the entry that
+    /// would prove it is no longer held. Plain `promote` remains available as an explicit
+    /// operator decision. `diverged` as for `NotMostAdvanced`.
+    #[error("{peer} (last_seq {seq}) is at least as far and its history cannot be verified; promote explicitly if intended (diverged peers: {diverged:?})")]
+    PromotionUnverifiable { peer: String, seq: Seq, diverged: Vec<(String, Seq)> },
     #[error(transparent)]
     RocksDb(#[from] rocksdb::Error),
     #[error(transparent)]

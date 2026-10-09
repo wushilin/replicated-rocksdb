@@ -68,14 +68,14 @@ pub use config::{
 };
 pub use log::{EntryIter, LogApi};
 pub use server::replicas::{FetchSettings, ReplicaStatus};
-pub use master::{Master, ReapStats};
+pub use master::{DemoteRefused, Master, ReapStats};
 pub mod listener;
 mod slave;
 
 pub use listener::ReplicationListener;
 pub use slave::{
-    Backoff, DivergencePolicy, FetchConfig, GapPolicy, HaltAction, HaltReason, IdentityPolicy, Slave, SlaveConfig,
-    SlaveState, SlaveStatus, UpstreamConfig,
+    Backoff, DivergencePolicy, FetchConfig, GapPolicy, HaltAction, HaltReason, IdentityPolicy, PromoteRefused, PromotionCheck,
+    Slave, SlaveConfig, SlaveState, SlaveStatus, UpstreamConfig,
 };
 pub(crate) mod server;
 pub(crate) mod failpoint;
