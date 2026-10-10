@@ -298,7 +298,7 @@ The server evaluates these rules **in order** (rule 10a before rule 9) and appli
 | 1 | `protocol_version` differs | `REJECT` | `PROTOCOL_MISMATCH` |
 | 2 | `envelope_version` differs | `REJECT` | `ENVELOPE_MISMATCH` |
 | 3 | `client_id` equals `server_id` or appears in `upstream_chain` | `REJECT` | `LOOP_DETECTED` |
-| 4 | The server is bootstrapping itself (it has no consistent state) | `REJECT` | `NOT_READY` |
+| 4 | The server is bootstrapping itself, or replaying a repair (§11.2; it has no consistent state) | `REJECT` | `NOT_READY` |
 | 5 | `known_identity` absent | `BOOTSTRAP` | `NO_LOCAL_STATE` |
 | 6 | `known_identity.db_uuid ≠ identity.db_uuid` | `BOOTSTRAP` | `IDENTITY_CHANGED` |
 | 7 | `known_identity.epoch > identity.epoch` | `REJECT` | `STALE_EPOCH` |
@@ -348,7 +348,7 @@ A read-only unary RPC for operators and promotion tooling. It is authenticated a
 | `identity`, `epoch_history` | As in the handshake. `identity` is absent while the node holds no consistent data. |
 | `last_seq`, `last_entry_crc` | The node's durable `last_seq` and the `crc32c` of the entry at `last_seq` (absent at seq 0). |
 | `last_ts_ms` | `ts_ms` of the entry at `last_seq`; 0 if it is not retained. |
-| `node_state` | `"ready"`, `"bootstrapping"` or `"halted:<Reason>"`. |
+| `node_state` | `"ready"`, `"bootstrapping"`, `"halted:<Reason>"` or `"repairing:<seq>"` (a repair is replaying up to `seq`; the node answers `NOT_READY` until then). |
 | `upstream` | The address the node replicates from; empty on the master. |
 | `replicas` | One `ReplicaSummary { node_id, applied_seq, in_sync }` per open Tail stream (§7.6). |
 | `max_burned_epoch` | The highest epoch number this node started as a master and then gave up by undoing the promotion (0 if none). Replicas that followed that promotion may hold the number, so a node being promoted SHOULD choose a higher one (§6.4). |
@@ -396,7 +396,7 @@ Before sending anything, the server MUST check the following and fail the call o
 
 | Condition | Status / reason |
 |---|---|
-| The server is bootstrapping itself | `UNAVAILABLE` / `NOT_READY` |
+| The server is bootstrapping itself, or replaying a repair | `UNAVAILABLE` / `NOT_READY` |
 | `identity ≠ server identity` | `FAILED_PRECONDITION` / `IDENTITY_CHANGED` |
 | The server is the master and `from_seq > last_seq + 1` | `FAILED_PRECONDITION` / `DIVERGED` |
 | `prev_crc32c` present, the server holds entry `from_seq − 1`, and its `crc32c` differs | `FAILED_PRECONDITION` / `DIVERGED` |
@@ -418,7 +418,7 @@ message Heartbeat   { uint64 upstream_last_seq = 1; uint64 origin_last_seq = 2; 
 - `upstream_last_seq` is the server's `last_seq`. `origin_last_seq` is the master's `last_seq` as last known to the server. `ts_ms` is the server's wall clock and is informational only.
 - The stream does not end on its own. The server ends it:
   - with `OUT_OF_RANGE` / `LOG_GAP` if the next entry to send has been removed by retention (slow consumer);
-  - with `UNAVAILABLE` / `UPSTREAM_RESET` if the server starts bootstrapping itself or its identity changes (for example an epoch bump on the master);
+  - with `UNAVAILABLE` / `UPSTREAM_RESET` if the server starts bootstrapping itself, commits a repair (§11.2), or its identity changes (for example an epoch bump on the master);
   - with `UNAVAILABLE` / `SHUTTING_DOWN` on a graceful shutdown;
   - with `DATA_LOSS` / `CORRUPT` if a stored entry fails its CRC;
   - with `FAILED_PRECONDITION` / `DIVERGED` if the junction check above fails;
@@ -476,7 +476,7 @@ rpc Bootstrap(BootstrapRequest) returns (stream BootstrapChunk);
 
 ### 8.1 Server procedure
 
-1. If the server is bootstrapping itself, fail with `UNAVAILABLE` / `NOT_READY`. If it is already serving `max_concurrent_bootstraps` bootstraps, fail with `RESOURCE_EXHAUSTED` / `BUSY`.
+1. If the server is bootstrapping itself or replaying a repair, fail with `UNAVAILABLE` / `NOT_READY`. If it is already serving `max_concurrent_bootstraps` bootstraps, fail with `RESOURCE_EXHAUSTED` / `BUSY`.
 2. Take a consistent point-in-time snapshot of the database, without blocking writers.
 3. Read through that snapshot: `S = last_seq`, the identity, the CF list, and the `crc32c` of entry `S` if known.
 4. Register a **retention guard**: no entry with seq greater than `S` may be removed while the guard is held. Then issue a lease (§8.4).
@@ -594,7 +594,7 @@ message SeqCrc         { uint64 seq = 1; fixed32 crc32c = 2; }
 - `ListRange`: the server returns up to `limit` keys from the range, in order, each with its `write_seq` and `payload_hash = BLAKE3(payload)`. `truncated` is set if there are more. `limit` MUST be between 1 and 1024. The server MAY return fewer than `limit` keys to bound the size of the answer (RECOMMENDED: stop once the keys add up to 1 MiB), but it MUST return at least two keys when the range holds two or more.
 - To continue a truncated listing, the client sends the same range with `lower` set to the last key it received, and skips that key when the answer repeats it first. This works under any comparator (appending a byte to a key gives its successor only under bytewise order), and the two-key rule guarantees progress.
 - A request whose `cf` is not in the session's snapshot, whose `range` or `kind` is missing, or whose `limit` is out of bounds fails with `INVALID_ARGUMENT`. A `VerifyBegin` with `mode = VERIFY_MODE_UNSPECIFIED` fails the same way.
-- When its state is replaced (it starts bootstrapping itself, or its identity changes), the server ends every `VerifyRange` stream with `UNAVAILABLE` / `UPSTREAM_RESET`, as it does for `Tail` (§7.3), and drops every session. A later request on a dropped session fails with `UPSTREAM_RESET` or `SESSION_NOT_FOUND`; a client MUST treat both as "start a new run".
+- When its state is replaced (it starts bootstrapping itself, commits a repair, or its identity changes), the server ends every `VerifyRange` stream with `UNAVAILABLE` / `UPSTREAM_RESET`, as it does for `Tail` (§7.3), and drops every session. A later request on a dropped session fails with `UPSTREAM_RESET` or `SESSION_NOT_FOUND`; a client MUST treat both as "start a new run".
 - `FetchKeys` (repair): the server returns, in the order asked, a `FetchedRecord` per key with its whole envelope as of the session's snapshot, or without `envelope` when the key does not exist. `keys` MUST NOT be empty and MUST NOT hold more than 1024 keys (`INVALID_ARGUMENT` otherwise). The server MAY answer only a prefix of the keys (setting `truncated`) to bound the answer (RECOMMENDED: stop once ~1 MiB of envelopes is reached), but answers at least one; the client asks again for the rest.
 - `FetchRange` (repair): like `ListRange`, but each record carries the whole envelope. The same limits, paging rule and two-record minimum apply.
 - `EntryCrcs` (repair): `from_seq ≤ to_seq ≤ snapshot_seq` is required (`INVALID_ARGUMENT` otherwise). The server returns `(seq, crc32c)` for every entry with `from_seq ≤ seq ≤ min(to_seq, from_seq + 1023)` that it held at the snapshot (entry `snapshot_seq` is known whenever the server knows its CRC: from the log, or from `last_entry_crc` after retention emptied the log or a bootstrap that carried one; it is not known for `snapshot_seq = 0`, nor after a bootstrap without a CRC, and is then omitted). They are read through the session's snapshot, so they never change during the session; a client compares them with its own entries (repair checks the entry before the fork its epoch history shows).
@@ -620,7 +620,7 @@ RPC failures use standard gRPC status codes. The status MUST carry a `google.rpc
 |---|---|---|---|
 | `PROTOCOL_MISMATCH` | `FAILED_PRECONDITION` | no | Protocol version differs (non-Handshake RPCs). |
 | `ENVELOPE_MISMATCH` | `FAILED_PRECONDITION` | no | Envelope version differs. |
-| `NOT_READY` | `UNAVAILABLE` | yes, with backoff | The server is bootstrapping itself. |
+| `NOT_READY` | `UNAVAILABLE` | yes, with backoff | The server is bootstrapping itself, or replaying a repair. |
 | `IDENTITY_CHANGED` | `FAILED_PRECONDITION` | after a new handshake | The client's identity is not the server's. |
 | `DIVERGED` | `FAILED_PRECONDITION` | per divergence policy | The client's history disagrees with the server's. |
 | `STALE_EPOCH` | `FAILED_PRECONDITION` | yes, with backoff | The server is behind the client's epoch: a replica that has not caught up yet, or a demoted master. |
@@ -643,7 +643,8 @@ A conforming client keeps, and updates atomically with every applied entry or co
 - `identity`, epoch history, `last_seq`, `last_crc32c`;
 - the CF list;
 - a copy of every applied entry (the exact `LogEntry` fields), kept for retention and for serving downstream;
-- its node state: *ready*, *bootstrapping*, or *halted(reason)*.
+- its node state: *ready*, *bootstrapping*, or *halted(reason)*;
+- while a repair replays, its repair target `S`, persisted apart from the node state (a halt does not clear it): the client is not ready, whatever its node state, until `last_seq` reaches `S`.
 
 ### 11.2 Acting on a decision
 
@@ -655,7 +656,8 @@ A conforming client keeps, and updates atomically with every applied entry or co
 | `BOOTSTRAP` / `NO_LOCAL_STATE` | Bootstrap (§8.3). |
 | `BOOTSTRAP` / `IDENTITY_CHANGED` | Identity policy *Refuse* (default) → halt `IdentityChanged`. *Rebootstrap* → bootstrap. |
 | `BOOTSTRAP` / `LOG_GAP` | Gap policy *Rebootstrap* (default) → bootstrap. *Halt* → halt `LogGap`. |
-| `REJECT` / `DIVERGED` | Divergence policy *Halt* (default) → halt `Diverged`. *Rebootstrap* → bootstrap. |
+| `REJECT` / `DIVERGED` | Divergence policy *Halt* (default) → halt `Diverged`. *Repair* → repair from a verify session on the same server (the fork `F` from the epoch histories, `EntryCrcs` to check entry `F − 1`, `FetchKeys` / `FetchRange` for the keys the local entries `F..=L` touched, all at the session's `snapshot_seq` `S`; §9.2), then rewind to `F − 1` in one atomic write and `Tail` from `F`; the client is not ready until `last_seq` reaches `S`. Anything it cannot prove falls back to a bootstrap. *Rebootstrap* → bootstrap. |
+| `RESUME` while a repair replays up to `S`, with a server epoch history that leaves the client's at or below `S` | Treat as `REJECT` / `DIVERGED`: the keys the repair took hold that server's state at `S` of a history the server no longer has, so replaying it cannot complete them. |
 | `REJECT` / `STALE_EPOCH` | Back off and retry the handshake. An upstream replica may still be catching up; a demoted master never will, and the operator must re-point the replica. The client SHOULD surface the condition in its status. |
 | `REJECT` / `PROTOCOL_MISMATCH`, `ENVELOPE_MISMATCH`, `LOOP_DETECTED` | Halt with that reason. Not persisted: re-evaluated on restart. |
 | `REJECT` / `NOT_READY` | Back off and retry the handshake. |
@@ -706,7 +708,7 @@ A failed bootstrap (bad footer, lost connection) also returns to `Connecting` th
 | `FetchKeys.keys` | client | 1..=1024 keys, ≤ 1 MiB of keys per request (a single larger key alone) |
 | `FetchRange.limit` | client | 1..=1024 |
 | `FetchResult` size | server | stop after ~1 MiB of keys and envelopes, but never fewer than 1 record (`FetchKeys`) or 2 records (`FetchRange`) |
-| `EntryCrcs` span | server | at most 1024 entries per request |
+| `EntryCrcs` span | server | at most 1024 entries per request, none after `snapshot_seq` (a client never asks past it) |
 | HTTP/2 keepalive | client | 30 s interval, 10 s timeout |
 | Reconnect backoff | client | 100 ms → 30 s, ×2, full jitter |
 
@@ -946,7 +948,7 @@ message StatusResponse {
   uint64   last_seq                 = 5;
   optional fixed32 last_entry_crc   = 6;
   uint64   last_ts_ms               = 7;   // ts of the entry at last_seq; 0 if unknown
-  string   node_state               = 8;   // "ready", "bootstrapping" or "halted:<Reason>"
+  string   node_state               = 8;   // "ready", "bootstrapping", "halted:<Reason>" or "repairing:<seq>"
   string   upstream                 = 9;   // empty on the master
   repeated ReplicaSummary replicas  = 10;
   optional fixed32 probe_crc        = 11;  // crc32c of the entry at probe_seq, if held

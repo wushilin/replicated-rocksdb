@@ -1,6 +1,6 @@
 # Spec addendum: acks, write concern, failover tooling and divergence repair
 
-Status: agreed with the user, 2026-10-09. To be merged into DESIGN.md and PROTOCOL.md by the owning tasks (Plan 2 amendment for §1–§4, Plan 3 for §5). Where this addendum and DESIGN/PROTOCOL disagree, this addendum wins until the merge.
+Status: agreed with the user, 2026-10-09. To be merged into DESIGN.md and PROTOCOL.md by the owning tasks (Plan 2 amendment for §1–§4, Plan 3 for §5, §7 and §8). Where this addendum and DESIGN/PROTOCOL disagree, this addendum wins until the merge. **Merged:** §1–§4 by Plan 2; §5 (DESIGN §12.1), §7 (DESIGN §13, PROTOCOL §5.5, §6.3) and §8 (DESIGN §5.2, §16) by Plan 3, which supersede this text.
 
 ## 1. Replica acks and replica status
 

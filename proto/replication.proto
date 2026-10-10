@@ -219,7 +219,7 @@ message StatusResponse {
   uint64   last_seq                 = 5;
   optional fixed32 last_entry_crc   = 6;
   uint64   last_ts_ms               = 7;   // ts of the entry at last_seq; 0 if unknown
-  string   node_state               = 8;   // "ready", "bootstrapping" or "halted:<Reason>"
+  string   node_state               = 8;   // "ready", "bootstrapping", "halted:<Reason>" or "repairing:<seq>"
   string   upstream                 = 9;   // empty on the master
   repeated ReplicaSummary replicas  = 10;
   optional fixed32 probe_crc        = 11;  // crc32c of the entry at probe_seq, if held

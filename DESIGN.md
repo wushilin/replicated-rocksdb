@@ -63,6 +63,8 @@ Master(A) ──► Slave(B) ──► Slave(C)
 | `epoch_history` | all | `Vec<EpochStart { epoch, start_seq, nonce }>`, sorted by epoch; first is `{1, 1, n}` (PROTOCOL.md §5.5). Written atomically with `origin_identity`. |
 | `max_entry_bytes` | slave | the master's value, as received in the handshake; forwarded downstream |
 | `node_state` | slave | text: `ready`, `bootstrapping` or `halted:<Reason>` (data-related reasons only); absent means `ready`. Persisted, see §16.3 |
+| `repair_until` | slave | while a repair replays (§12.1): the seq `last_seq` must reach before the node is ready again; written by the repair's batch, removed when replay reaches it or by a bootstrap. Kept apart from `node_state`, so a halt during the replay cannot make the node ready early |
+| `diverged_at` | slave | first seq of the local divergent suffix, recorded when the slave halts `Diverged` (`Slave::diverged_entries`); cleared by a repair or a bootstrap |
 | `bootstrap_cfs` | slave | physical CFs created by a bootstrap that has not finished, written (synced) before each is created; part of the known CF set at open, dropped by the next bootstrap reset |
 | `cf_specs` | all | live user CFs: `Vec<CfSpec>` plus `create_seq`, sorted by name |
 | `pending_cf_drops` | all | physical CFs logically dropped, awaiting physical drop |
@@ -226,7 +228,7 @@ after each batch (coalesced), and at least once per heartbeat:
 - **Upstream epoch histories are validated** (in an `EPOCH_ADVANCED` handshake and in a bootstrap header): non-empty, first record `{1, 1}`, epochs strictly increasing, start seqs non-decreasing, last epoch equal to the identity's epoch. An invalid history halts the slave with `Corrupt`.
 - Writes are not synced on slaves by default (`SlaveConfig::sync_writes = false`). A slave that crashes resumes from its durable `last_seq` and fetches the rest again from upstream. Its acks (§11) then promise that an entry is in its write-ahead log, which survives a process crash but not a power loss. With `sync_writes = true` every applied entry is fsynced, so an acknowledged entry survives a power loss of the replica too.
 - **A downstream replica can be ahead of its upstream slave.** If upstream B crashes unsynced after forwarding to C, C's `last_seq` can exceed B's. On handshake B replies `RESUME`, and the Tail stream sends only heartbeats until B passes C's seq. The content is identical because seqs come from the same origin log. This is allowed only when the upstream is a slave. The master rejects it (§13).
-- **Divergence check on connect.** The slave sends `last_entry_crc` in the handshake and `prev_crc32c` in `Tail`. If the upstream still holds that entry and its CRC differs, the upstream answers `DIVERGED` and the slave halts instead of applying a different history.
+- **Divergence check on connect.** The slave sends `last_entry_crc` in the handshake and `prev_crc32c` in `Tail`. If the upstream still holds that entry and its CRC differs, the upstream answers `DIVERGED` and the slave follows `on_divergence` (halt by default, §12.1 repair, or bootstrap) instead of applying a different history.
 
 ## 7. Column family lifecycle
 
@@ -314,7 +316,7 @@ pub(crate) trait LogSource: Send + Sync + 'static {
     fn heartbeat(&self) -> Duration;
     fn subscribe(&self) -> watch::Receiver<Seq>;
     fn resets(&self) -> watch::Receiver<u64>;                   // bumped when served streams must end
-    fn node_state(&self) -> String { "ready".into() }          // Status RPC: ready | bootstrapping | halted:<Reason>
+    fn node_state(&self) -> String { "ready".into() }          // Status RPC: ready | bootstrapping | halted:<Reason> | repairing:<seq>
     fn upstream(&self) -> Option<String> { None }               // Status RPC: upstream address (slaves)
 }
 ```
@@ -349,9 +351,118 @@ Normative messages: PROTOCOL.md §9.
 **Result**
 - `VerifyReport { seq, mode, cfs_checked, keys_checked, mismatches: Vec<Mismatch>, duration }` (`is_clean()`), where `Mismatch` is `CfSpec { name, local: Option<CfVersion>, upstream: Option<CfVersion> }` (`CfVersion { spec, create_seq }`), `Key { cf, key, local: Option<write_seq>, upstream: Option<write_seq> }` (equal `write_seq`s mean the values differ), or `Range { cf, lower, upper }` for keys that were not compared one by one: the listing could not be continued (its last key is longer than 2 MiB), or the run had already reported `max_reported_keys` keys.
 - A run that cannot produce a report fails with `Error::VerifyAborted(VerifyAbort)`: `Busy` and `SessionExpired` (from the upstream; the session expired, or the upstream's state was reset), `IdentityChanged`, `PassedSnapshot { snapshot_seq, applied_seq }` (the slave is already past `S`; retry later), `CaptureTimeout { snapshot_seq }` (the slave did not reach `S` within `capture_timeout`, or is halted), or `Upstream(..)`. Without data, `verify_now` returns `NotReady`.
-- Every report is stored in `SlaveStatus.last_verify` and passed to `on_verify_complete`. Under `MismatchPolicy::Rebootstrap`, a report with mismatches ends the current Tail stream and the slave bootstraps at once (a halted slave stays halted). This consent is narrow: it covers only the repoint generation the run started in and the database identity it verified (a repoint during the run cancels it), it turns only RESUME and BOOTSTRAP handshake answers into a bootstrap, and it never overrides a `DIVERGED` or `IDENTITY_CHANGED` answer: those follow `on_divergence` / `on_identity_change` (halt / refuse by default). It is separate from the operator's `clear_halt(Rebootstrap)`. A cancelled or shut-down run stops its local scans, and `Slave::shutdown` waits for them (up to 5 s, else `Timeout`) before closing the database.
-- `MismatchPolicy::Report` (default) or `MismatchPolicy::Rebootstrap`. There is no automatic range repair in v1.
+- Every report is stored in `SlaveStatus.last_verify` and passed to `on_verify_complete`. Under `MismatchPolicy::Rebootstrap`, a report with mismatches ends the current Tail stream and the slave bootstraps at once. Under `MismatchPolicy::Repair`, it ends the stream and the reported keys and ranges are repaired from the upstream (§12.1); a `CfSpec` mismatch bootstraps instead. A halted slave stays halted, and its reports never trigger a policy: it may be on another history than its upstream (a divergence the handshake refused). This consent (for `Repair` too) is narrow: it covers only the repoint generation the run started in and the database identity it verified (a repoint during the run cancels it), it turns only RESUME and BOOTSTRAP handshake answers into a bootstrap, and it never overrides a `DIVERGED` or `IDENTITY_CHANGED` answer: those follow `on_divergence` / `on_identity_change` (halt / refuse by default). It is separate from the operator's `clear_halt(Rebootstrap)`. A cancelled or shut-down run stops its local scans, and `Slave::shutdown` waits for them (up to 5 s, else `Timeout`) before closing the database.
+- `MismatchPolicy::Report` (default), `MismatchPolicy::Rebootstrap` or `MismatchPolicy::Repair`. **Verify cannot tell which side is damaged.** `Rebootstrap` and `Repair` assume the upstream is right: in a chain A→B→C, a damaged B copies its damage onto a correct C (and further down). Choosing one of these policies is the consent to that; prefer `Report` on nodes whose upstream is not the master, or verify the upstream first.
 - In a chain, each slave verifies against its own upstream. If every link matches, the whole chain matches.
+
+### 12.1 Repair
+
+A slave can take **only the keys that differ** from its upstream instead of bootstrapping. There are two kinds:
+
+- **Divergence repair.** The upstream answered `REJECT` / `DIVERGED`, under `DivergencePolicy::Repair` or a `repoint` with `RepointDivergence::Repair { accept_loss: AcceptDataLoss }`. These are the only ways to start it: under the default `Halt` and `Refuse`, a divergence halts with the data intact. The local log holds entries `F..=L` that the upstream's history does not have.
+- **Verify repair.** `MismatchPolicy::Repair`: the keys and ranges a verify reported (§12) are taken from the upstream that was verified.
+
+Repair runs in the driver between sessions, so no entry is applied meanwhile. Notation:
+
+- `T = F − 1` is the last seq both sides share. For a verify repair, `T = L`.
+- `S ≥ T` is the upstream's snapshot seq.
+- `K` is the set of keys and key ranges that the local entries `F..=L` touched: the keys of `Put` and `Delete`, and the ranges of `DeleteRange`. For a verify repair, `K` is the reported keys and ranges.
+
+**Finding `F`.** `F` comes from the epoch histories (§13, nonces included). It is where the slave's newest records leave the upstream's history (`fork_from`, the same rule the handshake uses).
+
+- Within one epoch there is exactly one writer process, so entries `1..=T` are identical on both sides. A slave that does not hold entry `T` itself (it bootstrapped at `T`) can still repair.
+- As a second line of defence, entry `T`'s CRC is compared where both sides hold it (`EntryCrcs`, never past `S`).
+- A fork computed too low is harmless: more keys are rewritten than needed. Histories never show a fork that is too high.
+- If the histories show no fork at or below `L`, repair is not possible, and the slave bootstraps instead.
+
+**Why the result is exact, key by key.** After the rewind (below), the local state is:
+
+- a key not in `K` holds its value at `T`. Local entries `F..=L` never touched it, and entries `1..=T` are the upstream's.
+- a key in `K` holds the upstream's value at `S`: its envelope, or absence. A range in `K` is cleared, then refilled with the upstream's keys of that range at `S`.
+
+The slave then replays the upstream's entries `T+1..=S`. Every op is absolute: `Put` sets a key, `Delete` and `DeleteRange` set keys to absent, whatever they held before. A key therefore ends at the value written by the last of those entries that touches it, or keeps the value it had if none does:
+
+| | written by the upstream in `T+1..=S` | not written in `T+1..=S` |
+|---|---|---|
+| **key not in `K`** | the last write of the replay, which is its value at `S` | its value at `T`, which equals its value at `S` because nothing changed it |
+| **key in `K`** | it held its value at `S`; the replay passes through older values and ends on the last write, its value at `S` | it already holds its value at `S`; the replay does not touch it |
+
+Every key ends at its value at `S`, so after replaying `S` the slave holds exactly the upstream's state at `S`. From there it is an ordinary replica.
+
+**Why this needs absolute ops.** With a relative op (a merge, an increment), replaying `T+1..=S` over a key that already holds its value at `S` would apply those deltas a second time. With absolute ops the replay is idempotent per key: only the last write counts. This is why the log may contain nothing else (§4).
+
+**Why no before-images or undo log are needed.** Repair never reconstructs a key's value at `T`:
+
+- a key the divergent suffix touched jumps forward to `S`, and the replay cannot move it anywhere else;
+- a key it did not touch already holds its value at `T`.
+
+Nothing has to be recorded at write time, and the divergent entries only need to be readable, not reversible.
+
+**Why the state at `S` is consistent.** The upstream's verify session pins one RocksDB snapshot (PROTOCOL.md §9.2). `S` (`__meta.last_seq`), the identity, `cf_specs` and every fetched envelope are read through it.
+
+- Every entry is one `WriteBatch` together with `__meta.last_seq`, on the master and on slaves (§5, §6). A snapshot therefore holds exactly the effects of entries `1..=S`: never part of an entry, never a later one.
+- Writes the upstream commits while the slave fetches are invisible to the fetch. They are entries after `S`, which the slave replays after `S`.
+- A local CF must exist on the upstream at `S` with the same `create_seq` and comparator. Otherwise repair is not possible.
+
+**Phases and what each guarantees on a crash:**
+
+1. **Fetch** (network phase, at most 120 s, abandoned on a repoint). Reads the local suffix (at most `repair_max_bytes`, kept from retention by a guard), opens a verify session, and fetches the affected keys (`FetchKeys`, at most 1 MiB of keys per request) and every key of the affected ranges (`FetchRange`) as envelopes at `S`. `S ≥ T` is required; otherwise the slave retries later. Local keys of the cleared ranges count against the same budget. **Nothing is written.** A crash, timeout, transient error or repoint leaves the slave as it was, and the repair is retried (or the next handshake decides).
+2. **Rewind** (one synced `WriteBatch`, never cancelled once started). It holds:
+   - the cleared ranges and the fetched keys;
+   - the removal of changelog entries `F..=L`;
+   - `last_seq = T` and `last_entry_crc` = CRC of entry `T`;
+   - the upstream's identity and epoch history;
+   - `node_state = ready`, and `diverged_at` removed;
+   - `repair_until = S` when `S > T`.
+
+   It is **all or nothing**. Before it, the old state stands (the divergent suffix is still readable and is retried); after it, the rewound state stands with its target. The batch is refused if the position moved since the fetch. Readers are refused before the batch becomes visible. Downstream streams and sessions are reset before and after it (they end with `UPSTREAM_RESET`, so no downstream bootstrap or verify completes on a mixed snapshot). A verify capture waiting on the old state is cancelled. In memory, identity and position follow on the same blocking thread.
+3. **Replay** (the ordinary apply path, §6). Each entry is its own atomic commit, together with `__changelog[seq]` and `last_seq`. A crash resumes from the durable `last_seq + 1`, since the handshake sends it. The mixed state is **hidden behind `repair_until`**. Until `last_seq` reaches it, the slave answers `NotReady` to reads, snapshots, `verify_now`, verify captures, promotion and downstream handshakes, bootstraps and verify sessions. `Status` reports `repairing:<S>`. All of this holds in every state, also after a restart and after a halt during the replay, because a halt rewrites `node_state` and not `repair_until`. The commit that reaches `S` removes `repair_until` (synced) before the slave reports ready. A crash in between leaves a target at or below `last_seq`, which the next open ignores.
+
+**Guards**
+
+- **A RESUME from an upstream whose history now leaves the slave's at or below `S` is treated as `DIVERGED`.** Such an upstream has lost entries up to `S`, for example after a restored backup or a failover to a node that never received them. The keys taken at `S` hold writes its history does not have, so replaying it would make the slave ready on a mix of two histories. The divergence policy then decides; a repair falls back to a bootstrap.
+- A divergence repair while an earlier repair is still replaying falls back to a bootstrap. The keys the earlier repair took are not recorded, so a second rewind could not account for them.
+- A verify repair is ready no earlier than the target of an unfinished earlier repair.
+- **Verify repair.** The reported keys and ranges are written at a fresh `S ≥ L`, and no entry is dropped (`T = L`). The slave then replays `L+1..=S`. An upstream behind the slave (`S < L`) is retried later: writing would set those keys to an older state, and rewinding would drop entries the verify never reported.
+  - The request is consent to re-copy from the verified upstream only. It is bound to the repoint generation and database of the run, acted on only after a `RESUME` from that database (never on `DIVERGED` or `IDENTITY_CHANGED`), and dropped by any halt, a bootstrap, or an answer from another database.
+  - A `CfSpec` mismatch re-bootstraps instead (the narrow verify consent of §12).
+
+**Fallback to a full bootstrap, from the same upstream in the same session.** It happens in any of these cases:
+
+- a CF operation in the suffix;
+- a suffix this slave no longer retains;
+- a fork entry the upstream no longer holds (`F < first_retained_seq`);
+- histories that do not show the fork;
+- an unfinished earlier repair;
+- a CF that differs between the sides, or a `CfSpec` mismatch;
+- an undecodable entry or envelope;
+- a key over 1 MiB, or a range bound or page key over 2 MiB;
+- more than `SlaveConfig::repair_max_bytes` (default 64 MiB) to read, fetch or delete.
+
+The consent that started the repair (the policy, or the repoint's `AcceptDataLoss`) covers this bootstrap. The operator's `force_bootstrap` is not used, so a later `IDENTITY_CHANGED` still follows its own policy. A transient failure (upstream unreachable, session lost, timeout) retries with backoff and `last_error` set. Under a repoint, it settles the repoint as `Retrying`, which ends the repoint's consent (§13.1).
+
+**Salvage.** A slave that halts `Diverged` records its fork point in `__meta.diverged_at` (from the histories, or the master's `last_seq + 1` for a slave ahead of its master). `Slave::diverged_entries()` then returns the local entries `F..=L`.
+
+**Listener.** `on_rewind(T)` is called after the batch, and `on_entry` then continues at `F`. `repoint` returns `RepointOutcome::Repaired { discarded: F..=L }`.
+
+**Acknowledgements while repairing are sound for write concern and in-sync replicas.** During replay the slave acknowledges each replayed entry to its upstream, as usual (§6, PROTOCOL.md §7.6), although it is not ready. The reasons this is sound:
+
+- **Every acknowledged entry is durable on the replica.** It was committed in the same batch as `__changelog[seq]` and `last_seq`, with the same durability as any acknowledgement: in the WAL by default, fsynced with `sync_writes`.
+- **A crash resumes the replay.** The node restarts from its durable `last_seq`, and the persisted `repair_until` keeps it not ready until it passes `S` again.
+- **Promotion is refused while repairing.** `promote` and `promote_checked` return `Error::Config`, and `Status` reports `repairing:<S>`, so a repairing replica is never a failover candidate.
+- **A repairing replica is never counted in sync, so its acknowledgements never satisfy a write concern.** The reasoning:
+  1. Write concern counts only in-sync replicas (§5.2).
+  2. A Tail stream is in sync only after it acknowledges a batch that drained the master's log, or acknowledges the master's `last_seq`.
+  3. A repair always ends its session, so the replay runs on a new stream that starts not caught up.
+  4. The master's `last_seq` is at least `S` throughout. Any draining send or caught-up acknowledgement on that stream is therefore at least `S`.
+  5. The slave removes `repair_until` in the same applier step that commits `S`, before it can acknowledge `S`.
+  6. An older stream of the same node that is still registered keeps its old acknowledged seq, which is at most `L`. It cannot satisfy a write after that.
+
+  `Master::replicas()` and `wait_in_sync` report a repairing replica as not in sync. Replicas of replicas never count.
+
+So the failover rule of §13.1 holds: the most advanced in-sync replica holds every acknowledged write, and it is promotable.
+
+One caveat applies to verify repair. A replica that was in sync until a verify found its data damaged may hold writes acknowledged before the repair. During its replay window it is not promotable, and the replay needs a node that holds entries up to `S`. Its damaged keys were not a valid failover state either.
 
 ## 13. Identity, epoch, versioning
 
@@ -362,7 +473,7 @@ Normative messages: PROTOCOL.md §9.
 - **Epoch continuity.** A slave of an older epoch with nothing at or past the fork point continues without a bootstrap (`EPOCH_ADVANCED`) when its newest epoch records (up to 5), nonces included, are all in the upstream's history, or when its last entry's CRC matches the upstream's (a CRC match proves continuity whether or not records were sent; records of epochs without entries do not count). A proven CRC mismatch is `DIVERGED` regardless. Anything else is `IDENTITY_CHANGED` (bootstrap), never `RESUME`. It persists the new identity and history before tailing. A slave with entries at or past the fork point is `DIVERGED`. The handshake carries those records as `known_epochs`. Rules: PROTOCOL.md §6.3 rules 6–10.
 - **Policies on the slave:**
   - `on_identity_change: IdentityPolicy` — `Refuse` (default) halts with `IdentityChanged`; `Rebootstrap` bootstraps. Applies when `db_uuid` differs, or when continuity across an epoch change cannot be proven.
-  - `on_divergence: DivergencePolicy` — `Halt` (default) halts with `Diverged`; `Rebootstrap` bootstraps. Applies to `DIVERGED` on reconnects; an explicit `Slave::repoint` uses `RepointOptions::on_divergence` instead (§13.1).
+  - `on_divergence: DivergencePolicy` — `Halt` (default) halts with `Diverged` (`Slave::diverged_entries` returns the divergent suffix); `Repair` repairs only the divergent suffix (§12.1); `Rebootstrap` bootstraps. Applies to `DIVERGED` on reconnects; an explicit `Slave::repoint` uses `RepointOptions::on_divergence` instead (§13.1).
   - `STALE_EPOCH` (the upstream is behind the slave's epoch) is retried with backoff and reported in `SlaveStatus.last_error`. An upstream replica that has not yet learned the new epoch catches up; a demoted master never does, and the operator must re-point the slave (`Slave::repoint`).
 - **Restoring a master from a backup** needs no special step: its open starts a new epoch at the restored `last_seq + 1` before the replication port opens. Slaves at or behind the restored seq continue (`EPOCH_ADVANCED`); slaves holding entries past it get `DIVERGED`, from the history alone (even when the restored node never held those entries, or already trimmed them). `MasterConfig::bump_epoch_on_open` is kept for compatibility and is redundant. Rules 11 and 12 (a slave ahead of the master, a last entry with a different CRC) remain as backstops.
 - **`PROTOCOL_VERSION: u32` must match exactly** in the handshake, and on every RPC through the `x-rrdb-protocol-version` metadata. The crate version is not compared. Upgrade procedure: stop all nodes, upgrade, start. `envelope_version` must also match exactly.
@@ -393,10 +504,10 @@ Normative messages: PROTOCOL.md §9.
 
 **Repoint.** `Slave::repoint(upstream, RepointOptions) -> Result<RepointOutcome>` switches a running slave to another upstream; reads keep being served. It closes the current upstream stream (a bootstrap in progress is abandoned and starts from scratch against the new upstream), clears a halt (in memory: `node_state = ready` is persisted only once the new upstream is accepted, so a restart before that reopens the slave still halted and the operator repoints again), forgets the old upstream chain, and handshakes the new upstream under all the normal rules (loop detection, `STALE_EPOCH`, epoch continuity). It returns once that handshake settles: `Resumed`, `EpochAdvanced`, `Bootstrapped`, or `Retrying { last_error }` when the new upstream cannot be used yet (unreachable, `STALE_EPOCH`, `NOT_READY`; the slave keeps retrying it). The new upstream is not persisted: after a restart, open the slave with it. A repoint replaced by a later one, or by a shutdown, before it settles returns `Error::RepointSuperseded`. `SlaveStatus.upstream` is the current target.
 
-**Divergence is never resolved implicitly by a repoint.** The configured `on_divergence` is not used after a repoint; the repoint's mode decides every `DIVERGED` answer (a handshake of any later session, or a Tail or Bootstrap ending `DIVERGED`) until the next repoint. **Consent is single-use:** `Rebootstrap` and `Repair` apply only to their own repoint until it settles (`repoint` returns, with any outcome including `Retrying` or an error); from then on the mode is `Refuse`, so a later, unrelated `DIVERGED` halts the slave with its data intact instead of discarding data again. `Refuse` stays in force until the next repoint. A forced bootstrap requested before the repoint (a gap, an earlier `Rebootstrap`) is bound to the generation that requested it and never applies to a later repoint; only `clear_halt(Rebootstrap)` issued after the repoint applies:
+**Divergence is never resolved implicitly by a repoint.** The configured `on_divergence` is not used after a repoint; the repoint's mode decides every `DIVERGED` answer (a handshake of any later session, or a Tail or Bootstrap ending `DIVERGED`) until the next repoint. **Consent is single-use:** `Rebootstrap` and `Repair` apply only to their own repoint until it settles (`repoint` returns, with any outcome including `Retrying` or an error; with `Repair`, when the repair the first answer started committed, failed, or fell back to a bootstrap); from then on the mode is `Refuse`, so a later, unrelated `DIVERGED` halts the slave with its data intact instead of discarding data again. `Refuse` stays in force until the next repoint. A forced bootstrap requested before the repoint (a gap, an earlier `Rebootstrap`) is bound to the generation that requested it and never applies to a later repoint; only `clear_halt(Rebootstrap)` issued after the repoint applies:
 - `Refuse` (default): `Error::Diverged { fork_seq, local_last_seq, divergent_entries }`; the slave halts `Diverged` with its data intact and readable.
 - `Rebootstrap { accept_loss: AcceptDataLoss }`: discard all local data and bootstrap from the new upstream.
-- `Repair { accept_loss: AcceptDataLoss }`: roll back only the divergent entries (§22). Until verify sessions exist it returns `Error::Unsupported`, and the slave halts `Diverged` with its data intact.
+- `Repair { accept_loss: AcceptDataLoss }`: roll back only the divergent entries and take the keys they touched from the new upstream (§12.1); returns `Repaired { discarded }` (reads answer `NotReady` until replay reaches the upstream's snapshot seq), `Bootstrapped` when repair falls back, or `Retrying` after a transient failure.
 
 `AcceptDataLoss` is a unit struct the caller writes out; nothing supplies it by default. A configured `IdentityPolicy::Rebootstrap` still applies to a target that is a different database (configured consent to replace the data). A repoint at the slave itself or at one of its own downstream nodes halts `LoopDetected` (`Err(Halted(LoopDetected))`) until it is repointed again.
 
@@ -452,13 +563,14 @@ pub trait ReplicationListener: Send + Sync + 'static {
     fn on_bootstrap_complete(&self, snapshot_seq: Seq) {}  // state replaced wholesale; rebuild derived state
     fn on_state_change(&self, state: &SlaveState) {}
     fn on_verify_complete(&self, report: &VerifyReport) {}
+    fn on_rewind(&self, last_seq: Seq) {}  // a repair (§12.1) moved the position back; on_entry continues at last_seq + 1
 }
 ```
 
 Listeners exist on slaves only. On the master, the application already sees every write it makes. To observe the log there, use `LogApi::entries_since` or `LogApi::subscribe`.
 
 Guarantees:
-- Strictly increasing `seq`, with no duplicates within a process, between bootstraps. After `on_bootstrap_complete(S)` delivery continues at `S + 1`; `S` can be lower than a seq delivered before a re-bootstrap, because state was replaced wholesale. Each entry of a Tail batch is committed and delivered on its own.
+- Strictly increasing `seq`, with no duplicates within a process, between bootstraps and rewinds. After `on_bootstrap_complete(S)` or `on_rewind(S)` delivery continues at `S + 1`; `S` can be lower than a seq delivered before a re-bootstrap, because state was replaced wholesale. Each entry of a Tail batch is committed and delivered on its own.
 - Called before the new seq is published to `wait_for_seq` and `subscribe`, so whoever waits for a seq also sees what the listener did with it.
 - Called **after commit**, so reads already reflect the entry.
 - Called inline in the apply loop. A slow listener slows replication down (back-pressure) and doesn't lose events. Heavy work should be handed off to a channel. A listener must not block on the slave's own replication progress (for example `wait_for_seq`), because that would deadlock the apply loop.
@@ -600,7 +712,8 @@ pub struct SlaveConfig {
                                              //   capture_timeout: 60 s, max_reported_keys: 10 000 }
     pub listener: Option<Arc<dyn ReplicationListener>>,
     pub on_identity_change: IdentityPolicy,  // Refuse (default) | Rebootstrap
-    pub on_divergence: DivergencePolicy,     // Halt (default) | Rebootstrap
+    pub on_divergence: DivergencePolicy,     // Halt (default) | Repair | Rebootstrap
+    pub repair_max_bytes: u64,               // a larger repair bootstraps instead; default 64 MiB
     pub on_log_gap: GapPolicy,               // Rebootstrap (default) | Halt
     pub reconnect: Backoff,                  // default 100 ms → 30 s, ×2, full jitter
     pub fetch: FetchConfig,                  // { min_batch_bytes: 0, max_wait: 100 ms, max_batch_bytes: 1 MiB }
@@ -665,6 +778,7 @@ impl Slave {
     pub async fn wait_streaming(&self, timeout: Duration) -> Result<()>;   // Err(Halted(r)) | Err(Timeout)
     pub fn watch_state(&self) -> watch::Receiver<SlaveState>;
     pub async fn verify_now(&self, mode: VerifyMode) -> Result<VerifyReport>;
+    pub fn diverged_entries(&self) -> Result<Vec<LogEntry>>;   // halted Diverged: the local suffix (§12.1)
     pub async fn clear_halt(&self, action: HaltAction) -> Result<()>;   // operator action
     pub async fn repoint(&self, upstream: UpstreamConfig, opts: RepointOptions) -> Result<RepointOutcome>;
                                              // switch upstream at runtime (§13.1)
@@ -723,7 +837,7 @@ See §5.1. `Master::get`, `Master::put`, `Master::write` and the crate-level doc
 
 ### 16.2 Errors
 
-`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }`, `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), `Diverged { fork_seq, local_last_seq, divergent_entries }` (a refused `repoint`), `RepointSuperseded`, `Unsupported`, `PeerUnreachable { peer, reason, source }` (`admin::node_status*` got no answer; `reason` is one line), `VerifyAborted(VerifyAbort)` (`verify_now` could not produce a report), `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
+`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping, or replaying a repair), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }`, `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), `Diverged { fork_seq, local_last_seq, divergent_entries }` (a refused `repoint`), `RepointSuperseded`, `Unsupported`, `PeerUnreachable { peer, reason, source }` (`admin::node_status*` got no answer; `reason` is one line), `VerifyAborted(VerifyAbort)` (`verify_now` could not produce a report), `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
 
 ### 16.3 Persisted vs runtime slave state
 
@@ -732,6 +846,8 @@ See §5.1. `Master::get`, `Master::put`, `Master::write` and the crate-level doc
 | `ready` (or absent) | `Connecting` or `Streaming` |
 | `bootstrapping` | `Bootstrapping { .. }`. After a restart, the bootstrap starts over. |
 | `halted:<Reason>`, data-related reasons only | `Halted(reason)`. The slave does not contact its upstream until `clear_halt`. |
+
+`__meta.repair_until` is independent of this table: while it is above `last_seq` (a repair is replaying, §12.1), the slave answers `NotReady` in every state, refuses promotion, and `Status` reports `repairing:<seq>` unless it is bootstrapping or halted.
 
 `clear_halt(Retry)` returns to `Connecting` (useful after fixing a missing comparator, or after `LogGap` with `GapPolicy::Halt` once the operator chooses to wait). `clear_halt(Rebootstrap { accept_loss: AcceptDataLoss })` starts a fresh bootstrap (discarding local data takes the explicit consent). It is the only way out of `Diverged` or `IdentityChanged` under `Refuse`, apart from `repoint`, which clears any halt before it handshakes the new upstream (§13.1).
 
@@ -773,12 +889,13 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 | In-sync window (`ServeLimits::replica_lag_time_max`) | 10 s |
 | Verify | off by default; `Quick` when enabled; ranges of 1 000 keys or 4 MiB, listed at ≤ 16 keys; capture timeout 60 s; at most 10 000 key mismatches per report |
 | Verify session timeout | 5 min |
+| Repair (`repair_max_bytes`, network phase) | 64 MiB, 120 s; a larger repair bootstraps |
 | Mismatch policy | Report |
 | Reaper | every 30 s; 1 000 deletes per entry; 100 000 per round |
 
 ## 19. Observability
 
-- **`tracing` spans** named `handshake`, `bootstrap`, `verify` and `reaper`, with fields `node_id` (this node), `upstream` (this node's upstream; absent on the master), `seq` and `epoch` (when known). Both ends of a handshake, bootstrap and verify session open one; the server's also carry `client`, and `verify` carries `mode`. Each applied entry is logged at `trace` level only.
+- **`tracing` spans** named `handshake`, `bootstrap`, `verify`, `repair` and `reaper`, with fields `node_id` (this node), `upstream` (this node's upstream; absent on the master), `seq` and `epoch` (when known). Both ends of a handshake, bootstrap and verify session open one; the server's also carry `client`, and `verify` carries `mode`. Each applied entry is logged at `trace` level only.
 - `SlaveStatus` carries `lag_ms` and `last_verify` (§16).
 - **Status APIs** (`Slave::status`, `Master::replicas`, `Slave::replicas`, `ReplicaStatus`, the `Status` RPC) are the source for metrics. The crate does not depend on a metrics library. A recommended set for applications to export:
   - `applied_seq`, `origin_last_seq`, lag in seqs and `lag_ms`;
@@ -838,6 +955,7 @@ Dependencies: `rocksdb`, `tokio`, `tonic` (tls), `prost`, `tonic-types` (ErrorIn
 - Token auth accept/reject; per-method authorisation; token without TLS is refused.
 - Entry over `max_entry_bytes` is rejected on the master. A large valid entry passes through the chain.
 - Injected corruption on a slave is detected by `Full` verify and localised to the key. A key that exists only on the upstream, between the slave's chunk boundaries, is found.
+- **Repair:** a diverged slave with puts, deletes and range deletes in its suffix (and no entry before the fork in its own log) repairs without a bootstrap and matches under `Full` verify, also while the new leader keeps writing to the affected keys during the fetch and the replay, and when it writes them between the snapshot and the fetch; `repoint(.., Repair { AcceptDataLoss })` returns `Repaired` and verifies clean; a CF op in the suffix, a trimmed local suffix, an upstream without the fork point and more than `repair_max_bytes` fall back to a bootstrap; a crash right after the rewind stays `NotReady` (`repairing:<S>`) until replay passes `S` (before and after a restart with no upstream, and after a persisted halt during the replay), then converges; a leader lost mid-replay leaves the slave not ready, not promotable, not serving downstream and not in sync, and it resumes without a bootstrap when the leader is back; an upstream whose history is lost below `S` mid-replay never makes the slave ready on a mixed state; `MismatchPolicy::Repair` fixes corrupted, missing and extra keys and `Range` mismatches; `diverged_entries` returns the suffix of a halted slave.
 - Wire codec matches the PROTOCOL.md §15 test vectors.
 
 ## 22. Decisions and future work
@@ -845,7 +963,7 @@ Dependencies: `rocksdb`, `tokio`, `tonic` (tls), `prost`, `tonic-types` (ErrorIn
 **Decided**
 - No `update` or compare-and-set API. Read-modify-write is done by the application under its own lock (§5.1).
 - `LogEntry.ops` is opaque bytes, forwarded verbatim; the CRC covers the header fields and the ops.
-- Divergence is detected by CRC comparison on connect and by rejecting slaves ahead of the master. It is not repaired automatically: an explicit `repoint` refuses by default and discards entries only with `AcceptDataLoss`.
+- Divergence is detected from the epoch histories (nonces included), with CRC comparison and the rejection of slaves ahead of the master as backstops. It is resolved only by policy (`DivergencePolicy::Repair` or `Rebootstrap`) or with explicit consent: a `repoint` refuses by default and discards entries only with `AcceptDataLoss`. Repair rewrites only the keys the divergent suffix touched (§12.1) and falls back to a bootstrap whenever it cannot prove the result.
 - The bootstrap retention guard lasts until the follow-up Tail presents the lease, or the lease expires.
 - Verify ranges are half-open and contiguous; leaf mismatches are resolved by listing keys.
 - Data-related halts are persisted and need operator action; configuration halts are not persisted.
@@ -854,4 +972,4 @@ Dependencies: `rocksdb`, `tokio`, `tonic` (tls), `prost`, `tonic-types` (ErrorIn
 - Optional write concern (`min_insync_replicas`, `ack_timeout`) with Kafka semantics: `AckTimeout` never undoes the write.
 
 **Future**
-- Automatic range repair after a verify mismatch.
+- Repair across CF operations: a `CreateCf` or `DropCf` in a divergent suffix falls back to a bootstrap today (§12.1).
