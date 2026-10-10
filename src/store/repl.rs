@@ -114,6 +114,30 @@ impl<'a> ReadCtx<'a> {
     }
 }
 
+impl<'a> ReadCtx<'a> {
+    /// Like [`iter_raw`](Self::iter_raw), starting at the first key `>= from` under the CF's
+    /// comparator (`None`: the first key).
+    #[allow(dead_code)] // used by verify scans (Tasks 4-5)
+    pub(crate) fn iter_raw_from(
+        &self,
+        cf: Arc<PhysCf>,
+        from: Option<&[u8]>,
+    ) -> Result<RawIter<'a>> {
+        let handle = self.db.cf_handle(&cf.physical).ok_or_else(|| {
+            Error::corrupt(format!("physical column family {} is missing", cf.physical))
+        })?;
+        let mode = match from {
+            Some(k) => IteratorMode::From(k, rocksdb::Direction::Forward),
+            None => IteratorMode::Start,
+        };
+        let inner = match self.snap {
+            Some(s) => s.iterator_cf(&handle, mode),
+            None => self.db.iterator_cf(&handle, mode),
+        };
+        Ok(RawIter { inner, _cf: cf })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

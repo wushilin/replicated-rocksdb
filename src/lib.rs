@@ -55,10 +55,14 @@ pub use types::{
 pub mod codec;
 pub(crate) mod source;
 pub(crate) mod store;
+pub(crate) mod verify;
 pub use codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 pub use read::{ReadApi, ReadSnapshot};
 pub use store::read::DbIter;
 pub use tuning::{CfKind, ComparatorRegistry, Compression, RocksTuning, Tunable};
+pub use verify::{
+    CfVersion, Mismatch, MismatchPolicy, VerifyAbort, VerifyConfig, VerifyMode, VerifyReport,
+};
 
 pub use auth::{
     AllowAll, AllowMethods, AuthError, Authenticator, CredentialsProvider, Method,

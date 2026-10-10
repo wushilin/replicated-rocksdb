@@ -144,6 +144,9 @@ pub enum Error {
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
+    /// A verify run was abandoned before it produced a report.
+    #[error("verify abandoned: {0:?}")]
+    VerifyAborted(crate::verify::VerifyAbort),
     #[error(transparent)]
     RocksDb(#[from] rocksdb::Error),
     #[error(transparent)]
