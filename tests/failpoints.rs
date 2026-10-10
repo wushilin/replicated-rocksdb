@@ -1559,3 +1559,173 @@ async fn a_queued_verify_repair_that_keeps_failing_does_not_stop_replication() {
     fail::remove("server-verify-begin");
     scenario.teardown();
 }
+
+/// Final fix wave, I2: a slave `d` (master `a`, backed up at "a-backup" first) applies
+/// entries `a` will lose, then sees a gap mid-stream (`server-tail-skip-entry`) and requests a
+/// bootstrap under the default `GapPolicy::Rebootstrap`. It is held in `slave-after-gap` (the
+/// returned gate, reached) before its next handshake, while `a` is stopped. With `repoint`, `d`
+/// was first repointed to the same upstream with the default (`Refuse`), which settled.
+/// Returns `d`, its listener, the stopped master's port and the first and last entry `d`
+/// holds that the backup does not.
+async fn gap_then_upstream_lost(
+    c: &Cluster,
+    tweak: impl FnOnce(&mut replicated_rocksdb::SlaveConfig),
+    repoint: bool,
+) -> (
+    Slave,
+    std::sync::Arc<support::RecordingListener>,
+    Gate,
+    u16,
+    u64,
+    u64,
+) {
+    let a = c.master("a").await;
+    a.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..10u8 {
+        a.put("c", &[i], b"base").unwrap();
+    }
+    let (mut cfg, ld) = c.slave_config("d", a.serve_addr().unwrap());
+    tweak(&mut cfg);
+    let d = Slave::open(cfg).await.unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    let a = c.restart_master_after_backup(a, "a", "a-backup").await;
+    d.wait_streaming(support::WAIT).await.unwrap();
+    if repoint {
+        let up = UpstreamConfig::from_addr(a.serve_addr().unwrap());
+        let outcome = d.repoint(up, RepointOptions::default()).await.unwrap();
+        assert_eq!(outcome, RepointOutcome::Resumed);
+    }
+    let fork = a.last_seq() + 1;
+    a.put("c", b"only-before-the-failover", b"x").unwrap();
+    a.put("c", &[1], b"lost").unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    let last = d.last_seq();
+
+    let gate = Gate::after(0);
+    gate.install("slave-after-gap");
+    fail::cfg("server-tail-skip-entry", "1*return").unwrap();
+    a.put("c", b"skipped", b"x").unwrap();
+    a.put("c", b"after-the-gap", b"x").unwrap();
+    wait_until("the slave saw the gap", || gate.reached()).await;
+    fail::remove("server-tail-skip-entry");
+    assert_eq!(d.last_seq(), last, "nothing past the gap applied");
+    let port = a.serve_addr().unwrap().port();
+    a.shutdown().await.unwrap();
+    (d, ld, gate, port, fork, last)
+}
+
+/// The backup of "a" restored with an epoch bump on `port`: the same database on a history
+/// without the slave's last entries.
+async fn restored_master(c: &Cluster, port: u16) -> Master {
+    support::restore_dir(&c.path("a-backup"), &c.path("a"));
+    let mut mcfg = c.master_config("a");
+    mcfg.serve.as_mut().unwrap().port = port;
+    mcfg.bump_epoch_on_open = true;
+    let a = Master::open(mcfg).await.unwrap();
+    a.put("c", b"new-history", b"y").unwrap();
+    a
+}
+
+/// Final fix wave, I2: the bootstrap a mid-stream gap requested (`GapPolicy::Rebootstrap`) is
+/// consent to re-copy the same history, not the operator's consent to lose data. When the
+/// next handshake answers DIVERGED (the upstream failed over to a history without the slave's
+/// last entries), the configured `DivergencePolicy::Halt` decides: the slave halts with its
+/// divergent entries intact. `clear_halt(Retry)` does not bring the request back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gap_request_does_not_override_a_later_divergence() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (d, ld, gate, port, fork, last) = gap_then_upstream_lost(&c, |_| {}, false).await;
+    let _gate = gate.open_on_drop();
+    let a = restored_master(&c, port).await;
+    gate.open();
+    fail::remove("slave-after-gap");
+
+    support::wait_state(&d, "Diverged halt", |s| {
+        *s == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
+    assert_eq!(ld.bootstraps(), 1, "nothing installed");
+    assert_eq!(d.last_seq(), last, "the divergent entries are kept");
+    let suffix: Vec<u64> = d
+        .diverged_entries()
+        .unwrap()
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(suffix, (fork..=last).collect::<Vec<_>>());
+
+    // Retry is no consent to lose data: the next DIVERGED halts again.
+    d.clear_halt(replicated_rocksdb::HaltAction::Retry)
+        .await
+        .unwrap();
+    support::wait_state(&d, "Diverged halt again", |s| {
+        *s == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
+    assert_eq!(ld.bootstraps(), 1);
+    assert_eq!(
+        d.get("c", b"only-before-the-failover").unwrap(),
+        Some(b"x".to_vec())
+    );
+    drop(a);
+    scenario.teardown();
+}
+
+/// Final fix wave, I2: the gap request never covers another database. When the address now
+/// serves a foreign database (BOOTSTRAP / IDENTITY_CHANGED), the default
+/// `IdentityPolicy::Refuse` halts the slave with its data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gap_request_does_not_bootstrap_a_foreign_database() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (d, ld, gate, port, _, last) = gap_then_upstream_lost(&c, |_| {}, false).await;
+    let _gate = gate.open_on_drop();
+    let mut zcfg = c.master_config("z");
+    zcfg.serve.as_mut().unwrap().port = port;
+    let z = Master::open(zcfg).await.unwrap();
+    z.create_cf(CfSpec::new("c")).unwrap();
+    gate.open();
+    fail::remove("slave-after-gap");
+
+    support::wait_state(&d, "IdentityChanged halt", |s| {
+        *s == SlaveState::Halted(HaltReason::IdentityChanged)
+    })
+    .await;
+    assert_eq!(ld.bootstraps(), 1, "the foreign database was not installed");
+    assert_eq!(d.last_seq(), last);
+    assert_eq!(
+        d.get("c", b"only-before-the-failover").unwrap(),
+        Some(b"x".to_vec())
+    );
+    drop(z);
+    scenario.teardown();
+}
+
+/// Final fix wave, I2: after a repoint settled, its mode is `Refuse` (consent is single-use).
+/// A later gap request does not skip it: a DIVERGED answer halts the slave, even though the
+/// configured `DivergencePolicy::Rebootstrap` would have bootstrapped without the repoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gap_request_does_not_override_a_settled_repoints_refuse() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (d, ld, gate, port, _, last) = gap_then_upstream_lost(
+        &c,
+        |cfg| cfg.on_divergence = replicated_rocksdb::DivergencePolicy::Rebootstrap,
+        true,
+    )
+    .await;
+    let _gate = gate.open_on_drop();
+    let a = restored_master(&c, port).await;
+    gate.open();
+    fail::remove("slave-after-gap");
+
+    support::wait_state(&d, "Diverged halt", |s| {
+        *s == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
+    assert_eq!(ld.bootstraps(), 1, "nothing installed");
+    assert_eq!(d.last_seq(), last);
+    drop(a);
+    scenario.teardown();
+}

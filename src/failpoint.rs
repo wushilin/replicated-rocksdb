@@ -4,6 +4,9 @@
 //! Points: `slave-after-apply` (after an entry commits, before the listener),
 //! `slave-bootstrap-after-chunk` (after a bootstrap records message is written),
 //! `server-tail-after-entry` (the server ends the Tail stream after sending an entry),
+//! `server-tail-skip-entry` (the server leaves the next entry out of the Tail stream: a gap),
+//! `slave-after-gap` (a slave saw a gap mid-stream and requested a bootstrap under
+//! `GapPolicy::Rebootstrap`, before the session ends; `pause` or `cfg_callback`),
 //! `master-bump-epoch-write` (the synced write of `bump_epoch` fails),
 //! `slave-commit-io` (a slave's commit of a received entry fails with an I/O error),
 //! `verify-before-finish` (a slave's verify run, after the comparison, before its report is acted on; `pause`),

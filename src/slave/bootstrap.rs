@@ -166,7 +166,8 @@ pub(crate) async fn install(
         }
     }
     inner.force_bootstrap.clear(generation);
-    // A verify's request is spent once a bootstrap installs.
+    // Automatic and verify requests are spent once a bootstrap installs.
+    inner.auto_rebootstrap.clear();
     inner.verify_rebootstrap.clear();
     // A verify waiting for a seq of the old state can never be served now.
     inner.cancel_capture();

@@ -20,7 +20,7 @@ use super::bootstrap;
 use super::client::{self, Client};
 use super::config::BackoffState;
 use super::inner::Inner;
-use super::policy::{self, Action, Force};
+use super::policy::{self, Action, AutoCause, Force};
 use super::repair::{self, RepairError};
 use super::repoint::{self, RepointDivergence, RepointOutcome};
 use super::state::{HaltReason, NodeState, SlaveState};
@@ -56,8 +56,16 @@ pub(crate) fn end_for(inner: &Inner, generation: u64, action: Action) -> Session
     match action {
         Action::Halt(r) => SessionEnd::Halt(r),
         Action::Retry(m) => SessionEnd::Retry(m),
+        // A stream that ended DIVERGED under a `Rebootstrap` policy or repoint mode: consent to
+        // re-copy this same database on a DIVERGED answer only, never the operator's (I2).
+        // DIVERGED implies the upstream follows this slave's database. Without an identity
+        // (mid-bootstrap) the next handshake answers NO_LOCAL_STATE and bootstraps anyway.
         Action::Bootstrap => {
-            inner.force_bootstrap.request(generation);
+            if let Some((id, _)) = inner.ident() {
+                inner
+                    .auto_rebootstrap
+                    .request(generation, id.db_uuid, AutoCause::Diverged);
+            }
             SessionEnd::Again
         }
         // A failed call carries no handshake to repair from: the next handshake answers
@@ -350,6 +358,7 @@ async fn session(
     let after_stream_diverged = inner.diverged_on_stream.swap(false, Ordering::SeqCst);
     let force = choose_force(
         inner.force_bootstrap.is_requested_for(generation),
+        inner.auto_rebootstrap.applies(generation, hs_uuid),
         inner.verify_rebootstrap.applies(generation, hs_uuid),
         after_stream_diverged,
     );
@@ -616,12 +625,22 @@ fn contradicting_resume(after_stream_diverged: bool, resumes: bool) -> Option<Se
     (after_stream_diverged && resumes).then(|| SessionEnd::Retry(CONTRADICTION.to_string()))
 }
 
-/// Which pending request, if any, applies to this handshake. The operator's consent counts as
-/// before; a verify's never applies right after a stream reported DIVERGED.
-fn choose_force(operator: bool, verify_applies: bool, after_stream_diverged: bool) -> Force {
+/// Which pending request, if any, applies to this handshake: the operator's consent first,
+/// then the slave's own (`auto`), then a verify's. Neither automatic one ever applies right after
+/// a stream reported DIVERGED (that answer is for the policy or the repoint's mode to decide).
+fn choose_force(
+    operator: bool,
+    auto: Option<AutoCause>,
+    verify_applies: bool,
+    after_stream_diverged: bool,
+) -> Force {
     if operator {
         Force::Operator
-    } else if verify_applies && !after_stream_diverged {
+    } else if after_stream_diverged {
+        Force::None
+    } else if let Some(cause) = auto {
+        Force::Policy(cause)
+    } else if verify_applies {
         Force::Verify
     } else {
         Force::None
@@ -718,6 +737,7 @@ async fn tail(
             // ignored.
             _ = inner.rebootstrap.notified() => {
                 if inner.force_bootstrap.is_requested_for(generation)
+                    || inner.auto_rebootstrap.pending_for(generation)
                     || inner.verify_rebootstrap.pending_for(generation)
                 {
                     return SessionEnd::Again;
@@ -833,11 +853,28 @@ mod tests {
     /// handshake answers; the operator's own consent is unchanged.
     #[test]
     fn a_verify_request_never_applies_after_a_diverged_stream() {
-        assert_eq!(choose_force(false, true, false), Force::Verify);
-        assert_eq!(choose_force(false, true, true), Force::None);
-        assert_eq!(choose_force(false, false, false), Force::None);
-        assert_eq!(choose_force(true, true, false), Force::Operator);
-        assert_eq!(choose_force(true, false, true), Force::Operator);
+        assert_eq!(choose_force(false, None, true, false), Force::Verify);
+        assert_eq!(choose_force(false, None, true, true), Force::None);
+        assert_eq!(choose_force(false, None, false, false), Force::None);
+        assert_eq!(choose_force(true, None, true, false), Force::Operator);
+        assert_eq!(choose_force(true, None, false, true), Force::Operator);
+    }
+
+    /// Final fix wave, I2: the order is operator, then the slave's own request, then a
+    /// verify's; neither automatic one applies right after a stream reported DIVERGED.
+    #[test]
+    fn an_automatic_request_ranks_below_the_operator() {
+        let gap = Some(AutoCause::Gap);
+        assert_eq!(
+            choose_force(true, gap, true, false),
+            Force::Operator,
+            "the operator's consent wins"
+        );
+        assert_eq!(
+            choose_force(false, gap, true, false),
+            Force::Policy(AutoCause::Gap)
+        );
+        assert_eq!(choose_force(false, gap, true, true), Force::None);
     }
 
     /// Fix round 1, B-M2: a Tail stream that ends `DIVERGED` under the configured

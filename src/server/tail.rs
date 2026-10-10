@@ -492,6 +492,11 @@ async fn produce(
         }
         // Move available entries into the pending batch; flush when it is full or big enough.
         if let Some(entry) = ahead.pop_front() {
+            // Test hook: a buggy upstream that leaves an entry out of the stream.
+            if failpoint::fire("server-tail-skip-entry") {
+                next = entry.seq + 1;
+                continue;
+            }
             if let Err(e) = entry.verify_crc() {
                 return out.end(store_status(e)).await;
             }

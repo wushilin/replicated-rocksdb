@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use super::config::GapPolicy;
 use super::driver::SessionEnd;
 use super::inner::Inner;
+use super::policy::AutoCause;
 use super::state::HaltReason;
 use crate::error::Error;
 use crate::failpoint;
@@ -71,7 +72,14 @@ pub(crate) async fn apply(
         return Applied::End(match inner.cfg.on_log_gap {
             GapPolicy::Halt => SessionEnd::Halt(HaltReason::LogGap),
             GapPolicy::Rebootstrap => {
-                inner.force_bootstrap.request(generation);
+                // Consent to re-copy this same database, not the operator's (final review I2).
+                if let Some((id, _)) = inner.ident() {
+                    inner
+                        .auto_rebootstrap
+                        .request(generation, id.db_uuid, AutoCause::Gap);
+                }
+                // Test hook: the bootstrap is requested; the next handshake has not happened.
+                failpoint::pause("slave-after-gap").await;
                 SessionEnd::Again
             }
         });

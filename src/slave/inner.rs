@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use tokio::sync::{Notify, oneshot, watch};
 
 use super::config::{BackoffState, SlaveConfig, UpstreamConfig};
-use super::policy::Policies;
+use super::policy::{AutoCause, Policies};
 use super::repair::AffectedSet;
 use super::repoint::PendingRepoint;
 use super::state::{HaltReason, NodeState, SlaveState, SlaveStatus, lag_ms};
@@ -21,9 +21,10 @@ use crate::store::meta::{MetaSnapshot, key};
 use crate::types::{DbIdentity, EpochStart, Seq, newest_records};
 use crate::verify::VerifyReport;
 
-/// A requested bootstrap, tagged with the repoint generation it was requested for. A request
-/// of an older generation (a session of the previous upstream still winding down) is inert:
-/// only the consent given for the current upstream counts.
+/// The operator's request for a bootstrap (`clear_halt(Rebootstrap)`, with `AcceptDataLoss`),
+/// tagged with the repoint generation it was requested for. A request of an older generation
+/// (a session of the previous upstream still winding down) is inert: only the consent given for
+/// the current upstream counts. Nothing automatic sets it: see [`AutoRebootstrap`].
 #[derive(Default)]
 pub(crate) struct ForcedBootstrap(AtomicU64);
 
@@ -43,6 +44,58 @@ impl ForcedBootstrap {
         let _ = self
             .0
             .compare_exchange(generation + 1, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+/// A bootstrap the slave asked for itself, under a configured policy or a repoint's mode: a
+/// gap seen mid-stream (`GapPolicy::Rebootstrap`), or a Tail or Bootstrap stream that ended
+/// `DIVERGED` (`DivergencePolicy::Rebootstrap`, a repoint's `Rebootstrap`). Unlike
+/// [`ForcedBootstrap`] (the operator's consent to lose data), it is consent only to what caused
+/// it, from the database that caused it: it carries the repoint generation and the `db_uuid`
+/// of that upstream, converts only its cause's allowlist (`policy::Force::Policy`; never
+/// IDENTITY_CHANGED), and expires on any halt, a repoint generation change, an answer from
+/// another database, and an installed bootstrap. `clear_halt(Retry)` therefore never finds one.
+#[derive(Default)]
+pub(crate) struct AutoRebootstrap(Mutex<Option<(u64, uuid::Uuid, AutoCause)>>);
+
+impl AutoRebootstrap {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<(u64, uuid::Uuid, AutoCause)>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Requests a bootstrap from the upstream of `generation` with database `db_uuid`. A
+    /// request of an older generation never replaces a newer one.
+    pub(crate) fn request(&self, generation: u64, db_uuid: uuid::Uuid, cause: AutoCause) {
+        let mut slot = self.slot();
+        if slot.is_none_or(|(g, _, _)| g <= generation) {
+            *slot = Some((generation, db_uuid, cause));
+        }
+    }
+
+    /// A request for this generation is waiting.
+    pub(crate) fn pending_for(&self, generation: u64) -> bool {
+        self.slot().is_some_and(|(g, _, _)| g == generation)
+    }
+
+    /// The request's cause if it covers a handshake in `generation` with an upstream of
+    /// `db_uuid` (`None`: the answer carried no identity, which leaves it in place). A request
+    /// of another generation or for another database expires.
+    pub(crate) fn applies(
+        &self,
+        generation: u64,
+        db_uuid: Option<uuid::Uuid>,
+    ) -> Option<AutoCause> {
+        let mut slot = self.slot();
+        let (g, id, cause) = (*slot)?;
+        if g != generation || db_uuid.is_some_and(|u| u != id) {
+            *slot = None;
+            return None;
+        }
+        db_uuid.map(|_| cause)
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.slot() = None;
     }
 }
 
@@ -154,9 +207,12 @@ pub(crate) struct Inner {
     pub max_entry_bytes: AtomicU64,
     last_contact: Mutex<Option<SystemTime>>,
     last_error: Mutex<Option<String>>,
-    /// Set by `clear_halt(Rebootstrap)`, by a gap seen mid-stream, and by a `DIVERGED` answer
-    /// under a `Rebootstrap` policy. Scoped to the repoint generation that requested it.
+    /// Set by `clear_halt(Rebootstrap)` only: the operator's consent. Scoped to the repoint
+    /// generation that requested it.
     pub force_bootstrap: ForcedBootstrap,
+    /// Set by a gap seen mid-stream and by a stream that ended `DIVERGED` under a `Rebootstrap`
+    /// policy or repoint mode (see [`AutoRebootstrap`]).
+    pub auto_rebootstrap: AutoRebootstrap,
     /// Shared with the driver, which waits on it without holding the `Inner`.
     pub halt_cleared: Arc<Notify>,
     listener_failed: AtomicBool,
@@ -267,6 +323,7 @@ impl Inner {
             last_contact: Mutex::new(None),
             last_error: Mutex::new(None),
             force_bootstrap: ForcedBootstrap::default(),
+            auto_rebootstrap: AutoRebootstrap::default(),
             halt_cleared: Arc::new(Notify::new()),
             listener_failed: AtomicBool::new(false),
             replicas: Arc::default(),
@@ -375,6 +432,7 @@ impl Inner {
         if changed {
             // A halt means the operator decides: a stale automatic consent must not outlive it.
             if matches!(s, SlaveState::Halted(_)) {
+                self.auto_rebootstrap.clear();
                 self.verify_rebootstrap.clear();
                 self.clear_pending_repair();
             }
@@ -1027,6 +1085,48 @@ mod tests {
         i.set_state(SlaveState::Halted(HaltReason::Diverged));
         assert!(!i.verify_rebootstrap.pending_for(0));
         assert!(!i.verify_rebootstrap.applies(0, Some(id)));
+    }
+
+    /// Final fix wave, I2: an automatic bootstrap request expires on any halt, so
+    /// `clear_halt(Retry)` never finds one.
+    #[test]
+    fn any_halt_expires_an_automatic_bootstrap_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inner(dir.path());
+        let id = uuid::Uuid::from_u128(1);
+        i.auto_rebootstrap.request(0, id, AutoCause::Gap);
+        i.set_state(SlaveState::Streaming);
+        assert!(i.auto_rebootstrap.pending_for(0), "other states keep it");
+        i.set_state(SlaveState::Halted(HaltReason::Diverged));
+        assert!(!i.auto_rebootstrap.pending_for(0));
+        assert_eq!(i.auto_rebootstrap.applies(0, Some(id)), None);
+    }
+
+    /// Final fix wave, I2: an automatic request covers one repoint generation and the database
+    /// that caused it; another generation or database expires it.
+    #[test]
+    fn an_automatic_bootstrap_request_is_scoped_to_one_generation_and_one_database() {
+        let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let r = AutoRebootstrap::default();
+        assert_eq!(r.applies(0, Some(a)), None);
+        r.request(3, a, AutoCause::Diverged);
+        assert_eq!(r.applies(3, None), None, "no identity: not applied");
+        assert!(r.pending_for(3), "and not spent");
+        assert_eq!(r.applies(3, Some(a)), Some(AutoCause::Diverged));
+        assert_eq!(r.applies(3, Some(b)), None, "another database");
+        assert!(!r.pending_for(3), "expires it");
+        r.request(3, a, AutoCause::Gap);
+        assert_eq!(r.applies(4, Some(a)), None, "another generation");
+        assert!(!r.pending_for(3) && !r.pending_for(4), "expires it");
+        r.request(5, a, AutoCause::Gap);
+        r.request(4, b, AutoCause::Diverged);
+        assert_eq!(
+            r.applies(5, Some(a)),
+            Some(AutoCause::Gap),
+            "an older generation never replaces a newer request"
+        );
+        r.clear();
+        assert!(!r.pending_for(5));
     }
 
     #[test]

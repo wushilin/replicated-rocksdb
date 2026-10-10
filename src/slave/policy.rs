@@ -41,12 +41,29 @@ fn diverged(p: &Policies) -> Action {
     }
 }
 
+/// Why the slave itself asked for a bootstrap (see `inner::AutoRebootstrap`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutoCause {
+    /// A gap seen mid-stream, under `GapPolicy::Rebootstrap`.
+    Gap,
+    /// A Tail or Bootstrap stream that ended `DIVERGED`, under `DivergencePolicy::Rebootstrap`
+    /// or a repoint's `Rebootstrap` mode.
+    Diverged,
+}
+
 /// What asked for a bootstrap before this handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Force {
     None,
-    /// The operator (`clear_halt(Rebootstrap)`, a gap seen mid-stream): overrides refusals.
+    /// The operator's own consent to lose data (`clear_halt(Rebootstrap)`): overrides
+    /// refusals.
     Operator,
+    /// The slave asked for it itself, under a configured policy or a repoint's mode, against
+    /// this very upstream and database (the caller checked). Consent only to what caused it:
+    /// after a gap, RESUME and BOOTSTRAP/{NO_LOCAL_STATE, LOG_GAP} become a bootstrap (re-copy
+    /// the same history); after a stream that ended DIVERGED, only REJECT/DIVERGED does.
+    /// IDENTITY_CHANGED, and a DIVERGED after a gap, follow the normal table.
+    Policy(AutoCause),
     /// A verify run found mismatches under `MismatchPolicy::Rebootstrap`, against this very
     /// upstream and database (the caller checked). Consent to re-copy, not to lose data on
     /// divergence or a foreign database: only RESUME and BOOTSTRAP/{NO_LOCAL_STATE, LOG_GAP}
@@ -54,25 +71,29 @@ pub(crate) enum Force {
     Verify,
 }
 
-/// The action for a handshake answer. `Force::Operator` is set by `clear_halt(Rebootstrap)`
-/// and by a gap seen mid-stream: any answer that lets the client proceed (RESUME, BOOTSTRAP,
-/// or REJECT/DIVERGED) becomes a bootstrap. A pending force therefore overrides
-/// `IdentityPolicy::Refuse` and `DivergencePolicy::Halt`; that is intended, because the
-/// operator asked for it through `clear_halt`. Rejections that retrying or reconfiguring
-/// cannot fix (protocol, envelope, loop, stale epoch, not ready) are not overridden.
+/// The action for a handshake answer. Only `Force::Operator` (`clear_halt(Rebootstrap)`)
+/// turns any answer that lets the client proceed (RESUME, BOOTSTRAP, or REJECT/DIVERGED) into
+/// a bootstrap, overriding `IdentityPolicy::Refuse` and `DivergencePolicy::Halt`: the operator
+/// asked for it. `Force::Policy` and `Force::Verify` are automatic consents and convert only
+/// their own allowlist (see [`Force`]); everything else follows the table. Rejections that
+/// retrying or reconfiguring cannot fix (protocol, envelope, loop, stale epoch, not ready) are
+/// never overridden.
 pub(crate) fn after_handshake(r: &pb::HandshakeResponse, p: &Policies, force: Force) -> Action {
     let decision = Decision::try_from(r.decision).unwrap_or(Decision::Unspecified);
     let reason = Reason::try_from(r.reason).unwrap_or(Reason::Unspecified);
-    let proceed = matches!(decision, Decision::Resume | Decision::Bootstrap)
-        || (decision == Decision::Reject && reason == Reason::Diverged);
-    if force == Force::Operator && proceed {
-        return Action::Bootstrap;
-    }
-    if force == Force::Verify
-        && (decision == Decision::Resume
-            || (decision == Decision::Bootstrap
-                && matches!(reason, Reason::NoLocalState | Reason::LogGap)))
-    {
+    let needs_data = decision == Decision::Resume
+        || (decision == Decision::Bootstrap
+            && matches!(reason, Reason::NoLocalState | Reason::LogGap));
+    let is_diverged = decision == Decision::Reject && reason == Reason::Diverged;
+    let converted = match force {
+        Force::None => false,
+        Force::Operator => {
+            matches!(decision, Decision::Resume | Decision::Bootstrap) || is_diverged
+        }
+        Force::Verify | Force::Policy(AutoCause::Gap) => needs_data,
+        Force::Policy(AutoCause::Diverged) => is_diverged,
+    };
+    if converted {
         return Action::Bootstrap;
     }
     let unexpected = || {
@@ -354,6 +375,73 @@ mod tests {
             verify(Bootstrap, Reason::IdentityChanged),
             Action::Halt(HaltReason::IdentityChanged)
         );
+    }
+
+    /// Final fix wave, I2: a bootstrap the slave requested itself (`Force::Policy`) is not the
+    /// operator's consent. After a gap it re-copies the same history (RESUME and need-data
+    /// BOOTSTRAP answers) and after a stream that ended DIVERGED it covers only DIVERGED; it never
+    /// overrides IDENTITY_CHANGED, nor a DIVERGED the configured policy does not cover.
+    #[test]
+    fn a_policy_request_converts_only_its_own_allowlist() {
+        use Decision::{Bootstrap, Reject, Resume};
+        let rows = [
+            (Resume, Reason::Unspecified),
+            (Resume, Reason::EpochAdvanced),
+            (Bootstrap, Reason::NoLocalState),
+            (Bootstrap, Reason::LogGap),
+            (Bootstrap, Reason::IdentityChanged),
+            (Bootstrap, Reason::Unspecified),
+            (Reject, Reason::Diverged),
+            (Reject, Reason::StaleEpoch),
+            (Reject, Reason::NotReady),
+            (Reject, Reason::ProtocolMismatch),
+            (Reject, Reason::EnvelopeMismatch),
+            (Reject, Reason::LoopDetected),
+            (Decision::Unspecified, Reason::Unspecified),
+        ];
+        for p in [&DEFAULTS, &OPPOSITE] {
+            let normal = |d, r| after_handshake(&answer(d, r), p, Force::None);
+            for (cause, converts) in [
+                (
+                    AutoCause::Gap,
+                    &[
+                        (Resume, Reason::Unspecified),
+                        (Resume, Reason::EpochAdvanced),
+                        (Bootstrap, Reason::NoLocalState),
+                        (Bootstrap, Reason::LogGap),
+                    ][..],
+                ),
+                (AutoCause::Diverged, &[(Reject, Reason::Diverged)][..]),
+            ] {
+                let auto = |d, r| after_handshake(&answer(d, r), p, Force::Policy(cause));
+                for (d, r) in rows {
+                    let want = if converts.contains(&(d, r)) {
+                        Action::Bootstrap
+                    } else {
+                        normal(d, r)
+                    };
+                    assert_eq!(auto(d, r), want, "{cause:?}: {d:?}/{r:?}");
+                }
+            }
+        }
+        // Under the defaults: a gap request leaves a later divergence and a foreign database to
+        // the policies, which halt.
+        let gap = |d, r| after_handshake(&answer(d, r), &DEFAULTS, Force::Policy(AutoCause::Gap));
+        assert_eq!(
+            gap(Reject, Reason::Diverged),
+            Action::Halt(HaltReason::Diverged)
+        );
+        assert_eq!(
+            gap(Bootstrap, Reason::IdentityChanged),
+            Action::Halt(HaltReason::IdentityChanged)
+        );
+        let div =
+            |d, r| after_handshake(&answer(d, r), &DEFAULTS, Force::Policy(AutoCause::Diverged));
+        assert_eq!(
+            div(Bootstrap, Reason::IdentityChanged),
+            Action::Halt(HaltReason::IdentityChanged)
+        );
+        assert_eq!(div(Resume, Reason::Unspecified), Action::Tail);
     }
 
     /// N1: a verify rebootstrap converts only an explicit allowlist of BOOTSTRAP reasons; a
