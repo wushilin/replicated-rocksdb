@@ -14,21 +14,26 @@ use crate::types::{LogEntry, Seq};
 /// data write; RocksDB may still touch its info LOG). `None` when there is no database or it never stored a role (missing directory,
 /// empty directory, or a crash during first creation).
 pub(crate) fn stored_meta(path: &Path) -> Result<Option<MetaSnapshot>> {
-    if !path.join("CURRENT").exists() {
-        return Ok(None);
-    }
-    if !DB::list_cf(&Options::default(), path)?
-        .iter()
-        .any(|n| n == CF_META)
-    {
+    if stored_cfs(path)?.is_none() {
         return Ok(None);
     }
     super::read_meta_read_only(path)
 }
 
-/// A read-only view of a closed store: its `__meta` and `__changelog`. Opening it takes no
-/// LOCK and writes nothing, so a fenced master's directory stays exactly as it was. Drop it
-/// before opening the directory for writing.
+/// The column families of the database at `path`; `None` when there is no database or it has
+/// no `__meta` (see [`stored_meta`]).
+fn stored_cfs(path: &Path) -> Result<Option<Vec<String>>> {
+    if !path.join("CURRENT").exists() {
+        return Ok(None);
+    }
+    let cfs = DB::list_cf(&Options::default(), path)?;
+    Ok(cfs.iter().any(|n| n == CF_META).then_some(cfs))
+}
+
+/// A read-only view of a closed store: its `__meta` and `__changelog`, both read through one
+/// read-only open (one consistent view). Opening it takes no LOCK and writes nothing, so a
+/// fenced master's directory stays exactly as it was. Drop it before opening the directory
+/// for writing.
 pub(crate) struct OfflineLog {
     db: DB,
     meta: MetaSnapshot,
@@ -37,18 +42,26 @@ pub(crate) struct OfflineLog {
 impl OfflineLog {
     /// `None` when `path` holds no stored role (see [`stored_meta`]).
     pub(crate) fn open(path: &Path) -> Result<Option<OfflineLog>> {
-        let Some(meta) = stored_meta(path)? else {
+        let Some(cfs) = stored_cfs(path)? else {
             return Ok(None);
         };
-        let db = DB::open_cf_descriptors_read_only(
-            &Options::default(),
-            path,
-            [
-                ColumnFamilyDescriptor::new(CF_META, Options::default()),
-                ColumnFamilyDescriptor::new(CF_CHANGELOG, Options::default()),
-            ],
-            false,
-        )?;
+        let mut descriptors = vec![ColumnFamilyDescriptor::new(CF_META, Options::default())];
+        if cfs.iter().any(|n| n == CF_CHANGELOG) {
+            descriptors.push(ColumnFamilyDescriptor::new(
+                CF_CHANGELOG,
+                Options::default(),
+            ));
+        }
+        let db = DB::open_cf_descriptors_read_only(&Options::default(), path, descriptors, false)?;
+        let meta = {
+            let cf = db
+                .cf_handle(CF_META)
+                .ok_or_else(|| Error::corrupt("__meta missing in read-only open"))?;
+            MetaSnapshot::load(|k| Ok(db.get_cf(&cf, k)?))?
+        };
+        let Some(meta) = meta else {
+            return Ok(None);
+        };
         Ok(Some(OfflineLog { db, meta }))
     }
 

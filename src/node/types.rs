@@ -22,9 +22,11 @@ pub enum FenceReason {
     /// The peer reports `role == Master`.
     PeerIsMaster { peer: String },
     /// The peer holds more of a compatible history, or knows an epoch at or above this
-    /// node's newest one (in its history, identity or `max_burned_epoch`).
+    /// node's newest one (in its identity or `max_burned_epoch`).
     PeerAhead { peer: String },
-    /// The peer's history and this node's hold different entries.
+    /// The peer's history and this node's hold different entries, or the peer's epoch history
+    /// holds a record (epoch, start, nonce) this node's does not, at any epoch number: another
+    /// writer exists.
     PeerDiverged { peer: String },
     /// The peer answered `Status` with an error, or belongs to another database.
     PeerError { peer: String, error: String },
