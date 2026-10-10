@@ -139,8 +139,7 @@ impl NodeState {
     }
 }
 
-/// A snapshot of a slave's replication status. More fields will be added (`lag_ms` and
-/// `last_verify` in Plan 3), hence `non_exhaustive`.
+/// A snapshot of a slave's replication status. More fields may be added, hence `non_exhaustive`.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct SlaveStatus {
@@ -150,6 +149,10 @@ pub struct SlaveStatus {
     pub first_retained_seq: Seq,
     pub upstream_last_seq: Seq,
     pub origin_last_seq: Seq,
+    /// 0 when `applied_seq >= origin_last_seq`; while behind, `now − ts_ms` of the last
+    /// applied entry; `None` while that timestamp is unknown (after a bootstrap, until the
+    /// next entry).
+    pub lag_ms: Option<u64>,
     /// The address of the current upstream (the target of the latest `Slave::repoint`, if any).
     pub upstream: String,
     /// Node ids from the upstream to the master, closest first.
@@ -161,6 +164,19 @@ pub struct SlaveStatus {
     pub listener_failed: bool,
     /// The last verify report (scheduled or `verify_now`), if any run produced one.
     pub last_verify: Option<VerifyReport>,
+}
+
+/// Replication lag in ms; see [`SlaveStatus::lag_ms`]. `last_applied_ts = 0` means unknown.
+pub(crate) fn lag_ms(
+    applied: Seq,
+    origin_last: Seq,
+    last_applied_ts: u64,
+    now_ms: u64,
+) -> Option<u64> {
+    if applied >= origin_last {
+        return Some(0);
+    }
+    (last_applied_ts > 0).then(|| now_ms.saturating_sub(last_applied_ts))
 }
 
 #[cfg(test)]
@@ -208,6 +224,31 @@ mod tests {
                 HaltReason::Corrupt,
                 HaltReason::SpecMismatch
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod lag_tests {
+    use super::lag_ms;
+
+    #[test]
+    fn lag_is_zero_when_caught_up_and_unknown_without_a_timestamp() {
+        assert_eq!(
+            lag_ms(10, 10, 0, 5),
+            Some(0),
+            "caught up, even without a timestamp"
+        );
+        assert_eq!(lag_ms(10, 12, 1_000, 4_000), Some(3_000));
+        assert_eq!(
+            lag_ms(10, 12, 0, 4_000),
+            None,
+            "behind, timestamp unknown (after a bootstrap)"
+        );
+        assert_eq!(
+            lag_ms(10, 12, 5_000, 4_000),
+            Some(0),
+            "clock skew never makes it negative"
         );
     }
 }

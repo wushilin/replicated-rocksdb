@@ -643,13 +643,14 @@ pub struct SlaveStatus {
     pub upstream_last_seq: Seq,
     pub origin_last_seq: Seq,
     pub upstream: String,                    // address of the current upstream (the latest repoint's target)
-    pub lag_ms: Option<u64>,                 // now − ts_ms of the last applied entry, while behind
+    pub lag_ms: Option<u64>,                 // 0 when caught up; while behind, now − ts_ms of the last
+                                             // applied entry; None while that ts is unknown (after a bootstrap)
     pub upstream_chain: Vec<String>,
     pub last_contact: Option<SystemTime>,
     pub last_verify: Option<VerifyReport>,
     pub last_error: Option<String>,          // last connection/handshake problem, e.g. STALE_EPOCH
     pub listener_failed: bool,               // the listener panicked; disabled until restart
-    // `SlaveStatus` is #[non_exhaustive]; `lag_ms` and `last_verify` above arrive in Plan 3.
+    // `SlaveStatus` is #[non_exhaustive].
 }
 
 impl Slave {

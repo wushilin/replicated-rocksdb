@@ -132,6 +132,7 @@ pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) 
     }
     inner.upstream_last_seq.fetch_max(seq, Ordering::SeqCst);
     inner.origin_last_seq.fetch_max(seq, Ordering::SeqCst);
+    inner.last_applied_ts.store(entry.ts_ms, Ordering::SeqCst);
     tracing::trace!(node = %inner.cfg.identifier, seq, "applied");
     if failpoint::fire("slave-after-apply") {
         // Emulated crash between commit and listener: freeze until the test kills the node.

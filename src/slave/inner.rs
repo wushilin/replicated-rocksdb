@@ -11,7 +11,7 @@ use tokio::sync::{Notify, oneshot, watch};
 use super::config::{SlaveConfig, UpstreamConfig};
 use super::policy::Policies;
 use super::repoint::PendingRepoint;
-use super::state::{HaltReason, NodeState, SlaveState, SlaveStatus};
+use super::state::{HaltReason, NodeState, SlaveState, SlaveStatus, lag_ms};
 use crate::error::{Error, Result};
 use crate::listener::ReplicationListener;
 use crate::read::ReadSnapshot;
@@ -173,8 +173,7 @@ pub(crate) struct Inner {
     pub verify_lock: tokio::sync::Mutex<()>,
     last_verify: Mutex<Option<VerifyReport>>,
     /// `ts_ms` of the last applied entry; 0 = unknown (right after a bootstrap).
-    // Read by the replication lag status (Plan 3 Task 7), which also keeps it current.
-    #[allow(dead_code)]
+    /// Kept current by the apply path and cleared by a bootstrap install; read by `status`.
     pub last_applied_ts: AtomicU64,
     /// Wakes the tail loop when a verify asks for a re-bootstrap.
     pub rebootstrap: Notify,
@@ -426,16 +425,23 @@ impl Inner {
 
     pub(crate) fn status(&self) -> SlaveStatus {
         let pos = self.store.position();
+        let origin_last_seq = self
+            .origin_last_seq
+            .load(Ordering::SeqCst)
+            .max(pos.last_seq);
         SlaveStatus {
             state: self.state(),
             origin_identity: self.ident().map(|(id, _)| id),
             applied_seq: pos.last_seq,
             first_retained_seq: self.store.first_retained_seq(),
             upstream_last_seq: self.upstream_last_seq.load(Ordering::SeqCst),
-            origin_last_seq: self
-                .origin_last_seq
-                .load(Ordering::SeqCst)
-                .max(pos.last_seq),
+            origin_last_seq,
+            lag_ms: lag_ms(
+                pos.last_seq,
+                origin_last_seq,
+                self.last_applied_ts.load(Ordering::SeqCst),
+                self.now_ms(),
+            ),
             upstream: self.upstream_uri(),
             upstream_chain: self.upstream_chain(),
             last_contact: *self
