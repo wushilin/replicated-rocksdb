@@ -60,3 +60,19 @@ Status: agreed with the user, 2026-10-09. To be merged into DESIGN.md and PROTOC
 
 - Acks: `replicas()` reports applied_seq/lag accurately while a replica lags and catches up; ack monotonicity violations rejected.
 - Write concern: N=1 with no replica → NotEnoughReplicas (no seq consumed); with a replica → returns after its ack; replica killed (failpoint/kill) → AckTimeout and the entry is still replicated after the replica returns; lagging replica drops out of ISR and rejoins; master killed after an acked write → promote_checked the in-sync replica → write present.
+
+## 7. Epoch nonces and per-open epochs (agreed 2026-10-10)
+
+Goal: decide compatibility of two histories exactly from the epoch history alone, so a peer whose log entries were trimmed is never "unverifiable".
+
+- **History record** becomes `EpochStart { epoch: u64, start_seq: u64, nonce: u64 }`. `nonce` is a random 64-bit value created when the epoch starts (fresh master, `bump_epoch`, promotion, and every master open — below). It is persisted with the history and carried wherever the history travels (handshake response, bootstrap header, Status RPC).
+- **Ordering is decided by the u64s only:** newest epoch number, then `last_seq`. The nonce never influences which node is later.
+- **The nonce only verifies identity:** two records with the same `epoch` are the same epoch iff their nonces are equal (start_seq must then also be equal). A nonce mismatch proves the histories forked at that epoch's start; the fork is the smaller of the two `start_seq`s. Collision probability 2⁻⁶⁴ per comparison.
+- **Every master open starts a new epoch** (fresh nonce, `start_seq = last_seq + 1`), like a Raft term / Kafka leader epoch. Consequences:
+  - Within one epoch there is exactly one writer process, so "same seq, same epoch, different content" is impossible; divergence can only begin at an epoch boundary.
+  - Restoring a master from a backup no longer needs `bump_epoch_on_open`: replicas holding entries at or after the restored node's new epoch start (in an epoch the restored history lacks) are `DIVERGED` by history alone. `bump_epoch_on_open` is kept as a no-op-compatible option (documented as redundant).
+  - Replicas at or behind the restart point move to the new epoch via `EPOCH_ADVANCED` without a bootstrap. History grows by one record per master open.
+- **Comparisons** (`decide` rules 6–10, `admin::compare`, `check_promotion`, repair fork search) first compare histories record by record: the first epoch record whose number matches but nonce differs, or that exists in one history and not the other below both nodes' positions, determines the fork exactly. Entry-CRC probes remain as a second line of defence, never a requirement.
+- **`promote_checked`:** a behind peer is compatible iff its history (with nonces) is a prefix of the candidate's up to its position; otherwise it is diverged with an exact fork, which blocks via `PromotionWouldDiscard` when the peer holds entries at or past the fork. `PromotionUnverifiable` remains only for peers whose Status could not be read (answered with an error) — still blocking.
+- **Wire/format:** `EpochStart.nonce` (proto field 3), local meta history encoding; `HandshakeRequest.known_epoch_start` is superseded by sending the client's newest record `{epoch, start_seq, nonce}`. PROTOCOL_VERSION stays 1 (pre-release).
+- Lands as Plan 3 Task 0b (before verify and repair), with handshake unit tests, promotion e2e (trimmed behind peer: compatible → not blocking; diverged → blocking), restore-without-bump e2e (detected DIVERGED with no bump), master restart e2e (followers EPOCH_ADVANCED, no bootstrap).
