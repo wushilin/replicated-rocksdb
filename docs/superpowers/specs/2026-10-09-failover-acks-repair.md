@@ -76,3 +76,15 @@ Goal: decide compatibility of two histories exactly from the epoch history alone
 - **`promote_checked`:** a behind peer is compatible iff its history (with nonces) is a prefix of the candidate's up to its position; otherwise it is diverged with an exact fork, which blocks via `PromotionWouldDiscard` when the peer holds entries at or past the fork. `PromotionUnverifiable` remains only for peers whose Status could not be read (answered with an error) — still blocking.
 - **Wire/format:** `EpochStart.nonce` (proto field 3), local meta history encoding; `HandshakeRequest.known_epoch_start` is superseded by sending the client's newest record `{epoch, start_seq, nonce}`. PROTOCOL_VERSION stays 1 (pre-release).
 - Lands as Plan 3 Task 0b (before verify and repair), with handshake unit tests, promotion e2e (trimmed behind peer: compatible → not blocking; diverged → blocking), restore-without-bump e2e (detected DIVERGED with no bump), master restart e2e (followers EPOCH_ADVANCED, no bootstrap).
+
+## 8. API ergonomics (agreed 2026-10-10)
+
+From writing the user-facing examples:
+- **CF operations are exempt from the configured write concern.** `create_cf`/`drop_cf` carry no user data and converge once replicated, so they always commit with the async default (fsync on the master only), whatever `MasterConfig::write_concern` says. Documented on both methods and in DESIGN §5.2.
+- `Master::wait_in_sync(n: usize, timeout) -> Result<()>` (async): resolves when at least `n` direct replicas are in sync; `Err(Timeout)` otherwise.
+- `Slave::wait_streaming(timeout) -> Result<()>` (async): resolves when the slave is `Streaming`; `Err(Halted(r))` if it halts, `Err(Timeout)` otherwise.
+- `PromoteRefused::into_parts() -> (Error, Option<Slave>)` and `DemoteRefused::into_parts() -> (Error, Option<Master>)`; rustdoc shows the pattern for keeping the node while still using `?`.
+- `MasterConfig::from_slave_config(&SlaveConfig, serve: Option<ServeConfig>) -> MasterConfig` (same identifier, path, retention, tuning, clock).
+- Inherent `last_seq()` on `Master` and `Slave` (no `LogApi` import needed).
+- `admin::gather`/`node_status` unreachable entries carry a short single-line reason (full chain available via the error's `source()` / Debug).
+- The examples in `examples/` are updated to use these.
