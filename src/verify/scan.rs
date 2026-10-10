@@ -59,7 +59,8 @@ pub(crate) fn list_range(
     Ok((l.keys, l.truncated))
 }
 
-/// Sleeps as long as `throttle` asks for after reading `n` bytes.
+/// Blocking: sleeps the OS thread (`std::thread::sleep`); async callers must run it inside
+/// `spawn_blocking` / `background::blocking`. Sleeps as long as `throttle` asks for after reading `n` bytes.
 pub(crate) fn pace(throttle: &Mutex<Throttle>, n: u64) {
     let pause = throttle
         .lock()
@@ -70,7 +71,8 @@ pub(crate) fn pace(throttle: &Mutex<Throttle>, n: u64) {
     }
 }
 
-/// The local records of a range, for narrowing.
+/// The local records of a range, for narrowing. Blocking (RocksDB reads plus [`pace`]): call
+/// only from `spawn_blocking` / `background::blocking`.
 pub(crate) fn load_range(
     snap: &ReadSnapshot,
     cf: Arc<PhysCf>,
@@ -89,7 +91,12 @@ pub(crate) fn load_range(
 }
 
 /// Cuts a whole CF into contiguous ranges and hands each to `emit` as soon as it is closed.
-/// Stops early (without error) when `emit` returns `false`. Returns the number of keys read.
+/// Blocking (RocksDB reads plus [`pace`]): call only from `spawn_blocking` /
+/// `background::blocking`.
+///
+/// Returns `Some(keys read)` when the whole CF was cut and emitted. Returns `None` when
+/// `emit` returned `false` and the scan stopped early: ranges are then missing, so callers
+/// must treat it as an abort, never as a complete scan.
 pub(crate) fn chunk_cf(
     snap: &ReadSnapshot,
     cf: Arc<PhysCf>,
@@ -98,7 +105,7 @@ pub(crate) fn chunk_cf(
     chunk_bytes: usize,
     throttle: &Mutex<Throttle>,
     mut emit: impl FnMut(LocalRange) -> bool,
-) -> Result<u64> {
+) -> Result<Option<u64>> {
     let mut chunker = Chunker::new(mode, chunk_keys, chunk_bytes);
     let mut keys = 0u64;
     let mut open = true;
@@ -116,10 +123,13 @@ pub(crate) fn chunk_cf(
             Ok(open)
         },
     )?;
-    if open {
-        emit(chunker.finish());
+    if !open {
+        return Ok(None);
     }
-    Ok(keys)
+    if !emit(chunker.finish()) {
+        return Ok(None);
+    }
+    Ok(Some(keys))
 }
 
 #[cfg(test)]
@@ -277,7 +287,7 @@ mod tests {
         )
         .unwrap();
         let snap = store.read_snapshot(0).unwrap();
-        let o = KeyOrder::new(&tuning.comparators, Some("reverse"));
+        let o = KeyOrder::new(&tuning.comparators, Some("reverse")).unwrap();
         let cf = snap.phys("r").unwrap();
         // [e, b) under reverse order is e, d, c.
         let (keys, more) = list_range(
@@ -327,7 +337,7 @@ mod tests {
             true
         })
         .unwrap();
-        assert_eq!(n, 6);
+        assert_eq!(n, Some(6));
         assert_eq!(ranges.len(), 2);
         assert_eq!(
             ranges[0].bounds.upper.as_deref(),

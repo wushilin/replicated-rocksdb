@@ -15,7 +15,7 @@ use super::{
     CfVersion, MAX_BOUNDARY_KEY_BYTES, MAX_LIST_LIMIT, MAX_RESUME_KEY_BYTES, Mismatch,
     VERIFY_WINDOW,
 };
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::pb;
 use crate::types::CfEntry;
 
@@ -34,6 +34,7 @@ pub(crate) trait Oracle {
 }
 
 /// The local side: the records of a range, read from the same snapshot as the ranges.
+/// Implementations over `scan::load_range` block the thread: run them in `spawn_blocking`.
 pub(crate) trait LocalSide {
     async fn load(&self, bounds: &Bounds) -> Result<Vec<LocalRecord>>;
 }
@@ -108,6 +109,13 @@ pub(crate) async fn compare_cf<O: Oracle, L: LocalSide>(
         };
         if batch.len() == VERIFY_WINDOW || (done && !batch.is_empty()) {
             let matched = oracle.hash(run.cf, &batch).await?;
+            if matched.len() != batch.len() {
+                return Err(Error::corrupt(format!(
+                    "verify upstream answered {} of {} hash requests",
+                    matched.len(),
+                    batch.len()
+                )));
+            }
             for (r, ok) in batch.drain(..).zip(matched) {
                 if !ok {
                     mismatched.push(r.bounds);
@@ -120,7 +128,13 @@ pub(crate) async fn compare_cf<O: Oracle, L: LocalSide>(
     }
     for bounds in mismatched {
         let records = local.load(&bounds).await?;
+        let before = run.out.len();
+        let (lower, upper) = (bounds.lower.clone(), bounds.upper.clone());
         narrow(oracle, run, bounds, &records).await?;
+        if run.out.len() == before {
+            // The hash said "differs" but the key diff found nothing: never end clean.
+            run.range(lower, upper);
+        }
     }
     Ok(())
 }
@@ -170,6 +184,12 @@ async fn narrow<O: Oracle>(
             &recs[i..],
         );
         let matched = oracle.hash(run.cf, &[left.clone(), right.clone()]).await?;
+        if matched.len() != 2 {
+            return Err(Error::corrupt(format!(
+                "verify upstream answered {} of 2 hash requests",
+                matched.len()
+            )));
+        }
         // Right first, so the left half is narrowed (and reported) first.
         if !matched[1] {
             stack.push((right.bounds, idx.start + i..idx.end));
@@ -201,23 +221,24 @@ async fn list_and_diff<O: Oracle>(
                 continue;
             }
             // Local keys before `u` exist only locally.
-            while i < local.len() && run.order.cmp(&local[i].key, &u.key) == Ordering::Less {
+            // Keys are paired by their bytes; the comparator only drives the merge order, so two
+            // keys it ranks equal but whose bytes differ are one local-only and one upstream-only.
+            while i < local.len() && precedes(&run.order, &local[i].key, &u.key) {
                 if !run.key(&local[i].key, Some(local[i].write_seq), None) {
                     run.range(Some(local[i].key.clone()), bounds.upper.clone());
                     return Ok(());
                 }
                 i += 1;
             }
-            let reported =
-                if i < local.len() && run.order.cmp(&local[i].key, &u.key) == Ordering::Equal {
-                    let l = &local[i];
-                    i += 1;
-                    let same = l.write_seq == u.write_seq
-                        && blake3::hash(&l.payload).as_bytes()[..] == u.payload_hash[..];
-                    same || run.key(&u.key, Some(l.write_seq), Some(u.write_seq))
-                } else {
-                    run.key(&u.key, None, Some(u.write_seq))
-                };
+            let reported = if i < local.len() && local[i].key == u.key {
+                let l = &local[i];
+                i += 1;
+                let same = l.write_seq == u.write_seq
+                    && blake3::hash(&l.payload).as_bytes()[..] == u.payload_hash[..];
+                same || run.key(&u.key, Some(l.write_seq), Some(u.write_seq))
+            } else {
+                run.key(&u.key, None, Some(u.write_seq))
+            };
             if !reported {
                 run.range(Some(u.key.clone()), bounds.upper.clone());
                 return Ok(());
@@ -248,6 +269,16 @@ async fn list_and_diff<O: Oracle>(
         i += 1;
     }
     Ok(())
+}
+
+/// True when local key `l` must be emitted before upstream key `u`: it sorts first, or the
+/// order ranks them equal although their bytes differ.
+fn precedes(order: &KeyOrder, l: &[u8], u: &[u8]) -> bool {
+    match order.cmp(l, u) {
+        Ordering::Less => true,
+        Ordering::Equal => l != u,
+        Ordering::Greater => false,
+    }
 }
 
 fn version(e: &CfEntry) -> CfVersion {
@@ -309,6 +340,8 @@ mod tests {
         soft_bytes: usize,
         hash_batches: Vec<usize>,
         lists: Vec<Bounds>,
+        lie: bool,
+        short_from: Option<usize>,
     }
 
     impl Fake {
@@ -320,6 +353,8 @@ mod tests {
                 soft_bytes: usize::MAX,
                 hash_batches: Vec::new(),
                 lists: Vec::new(),
+                lie: false,
+                short_from: None,
             }
         }
 
@@ -336,16 +371,21 @@ mod tests {
     impl Oracle for Fake {
         async fn hash(&mut self, _cf: &str, ranges: &[LocalRange]) -> Result<Vec<bool>> {
             self.hash_batches.push(ranges.len());
-            Ok(ranges
+            let call = self.hash_batches.len() - 1;
+            let mut v: Vec<bool> = ranges
                 .iter()
                 .map(|r| {
                     let mut h = RangeHasher::new(self.mode);
                     for (k, v) in self.in_range(&r.bounds) {
                         h.add(k, v).unwrap();
                     }
-                    h.finish() == (r.count, r.hash)
+                    !self.lie && h.finish() == (r.count, r.hash)
                 })
-                .collect())
+                .collect();
+            if self.short_from.is_some_and(|n| call >= n) {
+                v.pop();
+            }
+            Ok(v)
         }
 
         async fn list(
@@ -401,6 +441,18 @@ mod tests {
         min_chunk_keys: usize,
         budget: usize,
     ) -> Vec<Mismatch> {
+        try_run(local, upstream, chunk_keys, min_chunk_keys, budget)
+            .await
+            .unwrap()
+    }
+
+    async fn try_run(
+        local: Data,
+        upstream: &mut Fake,
+        chunk_keys: usize,
+        min_chunk_keys: usize,
+        budget: usize,
+    ) -> Result<Vec<Mismatch>> {
         let mode = upstream.mode;
         let (tx, mut rx) = mpsc::channel(4);
         let ranges = {
@@ -418,7 +470,7 @@ mod tests {
             }
         });
         let side = Local {
-            order: KeyOrder::bytewise(),
+            order: upstream.order.clone(),
             mode,
             data: local,
         };
@@ -426,13 +478,13 @@ mod tests {
         let mut out = Vec::new();
         let mut cf = CfRun {
             cf: "c",
-            order: KeyOrder::bytewise(),
+            order: upstream.order.clone(),
             min_chunk_keys,
             budget: &mut budget,
             out: &mut out,
         };
-        compare_cf(upstream, &side, &mut cf, &mut rx).await.unwrap();
-        out
+        compare_cf(upstream, &side, &mut cf, &mut rx).await?;
+        Ok(out)
     }
 
     fn key(k: &str, local: Option<u64>, upstream: Option<u64>) -> Mismatch {
@@ -591,6 +643,54 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn ci() -> KeyOrder {
+        let mut reg = crate::tuning::ComparatorRegistry::default();
+        reg.register("ci", |a: &[u8], b: &[u8]| {
+            a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
+        });
+        KeyOrder::new(&reg, Some("ci")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn keys_the_comparator_ranks_equal_but_with_other_bytes_are_reported() {
+        let rec = |k: &str| (k.as_bytes().to_vec(), encode(5, None, b"v"));
+        let mut up = Fake::new(vec![rec("user:a")], VerifyMode::Full);
+        up.order = ci();
+        let out = run(vec![rec("user:A")], &mut up, 10, 4, 100).await;
+        assert_eq!(
+            out,
+            vec![key("user:A", Some(5), None), key("user:a", None, Some(5))]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hash_mismatch_that_the_diff_cannot_explain_is_a_range() {
+        let mut up = Fake::new(data(40), VerifyMode::Full);
+        up.lie = true; // every hash "mismatches", yet the listings are identical
+        let out = run(data(40), &mut up, 100, 4, 100).await;
+        assert_eq!(
+            out,
+            vec![Mismatch::Range {
+                cf: "c".into(),
+                lower: None,
+                upper: None
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_oracle_answer_is_an_error_not_a_match() {
+        let mut up = Fake::new(data(40), VerifyMode::Full);
+        up.short_from = Some(0);
+        assert!(try_run(data(40), &mut up, 10, 4, 100).await.is_err());
+        // Short only while narrowing (the first window is answered in full).
+        let mut upstream = data(40);
+        upstream[5].1 = encode(99, None, b"x");
+        let mut up = Fake::new(upstream, VerifyMode::Full);
+        up.short_from = Some(1);
+        assert!(try_run(data(40), &mut up, 10, 2, 100).await.is_err());
     }
 
     #[test]

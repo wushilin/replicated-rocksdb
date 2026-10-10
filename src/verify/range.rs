@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use super::{MAX_BOUNDARY_KEY_BYTES, VerifyMode};
 use crate::codec::digest::Digest;
 use crate::codec::envelope;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::pb;
 use crate::tuning::{ComparatorRegistry, CompareFn};
 use crate::types::Seq;
@@ -23,9 +23,16 @@ impl KeyOrder {
         KeyOrder(None)
     }
 
-    /// `None`, or a name that is not registered, is bytewise (as in `ComparatorRegistry::compare`).
-    pub(crate) fn new(reg: &ComparatorRegistry, name: Option<&str>) -> Self {
-        KeyOrder(name.and_then(|n| reg.get(n)))
+    /// `None` is bytewise. A name that is not registered is an error: guessing bytewise would
+    /// make ranges disagree with the CF's real order.
+    pub(crate) fn new(reg: &ComparatorRegistry, name: Option<&str>) -> Result<Self> {
+        match name {
+            None => Ok(KeyOrder(None)),
+            Some(n) => reg
+                .get(n)
+                .map(|f| KeyOrder(Some(f)))
+                .ok_or_else(|| Error::Config(format!("comparator {n:?} is not registered"))),
+        }
     }
 
     pub(crate) fn cmp(&self, a: &[u8], b: &[u8]) -> Ordering {
@@ -374,10 +381,17 @@ mod tests {
     }
 
     #[test]
+    fn an_unregistered_comparator_is_an_error() {
+        let reg = ComparatorRegistry::default();
+        assert!(KeyOrder::new(&reg, Some("nope")).is_err());
+        assert!(KeyOrder::new(&reg, None).is_ok());
+    }
+
+    #[test]
     fn custom_order_decides_containment() {
         let mut reg = ComparatorRegistry::default();
         reg.register("reverse", |a: &[u8], b: &[u8]| b.cmp(a));
-        let o = KeyOrder::new(&reg, Some("reverse"));
+        let o = KeyOrder::new(&reg, Some("reverse")).unwrap();
         let b = Bounds {
             lower: Some(b"m".to_vec()),
             upper: Some(b"c".to_vec()),
