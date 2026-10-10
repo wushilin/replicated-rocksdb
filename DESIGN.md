@@ -643,8 +643,10 @@ pub struct SlaveStatus {
     pub upstream_last_seq: Seq,
     pub origin_last_seq: Seq,
     pub upstream: String,                    // address of the current upstream (the latest repoint's target)
-    pub lag_ms: Option<u64>,                 // 0 when caught up; while behind, now − ts_ms of the last
-                                             // applied entry; None while that ts is unknown (after a bootstrap)
+    pub lag_ms: Option<u64>,                 // 0 when caught up; while behind, now − ts_ms of the oldest entry
+                                             // received but not yet applied; if none is received yet, now − ts_ms
+                                             // of the last applied entry (an upper bound: it includes the
+                                             // master's idle gap); None if that ts is unknown (after a bootstrap)
     pub upstream_chain: Vec<String>,
     pub last_contact: Option<SystemTime>,
     pub last_verify: Option<VerifyReport>,

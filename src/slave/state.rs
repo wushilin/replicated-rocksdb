@@ -149,9 +149,10 @@ pub struct SlaveStatus {
     pub first_retained_seq: Seq,
     pub upstream_last_seq: Seq,
     pub origin_last_seq: Seq,
-    /// 0 when `applied_seq >= origin_last_seq`; while behind, `now − ts_ms` of the last
-    /// applied entry; `None` while that timestamp is unknown (after a bootstrap, until the
-    /// next entry).
+    /// 0 when `applied_seq >= origin_last_seq`. While behind: the age (`now − ts_ms`) of the
+    /// oldest entry received but not yet applied. If nothing is received yet, the age of the
+    /// last applied entry instead, an upper bound that includes the master's idle gap.
+    /// `None` while behind with no timestamp known (after a bootstrap, until the next entry).
     pub lag_ms: Option<u64>,
     /// The address of the current upstream (the target of the latest `Slave::repoint`, if any).
     pub upstream: String,
@@ -166,17 +167,23 @@ pub struct SlaveStatus {
     pub last_verify: Option<VerifyReport>,
 }
 
-/// Replication lag in ms; see [`SlaveStatus::lag_ms`]. `last_applied_ts = 0` means unknown.
+/// Replication lag in ms; see [`SlaveStatus::lag_ms`]. A timestamp of 0 means unknown.
 pub(crate) fn lag_ms(
     applied: Seq,
     origin_last: Seq,
+    pending_ts: u64,
     last_applied_ts: u64,
     now_ms: u64,
 ) -> Option<u64> {
     if applied >= origin_last {
         return Some(0);
     }
-    (last_applied_ts > 0).then(|| now_ms.saturating_sub(last_applied_ts))
+    let since = if pending_ts > 0 {
+        pending_ts
+    } else {
+        last_applied_ts
+    };
+    (since > 0).then(|| now_ms.saturating_sub(since))
 }
 
 #[cfg(test)]
@@ -233,22 +240,26 @@ mod lag_tests {
     use super::lag_ms;
 
     #[test]
-    fn lag_is_zero_when_caught_up_and_unknown_without_a_timestamp() {
+    fn lag_semantics() {
+        // lag_ms(applied, origin_last, pending_ts, last_applied_ts, now)
+        assert_eq!(lag_ms(10, 10, 0, 0, 5), Some(0), "caught up, no timestamps");
+        assert_eq!(lag_ms(10, 10, 900, 100, 5_000), Some(0), "caught up wins");
         assert_eq!(
-            lag_ms(10, 10, 0, 5),
-            Some(0),
-            "caught up, even without a timestamp"
+            lag_ms(10, 12, 3_000, 1_000, 4_000),
+            Some(1_000),
+            "behind with a received entry: its age, not the last applied one"
         );
-        assert_eq!(lag_ms(10, 12, 1_000, 4_000), Some(3_000));
         assert_eq!(
-            lag_ms(10, 12, 0, 4_000),
+            lag_ms(10, 12, 0, 1_000, 4_000),
+            Some(3_000),
+            "nothing received: upper bound from the last applied entry"
+        );
+        assert_eq!(
+            lag_ms(10, 12, 0, 0, 4_000),
             None,
-            "behind, timestamp unknown (after a bootstrap)"
+            "behind, nothing known (after a bootstrap)"
         );
-        assert_eq!(
-            lag_ms(10, 12, 5_000, 4_000),
-            Some(0),
-            "clock skew never makes it negative"
-        );
+        assert_eq!(lag_ms(10, 12, 5_000, 0, 4_000), Some(0), "skew clamps");
+        assert_eq!(lag_ms(10, 12, 0, 5_000, 4_000), Some(0), "skew clamps");
     }
 }

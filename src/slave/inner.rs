@@ -175,6 +175,9 @@ pub(crate) struct Inner {
     /// `ts_ms` of the last applied entry; 0 = unknown (right after a bootstrap).
     /// Kept current by the apply path and cleared by a bootstrap install; read by `status`.
     pub last_applied_ts: AtomicU64,
+    /// `ts_ms` of the oldest entry received in the current tail batch and not yet applied;
+    /// 0 = none. Advanced by the apply path, cleared when the batch or stream ends.
+    pub pending_ts: AtomicU64,
     /// Wakes the tail loop when a verify asks for a re-bootstrap.
     pub rebootstrap: Notify,
     /// The re-bootstrap a verify asked for, if any (see [`VerifyRebootstrap`]).
@@ -239,6 +242,7 @@ impl Inner {
             verify_lock: tokio::sync::Mutex::new(()),
             last_verify: Mutex::new(None),
             last_applied_ts: AtomicU64::new(last_applied_ts),
+            pending_ts: AtomicU64::new(0),
             rebootstrap: Notify::new(),
             verify_rebootstrap: VerifyRebootstrap::default(),
             verify_work: Arc::default(),
@@ -439,6 +443,7 @@ impl Inner {
             lag_ms: lag_ms(
                 pos.last_seq,
                 origin_last_seq,
+                self.pending_ts.load(Ordering::SeqCst),
                 self.last_applied_ts.load(Ordering::SeqCst),
                 self.now_ms(),
             ),

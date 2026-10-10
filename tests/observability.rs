@@ -58,3 +58,54 @@ async fn lag_ms_is_the_age_of_the_last_applied_entry_while_behind() {
     assert_converged(&m, &[("b", &b)]).await;
     assert_eq!(b.status().lag_ms, Some(0));
 }
+
+/// The live apply path keeps the timestamp: no reopen between the writes and the reading.
+/// B is stopped behind by an entry it cannot apply (`SpecMismatch`); the bound is the last
+/// entry it applied while streaming, written at T0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lag_ms_follows_the_live_apply_path() {
+    let c = Cluster::new();
+    let mut mcfg = c.master_config("a");
+    mcfg.rocksdb.comparators.register("reverse", reverse);
+    let m = Master::open(mcfg).await.unwrap();
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    let b = Slave::open(cfg).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    m.put("c", b"k", b"v").unwrap(); // T0, applied by the live session
+    assert_converged(&m, &[("b", &b)]).await;
+    c.clock.advance(Duration::from_secs(1));
+    m.create_cf(CfSpec::new("rev").with_comparator("reverse"))
+        .unwrap();
+    wait_state(&b, "SpecMismatch halt", |s| {
+        *s == SlaveState::Halted(HaltReason::SpecMismatch)
+    })
+    .await;
+    c.clock.advance(Duration::from_secs(7));
+    assert_eq!(b.status().lag_ms, Some(8_000));
+}
+
+/// After a bootstrap install the last applied entry's timestamp is unknown: while behind,
+/// `lag_ms` is `None`, not a stale number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lag_ms_is_unknown_behind_right_after_a_bootstrap() {
+    let c = Cluster::new();
+    let mut mcfg = c.master_config("a");
+    mcfg.rocksdb.comparators.register("reverse", reverse);
+    let m = Master::open(mcfg).await.unwrap();
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", b"k", b"v").unwrap();
+    let (cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    let b = Slave::open(cfg).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await; // installed by bootstrap
+    c.clock.advance(Duration::from_secs(5));
+    m.create_cf(CfSpec::new("rev").with_comparator("reverse"))
+        .unwrap();
+    wait_state(&b, "SpecMismatch halt", |s| {
+        *s == SlaveState::Halted(HaltReason::SpecMismatch)
+    })
+    .await;
+    let st = b.status();
+    assert!(st.applied_seq < st.origin_last_seq);
+    assert_eq!(st.lag_ms, None);
+}

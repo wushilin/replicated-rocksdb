@@ -39,7 +39,12 @@ fn epoch_mismatch(history: &[crate::types::EpochStart], entry: &LogEntry) -> Opt
     })
 }
 
-pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) -> Applied {
+pub(crate) async fn apply(
+    inner: &Arc<Inner>,
+    generation: u64,
+    entry: LogEntry,
+    next_ts: u64,
+) -> Applied {
     let seq = entry.seq;
     // 1. CRC
     if let Err(e) = entry.verify_crc() {
@@ -58,6 +63,7 @@ pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) 
     // 3, 4. Exactly once, no gaps.
     let last = inner.store.position().last_seq;
     if seq <= last {
+        inner.pending_ts.store(next_ts, Ordering::SeqCst);
         return Applied::Skipped;
     }
     if seq != last + 1 {
@@ -80,6 +86,7 @@ pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) 
     };
     // A verify holds the applier while the upstream pins its snapshot (DESIGN.md §12).
     inner.wait_while_held().await;
+    failpoint::pause("slave-before-apply").await;
     let i = inner.clone();
     let e = entry.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -133,6 +140,8 @@ pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) 
     inner.upstream_last_seq.fetch_max(seq, Ordering::SeqCst);
     inner.origin_last_seq.fetch_max(seq, Ordering::SeqCst);
     inner.last_applied_ts.store(entry.ts_ms, Ordering::SeqCst);
+    // The next received entry (if any) is now the oldest unapplied one.
+    inner.pending_ts.store(next_ts, Ordering::SeqCst);
     tracing::trace!(node = %inner.cfg.identifier, seq, "applied");
     if failpoint::fire("slave-after-apply") {
         // Emulated crash between commit and listener: freeze until the test kills the node.

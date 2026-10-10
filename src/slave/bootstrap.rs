@@ -116,6 +116,7 @@ pub(crate) async fn install(
     inner.cancel_capture();
     // The snapshot's last entry is not transferred: its ts_ms is unknown until the next entry.
     inner.last_applied_ts.store(0, Ordering::SeqCst);
+    inner.pending_ts.store(0, Ordering::SeqCst);
     inner.set_ident(None);
     inner.reset_downstream();
     inner.seq_tx.send_replace(0);

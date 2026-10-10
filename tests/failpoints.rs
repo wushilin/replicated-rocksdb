@@ -507,3 +507,39 @@ async fn a_repoint_during_a_run_makes_its_rebootstrap_inert() {
     );
     scenario.teardown();
 }
+
+/// Kafka-style lag: while an entry is received but not yet applied, `lag_ms` is its age, not
+/// the age of the last applied entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lag_ms_is_the_age_of_the_oldest_received_unapplied_entry() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    let b = Slave::open(cfg).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    b.wait_streaming(support::WAIT).await.unwrap();
+    m.put("c", b"a", b"1").unwrap(); // T0, applied
+    assert_converged(&m, &[("b", &b)]).await;
+    assert_eq!(b.status().lag_ms, Some(0));
+
+    c.clock.advance(Duration::from_secs(30));
+    fail::cfg("slave-before-apply", "pause").unwrap();
+    m.put("c", b"b", b"2").unwrap(); // T0 + 30 s, received, held before its commit
+    c.clock.advance(Duration::from_secs(5));
+    wait_until("received, not applied", || {
+        let s = b.status();
+        s.origin_last_seq > s.applied_seq
+    })
+    .await;
+    assert_eq!(
+        b.status().lag_ms,
+        Some(5_000),
+        "age of the held entry, not 35 s"
+    );
+    fail::remove("slave-before-apply");
+    assert_converged(&m, &[("b", &b)]).await;
+    assert_eq!(b.status().lag_ms, Some(0));
+    scenario.teardown();
+}

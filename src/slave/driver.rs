@@ -496,9 +496,18 @@ async fn tail(
                 if batch.entries.is_empty() {
                     return SessionEnd::Retry("empty entry batch from upstream".into());
                 }
+                // Received entries prove the origin is at least this far, and the oldest
+                // unapplied one gives the lag.
+                if let Some(last) = batch.entries.last() {
+                    inner.origin_last_seq.fetch_max(last.seq, Ordering::SeqCst);
+                }
+                let ts: Vec<u64> = batch.entries.iter().map(|e| e.ts_ms).collect();
+                inner.pending_ts.store(ts[0], Ordering::SeqCst);
+                let _clear = ClearPending(inner);
                 // Each entry is its own atomic write, so a crash mid-batch leaves a clean boundary.
-                for e in batch.entries {
-                    match apply::apply(inner, generation, entry_from_pb(e)).await {
+                for (i, e) in batch.entries.into_iter().enumerate() {
+                    let next_ts = ts.get(i + 1).copied().unwrap_or(0);
+                    match apply::apply(inner, generation, entry_from_pb(e), next_ts).await {
                         Applied::Committed => {
                             if !cleared {
                                 inner.set_last_error(None);
@@ -513,6 +522,15 @@ async fn tail(
             }
             None => return SessionEnd::Retry("tail message without content".into()),
         }
+    }
+}
+
+/// Clears `pending_ts` whenever a batch ends, however it ends.
+struct ClearPending<'a>(&'a Inner);
+
+impl Drop for ClearPending<'_> {
+    fn drop(&mut self) {
+        self.0.pending_ts.store(0, Ordering::SeqCst);
     }
 }
 
