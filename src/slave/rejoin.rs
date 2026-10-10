@@ -29,8 +29,10 @@ impl Slave {
     ///    `max_burned_epoch`, as `Master::demote` does; `origin_identity` follows the newest
     ///    remaining record (same batch); master-only keys (`__ttl_index`, `promoted_from_len`,
     ///    `last_ts`) are removed. The role is persisted before the handshake: a slave never
-    ///    writes and divergence halts by default, and consent is never persisted, so a crash
-    ///    after the batch reopens as a slave that halts `Diverged` if it diverged.
+    ///    writes and consent is never persisted, so a crash after the batch reopens (with
+    ///    `Slave::open`) as a slave under its configured `on_divergence` policy: if it diverged,
+    ///    it halts `Diverged` under the default policy, and a configured `DivergencePolicy`
+    ///    applies on that reopen.
     /// 3. Opens the slave and returns once its first handshake with `cfg.upstream` settles,
     ///    under `opts.on_divergence` (never `cfg.on_divergence`) and with the outcomes of
     ///    [`Slave::repoint`]: `Ok(EpochAdvanced)` when the old master's log is a prefix of the
@@ -39,7 +41,10 @@ impl Slave {
     ///    `Retrying { .. }`, or `Err(Diverged { .. })` under `RepointDivergence::Refuse` (the
     ///    default) with the slave halted `Diverged`, its data intact and
     ///    [`diverged_entries`](Self::diverged_entries) available. The consent in `opts` is
-    ///    single-use, as for `repoint`.
+    ///    single-use, as for `repoint`. As after a repoint, the returned slave keeps the
+    ///    rejoin's mode (`Refuse` once the consent is used) and so ignores `cfg.on_divergence`
+    ///    until the next repoint or a restart. `IDENTITY_CHANGED` (an upstream of another
+    ///    database) is never overridden: the slave halts with its data intact.
     ///
     /// **Return value:** the outer `Err` means no slave was opened: a refusal of step 1 (the
     /// directory is unchanged and still a master), or a failure after step 2 (the directory

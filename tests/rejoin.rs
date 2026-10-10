@@ -6,7 +6,7 @@ mod support;
 use std::sync::Arc;
 
 use replicated_rocksdb::{
-    AcceptDataLoss, Error, HaltReason, Master, ReadApi, RejoinOptions, RepointDivergence,
+    AcceptDataLoss, CfSpec, Error, HaltReason, Master, ReadApi, RejoinOptions, RepointDivergence,
     RepointOutcome, Role, Slave, SlaveState,
 };
 use support::{Cluster, RecordingListener, assert_converged, failover};
@@ -149,12 +149,14 @@ async fn rejoin_refuses_a_slave_directory_an_empty_one_and_an_invalid_config() {
             found: Role::Slave
         })
     ));
-    // No database.
+    // No database: nothing is created.
     let (cfg, _) = c.slave_config("empty", b_addr);
+    assert!(!c.path("empty").exists());
     assert!(matches!(
         Slave::rejoin(cfg, RejoinOptions::default()).await,
         Err(Error::Config(_))
     ));
+    assert!(!c.path("empty").exists(), "the directory is not created");
     // Invalid config: the stored master stays a master.
     let (mut cfg, _) = c.slave_config("a", b_addr);
     cfg.identifier = "bad id".into();
@@ -176,7 +178,11 @@ async fn rejoin_refuses_a_directory_that_is_still_open() {
     let a = Master::open(a_cfg).await.unwrap();
     let id = a.identity();
     let (cfg, _) = c.slave_config("a", b.serve_addr().unwrap());
-    assert!(Slave::rejoin(cfg, RejoinOptions::default()).await.is_err());
+    // RocksDB's LOCK, held by the running master, refuses the store open.
+    assert!(matches!(
+        Slave::rejoin(cfg, RejoinOptions::default()).await,
+        Err(Error::RocksDb(_))
+    ));
     assert_eq!(a.identity(), id);
     a.put("c", b"still writing", b"1")
         .expect("the master is untouched");
@@ -185,4 +191,45 @@ async fn rejoin_refuses_a_directory_that_is_still_open() {
         .await
         .expect("still stored as master");
     a.shutdown().await.unwrap();
+}
+
+/// Consent to lose divergent entries never overrides `IDENTITY_CHANGED`: rejoining a master
+/// to the upstream of another database halts, and nothing is deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consent_does_not_override_an_identity_change() {
+    for on_divergence in [
+        RepointDivergence::Repair {
+            accept_loss: AcceptDataLoss,
+        },
+        RepointDivergence::Rebootstrap {
+            accept_loss: AcceptDataLoss,
+        },
+    ] {
+        let c = Cluster::new();
+        let (_, _b, _) = failover(&c, true).await;
+        let other = c.master("other").await;
+        other.create_cf(CfSpec::new("c")).unwrap();
+        other.put("c", b"k", b"other").unwrap();
+        let a_last = support::RawDb::open(&c.path("a")).last_seq();
+        let (cfg, la) = c.slave_config("a", other.serve_addr().unwrap());
+        let (a, outcome) = tokio::time::timeout(
+            support::WAIT,
+            Slave::rejoin(cfg, RejoinOptions { on_divergence }),
+        )
+        .await
+        .expect("rejoin settles")
+        .expect("the slave is opened");
+        assert!(
+            matches!(outcome, Err(Error::Halted(HaltReason::IdentityChanged))),
+            "{on_divergence:?}: {outcome:?}"
+        );
+        assert_eq!(
+            a.status().state,
+            SlaveState::Halted(HaltReason::IdentityChanged)
+        );
+        assert_eq!(a.last_seq(), a_last, "nothing deleted");
+        assert_eq!(a.get("c", b"only on a").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(a.get("c", b"k").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(la.bootstraps(), 0);
+    }
 }
