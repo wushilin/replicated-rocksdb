@@ -390,3 +390,77 @@ impl ReplicationListener for RecordingListener {
             .push(report.clone());
     }
 }
+
+/// A **stopped** node's directory opened with plain RocksDB, bypassing the crate, to inject
+/// damage replication itself never causes. `comparators` lists `(logical CF, comparator
+/// name, ordering)` for each CF created with a custom comparator (RocksDB refuses to open a
+/// CF with another comparator name).
+pub struct RawDb {
+    db: rocksdb::DB,
+    names: Vec<String>,
+}
+
+/// A key ordering for [`RawDb::open_with`].
+pub type KeyCmp = fn(&[u8], &[u8]) -> std::cmp::Ordering;
+
+impl RawDb {
+    pub fn open(path: &Path) -> RawDb {
+        Self::open_with(path, &[])
+    }
+
+    pub fn open_with(path: &Path, comparators: &[(&str, &str, KeyCmp)]) -> RawDb {
+        let names = rocksdb::DB::list_cf(&rocksdb::Options::default(), path).unwrap();
+        let descriptors: Vec<rocksdb::ColumnFamilyDescriptor> = names
+            .iter()
+            .map(|n| {
+                let mut opts = rocksdb::Options::default();
+                for &(cf, name, f) in comparators {
+                    if n.starts_with(&format!("u:{cf}:")) {
+                        opts.set_comparator(name, Box::new(f));
+                    }
+                }
+                rocksdb::ColumnFamilyDescriptor::new(n, opts)
+            })
+            .collect();
+        let db = rocksdb::DB::open_cf_descriptors(&rocksdb::Options::default(), path, descriptors)
+            .unwrap();
+        RawDb { db, names }
+    }
+
+    /// The physical CF of logical CF `name` (`u:{name}:{create_seq}`); there must be one.
+    fn cf(&self, name: &str) -> Arc<rocksdb::BoundColumnFamily<'_>> {
+        let prefix = format!("u:{name}:");
+        let mut found = self.names.iter().filter(|n| n.starts_with(&prefix));
+        let physical = found
+            .next()
+            .unwrap_or_else(|| panic!("no physical CF for {name}"));
+        assert!(found.next().is_none(), "{name} has several physical CFs");
+        self.db.cf_handle(physical).unwrap()
+    }
+
+    /// The stored envelope.
+    pub fn get(&self, cf: &str, key: &[u8]) -> Option<Vec<u8>> {
+        self.db.get_cf(&self.cf(cf), key).unwrap()
+    }
+
+    pub fn put(&self, cf: &str, key: &[u8], envelope: &[u8]) {
+        self.db.put_cf(&self.cf(cf), key, envelope).unwrap();
+    }
+
+    pub fn delete(&self, cf: &str, key: &[u8]) {
+        self.db.delete_cf(&self.cf(cf), key).unwrap();
+    }
+
+    /// Flips the last byte of a stored value, keeping its envelope header (and `write_seq`):
+    /// the damage only a `Full` verify can see.
+    pub fn corrupt_value(&self, cf: &str, key: &[u8]) {
+        let mut env = self.get(cf, key).expect("the key to corrupt exists");
+        let header = replicated_rocksdb::codec::envelope::decode(&env)
+            .unwrap()
+            .header_len;
+        assert!(env.len() > header, "the value must be non-empty");
+        let last = env.len() - 1;
+        env[last] ^= 0xFF;
+        self.put(cf, key, &env);
+    }
+}
