@@ -6,6 +6,8 @@
 //! `server-tail-after-entry` (the server ends the Tail stream after sending an entry),
 //! `master-bump-epoch-write` (the synced write of `bump_epoch` fails),
 //! `slave-commit-io` (a slave's commit of a received entry fails with an I/O error),
+//! `verify-before-finish` (a slave's verify run, after the comparison, before its report is acted on; `pause`),
+//! `server-verify-begin` (the server's VerifyBegin handler, before it answers; `pause`),
 //! `slave-before-halt` (a session ended in a halt, before it is persisted; use `cfg_callback`).
 //!
 //! Configure with `fail::cfg(name, "1*return")` to make the point fire once, or
@@ -34,3 +36,14 @@ pub(crate) fn io_error(name: &str) -> crate::Result<()> {
         Ok(())
     }
 }
+
+/// Async pause point for tests: with a `pause` action configured the call waits (on a blocking
+/// thread) until the point is removed. Without the feature it does nothing.
+#[cfg(feature = "failpoints")]
+pub(crate) async fn pause(name: &'static str) {
+    let _ = tokio::task::spawn_blocking(move || fire(name)).await;
+}
+
+#[cfg(not(feature = "failpoints"))]
+#[inline(always)]
+pub(crate) async fn pause(_name: &'static str) {}

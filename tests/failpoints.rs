@@ -8,8 +8,8 @@ use std::time::Duration;
 use tokio::sync::{Mutex, MutexGuard};
 
 use replicated_rocksdb::{
-    CfSpec, Error, LogApi, Master, ReadApi, RepointOptions, RepointOutcome, Slave, SlaveState,
-    UpstreamConfig, WriteConcern,
+    CfSpec, Error, HaltReason, LogApi, Master, MismatchPolicy, ReadApi, RepointOptions,
+    RepointOutcome, Slave, SlaveState, UpstreamConfig, VerifyAbort, VerifyMode, WriteConcern,
 };
 use support::{Cluster, assert_converged, wait_until};
 
@@ -364,5 +364,146 @@ async fn an_io_error_on_commit_is_retried_not_a_corrupt_halt() {
     assert!(!matches!(b.status().state, SlaveState::Halted(_)));
     m.put("c", b"k2", b"v").unwrap();
     assert_converged(&m, &[("b", &b)]).await;
+    scenario.teardown();
+}
+
+/// The upstream does not answer `VerifyBegin`: the applier is held, but only for
+/// `min(10 s, capture_timeout)`. Replication continues once the run gave up, and also when the
+/// caller drops the `verify_now` future while the applier is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_applier_is_released_when_verify_begin_stalls_or_the_run_is_dropped() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    cfg.verify.capture_timeout = Duration::from_millis(600);
+    let b = Slave::open(cfg).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    b.wait_streaming(support::WAIT).await.unwrap();
+
+    fail::cfg("server-verify-begin", "pause").unwrap();
+    // 1. The run gives up after the bound; meanwhile the slave applies nothing.
+    let (r, ()) = tokio::join!(b.verify_now(VerifyMode::Quick), async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        m.put("c", b"held", b"1").unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(b.last_seq() < m.last_seq(), "the applier is held");
+    });
+    assert!(
+        matches!(r, Err(Error::VerifyAborted(VerifyAbort::Upstream(_)))),
+        "{r:?}"
+    );
+    wait_until("replication continues", || b.last_seq() == m.last_seq()).await;
+
+    // 2. The future is dropped while the applier is held.
+    let r = tokio::time::timeout(Duration::from_millis(200), async {
+        tokio::join!(b.verify_now(VerifyMode::Quick), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            m.put("c", b"held2", b"1").unwrap();
+            std::future::pending::<()>().await
+        })
+    })
+    .await;
+    assert!(r.is_err(), "dropped by the timeout");
+    wait_until("replication continues after a cancel", || {
+        b.last_seq() == m.last_seq()
+    })
+    .await;
+    fail::remove("server-verify-begin");
+    scenario.teardown();
+}
+
+/// The slave's applier is frozen behind the upstream's snapshot: the run gives up with
+/// `CaptureTimeout` after the configured time and releases its hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slave_that_cannot_reach_the_snapshot_times_out() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    cfg.verify.capture_timeout = Duration::from_millis(500);
+    let b = Slave::open(cfg).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    b.wait_streaming(support::WAIT).await.unwrap();
+    fail::cfg("slave-after-apply", "1*return").unwrap();
+    m.put("c", b"a", b"1").unwrap();
+    wait_until("frozen after the entry", || b.last_seq() == m.last_seq()).await;
+    m.put("c", b"b", b"2").unwrap();
+    m.put("c", b"c", b"3").unwrap();
+    let started = std::time::Instant::now();
+    let e = b.verify_now(VerifyMode::Quick).await.unwrap_err();
+    assert!(
+        matches!(e, Error::VerifyAborted(VerifyAbort::CaptureTimeout { snapshot_seq }) if snapshot_seq == m.last_seq()),
+        "{e:?}"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(450));
+    fail::remove("slave-after-apply");
+    b.kill().await.unwrap();
+    scenario.teardown();
+}
+
+/// `MismatchPolicy::Rebootstrap` is consent to re-copy from the upstream that was verified. If
+/// the operator repoints the slave to another database while the run is still in flight, the
+/// mismatch found against the old upstream must not make the slave discard its data for the
+/// new one: the repoint's own refusal (`Refuse` on a foreign identity) stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repoint_during_a_run_makes_its_rebootstrap_inert() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    a.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..20u8 {
+        a.put("c", &[i], &[i]).unwrap();
+    }
+    let (mut cfg, listener) = c.slave_config("b", a.serve_addr().unwrap());
+    cfg.verify.on_mismatch = MismatchPolicy::Rebootstrap;
+    let b = Slave::open(cfg.clone()).await.unwrap();
+    assert_converged(&a, &[("b", &b)]).await;
+    b.wait_streaming(support::WAIT).await.unwrap();
+    b.shutdown().await.unwrap();
+    c.delete_behind_its_back("b", "c", &[7]);
+
+    let other = c.master("other").await;
+    other.create_cf(CfSpec::new("c")).unwrap();
+    other.put("c", b"x", b"1").unwrap();
+    let b = std::sync::Arc::new(Slave::open(cfg).await.unwrap());
+    b.wait_streaming(support::WAIT).await.unwrap();
+    assert_eq!(listener.bootstraps(), 1, "the first copy");
+
+    fail::cfg("verify-before-finish", "pause").unwrap();
+    let run = tokio::spawn({
+        let b = b.clone();
+        async move { b.verify_now(VerifyMode::Quick).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let repoint = tokio::spawn({
+        let b = b.clone();
+        let to = UpstreamConfig::from_addr(other.serve_addr().unwrap());
+        async move { b.repoint(to, RepointOptions::default()).await }
+    });
+    support::wait_state(&b, "refused the foreign database", |s| {
+        *s == SlaveState::Halted(HaltReason::IdentityChanged)
+    })
+    .await;
+    fail::remove("verify-before-finish");
+    let report = run.await.unwrap().unwrap();
+    assert!(!report.is_clean(), "the run did find the missing key");
+    let _ = repoint.await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        b.status().state,
+        SlaveState::Halted(HaltReason::IdentityChanged)
+    );
+    assert_eq!(
+        listener.bootstraps(),
+        1,
+        "no bootstrap from the new upstream"
+    );
+    assert!(
+        b.get("c", &[1]).unwrap().is_some(),
+        "the data is still there"
+    );
     scenario.teardown();
 }

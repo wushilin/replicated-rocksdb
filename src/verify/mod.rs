@@ -193,8 +193,9 @@ impl VerifyReport {
 pub enum VerifyAbort {
     /// The upstream already serves `max_verify_sessions` sessions (`BUSY`). Retry later.
     Busy,
-    /// The upstream no longer knows the session (`SESSION_NOT_FOUND`): it was idle longer
-    /// than the upstream's `verify_session_timeout`.
+    /// The upstream no longer knows the session: `SESSION_NOT_FOUND` (it was idle longer than
+    /// the upstream's `verify_session_timeout`) or `UPSTREAM_RESET` (the upstream's state was
+    /// replaced, which drops its sessions). Retry.
     SessionExpired,
     /// The upstream follows another database identity than this slave.
     IdentityChanged,

@@ -140,6 +140,8 @@ pub(super) async fn begin(
     state: &Arc<ServerState>,
     req: Request<pb::VerifyBeginRequest>,
 ) -> Result<Response<pb::VerifyBeginResponse>, Status> {
+    // Test hook: a stalled upstream.
+    crate::failpoint::pause("server-verify-begin").await;
     let call = call_info(&req, Method::Verify)?;
     let src = state.authorize(&call, Method::Verify).await?;
     let r = req.into_inner();

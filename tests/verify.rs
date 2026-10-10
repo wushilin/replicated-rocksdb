@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use replicated_rocksdb::{
-    CfSpec, Error, HaltReason, Master, ReadApi, Slave, SlaveState, VerifyAbort, VerifyMode,
+    CfSpec, Error, HaltReason, LogApi, Master, ReadApi, Slave, SlaveState, VerifyAbort, VerifyMode,
 };
 use support::{Cluster, assert_converged, wait_state, wait_until};
 
@@ -191,18 +191,7 @@ async fn a_mismatch_is_reported_and_rebootstrap_repairs_it() {
     let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
     assert_converged(&m, &[("b", &b)]).await;
     b.shutdown().await.unwrap();
-    {
-        let path = c.path("b");
-        let opts = rocksdb::Options::default();
-        let names = rocksdb::DB::list_cf(&opts, &path).unwrap();
-        let mut o = rocksdb::Options::default();
-        o.create_if_missing(false);
-        let db = rocksdb::DB::open_cf(&o, &path, &names).unwrap();
-        let cf = db
-            .cf_handle(names.iter().find(|n| n.starts_with("u:data:")).unwrap())
-            .unwrap();
-        db.delete_cf(&cf, [7u8]).unwrap();
-    }
+    c.delete_behind_its_back("b", "data", &[7]);
 
     for policy in [MismatchPolicy::Report, MismatchPolicy::Rebootstrap] {
         let (mut cfg, listener) = c.slave_config("b", m.serve_addr().unwrap());
@@ -228,4 +217,75 @@ async fn a_mismatch_is_reported_and_rebootstrap_repairs_it() {
             assert!(b.verify_now(VerifyMode::Full).await.unwrap().is_clean());
         }
     }
+}
+
+/// A run that is still scanning, throttled to a crawl, when the slave shuts down stops its
+/// local scans: the database is closed when `shutdown` returns, and the path opens again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_stops_a_throttled_run_and_the_path_reopens() {
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("data")).unwrap();
+    for i in 0..200u32 {
+        m.put("data", &i.to_be_bytes(), &[7u8; 2000]).unwrap();
+    }
+    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    cfg.verify.interval = Some(Duration::from_millis(100));
+    cfg.verify.mode = VerifyMode::Full;
+    // 400 KB at 10 KB/s: the run is far from done when the slave shuts down.
+    cfg.verify.max_bytes_per_sec = Some(10_000);
+    let b = Slave::open(cfg.clone()).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let started = std::time::Instant::now();
+    b.shutdown().await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    let b = Slave::open(cfg).await.expect("the database is closed");
+    b.shutdown().await.unwrap();
+}
+
+/// A slave that halted behind the upstream's snapshot can never reach it: the run gives up at
+/// once, not after `capture_timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_halted_slave_behind_the_snapshot_gives_up_at_once() {
+    use replicated_rocksdb::GapPolicy;
+    let c = Cluster::new();
+    let mut mcfg = c.master_config("a");
+    mcfg.retention.max_entries = Some(2);
+    mcfg.retention.check_interval = Duration::from_millis(20);
+    let m = Master::open(mcfg).await.unwrap();
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    cfg.on_log_gap = GapPolicy::Halt;
+    cfg.verify.capture_timeout = Duration::from_secs(60);
+    let b = Slave::open(cfg.clone()).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
+    let behind = b.last_seq();
+    b.shutdown().await.unwrap();
+    for i in 0..20u8 {
+        m.put("c", &[i], b"v").unwrap();
+    }
+    wait_until("master retention", || m.first_retained_seq() > behind + 1).await;
+    let b = Slave::open(cfg).await.unwrap();
+    wait_state(&b, "LogGap halt", |s| {
+        *s == SlaveState::Halted(HaltReason::LogGap)
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let e = b.verify_now(VerifyMode::Quick).await.unwrap_err();
+    assert!(
+        matches!(e, Error::VerifyAborted(VerifyAbort::CaptureTimeout { .. })),
+        "{e:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(b.status().last_verify.is_none());
 }

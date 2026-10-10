@@ -18,7 +18,7 @@ use super::bootstrap;
 use super::client::{self, Client};
 use super::config::BackoffState;
 use super::inner::Inner;
-use super::policy::{self, Action};
+use super::policy::{self, Action, Force};
 use super::repoint::{self, RepointDivergence, RepointOutcome};
 use super::state::{HaltReason, NodeState, SlaveState};
 use crate::background::blocking;
@@ -279,13 +279,24 @@ async fn session(
     } else {
         inner.note_contact();
     }
-    let force = inner.force_bootstrap.is_requested_for(generation);
+    let hs_uuid = hs
+        .identity
+        .as_ref()
+        .and_then(|i| identity_from_pb(i).ok())
+        .map(|i| i.db_uuid);
+    let force = if inner.force_bootstrap.is_requested_for(generation) {
+        Force::Operator
+    } else if inner.verify_rebootstrap.applies(generation, hs_uuid) {
+        Force::Verify
+    } else {
+        Force::None
+    };
     let after_stream_diverged = inner.diverged_on_stream.swap(false, Ordering::SeqCst);
     let mut action = policy::after_handshake(&hs, &inner.policies(), force);
     // An explicit repoint never resolves divergence by the configured policy.
     if let Some(mode) = inner.repoint_mode() {
         let diverged = hs.decision() == pb::Decision::Reject && hs.reason() == pb::Reason::Diverged;
-        if diverged && !force {
+        if diverged && force != Force::Operator {
             action = match mode {
                 RepointDivergence::Rebootstrap { .. } => Action::Bootstrap,
                 RepointDivergence::Refuse | RepointDivergence::Repair { .. } => {
@@ -436,7 +447,9 @@ async fn tail(
             // A verify asked for a re-bootstrap (`MismatchPolicy::Rebootstrap`): handshake again,
             // which bootstraps because the request is set. A stale wake-up is ignored.
             _ = inner.rebootstrap.notified() => {
-                if inner.force_bootstrap.is_requested_for(generation) {
+                if inner.force_bootstrap.is_requested_for(generation)
+                    || inner.verify_rebootstrap.pending_for(generation)
+                {
                     return SessionEnd::Again;
                 }
                 continue;

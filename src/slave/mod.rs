@@ -249,6 +249,12 @@ impl Slave {
         {
             let _ = task.await;
         }
+        // A verify run's blocking scans stop at their next key (the run set their stop flag when
+        // it was cancelled); each references the database, so wait for them before closing.
+        if !self.inner.verify_work.idle(Duration::from_secs(5)).await {
+            tracing::warn!(node = %self.inner.cfg.identifier, "verify scans did not stop in 5 s");
+            return Err(Error::Timeout);
+        }
         if await_sole_owner(&self.inner, Duration::from_secs(10)).await {
             served
         } else {
@@ -276,6 +282,9 @@ impl Slave {
         {
             task.abort();
             let _ = task.await;
+        }
+        if !self.inner.verify_work.idle(Duration::from_secs(5)).await {
+            return Err(Error::Timeout);
         }
         if await_sole_owner(&self.inner, Duration::from_secs(10)).await {
             Ok(())

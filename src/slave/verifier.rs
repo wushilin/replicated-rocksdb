@@ -2,7 +2,7 @@
 //! capture a local snapshot at exactly the upstream's seq `S` (taken by the applier right
 //! after it commits `S`), compare the CF lists, then compare each common CF range by range.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,7 @@ use tonic::{Status, Streaming};
 use tracing::Instrument;
 
 use super::client::{self, Client};
-use super::inner::{CaptureHold, CaptureMiss, Inner};
+use super::inner::{CaptureHold, CaptureMiss, Inner, VerifyWork};
 use super::state::SlaveState;
 use crate::background::blocking;
 use crate::error::{Error, Result};
@@ -38,6 +38,18 @@ use crate::verify::{
 const BEGIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest one answer on the verify stream may take.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest `VerifyEnd` may take: it is best effort and delays the report.
+const END_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Sets the run's stop flag when the run ends or is dropped (cancelled, or its `verify_now`
+/// future was dropped): blocking scans check it, so none keeps the database open.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
 
 fn abort(a: VerifyAbort) -> Error {
     Error::VerifyAborted(a)
@@ -73,6 +85,10 @@ pub(crate) async fn verify(inner: &Arc<Inner>, mode: VerifyMode) -> Result<Verif
     let Some((identity, _)) = inner.ident() else {
         return Err(Error::NotReady);
     };
+    // The repoint generation the run belongs to, read before it connects to the current
+    // upstream: a repoint during the run makes its policy action inert.
+    let generation = *inner.repoint_tx.borrow();
+    let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
     let span = tracing::info_span!(
         "verify",
         node_id = %inner.cfg.identifier,
@@ -81,20 +97,36 @@ pub(crate) async fn verify(inner: &Arc<Inner>, mode: VerifyMode) -> Result<Verif
         epoch = identity.epoch,
         mode = ?mode,
     );
-    let result = session(inner, identity, mode, &span)
+    let result = session(inner, identity, mode, &span, &stop.0)
         .instrument(span.clone())
         .await;
+    if result.is_ok() {
+        // Test hook: lets a test act between the comparison and its consequences.
+        crate::failpoint::pause("verify-before-finish").await;
+    }
     span.in_scope(|| match &result {
-        Ok(report) => finish(inner, report),
+        Ok(report) => finish(inner, report, generation, identity),
         Err(e) => tracing::warn!(error = %e, "verify abandoned"),
     });
     result
 }
 
-fn finish(inner: &Inner, report: &VerifyReport) {
-    // A halted slave may be on another history than its upstream (a divergence the handshake
-    // refused): a mismatch policy must not act on that. The report is still kept.
+/// Whether a report with mismatches may start a re-bootstrap. Never on a halted slave (it may
+/// be on another history than its upstream: a divergence the handshake refused), and never when
+/// the slave was repointed during the run (the report is about the old upstream).
+fn may_rebootstrap(
+    policy: MismatchPolicy,
+    clean: bool,
+    halted: bool,
+    started_generation: u64,
+    generation: u64,
+) -> bool {
+    !clean && !halted && started_generation == generation && policy == MismatchPolicy::Rebootstrap
+}
+
+fn finish(inner: &Inner, report: &VerifyReport, started_generation: u64, verified: DbIdentity) {
     let halted = matches!(inner.state(), SlaveState::Halted(_));
+    let generation = *inner.repoint_tx.borrow();
     if report.is_clean() {
         tracing::info!(
             seq = report.seq,
@@ -108,10 +140,16 @@ fn finish(inner: &Inner, report: &VerifyReport) {
             mismatches = report.mismatches.len(),
             "verify found mismatches"
         );
-        if !halted && inner.cfg.verify.on_mismatch == MismatchPolicy::Rebootstrap {
-            // For the upstream the slave follows now; a later repoint makes it inert.
-            inner.force_bootstrap.request(*inner.repoint_tx.borrow());
+        let policy = inner.cfg.verify.on_mismatch;
+        if may_rebootstrap(policy, false, halted, started_generation, generation) {
+            // Consent to re-copy from the upstream that was verified, nothing more: not the
+            // operator's `force_bootstrap`, which also overrides DIVERGED and IDENTITY_CHANGED.
+            inner
+                .verify_rebootstrap
+                .request(started_generation, verified.db_uuid);
             inner.rebootstrap.notify_one();
+        } else if policy == MismatchPolicy::Rebootstrap && started_generation != generation {
+            tracing::warn!("the slave was repointed during the run; not re-bootstrapping");
         }
     }
     inner.set_last_verify(report.clone());
@@ -123,6 +161,7 @@ async fn session(
     identity: DbIdentity,
     mode: VerifyMode,
     span: &tracing::Span,
+    stop: &Arc<AtomicBool>,
 ) -> Result<VerifyReport> {
     let started = Instant::now();
     let limit = decode_limit(inner.max_entry_bytes.load(Ordering::SeqCst));
@@ -149,16 +188,29 @@ async fn session(
         .map_err(|s| status_abort(&s))?
         .into_inner();
     span.record("seq", begin.snapshot_seq);
-    let result = compare(inner, &mut client, &begin, hold, identity, mode, started).await;
-    // Best effort: the upstream also expires idle sessions.
-    let _ = client
-        .verify_end(pb::VerifyEndRequest {
+    let result = compare(
+        inner,
+        &mut client,
+        &begin,
+        hold,
+        identity,
+        mode,
+        started,
+        stop,
+    )
+    .await;
+    // Best effort and bounded: the upstream also expires idle sessions.
+    let _ = tokio::time::timeout(
+        END_TIMEOUT,
+        client.verify_end(pb::VerifyEndRequest {
             session_id: begin.session_id.clone(),
-        })
-        .await;
+        }),
+    )
+    .await;
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn compare(
     inner: &Arc<Inner>,
     client: &mut Client,
@@ -167,6 +219,7 @@ async fn compare(
     identity: DbIdentity,
     mode: VerifyMode,
     started: Instant,
+    stop: &Arc<AtomicBool>,
 ) -> Result<VerifyReport> {
     let upstream_identity = begin.identity.as_ref().map(identity_from_pb).transpose()?;
     if upstream_identity != Some(identity) {
@@ -174,17 +227,23 @@ async fn compare(
     }
     let s = begin.snapshot_seq;
     let snap = Arc::new(capture(inner, hold, s).await?);
+    debug_assert_eq!(snap.seq(), s);
     let meta_snap = snap.clone();
     let local_cfs = blocking(move || meta_snap.meta()).await?.cf_specs;
     let upstream_cfs: Vec<CfEntry> = begin.cf_specs.iter().map(cf_from_pb).collect();
     let (mut mismatches, common) = compare_specs(&local_cfs, &upstream_cfs);
 
     let (tx, rx) = mpsc::channel(2 * VERIFY_WINDOW);
-    let answers = client
-        .verify_range(ReceiverStream::new(rx))
-        .await
-        .map_err(|s| status_abort(&s))?
-        .into_inner();
+    let answers =
+        tokio::time::timeout(ANSWER_TIMEOUT, client.verify_range(ReceiverStream::new(rx)))
+            .await
+            .map_err(|_| {
+                abort(VerifyAbort::Upstream(format!(
+                    "VerifyRange was not opened within {ANSWER_TIMEOUT:?}"
+                )))
+            })?
+            .map_err(|s| status_abort(&s))?
+            .into_inner();
     let mut upstream = Upstream {
         tx,
         answers,
@@ -208,9 +267,21 @@ async fn compare(
         let producer = {
             let (snap, phys, throttle) = (snap.clone(), phys.clone(), throttle.clone());
             let (chunk_keys, chunk_bytes) = (cfg.chunk_keys, cfg.chunk_bytes);
+            let (stop, work) = (stop.clone(), inner.verify_work.enter());
             tokio::task::spawn_blocking(move || {
+                // Counted until the scan returns: shutdown waits for it.
+                let _work = work;
                 let emit = |r: LocalRange| range_tx.blocking_send(Ok(r)).is_ok();
-                match chunk_cf(&snap, phys, mode, chunk_keys, chunk_bytes, &throttle, emit) {
+                match chunk_cf(
+                    &snap,
+                    phys,
+                    mode,
+                    chunk_keys,
+                    chunk_bytes,
+                    &throttle,
+                    &stop,
+                    emit,
+                ) {
                     Ok(keys) => keys,
                     // The error goes into the channel before it closes: a closed channel
                     // alone reads as "all ranges sent".
@@ -227,6 +298,8 @@ async fn compare(
             order: order.clone(),
             mode,
             throttle: throttle.clone(),
+            stop: stop.clone(),
+            work: inner.verify_work.clone(),
         };
         let mut run = CfRun {
             cf: &name,
@@ -245,7 +318,7 @@ async fn compare(
         // `None` means the scan stopped early because the receiver was gone, which cannot
         // happen before the comparison returned: never count it as a full scan.
         let keys = keys.ok_or_else(|| {
-            abort(VerifyAbort::Upstream(format!(
+            Error::Io(std::io::Error::other(format!(
                 "the local scan of CF {name} stopped early"
             )))
         })?;
@@ -390,6 +463,8 @@ struct Local {
     order: KeyOrder,
     mode: VerifyMode,
     throttle: Arc<Mutex<Throttle>>,
+    stop: Arc<AtomicBool>,
+    work: Arc<VerifyWork>,
 }
 
 impl LocalSide for Local {
@@ -401,7 +476,12 @@ impl LocalSide for Local {
             self.throttle.clone(),
         );
         let (mode, bounds) = (self.mode, bounds.clone());
-        blocking(move || load_range(&snap, phys, &order, &bounds, mode, &throttle)).await
+        let (stop, work) = (self.stop.clone(), self.work.enter());
+        blocking(move || {
+            let _work = work;
+            load_range(&snap, phys, &order, &bounds, mode, &throttle, &stop)
+        })
+        .await
     }
 }
 
@@ -455,9 +535,37 @@ mod tests {
             status_abort(&gone),
             Error::VerifyAborted(VerifyAbort::SessionExpired)
         ));
+        // A reset of the upstream's state drops its sessions too.
+        let reset = crate::net::reason_status(pb::Reason::UpstreamReset, "x");
+        assert!(matches!(
+            status_abort(&reset),
+            Error::VerifyAborted(VerifyAbort::SessionExpired)
+        ));
         assert!(matches!(
             status_abort(&Status::internal("x")),
             Error::VerifyAborted(VerifyAbort::Upstream(_))
         ));
+    }
+
+    /// The policy acts only on a mismatch, on a slave that is not halted, in the repoint
+    /// generation the run started in.
+    #[test]
+    fn a_rebootstrap_needs_a_mismatch_a_live_slave_and_the_same_generation() {
+        use MismatchPolicy::{Rebootstrap, Report};
+        // (policy, clean, halted, started, now) -> acts
+        let rows = [
+            (Rebootstrap, false, false, 2, 2, true),
+            (Rebootstrap, true, false, 2, 2, false),
+            (Rebootstrap, false, true, 2, 2, false),
+            (Rebootstrap, false, false, 2, 3, false),
+            (Report, false, false, 2, 2, false),
+        ];
+        for (policy, clean, halted, started, now, acts) in rows {
+            assert_eq!(
+                may_rebootstrap(policy, clean, halted, started, now),
+                acts,
+                "{policy:?} clean={clean} halted={halted} {started}->{now}"
+            );
+        }
     }
 }

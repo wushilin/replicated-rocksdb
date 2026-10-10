@@ -106,6 +106,21 @@ impl Cluster {
         Master::open(cfg).await.unwrap()
     }
 
+    /// Deletes `key` of user CF `cf` straight in the directory of the stopped node `name`
+    /// (plain RocksDB), so the node no longer matches its upstream.
+    pub fn delete_behind_its_back(&self, name: &str, cf: &str, key: &[u8]) {
+        let path = self.path(name);
+        let names = rocksdb::DB::list_cf(&rocksdb::Options::default(), &path).unwrap();
+        let mut o = rocksdb::Options::default();
+        o.create_if_missing(false);
+        let db = rocksdb::DB::open_cf(&o, &path, &names).unwrap();
+        let prefix = format!("u:{cf}:");
+        let handle = db
+            .cf_handle(names.iter().find(|n| n.starts_with(&prefix)).unwrap())
+            .unwrap();
+        db.delete_cf(&handle, key).unwrap();
+    }
+
     /// A serving slave with fast reconnects and a recording listener.
     pub fn slave_config(
         &self,

@@ -110,6 +110,8 @@ pub(crate) async fn install(
     hs: &pb::HandshakeResponse,
 ) -> std::result::Result<Vec<u8>, SessionEnd> {
     inner.force_bootstrap.clear(generation);
+    // A verify's request is spent once a bootstrap installs.
+    inner.verify_rebootstrap.clear();
     // A verify waiting for a seq of the old state can never be served now.
     inner.cancel_capture();
     inner.set_ident(None);

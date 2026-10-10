@@ -37,22 +37,36 @@ fn diverged(p: &Policies) -> Action {
     }
 }
 
-/// The action for a handshake answer. `force_bootstrap` is set by `clear_halt(Rebootstrap)`
+/// What asked for a bootstrap before this handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Force {
+    None,
+    /// The operator (`clear_halt(Rebootstrap)`, a gap seen mid-stream): overrides refusals.
+    Operator,
+    /// A verify run found mismatches under `MismatchPolicy::Rebootstrap`, against this very
+    /// upstream and database (the caller checked). Consent to re-copy, not to lose data on
+    /// divergence or a foreign database: only RESUME and BOOTSTRAP answers become a bootstrap.
+    Verify,
+}
+
+/// The action for a handshake answer. `Force::Operator` is set by `clear_halt(Rebootstrap)`
 /// and by a gap seen mid-stream: any answer that lets the client proceed (RESUME, BOOTSTRAP,
 /// or REJECT/DIVERGED) becomes a bootstrap. A pending force therefore overrides
 /// `IdentityPolicy::Refuse` and `DivergencePolicy::Halt`; that is intended, because the
 /// operator asked for it through `clear_halt`. Rejections that retrying or reconfiguring
 /// cannot fix (protocol, envelope, loop, stale epoch, not ready) are not overridden.
-pub(crate) fn after_handshake(
-    r: &pb::HandshakeResponse,
-    p: &Policies,
-    force_bootstrap: bool,
-) -> Action {
+pub(crate) fn after_handshake(r: &pb::HandshakeResponse, p: &Policies, force: Force) -> Action {
     let decision = Decision::try_from(r.decision).unwrap_or(Decision::Unspecified);
     let reason = Reason::try_from(r.reason).unwrap_or(Reason::Unspecified);
     let proceed = matches!(decision, Decision::Resume | Decision::Bootstrap)
         || (decision == Decision::Reject && reason == Reason::Diverged);
-    if force_bootstrap && proceed {
+    if force == Force::Operator && proceed {
+        return Action::Bootstrap;
+    }
+    if force == Force::Verify
+        && (decision == Decision::Resume
+            || (decision == Decision::Bootstrap && reason != Reason::IdentityChanged))
+    {
         return Action::Bootstrap;
     }
     let unexpected = || {
@@ -168,7 +182,7 @@ mod tests {
     }
 
     fn act(d: Decision, r: Reason, p: &Policies) -> Action {
-        after_handshake(&answer(d, r), p, false)
+        after_handshake(&answer(d, r), p, Force::None)
     }
 
     #[test]
@@ -245,7 +259,7 @@ mod tests {
 
     #[test]
     fn forced_bootstrap_overrides_only_answers_that_let_the_client_proceed() {
-        let forced = |d, r| after_handshake(&answer(d, r), &DEFAULTS, true);
+        let forced = |d, r| after_handshake(&answer(d, r), &DEFAULTS, Force::Operator);
         assert_eq!(
             forced(Decision::Resume, Reason::Unspecified),
             Action::Bootstrap
@@ -265,6 +279,48 @@ mod tests {
         assert_eq!(
             forced(Decision::Reject, Reason::LoopDetected),
             Action::Halt(HaltReason::LoopDetected)
+        );
+    }
+
+    /// A verify's rebootstrap re-copies from the verified upstream. It turns RESUME,
+    /// EPOCH_ADVANCED and same-identity BOOTSTRAP answers into a bootstrap, and never overrides
+    /// DIVERGED or IDENTITY_CHANGED: those follow the configured policy (halt / refuse by default).
+    #[test]
+    fn a_verify_rebootstrap_never_overrides_divergence_or_a_foreign_identity() {
+        use Decision::{Bootstrap, Reject, Resume};
+        for p in [&DEFAULTS, &OPPOSITE] {
+            let verify = |d, r| after_handshake(&answer(d, r), p, Force::Verify);
+            let normal = |d, r| after_handshake(&answer(d, r), p, Force::None);
+            for (d, r) in [
+                (Resume, Reason::Unspecified),
+                (Resume, Reason::EpochAdvanced),
+                (Bootstrap, Reason::NoLocalState),
+                (Bootstrap, Reason::LogGap),
+            ] {
+                assert_eq!(verify(d, r), Action::Bootstrap, "{d:?}/{r:?}");
+            }
+            // Everything else follows the normal table, row by row.
+            for (d, r) in [
+                (Bootstrap, Reason::IdentityChanged),
+                (Reject, Reason::Diverged),
+                (Reject, Reason::StaleEpoch),
+                (Reject, Reason::NotReady),
+                (Reject, Reason::ProtocolMismatch),
+                (Reject, Reason::EnvelopeMismatch),
+                (Reject, Reason::LoopDetected),
+                (Decision::Unspecified, Reason::Unspecified),
+            ] {
+                assert_eq!(verify(d, r), normal(d, r), "{d:?}/{r:?}");
+            }
+        }
+        let verify = |d, r| after_handshake(&answer(d, r), &DEFAULTS, Force::Verify);
+        assert_eq!(
+            verify(Reject, Reason::Diverged),
+            Action::Halt(HaltReason::Diverged)
+        );
+        assert_eq!(
+            verify(Bootstrap, Reason::IdentityChanged),
+            Action::Halt(HaltReason::IdentityChanged)
         );
     }
 

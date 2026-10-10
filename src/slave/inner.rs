@@ -2,7 +2,7 @@
 //! replication server (when serving) read.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::SystemTime;
 
@@ -42,6 +42,84 @@ impl ForcedBootstrap {
         let _ = self
             .0
             .compare_exchange(generation + 1, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+/// A re-bootstrap asked for by a verify run (`MismatchPolicy::Rebootstrap`). Unlike
+/// `ForcedBootstrap` (the operator's explicit consent to lose data, through `clear_halt`), it is
+/// consent only to re-copy from the upstream that was verified: it applies to one repoint
+/// generation and one database identity, and it never overrides a DIVERGED or IDENTITY_CHANGED
+/// answer (`policy::after_handshake`). It ends when a bootstrap is installed.
+#[derive(Default)]
+pub(crate) struct VerifyRebootstrap(Mutex<Option<(u64, uuid::Uuid)>>);
+
+impl VerifyRebootstrap {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<(u64, uuid::Uuid)>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn request(&self, generation: u64, db_uuid: uuid::Uuid) {
+        *self.slot() = Some((generation, db_uuid));
+    }
+
+    /// A request for this generation is waiting.
+    pub(crate) fn pending_for(&self, generation: u64) -> bool {
+        self.slot().is_some_and(|(g, _)| g == generation)
+    }
+
+    /// Whether the request covers a handshake in `generation` with an upstream of `db_uuid`
+    /// (`None`: the answer carried no identity). A request for another database is dropped.
+    pub(crate) fn applies(&self, generation: u64, db_uuid: Option<uuid::Uuid>) -> bool {
+        let mut slot = self.slot();
+        match *slot {
+            Some((g, id)) if g == generation => {
+                if db_uuid == Some(id) {
+                    true
+                } else {
+                    if db_uuid.is_some() {
+                        *slot = None;
+                    }
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.slot() = None;
+    }
+}
+
+/// Blocking work of verify runs that still references the database (scans on blocking threads
+/// outlive a cancelled run for a moment). `Slave::shutdown` waits for it to drain.
+#[derive(Default)]
+pub(crate) struct VerifyWork(AtomicUsize);
+
+pub(crate) struct WorkGuard(Arc<VerifyWork>);
+
+impl Drop for WorkGuard {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl VerifyWork {
+    pub(crate) fn enter(self: &Arc<Self>) -> WorkGuard {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        WorkGuard(self.clone())
+    }
+
+    /// True once no blocking work is left, false after `limit`.
+    pub(crate) async fn idle(&self, limit: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while self.0.load(Ordering::SeqCst) > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        true
     }
 }
 
@@ -86,7 +164,9 @@ pub(crate) struct Inner {
     /// next handshake must not answer RESUME (see `driver::contradicting_resume`).
     pub diverged_on_stream: AtomicBool,
     /// What a verify asked of the applier: hold, or snapshot at a seq.
-    capture: Mutex<Capture>,
+    capture: Mutex<CaptureSlot>,
+    /// Hands out hold ids.
+    capture_ids: AtomicU64,
     /// Wakes an applier waiting on a hold.
     capture_changed: Notify,
     /// One verify run at a time.
@@ -98,6 +178,10 @@ pub(crate) struct Inner {
     pub last_applied_ts: AtomicU64,
     /// Wakes the tail loop when a verify asks for a re-bootstrap.
     pub rebootstrap: Notify,
+    /// The re-bootstrap a verify asked for, if any (see [`VerifyRebootstrap`]).
+    pub verify_rebootstrap: VerifyRebootstrap,
+    /// Blocking work of verify runs; shutdown waits for it.
+    pub verify_work: Arc<VerifyWork>,
 }
 
 impl Inner {
@@ -150,12 +234,15 @@ impl Inner {
             repoint_divergence: Mutex::new(None),
             halt_clear_pending: AtomicBool::new(false),
             diverged_on_stream: AtomicBool::new(false),
-            capture: Mutex::new(Capture::Idle),
+            capture: Mutex::default(),
+            capture_ids: AtomicU64::new(0),
             capture_changed: Notify::new(),
             verify_lock: tokio::sync::Mutex::new(()),
             last_verify: Mutex::new(None),
             last_applied_ts: AtomicU64::new(last_applied_ts),
             rebootstrap: Notify::new(),
+            verify_rebootstrap: VerifyRebootstrap::default(),
+            verify_work: Arc::default(),
         })
     }
 
@@ -393,6 +480,9 @@ pub(crate) enum Capture {
 /// target set with [`CaptureHold::target`]; dropping it releases the applier.
 pub(crate) struct CaptureHold {
     inner: Arc<Inner>,
+    /// Identifies this hold in the slot: a hold that was replaced by a later one (its run was
+    /// cancelled while its `target` call was still queued) must not touch the later one's state.
+    id: u64,
 }
 
 impl CaptureHold {
@@ -400,28 +490,21 @@ impl CaptureHold {
     ///
     /// Answered at once when the slave is already at or past `seq`: a commit that was under
     /// way when the hold was taken may have landed since. The applier is held, so a snapshot
-    /// taken now is exactly the state at `seq`.
+    /// taken now is exactly the state at `seq`. Blocking when it takes the snapshot: call it
+    /// from a blocking thread.
     pub(crate) fn target(&self, seq: Seq) -> oneshot::Receiver<CaptureReply> {
         let (tx, rx) = oneshot::channel();
         let mut slot = self.inner.capture();
-        if matches!(*slot, Capture::Cancelled) {
+        if slot.owner != self.id || matches!(slot.state, Capture::Cancelled) {
             let _ = tx.send(Err(CaptureMiss::Cancelled));
             return rx;
         }
         let applied = self.inner.store.position().last_seq;
         if applied >= seq {
-            let reply = if applied == seq {
-                self.inner.store.read_snapshot(0).map_err(|e| {
-                    tracing::warn!(node = %self.inner.cfg.identifier, seq, error = %e, "verify snapshot failed");
-                    CaptureMiss::Cancelled
-                })
-            } else {
-                Err(CaptureMiss::Passed(applied))
-            };
-            let _ = tx.send(reply);
+            let _ = tx.send(self.inner.snapshot_at(seq));
             return rx;
         }
-        *slot = Capture::At { seq, tx };
+        slot.state = Capture::At { seq, tx };
         drop(slot);
         self.inner.capture_changed.notify_waiters();
         rx
@@ -430,23 +513,55 @@ impl CaptureHold {
 
 impl Drop for CaptureHold {
     fn drop(&mut self) {
-        *self.inner.capture() = Capture::Idle;
-        self.inner.capture_changed.notify_waiters();
+        let mut slot = self.inner.capture();
+        if slot.owner == self.id {
+            slot.state = Capture::Idle;
+            drop(slot);
+            self.inner.capture_changed.notify_waiters();
+        }
     }
 }
 
+/// The capture slot: the state, and the hold that owns it.
+#[derive(Default)]
+pub(crate) struct CaptureSlot {
+    owner: u64,
+    state: Capture,
+}
+
 impl Inner {
-    fn capture(&self) -> std::sync::MutexGuard<'_, Capture> {
+    fn capture(&self) -> std::sync::MutexGuard<'_, CaptureSlot> {
         self.capture.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A snapshot of exactly the state at `seq`. The snapshot's own `seq()` is checked: a
+    /// commit that landed between the position read and the snapshot would make it later, and
+    /// a run on it would report differences that are not there.
+    fn snapshot_at(&self, seq: Seq) -> CaptureReply {
+        match self.store.read_snapshot(0) {
+            Ok(snap) if snap.seq() == seq => Ok(snap),
+            Ok(snap) => Err(CaptureMiss::Passed(snap.seq())),
+            Err(e) => {
+                tracing::warn!(node = %self.cfg.identifier, seq, error = %e, "verify snapshot failed");
+                Err(CaptureMiss::Cancelled)
+            }
+        }
     }
 
     /// Pauses the applier before its next commit, until the hold sets a target or is dropped.
     /// A verify takes it before asking the upstream for its snapshot, so this slave cannot pass
     /// the snapshot's seq meanwhile.
     pub(crate) fn hold_applier(self: &Arc<Self>) -> CaptureHold {
-        *self.capture() = Capture::Hold;
+        let id = self.capture_ids.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut slot = self.capture();
+        *slot = CaptureSlot {
+            owner: id,
+            state: Capture::Hold,
+        };
+        drop(slot);
         CaptureHold {
             inner: self.clone(),
+            id,
         }
     }
 
@@ -456,7 +571,7 @@ impl Inner {
             let notified = self.capture_changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if !matches!(*self.capture(), Capture::Hold) {
+            if !matches!(self.capture().state, Capture::Hold) {
                 return;
             }
             notified.await;
@@ -467,12 +582,12 @@ impl Inner {
     /// set is answered `Cancelled`, and so is one a held verify sets later.
     pub(crate) fn cancel_capture(&self) {
         let mut slot = self.capture();
-        match std::mem::take(&mut *slot) {
+        match std::mem::take(&mut slot.state) {
             Capture::At { tx, .. } => {
                 let _ = tx.send(Err(CaptureMiss::Cancelled));
-                *slot = Capture::Cancelled;
+                slot.state = Capture::Cancelled;
             }
-            Capture::Hold | Capture::Cancelled => *slot = Capture::Cancelled,
+            Capture::Hold | Capture::Cancelled => slot.state = Capture::Cancelled,
             Capture::Idle => {}
         }
         drop(slot);
@@ -484,20 +599,19 @@ impl Inner {
     pub(crate) fn capture_after_commit(&self, seq: Seq) {
         let tx = {
             let mut slot = self.capture();
-            match &*slot {
-                Capture::At { seq: want, .. } if *want <= seq => match std::mem::take(&mut *slot) {
-                    Capture::At { seq: want, tx } => Some((want, tx)),
-                    _ => None,
-                },
+            match &slot.state {
+                Capture::At { seq: want, .. } if *want <= seq => {
+                    match std::mem::take(&mut slot.state) {
+                        Capture::At { seq: want, tx } => Some((want, tx)),
+                        _ => None,
+                    }
+                }
                 _ => None,
             }
         };
         let Some((want, tx)) = tx else { return };
         let reply = if want == seq {
-            self.store.read_snapshot(0).map_err(|e| {
-                tracing::warn!(node = %self.cfg.identifier, seq, error = %e, "verify snapshot failed");
-                CaptureMiss::Cancelled
-            })
+            self.snapshot_at(seq)
         } else {
             Err(CaptureMiss::Passed(seq))
         };
@@ -521,7 +635,189 @@ impl Inner {
 
 #[cfg(test)]
 mod tests {
-    use super::ForcedBootstrap;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::codec::encode_ops;
+    use crate::slave::config::UpstreamConfig;
+    use crate::tuning::RocksTuning;
+    use crate::types::{LogEntry, Op, Role};
+
+    /// A slave `Inner` over a fresh store; `apply` commits the next entry like the applier.
+    fn inner(dir: &std::path::Path) -> Arc<Inner> {
+        let (store, meta) = Store::open(dir, Role::Slave, RocksTuning::new()).unwrap();
+        let up = UpstreamConfig::new("127.0.0.1", 1);
+        let cfg = SlaveConfig::new("t", dir, up);
+        Arc::new(Inner::new(store, cfg, &meta).unwrap())
+    }
+
+    fn apply(i: &Inner) -> Seq {
+        let seq = i.store.position().last_seq + 1;
+        let ops = vec![Op::CreateCf {
+            spec: crate::types::CfSpec::new(format!("c{seq}")),
+        }];
+        let e = LogEntry::new(seq, 1, 1_000 * seq, encode_ops(&ops));
+        let prepared = i.store.prepare(&e, &ops).unwrap();
+        i.store.commit(prepared, false).unwrap();
+        i.capture_after_commit(seq);
+        seq
+    }
+
+    async fn released(i: &Inner) -> bool {
+        tokio::time::timeout(Duration::from_millis(500), i.wait_while_held())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_hold_stops_the_applier_until_it_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inner(dir.path());
+        assert!(released(&i).await, "nothing holds the applier");
+        let hold = i.hold_applier();
+        assert!(!released(&i).await, "held");
+        drop(hold);
+        assert!(released(&i).await, "dropping the hold releases it");
+    }
+
+    #[tokio::test]
+    async fn a_waiting_applier_wakes_when_the_hold_sets_a_target_or_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inner(dir.path());
+        for _ in 0..3 {
+            apply(&i);
+        }
+        let hold = i.hold_applier();
+        let waiter = tokio::spawn({
+            let i = i.clone();
+            async move { i.wait_while_held().await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished());
+        let rx = hold.target(5);
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("a target releases the applier up to it")
+            .unwrap();
+        // The applier commits 4, then 5: the snapshot is taken right after 5.
+        apply(&i);
+        assert_eq!(apply(&i), 5);
+        let snap = rx.await.unwrap().ok().expect("a snapshot");
+        assert_eq!(snap.seq(), 5);
+        drop(hold);
+    }
+
+    #[tokio::test]
+    async fn a_target_at_or_behind_the_applied_seq_is_answered_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inner(dir.path());
+        for _ in 0..3 {
+            apply(&i);
+        }
+        let hold = i.hold_applier();
+        let at = hold.target(3).await.unwrap();
+        assert_eq!(at.ok().expect("snapshot").seq(), 3);
+        let hold = i.hold_applier();
+        match hold.target(2).await.unwrap() {
+            Err(CaptureMiss::Passed(3)) => {}
+            other => panic!("expected Passed(3), got ok={}", other.is_ok()),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_answers_a_pending_target_and_refuses_later_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inner(dir.path());
+        apply(&i);
+        // During a hold, before any target.
+        let hold = i.hold_applier();
+        i.cancel_capture();
+        assert!(
+            released(&i).await,
+            "a cancelled hold does not hold the applier"
+        );
+        assert!(matches!(
+            hold.target(5).await.unwrap(),
+            Err(CaptureMiss::Cancelled)
+        ));
+        drop(hold);
+        // During a pending target.
+        let hold = i.hold_applier();
+        let rx = hold.target(5);
+        i.cancel_capture();
+        assert!(matches!(rx.await.unwrap(), Err(CaptureMiss::Cancelled)));
+        drop(hold);
+        // Nothing to cancel: the next hold works.
+        i.cancel_capture();
+        let hold = i.hold_applier();
+        assert!(!released(&i).await);
+        drop(hold);
+    }
+
+    /// A hold replaced by a later run (its run was cancelled while its `target` call was
+    /// queued) must not release or answer the later run's capture when it is dropped.
+    #[tokio::test]
+    async fn a_stale_hold_does_not_clobber_the_next_runs_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inner(dir.path());
+        apply(&i);
+        let stale = i.hold_applier();
+        let current = i.hold_applier();
+        let rx = current.target(4);
+        drop(stale);
+        assert_eq!(apply(&i), 2);
+        apply(&i);
+        assert_eq!(apply(&i), 4);
+        assert_eq!(rx.await.unwrap().ok().expect("snapshot").seq(), 4);
+        let again = i.hold_applier();
+        assert!(matches!(
+            stale_target(&i).await,
+            Err(CaptureMiss::Cancelled)
+        ));
+        drop((current, again));
+    }
+
+    async fn stale_target(i: &Arc<Inner>) -> CaptureReply {
+        let old = i.hold_applier();
+        let _newer = i.hold_applier();
+        old.target(99).await.unwrap()
+    }
+
+    #[test]
+    fn a_verify_rebootstrap_is_scoped_to_one_generation_and_one_database() {
+        let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let r = VerifyRebootstrap::default();
+        assert!(!r.applies(0, Some(a)) && !r.pending_for(0));
+        r.request(3, a);
+        assert!(r.pending_for(3) && !r.pending_for(4));
+        assert!(!r.applies(4, Some(a)), "another repoint generation");
+        assert!(
+            r.pending_for(3),
+            "an older generation's request just stays inert"
+        );
+        assert!(r.applies(3, Some(a)));
+        assert!(
+            !r.applies(3, None),
+            "an answer without identity does not apply"
+        );
+        assert!(r.applies(3, Some(a)), "and does not spend it");
+        assert!(!r.applies(3, Some(b)), "another database");
+        assert!(!r.pending_for(3), "which expires it for good");
+        assert!(!r.applies(3, Some(a)));
+        r.request(3, a);
+        r.clear();
+        assert!(!r.applies(3, Some(a)));
+    }
+
+    #[tokio::test]
+    async fn verify_work_drains() {
+        let w = Arc::new(VerifyWork::default());
+        assert!(w.idle(Duration::from_millis(10)).await);
+        let g = w.enter();
+        assert!(!w.idle(Duration::from_millis(50)).await);
+        drop(g);
+        assert!(w.idle(Duration::from_millis(500)).await);
+    }
 
     #[test]
     fn an_older_request_never_overwrites_a_newer_one() {

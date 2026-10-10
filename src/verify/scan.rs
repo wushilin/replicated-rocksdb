@@ -16,6 +16,7 @@ use crate::store::cfs::PhysCf;
 
 /// Calls `f(key, envelope)` for each key of `cf` in `bounds`, in order, until `f` returns
 /// `false`. Expired values are included: verify compares what is stored.
+#[cfg(test)]
 pub(crate) fn scan(
     snap: &ReadSnapshot,
     cf: Arc<PhysCf>,
@@ -82,19 +83,33 @@ pub(crate) fn list_range(
 }
 
 /// Blocking: sleeps the OS thread (`std::thread::sleep`); async callers must run it inside
-/// `spawn_blocking` / `background::blocking`. Sleeps as long as `throttle` asks for after reading `n` bytes.
-pub(crate) fn pace(throttle: &Mutex<Throttle>, n: u64) {
-    let pause = throttle
+/// `spawn_blocking` / `background::blocking`. Sleeps as long as `throttle` asks for after
+/// reading `n` bytes, in slices of at most [`PACE_SLICE`], and returns early once `stop` is set.
+pub(crate) fn pace(throttle: &Mutex<Throttle>, n: u64, stop: &AtomicBool) {
+    let mut pause = throttle
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .consume(n);
-    if !pause.is_zero() {
-        std::thread::sleep(pause);
+    while !pause.is_zero() && !stop.load(Ordering::Relaxed) {
+        let slice = pause.min(PACE_SLICE);
+        std::thread::sleep(slice);
+        pause -= slice;
     }
 }
 
+/// The longest [`pace`] sleeps without looking at its stop flag.
+pub(crate) const PACE_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The error of a local scan that `stop` ended: the run is gone, nobody reads the result.
+fn stopped() -> crate::error::Error {
+    crate::error::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "the verify run was stopped",
+    ))
+}
+
 /// The local records of a range, for narrowing. Blocking (RocksDB reads plus [`pace`]): call
-/// only from `spawn_blocking` / `background::blocking`.
+/// only from `spawn_blocking` / `background::blocking`. `Err(Interrupted)` once `stop` is set.
 pub(crate) fn load_range(
     snap: &ReadSnapshot,
     cf: Arc<PhysCf>,
@@ -102,13 +117,17 @@ pub(crate) fn load_range(
     bounds: &Bounds,
     mode: VerifyMode,
     throttle: &Mutex<Throttle>,
+    stop: &AtomicBool,
 ) -> Result<Vec<LocalRecord>> {
     let mut out = Vec::new();
-    scan(snap, cf, order, bounds, |k, v| {
-        pace(throttle, (k.len() + v.len()) as u64);
+    let finished = scan_until(snap, cf, order, bounds, Some(stop), |k, v| {
+        pace(throttle, (k.len() + v.len()) as u64, stop);
         out.push(LocalRecord::new(k, v, mode)?);
         Ok(true)
     })?;
+    if !finished || stop.load(Ordering::Relaxed) {
+        return Err(stopped());
+    }
     Ok(out)
 }
 
@@ -117,8 +136,9 @@ pub(crate) fn load_range(
 /// `background::blocking`.
 ///
 /// Returns `Some(keys read)` when the whole CF was cut and emitted. Returns `None` when
-/// `emit` returned `false` and the scan stopped early: ranges are then missing, so callers
-/// must treat it as an abort, never as a complete scan.
+/// `emit` returned `false` or `stop` was set and the scan stopped early: ranges are then
+/// missing, so callers must treat it as an abort, never as a complete scan.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn chunk_cf(
     snap: &ReadSnapshot,
     cf: Arc<PhysCf>,
@@ -126,26 +146,28 @@ pub(crate) fn chunk_cf(
     chunk_keys: usize,
     chunk_bytes: usize,
     throttle: &Mutex<Throttle>,
+    stop: &AtomicBool,
     mut emit: impl FnMut(LocalRange) -> bool,
 ) -> Result<Option<u64>> {
     let mut chunker = Chunker::new(mode, chunk_keys, chunk_bytes);
     let mut keys = 0u64;
     let mut open = true;
-    scan(
+    let finished = scan_until(
         snap,
         cf,
         &KeyOrder::bytewise(),
         &Bounds::default(),
+        Some(stop),
         |k, v| {
-            pace(throttle, (k.len() + v.len()) as u64);
+            pace(throttle, (k.len() + v.len()) as u64, stop);
             keys += 1;
             if let Some(r) = chunker.push(k, v)? {
                 open = emit(r);
             }
-            Ok(open)
+            Ok(open && !stop.load(Ordering::Relaxed))
         },
     )?;
-    if !open {
+    if !finished || !open || stop.load(Ordering::Relaxed) {
         return Ok(None);
     }
     if !emit(chunker.finish()) {
@@ -347,6 +369,7 @@ mod tests {
             &b(None, Some(b"d")),
             VerifyMode::Full,
             &t,
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(
@@ -354,10 +377,19 @@ mod tests {
             vec![b"f".to_vec(), b"e".to_vec()]
         );
         let mut ranges = Vec::new();
-        let n = chunk_cf(&snap, cf, VerifyMode::Quick, 4, usize::MAX, &t, |r| {
-            ranges.push(r);
-            true
-        })
+        let n = chunk_cf(
+            &snap,
+            cf,
+            VerifyMode::Quick,
+            4,
+            usize::MAX,
+            &t,
+            &AtomicBool::new(false),
+            |r| {
+                ranges.push(r);
+                true
+            },
+        )
         .unwrap();
         assert_eq!(n, Some(6));
         assert_eq!(ranges.len(), 2);
@@ -365,6 +397,63 @@ mod tests {
             ranges[0].bounds.upper.as_deref(),
             Some(&b"b"[..]),
             "boundaries follow the CF order"
+        );
+    }
+
+    /// A stop flag ends local scans at once, even throttled to a crawl: they must not keep the
+    /// database open after the run is gone.
+    #[test]
+    fn a_stopped_scan_ends_at_once_even_when_throttled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        apply(
+            &store,
+            vec![Op::CreateCf {
+                spec: CfSpec::new("c"),
+            }],
+        )
+        .unwrap();
+        let ops = (0..50u8).map(|i| put("c", &[i], &[i; 100])).collect();
+        apply(&store, ops).unwrap();
+        let snap = store.read_snapshot(0).unwrap();
+        let cf = snap.phys("c").unwrap();
+        // 100 bytes per second: the unstopped scan would take over a minute.
+        let slow = Mutex::new(Throttle::new(Some(100)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let n = chunk_cf(
+            &snap,
+            cf.clone(),
+            VerifyMode::Full,
+            10,
+            usize::MAX,
+            &slow,
+            &stop,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(n, None, "an early stop is never a complete scan");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        setter.join().unwrap();
+        // Already stopped: load_range refuses at once.
+        let e = load_range(
+            &snap,
+            cf,
+            &KeyOrder::bytewise(),
+            &all(),
+            VerifyMode::Full,
+            &slow,
+            &stop,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, crate::error::Error::Io(io) if io.kind() == std::io::ErrorKind::Interrupted),
+            "{e:?}"
         );
     }
 
