@@ -5,6 +5,7 @@ use std::time::SystemTime;
 use crate::error::{Error, Result};
 use crate::store::bootstrap::{NODE_BOOTSTRAPPING, NODE_READY};
 use crate::types::{DbIdentity, Seq};
+use crate::verify::VerifyReport;
 
 /// Why a slave stopped advancing. Reads keep working while halted. More reasons may be added,
 /// hence `non_exhaustive`.
@@ -158,6 +159,8 @@ pub struct SlaveStatus {
     pub last_error: Option<String>,
     /// True after the listener panicked; it is not called again until restart.
     pub listener_failed: bool,
+    /// The last verify report (scheduled or `verify_now`), if any run produced one.
+    pub last_verify: Option<VerifyReport>,
 }
 
 #[cfg(test)]

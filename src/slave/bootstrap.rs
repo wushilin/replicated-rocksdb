@@ -110,6 +110,8 @@ pub(crate) async fn install(
     hs: &pb::HandshakeResponse,
 ) -> std::result::Result<Vec<u8>, SessionEnd> {
     inner.force_bootstrap.clear(generation);
+    // A verify waiting for a seq of the old state can never be served now.
+    inner.cancel_capture();
     inner.set_ident(None);
     inner.reset_downstream();
     inner.seq_tx.send_replace(0);

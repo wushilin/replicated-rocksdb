@@ -333,7 +333,7 @@ Normative messages: PROTOCOL.md §9.
 
 **Comparing at the same seq**
 1. Slave → `VerifyBegin`. The upstream opens a snapshot, reads `S`, identity and `cf_specs` through it, and returns them with a `session_id`.
-2. The slave's applier captures a snapshot **exactly at `S`**: it applies up to `S` and snapshots before `S + 1`. Normally the slave is at or behind `S`, since it can only have received what the upstream had. The exception is the case in §6, where it can be ahead. If it is already past `S`, the session is abandoned and retried later.
+2. The slave's applier captures a snapshot **exactly at `S`**. The slave connects first, then **holds its applier before sending `VerifyBegin`**, so it cannot run past `S` while the answer travels back (a slave following a busy master otherwise always would). Once `S` is known the applier runs up to `S`, snapshots right after committing it, and continues; a slave already at `S` snapshots at once. The pause is bounded: `VerifyBegin` must answer within `min(10 s, capture_timeout)`, because a held slave applies and acknowledges nothing (a write concern on the master would time out). Normally the slave is at or behind `S`, since it can only have received what the upstream had; the exception is the case in §6, where it can be ahead: then the run is abandoned (`PassedSnapshot`) and retried later. A slave that cannot reach `S` gives up after `capture_timeout`, and at once when it is halted.
 3. First compare `cf_specs`. Then, for each CF present on both sides, compare ranges.
 
 **Ranges**
@@ -342,11 +342,14 @@ Normative messages: PROTOCOL.md §9.
 - Hash: BLAKE3 over length-prefixed `(key, payload)` records in key order (PROTOCOL.md §5.4).
   - `VerifyMode::Quick`: payload = envelope header (`ver`, `flags`, `write_seq`, `expire_at`). Detects missing, extra or stale writes without reading large values.
   - `VerifyMode::Full`: payload = full envelope. Also detects value corruption.
+- Keys longer than 1 MiB are never used as boundaries, so range requests stay small; a range simply grows past them.
 - On a mismatch the slave splits the range at its median key, repeating down to `min_chunk_keys`. Then it asks the upstream to list that range (`ListRange`: key, `write_seq`, payload hash) and diffs it key by key. Listing also finds keys that exist only on the upstream.
 - Up to 16 range requests are pipelined. The slave throttles itself with `max_bytes_per_sec`. The upstream limits concurrent sessions and closes sessions idle for longer than `session_timeout`.
 
 **Result**
-- `VerifyReport { seq, mode, cfs_checked, keys_checked, mismatches: Vec<Mismatch>, duration }`, where `Mismatch` is `CfSpec { .. }` or `Key { cf, key, local: Option<write_seq>, upstream: Option<write_seq> }`, or `Range { cf, lower, upper }` if listing was cut short.
+- `VerifyReport { seq, mode, cfs_checked, keys_checked, mismatches: Vec<Mismatch>, duration }` (`is_clean()`), where `Mismatch` is `CfSpec { name, local: Option<CfVersion>, upstream: Option<CfVersion> }` (`CfVersion { spec, create_seq }`), `Key { cf, key, local: Option<write_seq>, upstream: Option<write_seq> }` (equal `write_seq`s mean the values differ), or `Range { cf, lower, upper }` for keys that were not compared one by one: the listing could not be continued (its last key is longer than 2 MiB), or the run had already reported `max_reported_keys` keys.
+- A run that cannot produce a report fails with `Error::VerifyAborted(VerifyAbort)`: `Busy` and `SessionExpired` (from the upstream), `IdentityChanged`, `PassedSnapshot { snapshot_seq, applied_seq }` (the slave is already past `S`; retry later), `CaptureTimeout { snapshot_seq }` (the slave did not reach `S` within `capture_timeout`, or is halted), or `Upstream(..)`. Without data, `verify_now` returns `NotReady`.
+- Every report is stored in `SlaveStatus.last_verify` and passed to `on_verify_complete`. Under `MismatchPolicy::Rebootstrap`, a report with mismatches ends the current Tail stream and the slave bootstraps at once (a halted slave stays halted).
 - `MismatchPolicy::Report` (default) or `MismatchPolicy::Rebootstrap`. There is no automatic range repair in v1.
 - In a chain, each slave verifies against its own upstream. If every link matches, the whole chain matches.
 
@@ -592,8 +595,9 @@ pub struct SlaveConfig {
     pub upstream: UpstreamConfig,
     pub serve: Option<ServeConfig>,          // Some = also serves downstream replicas
     pub retention: Retention,
-    pub verify: VerifyConfig,                // { interval: Option<Duration>, mode, chunk_keys, chunk_bytes,
-                                             //   min_chunk_keys, max_bytes_per_sec, on_mismatch }
+    pub verify: VerifyConfig,                // { interval: None, mode: Quick, chunk_keys: 1 000, chunk_bytes: 4 MiB,
+                                             //   min_chunk_keys: 16, max_bytes_per_sec: None, on_mismatch: Report,
+                                             //   capture_timeout: 60 s, max_reported_keys: 10 000 }
     pub listener: Option<Arc<dyn ReplicationListener>>,
     pub on_identity_change: IdentityPolicy,  // Refuse (default) | Rebootstrap
     pub on_divergence: DivergencePolicy,     // Halt (default) | Rebootstrap
@@ -716,7 +720,7 @@ See §5.1. `Master::get`, `Master::put`, `Master::write` and the crate-level doc
 
 ### 16.2 Errors
 
-`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }`, `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), `Diverged { fork_seq, local_last_seq, divergent_entries }` (a refused `repoint`), `RepointSuperseded`, `Unsupported`, `PeerUnreachable { peer, reason, source }` (`admin::node_status*` got no answer; `reason` is one line), `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
+`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }`, `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), `Diverged { fork_seq, local_last_seq, divergent_entries }` (a refused `repoint`), `RepointSuperseded`, `Unsupported`, `PeerUnreachable { peer, reason, source }` (`admin::node_status*` got no answer; `reason` is one line), `VerifyAborted(VerifyAbort)` (`verify_now` could not produce a report), `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
 
 ### 16.3 Persisted vs runtime slave state
 
@@ -764,7 +768,7 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 | Bootstrap chunk size | 1 MiB |
 | Tail fetch batching (slave) | `min_batch_bytes` 0 (real-time), `max_wait` 100 ms, `max_batch_bytes` 1 MiB; server cap 4 MiB |
 | In-sync window (`ServeLimits::replica_lag_time_max`) | 10 s |
-| Verify | off by default; `Quick` when enabled |
+| Verify | off by default; `Quick` when enabled; ranges of 1 000 keys or 4 MiB, listed at ≤ 16 keys; capture timeout 60 s; at most 10 000 key mismatches per report |
 | Verify session timeout | 5 min |
 | Mismatch policy | Report |
 | Reaper | every 30 s; 1 000 deletes per entry; 100 000 per round |

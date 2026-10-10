@@ -5,10 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::VerifyMode;
-use super::range::{
-    Bounds, Chunker, KeyOrder, Lister, LocalRange, LocalRecord, RangeHasher, Throttle,
-};
+use super::range::{Bounds, Chunker, KeyOrder, LocalRange, LocalRecord, Throttle};
+#[cfg(test)]
+use super::range::{Lister, RangeHasher};
 use crate::error::Result;
+#[cfg(test)]
 use crate::pb;
 use crate::read::ReadSnapshot;
 use crate::store::cfs::PhysCf;
@@ -48,7 +49,9 @@ pub(crate) fn scan_until(
     Ok(true)
 }
 
-/// `(count, hash)` of a range (PROTOCOL.md §5.4, §9.3).
+/// `(count, hash)` of a range (PROTOCOL.md §5.4, §9.3). The server hashes through `scan_until`
+/// (cancellable); this is the plain reference its tests compare against.
+#[cfg(test)]
 pub(crate) fn hash_range(
     snap: &ReadSnapshot,
     cf: Arc<PhysCf>,
@@ -62,6 +65,8 @@ pub(crate) fn hash_range(
 }
 
 /// Up to `limit` keys of a range with their `write_seq` and payload hash; `true` if there are more.
+/// Test reference for the server's cancellable listing.
+#[cfg(test)]
 pub(crate) fn list_range(
     snap: &ReadSnapshot,
     cf: Arc<PhysCf>,

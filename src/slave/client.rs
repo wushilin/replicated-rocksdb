@@ -62,12 +62,39 @@ pub(crate) fn connect(inner: &Inner) -> Result<Client> {
     )
 }
 
+/// A client for the current upstream whose connection is already established (bounded by
+/// `connect_timeout`). A verify connects this way before it holds the applier.
+pub(crate) async fn connect_now(inner: &Inner) -> Result<Client> {
+    let (endpoint, meta) = endpoint_for(
+        &inner.upstream(),
+        &inner.cfg.identifier,
+        inner.cfg.connect_timeout,
+    )?;
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+    Ok(ReplicationClient::with_interceptor(channel, meta))
+}
+
 /// A client for `up`, identifying itself as `identifier`.
 pub(crate) fn connect_upstream(
     up: &UpstreamConfig,
     identifier: &str,
     connect_timeout: Duration,
 ) -> Result<Client> {
+    let (endpoint, meta) = endpoint_for(up, identifier, connect_timeout)?;
+    Ok(ReplicationClient::with_interceptor(
+        endpoint.connect_lazy(),
+        meta,
+    ))
+}
+
+fn endpoint_for(
+    up: &UpstreamConfig,
+    identifier: &str,
+    connect_timeout: Duration,
+) -> Result<(Endpoint, CallMeta)> {
     let mut endpoint = Endpoint::from_shared(up.uri())
         .map_err(|e| Error::Config(format!("upstream address {}: {e}", up.uri())))?
         .connect_timeout(connect_timeout)
@@ -86,8 +113,5 @@ pub(crate) fn connect_upstream(
         node_id,
         credentials: up.credentials.clone(),
     };
-    Ok(ReplicationClient::with_interceptor(
-        endpoint.connect_lazy(),
-        meta,
-    ))
+    Ok((endpoint, meta))
 }

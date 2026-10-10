@@ -2,10 +2,6 @@
 //! logic shared by the server (hashes and listings over a pinned snapshot) and the slave
 //! verifier (contiguous ranges, bisection, listing and key-by-key diff).
 
-// Task 5 (the slave verifier) is the caller of the client-side items (`compare`, the
-// boundary limits, `VERIFY_WINDOW`, `to_pb`, `VerifyConfig::validate`); remove when it lands.
-#![allow(dead_code)]
-
 pub(crate) mod compare;
 pub(crate) mod range;
 pub(crate) mod scan;

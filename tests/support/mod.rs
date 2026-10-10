@@ -11,7 +11,7 @@ use std::time::Duration;
 use replicated_rocksdb::{
     AllowAll, Backoff, CfSpec, IterMode, LogApi, LogEntry, ManualClock, Master, MasterConfig,
     ReadApi, ReplicationListener, Seq, ServeConfig, Slave, SlaveConfig, SlaveState, UpstreamConfig,
-    ValueMeta,
+    ValueMeta, VerifyReport,
 };
 
 pub const T0: u64 = 1_700_000_000_000;
@@ -297,6 +297,7 @@ pub struct RecordingListener {
     pub bootstraps_begun: AtomicUsize,
     pub bootstraps: AtomicUsize,
     pub states: Mutex<Vec<SlaveState>>,
+    pub verifies: Mutex<Vec<VerifyReport>>,
     pub violations: Mutex<Vec<String>>,
     last: AtomicU64,
 }
@@ -315,6 +316,13 @@ impl RecordingListener {
 
     pub fn states(&self) -> Vec<SlaveState> {
         self.states
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn verifies(&self) -> Vec<VerifyReport> {
+        self.verifies
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -358,5 +366,12 @@ impl ReplicationListener for RecordingListener {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(state.clone());
+    }
+
+    fn on_verify_complete(&self, report: &VerifyReport) {
+        self.verifies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(report.clone());
     }
 }

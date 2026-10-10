@@ -2,6 +2,7 @@
 
 use crate::slave::SlaveState;
 use crate::types::{LogEntry, Seq};
+use crate::verify::VerifyReport;
 
 /// Observes a slave's replication. Called inline in the apply loop, after commit and
 /// before the new seq is published to `wait_for_seq` and `subscribe`: a slow listener
@@ -18,4 +19,8 @@ pub trait ReplicationListener: Send + Sync + 'static {
     fn on_bootstrap_begin(&self, _snapshot_seq: Seq) {}
     fn on_bootstrap_complete(&self, _snapshot_seq: Seq) {}
     fn on_state_change(&self, _state: &SlaveState) {}
+    /// After every verify run that produced a report (scheduled or `Slave::verify_now`).
+    /// Mismatches are in `report.mismatches`; under `MismatchPolicy::Rebootstrap` the
+    /// re-bootstrap has already been requested.
+    fn on_verify_complete(&self, _report: &VerifyReport) {}
 }

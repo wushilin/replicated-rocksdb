@@ -431,13 +431,18 @@ async fn tail(
     let mut cleared = false;
     let started = Instant::now();
     loop {
-        let next = match unless_repointed(
-            inner,
-            generation,
-            tokio::time::timeout(idle, stream.message()),
-        )
-        .await
-        {
+        let received = tokio::select! {
+            r = unless_repointed(inner, generation, tokio::time::timeout(idle, stream.message())) => r,
+            // A verify asked for a re-bootstrap (`MismatchPolicy::Rebootstrap`): handshake again,
+            // which bootstraps because the request is set. A stale wake-up is ignored.
+            _ = inner.rebootstrap.notified() => {
+                if inner.force_bootstrap.is_requested_for(generation) {
+                    return SessionEnd::Again;
+                }
+                continue;
+            }
+        };
+        let next = match received {
             Ok(next) => next,
             Err(end) => return end,
         };

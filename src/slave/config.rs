@@ -11,6 +11,7 @@ use crate::config::{Retention, ServeConfig, TlsClientConfig, validate_identifier
 use crate::error::{Error, Result};
 use crate::listener::ReplicationListener;
 use crate::tuning::RocksTuning;
+use crate::verify::VerifyConfig;
 
 /// The node this slave replicates from: the master or another slave.
 #[derive(Clone)]
@@ -154,6 +155,9 @@ pub struct SlaveConfig {
     /// `Some` = this slave also serves downstream replicas.
     pub serve: Option<ServeConfig>,
     pub retention: Retention,
+    /// Integrity verification against the upstream (DESIGN.md §12). Scheduled runs are off
+    /// unless `interval` is set; `Slave::verify_now` always works.
+    pub verify: VerifyConfig,
     pub listener: Option<Arc<dyn ReplicationListener>>,
     pub on_identity_change: IdentityPolicy,
     pub on_divergence: DivergencePolicy,
@@ -185,6 +189,7 @@ impl SlaveConfig {
             upstream,
             serve: None,
             retention: Retention::default(),
+            verify: VerifyConfig::default(),
             listener: None,
             on_identity_change: IdentityPolicy::default(),
             on_divergence: DivergencePolicy::default(),
@@ -227,6 +232,7 @@ impl SlaveConfig {
                 "heartbeat, connect_timeout and retention.check_interval must be positive".into(),
             ));
         }
+        self.verify.validate()?;
         if let Some(serve) = &self.serve {
             serve.validate()?;
             serve.check_heartbeat(self.heartbeat)?;

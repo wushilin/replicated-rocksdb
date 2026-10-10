@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::SystemTime;
 
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, oneshot, watch};
 
 use super::config::{SlaveConfig, UpstreamConfig};
 use super::policy::Policies;
@@ -14,9 +14,11 @@ use super::repoint::PendingRepoint;
 use super::state::{HaltReason, NodeState, SlaveState, SlaveStatus};
 use crate::error::{Error, Result};
 use crate::listener::ReplicationListener;
+use crate::read::ReadSnapshot;
 use crate::store::Store;
 use crate::store::meta::{MetaSnapshot, key};
 use crate::types::{DbIdentity, EpochStart, Seq, newest_records};
+use crate::verify::VerifyReport;
 
 /// A requested bootstrap, tagged with the repoint generation it was requested for. A request
 /// of an older generation (a session of the previous upstream still winding down) is inert:
@@ -83,6 +85,19 @@ pub(crate) struct Inner {
     /// A stream ended `DIVERGED` under a repoint's mode and the session was restarted: the
     /// next handshake must not answer RESUME (see `driver::contradicting_resume`).
     pub diverged_on_stream: AtomicBool,
+    /// What a verify asked of the applier: hold, or snapshot at a seq.
+    capture: Mutex<Capture>,
+    /// Wakes an applier waiting on a hold.
+    capture_changed: Notify,
+    /// One verify run at a time.
+    pub verify_lock: tokio::sync::Mutex<()>,
+    last_verify: Mutex<Option<VerifyReport>>,
+    /// `ts_ms` of the last applied entry; 0 = unknown (right after a bootstrap).
+    // Read by the replication lag status (Plan 3 Task 7), which also keeps it current.
+    #[allow(dead_code)]
+    pub last_applied_ts: AtomicU64,
+    /// Wakes the tail loop when a verify asks for a re-bootstrap.
+    pub rebootstrap: Notify,
 }
 
 impl Inner {
@@ -102,6 +117,15 @@ impl Inner {
             NodeState::Ready | NodeState::Bootstrapping => SlaveState::Connecting,
         };
         let last_seq = store.position().last_seq;
+        // The entry at last_seq, if still in the log, gives the lag's time base after a restart.
+        let last_applied_ts = match last_seq {
+            0 => 0,
+            s => store
+                .read_entries(s, 1, usize::MAX)
+                .ok()
+                .and_then(|v| v.first().map(|e| e.ts_ms))
+                .unwrap_or(0),
+        };
         Ok(Inner {
             store,
             upstream: RwLock::new(cfg.upstream.clone()),
@@ -126,6 +150,12 @@ impl Inner {
             repoint_divergence: Mutex::new(None),
             halt_clear_pending: AtomicBool::new(false),
             diverged_on_stream: AtomicBool::new(false),
+            capture: Mutex::new(Capture::Idle),
+            capture_changed: Notify::new(),
+            verify_lock: tokio::sync::Mutex::new(()),
+            last_verify: Mutex::new(None),
+            last_applied_ts: AtomicU64::new(last_applied_ts),
+            rebootstrap: Notify::new(),
         })
     }
 
@@ -327,7 +357,165 @@ impl Inner {
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone(),
             listener_failed: self.listener_failed.load(Ordering::SeqCst),
+            last_verify: self.last_verify(),
         }
+    }
+}
+
+/// Why a verify waiting for seq `S` got no snapshot from the applier.
+pub(crate) enum CaptureMiss {
+    /// The applier committed this later seq without ever being at `S` while asked.
+    Passed(Seq),
+    /// Cancelled (a bootstrap began), or the snapshot could not be taken.
+    Cancelled,
+}
+
+pub(crate) type CaptureReply = std::result::Result<ReadSnapshot, CaptureMiss>;
+
+/// What a verify asked of the applier (DESIGN.md §12).
+#[derive(Default)]
+pub(crate) enum Capture {
+    #[default]
+    Idle,
+    /// Commit nothing more until the upstream's snapshot seq is known.
+    Hold,
+    /// Take a snapshot right after committing `seq`.
+    At {
+        seq: Seq,
+        tx: oneshot::Sender<CaptureReply>,
+    },
+    /// The state a held verify was waiting for is gone (a bootstrap began): its target is
+    /// answered `Cancelled`, and the applier is not held.
+    Cancelled,
+}
+
+/// A verify's hold on the applier. While it exists the applier commits nothing past the
+/// target set with [`CaptureHold::target`]; dropping it releases the applier.
+pub(crate) struct CaptureHold {
+    inner: Arc<Inner>,
+}
+
+impl CaptureHold {
+    /// Lets the applier run up to `seq`, snapshot right after committing it, and continue.
+    ///
+    /// Answered at once when the slave is already at or past `seq`: a commit that was under
+    /// way when the hold was taken may have landed since. The applier is held, so a snapshot
+    /// taken now is exactly the state at `seq`.
+    pub(crate) fn target(&self, seq: Seq) -> oneshot::Receiver<CaptureReply> {
+        let (tx, rx) = oneshot::channel();
+        let mut slot = self.inner.capture();
+        if matches!(*slot, Capture::Cancelled) {
+            let _ = tx.send(Err(CaptureMiss::Cancelled));
+            return rx;
+        }
+        let applied = self.inner.store.position().last_seq;
+        if applied >= seq {
+            let reply = if applied == seq {
+                self.inner.store.read_snapshot(0).map_err(|e| {
+                    tracing::warn!(node = %self.inner.cfg.identifier, seq, error = %e, "verify snapshot failed");
+                    CaptureMiss::Cancelled
+                })
+            } else {
+                Err(CaptureMiss::Passed(applied))
+            };
+            let _ = tx.send(reply);
+            return rx;
+        }
+        *slot = Capture::At { seq, tx };
+        drop(slot);
+        self.inner.capture_changed.notify_waiters();
+        rx
+    }
+}
+
+impl Drop for CaptureHold {
+    fn drop(&mut self) {
+        *self.inner.capture() = Capture::Idle;
+        self.inner.capture_changed.notify_waiters();
+    }
+}
+
+impl Inner {
+    fn capture(&self) -> std::sync::MutexGuard<'_, Capture> {
+        self.capture.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Pauses the applier before its next commit, until the hold sets a target or is dropped.
+    /// A verify takes it before asking the upstream for its snapshot, so this slave cannot pass
+    /// the snapshot's seq meanwhile.
+    pub(crate) fn hold_applier(self: &Arc<Self>) -> CaptureHold {
+        *self.capture() = Capture::Hold;
+        CaptureHold {
+            inner: self.clone(),
+        }
+    }
+
+    /// Called by the applier before each commit: waits while a verify holds it.
+    pub(crate) async fn wait_while_held(&self) {
+        loop {
+            let notified = self.capture_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !matches!(*self.capture(), Capture::Hold) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Ends any capture (a bootstrap replaces the state it was waiting for): a target already
+    /// set is answered `Cancelled`, and so is one a held verify sets later.
+    pub(crate) fn cancel_capture(&self) {
+        let mut slot = self.capture();
+        match std::mem::take(&mut *slot) {
+            Capture::At { tx, .. } => {
+                let _ = tx.send(Err(CaptureMiss::Cancelled));
+                *slot = Capture::Cancelled;
+            }
+            Capture::Hold | Capture::Cancelled => *slot = Capture::Cancelled,
+            Capture::Idle => {}
+        }
+        drop(slot);
+        self.capture_changed.notify_waiters();
+    }
+
+    /// Called by the applier on its blocking thread right after committing `seq`, before the
+    /// next entry can commit: the snapshot it takes is exactly the state at `seq`.
+    pub(crate) fn capture_after_commit(&self, seq: Seq) {
+        let tx = {
+            let mut slot = self.capture();
+            match &*slot {
+                Capture::At { seq: want, .. } if *want <= seq => match std::mem::take(&mut *slot) {
+                    Capture::At { seq: want, tx } => Some((want, tx)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let Some((want, tx)) = tx else { return };
+        let reply = if want == seq {
+            self.store.read_snapshot(0).map_err(|e| {
+                tracing::warn!(node = %self.cfg.identifier, seq, error = %e, "verify snapshot failed");
+                CaptureMiss::Cancelled
+            })
+        } else {
+            Err(CaptureMiss::Passed(seq))
+        };
+        let _ = tx.send(reply);
+    }
+
+    pub(crate) fn set_last_verify(&self, report: VerifyReport) {
+        *self
+            .last_verify
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(report);
+    }
+
+    pub(crate) fn last_verify(&self) -> Option<VerifyReport> {
+        self.last_verify
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 

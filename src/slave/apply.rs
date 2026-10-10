@@ -78,6 +78,8 @@ pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) 
             return Applied::End(SessionEnd::Halt(HaltReason::Corrupt));
         }
     };
+    // A verify holds the applier while the upstream pins its snapshot (DESIGN.md §12).
+    inner.wait_while_held().await;
     let i = inner.clone();
     let e = entry.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -85,7 +87,11 @@ pub(crate) async fn apply(inner: &Arc<Inner>, generation: u64, entry: LogEntry) 
         failpoint::io_error("slave-commit-io").map_err(Failure::Commit)?;
         i.store
             .commit(prepared, i.cfg.sync_writes)
-            .map_err(Failure::Commit)
+            .map_err(Failure::Commit)?;
+        // Still on the applier's thread, before the next entry can commit: a verify waiting
+        // for this seq gets a snapshot of exactly this state (DESIGN.md §12).
+        i.capture_after_commit(e.seq);
+        Ok::<(), Failure>(())
     })
     .await;
     match result {

@@ -13,6 +13,7 @@ mod promote;
 mod repoint;
 mod source;
 mod state;
+mod verifier;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,6 +31,7 @@ use crate::store::Store;
 use crate::store::meta::key;
 use crate::store::read::DbIter;
 use crate::types::{CfSpec, Direction, IterMode, Role, Seq, ValueMeta};
+use crate::verify::{VerifyMode, VerifyReport};
 use inner::Inner;
 use state::NodeState;
 
@@ -49,6 +51,7 @@ pub struct Slave {
     inner: Arc<Inner>,
     driver: Option<JoinHandle<()>>,
     maintenance: Option<JoinHandle<()>>,
+    verifier: Option<JoinHandle<()>>,
     server: Option<ServerHandle>,
 }
 
@@ -64,10 +67,12 @@ impl Slave {
                 .await?;
         let driver = driver::spawn(&inner);
         let maintenance = maintenance::spawn(&inner);
+        let verifier = verifier::spawn(&inner);
         Ok(Slave {
             inner,
             driver: Some(driver),
             maintenance: Some(maintenance),
+            verifier,
             server,
         })
     }
@@ -150,6 +155,20 @@ impl Slave {
             .map_err(|_| Error::Timeout)?
     }
 
+    /// Compares this slave's data with its upstream's now (DESIGN.md §12) and returns the
+    /// report. The report is also stored in [`SlaveStatus::last_verify`] and passed to the
+    /// listener's `on_verify_complete`; under `MismatchPolicy::Rebootstrap` a report with
+    /// mismatches makes the slave bootstrap. `cfg.verify` sets range sizes, the rate limit and
+    /// the policy; `mode` overrides `cfg.verify.mode`. One run at a time: a concurrent call
+    /// waits for the first.
+    ///
+    /// Errors: `NotReady` without data; `VerifyAborted(_)` when no report could be made
+    /// (`Busy`, `SessionExpired`, `IdentityChanged`, `PassedSnapshot`, `CaptureTimeout`,
+    /// `Upstream`); these leave `last_verify` unchanged.
+    pub async fn verify_now(&self, mode: VerifyMode) -> Result<VerifyReport> {
+        verifier::verify(&self.inner, mode).await
+    }
+
     pub fn watch_state(&self) -> watch::Receiver<SlaveState> {
         self.inner.state_tx.subscribe()
     }
@@ -220,9 +239,13 @@ impl Slave {
             None => Ok(()),
         };
         self.inner.shutdown_tx.send_replace(true);
-        for task in [self.driver.take(), self.maintenance.take()]
-            .into_iter()
-            .flatten()
+        for task in [
+            self.driver.take(),
+            self.maintenance.take(),
+            self.verifier.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             let _ = task.await;
         }
@@ -243,9 +266,13 @@ impl Slave {
         if let Some(server) = self.server.take() {
             server.abort();
         }
-        for task in [self.driver.take(), self.maintenance.take()]
-            .into_iter()
-            .flatten()
+        for task in [
+            self.driver.take(),
+            self.maintenance.take(),
+            self.verifier.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             task.abort();
             let _ = task.await;
