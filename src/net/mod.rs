@@ -71,11 +71,6 @@ pub(crate) fn invalid_argument(message: impl Into<String>) -> Status {
     unspecified_status(Code::InvalidArgument, message)
 }
 
-/// `UNIMPLEMENTED` with `ErrorInfo` (`REASON_UNSPECIFIED`).
-pub(crate) fn unimplemented(message: impl Into<String>) -> Status {
-    unspecified_status(Code::Unimplemented, message)
-}
-
 /// The protocol reason carried by `status`, if any.
 pub(crate) fn reason_of(status: &Status) -> Option<pb::Reason> {
     let details = status.get_error_details();

@@ -462,22 +462,6 @@ async fn status_and_tail_reject_a_client_id_that_differs_from_the_metadata() {
     );
 }
 
-#[tokio::test]
-async fn verify_is_not_implemented_yet() {
-    let dir = tempfile::tempdir().unwrap();
-    let (m, _) = serving_master(dir.path(), |_| {}).await;
-    let e = client(m.serve_addr().unwrap(), "b")
-        .verify_begin(pb::VerifyBeginRequest::default())
-        .await
-        .unwrap_err();
-    assert_eq!(e.code(), Code::Unimplemented);
-    assert_eq!(
-        reason_of(&e),
-        Some(pb::Reason::Unspecified),
-        "UNIMPLEMENTED carries ErrorInfo"
-    );
-}
-
 /// Reads a whole bootstrap stream: (header, records per message, footer).
 async fn read_bootstrap(
     c: &mut super::test_client::Client,

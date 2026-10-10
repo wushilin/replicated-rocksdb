@@ -581,7 +581,10 @@ message KeyDigest  { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3
 - A `KeyRange` is half-open, `[lower, upper)`, under the CF's comparator. An absent `lower` means unbounded below, and an absent `upper` means unbounded above. An empty byte string is a valid key and is **not** the same as absent.
 - **The client MUST cover each CF with contiguous ranges:** the first range has no `lower`, each range's `upper` is the next range's `lower`, and the last range has no `upper`. A key that exists only on the server can then never fall between two ranges.
 - `HashRange`: the client sends its own `count` and range hash (§5.4). The server computes both over the same range in its snapshot and replies with `matched = (count and hash both equal)`, plus its own `count` and `hash`.
-- `ListRange`: the server returns up to `limit` keys from the range, in order, each with its `write_seq` and `payload_hash = BLAKE3(payload)`. `truncated` is set if there are more. `limit` MUST NOT exceed 1024.
+- `ListRange`: the server returns up to `limit` keys from the range, in order, each with its `write_seq` and `payload_hash = BLAKE3(payload)`. `truncated` is set if there are more. `limit` MUST be between 1 and 1024. The server MAY return fewer than `limit` keys to bound the size of the answer (RECOMMENDED: stop once the keys add up to 1 MiB), but it MUST return at least two keys when the range holds two or more.
+- To continue a truncated listing, the client sends the same range with `lower` set to the last key it received, and skips that key when the answer repeats it first. This works under any comparator (appending a byte to a key gives its successor only under bytewise order), and the two-key rule guarantees progress.
+- A request whose `cf` is not in the session's snapshot, whose `range` or `kind` is missing, or whose `limit` is out of bounds fails with `INVALID_ARGUMENT`. A `VerifyBegin` with `mode = VERIFY_MODE_UNSPECIFIED` fails the same way.
+- The server ends every `VerifyRange` stream, and drops every session, with `UNAVAILABLE` / `UPSTREAM_RESET` when its state is replaced (it starts bootstrapping itself, or its identity changes), as it does for `Tail` (§7.3).
 - The client MAY pipeline up to `verify_window` requests (RECOMMENDED: 16). The server answers in request order, and `request_id` echoes the request.
 
 ### 9.3 Modes
@@ -593,7 +596,7 @@ message KeyDigest  { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3
 
 ### 9.4 Narrowing a mismatch (informative)
 
-The client chooses the range boundaries, for example every `chunk_keys` keys or `chunk_bytes` bytes of its own data. When a range does not match, it splits the range at its median local key and hashes both halves. Once a range holds at most `min_chunk_keys` local keys, or cannot be split further, it sends `ListRange` and compares the keys directly. That last step also finds keys that exist only on the server. Clients SHOULD limit their own read rate (`max_bytes_per_sec`), and servers MAY limit theirs.
+The client chooses the range boundaries, for example every `chunk_keys` keys or `chunk_bytes` bytes of its own data. When a range does not match, it splits the range at its median local key and hashes both halves. Once a range holds at most `min_chunk_keys` local keys, or cannot be split further, it sends `ListRange` and compares the keys directly. That last step also finds keys that exist only on the server. Clients SHOULD limit their own read rate (`max_bytes_per_sec`), and servers MAY limit theirs. A client SHOULD NOT use very long keys as range boundaries, so that every request stays far below the server's request size limit; this implementation never uses a key longer than 1 MiB as a boundary, and continues a truncated listing only from a key of at most 2 MiB (otherwise it reports the rest of the range as not compared).
 
 ## 10. Error model
 
@@ -685,6 +688,7 @@ A failed bootstrap (bad footer, lost connection) also returns to `Connecting` th
 | `session_timeout_ms` (verify) | server | 300 000 (5 min) |
 | `verify_window` | client | 16 |
 | `ListRange.limit` | client | ≤ 1024 |
+| `ListResult` size | server | stop after ~1 MiB of keys, but never fewer than 2 keys |
 | HTTP/2 keepalive | client | 30 s interval, 10 s timeout |
 | Reconnect backoff | client | 100 ms → 30 s, ×2, full jitter |
 

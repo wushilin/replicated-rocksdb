@@ -7,6 +7,7 @@ pub(crate) mod handshake;
 pub(crate) mod replicas;
 pub(crate) mod status;
 mod tail;
+pub(crate) mod verify;
 pub(crate) use tail::DEFAULT_MAX_BATCH_BYTES;
 #[cfg(test)]
 pub(crate) use tail::READ_BATCH;
@@ -58,6 +59,8 @@ pub(crate) struct ServerState {
     auth_failures: FailureLimiter,
     /// The node's downstream replicas (shared with the node, which reports and waits on them).
     pub(crate) replicas: Arc<ReplicaRegistry>,
+    /// Open verify sessions; each owns a snapshot (PROTOCOL.md §9).
+    pub(crate) verify_sessions: verify::Sessions,
 }
 
 impl ServerState {
@@ -295,22 +298,18 @@ impl Replication for Svc {
 
     async fn verify_begin(
         &self,
-        _: Request<pb::VerifyBeginRequest>,
+        req: Request<pb::VerifyBeginRequest>,
     ) -> Result<Response<pb::VerifyBeginResponse>, Status> {
-        Err(net::unimplemented(
-            "Verify is not implemented by this version",
-        ))
+        verify::begin(&self.0, req).await
     }
 
     type VerifyRangeStream = VerifyRangeStream;
 
     async fn verify_range(
         &self,
-        _: Request<tonic::Streaming<pb::VerifyRangeRequest>>,
+        req: Request<tonic::Streaming<pb::VerifyRangeRequest>>,
     ) -> Result<Response<VerifyRangeStream>, Status> {
-        Err(net::unimplemented(
-            "Verify is not implemented by this version",
-        ))
+        verify::range(&self.0, req).await
     }
 
     async fn status(
@@ -333,11 +332,9 @@ impl Replication for Svc {
 
     async fn verify_end(
         &self,
-        _: Request<pb::VerifyEndRequest>,
+        req: Request<pb::VerifyEndRequest>,
     ) -> Result<Response<pb::VerifyEndResponse>, Status> {
-        Err(net::unimplemented(
-            "Verify is not implemented by this version",
-        ))
+        verify::end(&self.0, req).await
     }
 }
 
@@ -395,6 +392,7 @@ impl ServerHandle {
         // A Bootstrap that arrives later on an existing connection is refused.
         self.state.bootstraps.close();
         self.state.leases().clear();
+        self.state.verify_sessions.clear();
         if let Some(sweep) = self.sweep.take() {
             let _ = sweep.await;
         }
@@ -414,6 +412,7 @@ impl ServerHandle {
     pub(crate) fn abort(mut self) {
         self.shutdown_tx.send_replace(true);
         self.state.leases().clear();
+        self.state.verify_sessions.clear();
         if let Some(t) = self.sweep.take() {
             t.abort();
         }
@@ -449,6 +448,10 @@ pub(crate) async fn start(
         ),
         leases: Mutex::new(HashMap::new()),
         shutdown: shutdown_rx.clone(),
+        verify_sessions: verify::Sessions::new(
+            cfg.limits.max_verify_sessions,
+            cfg.limits.verify_session_timeout,
+        ),
         cfg,
         replicas,
     });
@@ -485,7 +488,13 @@ async fn sweep_leases(state: Arc<ServerState>, mut shutdown: watch::Receiver<boo
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
-            _ = tick.tick() => state.expire_leases(Instant::now()),
+            _ = tick.tick() => {
+                let now = Instant::now();
+                state.expire_leases(now);
+                // Sessions idle too long, or opened before a reset of this node's state.
+                let reset_gen = state.source.upgrade().map(|s| *s.resets().borrow());
+                state.verify_sessions.expire(now, reset_gen);
+            }
             r = shutdown.changed() => if r.is_err() || *shutdown.borrow() { return },
         }
     }

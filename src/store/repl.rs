@@ -117,7 +117,6 @@ impl<'a> ReadCtx<'a> {
 impl<'a> ReadCtx<'a> {
     /// Like [`iter_raw`](Self::iter_raw), starting at the first key `>= from` under the CF's
     /// comparator (`None`: the first key).
-    #[allow(dead_code)] // used by verify scans (Tasks 4-5)
     pub(crate) fn iter_raw_from(
         &self,
         cf: Arc<PhysCf>,

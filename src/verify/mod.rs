@@ -2,7 +2,8 @@
 //! logic shared by the server (hashes and listings over a pinned snapshot) and the slave
 //! verifier (contiguous ranges, bisection, listing and key-by-key diff).
 
-// Tasks 4-5 (server RPCs, slave verifier) are the callers; remove when they land.
+// Task 5 (the slave verifier) is the caller of the client-side items (`compare`, the
+// boundary limits, `VERIFY_WINDOW`, `to_pb`, `VerifyConfig::validate`); remove when it lands.
 #![allow(dead_code)]
 
 pub(crate) mod compare;
