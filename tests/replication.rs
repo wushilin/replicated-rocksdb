@@ -411,3 +411,40 @@ async fn a_cf_held_by_a_snapshot_is_retried_not_halted() {
     assert_eq!(b.get("c", b"new").unwrap(), Some(b"2".to_vec()));
     assert_eq!(b.get("c", b"old").unwrap(), None);
 }
+
+/// DESIGN.md §21: a CF dropped while a `ReadSnapshot` of a slave is open stays readable
+/// through the snapshot; the slave drops it physically once the snapshot is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replicated_cf_drop_waits_for_a_slave_snapshot() {
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("gone")).unwrap();
+    m.put("gone", b"k", b"v").unwrap();
+    let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
+    assert_converged(&m, &[("b", &b)]).await;
+    let snap = b.snapshot().unwrap();
+    m.drop_cf("gone").unwrap();
+    b.wait_for_seq(m.last_seq(), WAIT).await.unwrap();
+    assert!(b.list_cfs().is_empty(), "dropped for live reads");
+    assert_eq!(
+        snap.get("gone", b"k").unwrap(),
+        Some(b"v".to_vec()),
+        "the snapshot still reads it"
+    );
+    assert_eq!(snap.list_cfs(), vec![CfSpec::new("gone")]);
+    // Physical CFs of the running slave, from its MANIFEST.
+    let physical = |dir: &std::path::Path| {
+        rocksdb::DB::list_cf(&rocksdb::Options::default(), dir)
+            .map(|names| names.iter().filter(|n| n.starts_with("u:gone:")).count())
+    };
+    assert_eq!(
+        physical(&c.path("b")).unwrap(),
+        1,
+        "kept while the snapshot is alive"
+    );
+    drop(snap);
+    wait_until("the slave drops the physical CF", || {
+        physical(&c.path("b")).is_ok_and(|n| n == 0)
+    })
+    .await;
+}

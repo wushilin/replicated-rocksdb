@@ -66,9 +66,12 @@ impl Cluster {
         self.dir.path().join(name)
     }
 
-    /// Plaintext, `AllowAll`, port 0.
+    /// Plaintext, `AllowAll`, on a [`reserved_port`]. Not port 0: tests restart nodes on their
+    /// old address (`restart_master`, `restart_slave`, a restored master on the lost master's
+    /// port), and an ephemeral port released by a shut-down server can be taken as the source
+    /// port of another connection before it is bound again (AddrInUse).
     pub fn serve(&self) -> ServeConfig {
-        ServeConfig::new(localhost(), 0, Arc::new(AllowAll))
+        ServeConfig::new(localhost(), reserved_port(), Arc::new(AllowAll))
     }
 
     /// Serving master with a manual clock and background maintenance effectively off.

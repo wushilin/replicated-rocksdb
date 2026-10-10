@@ -199,3 +199,47 @@ async fn a_master_restart_moves_followers_to_the_new_epoch_without_a_bootstrap()
     assert_eq!(listener.bootstraps(), 1, "only the initial bootstrap");
     listener.assert_no_violations();
 }
+
+/// DESIGN.md §21: a quiet master whose whole changelog expired keeps its `last_seq`, across
+/// a restart too, and a slave stopped at that seq resumes without a bootstrap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quiet_master_with_an_empty_log_keeps_last_seq_and_slaves_resume() {
+    let c = Cluster::new();
+    let mut mcfg = c.master_config("a");
+    mcfg.retention.max_age = Some(Duration::from_secs(60));
+    mcfg.retention.check_interval = Duration::from_millis(20);
+    let m = Master::open(mcfg.clone()).await.unwrap();
+    m.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..5u8 {
+        m.put("c", &[i], b"v").unwrap();
+    }
+    let (b_cfg, listener) = c.slave_config("b", m.serve_addr().unwrap());
+    let b = Slave::open(b_cfg.clone()).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    // The Tail presenting the bootstrap lease has started: the lease no longer holds retention.
+    wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
+    b.shutdown().await.unwrap();
+
+    let last = m.last_seq();
+    c.clock.advance(Duration::from_secs(120));
+    wait_until("the whole log expired", || {
+        m.first_retained_seq() == last + 1
+    })
+    .await;
+    let m = c.restart_master(m, mcfg).await;
+    assert_eq!(
+        (m.last_seq(), m.first_retained_seq()),
+        (last, last + 1),
+        "the position survives an empty log"
+    );
+    assert_eq!(m.entries_since(last).unwrap().count(), 0);
+
+    let b = Slave::open(b_cfg).await.unwrap();
+    wait_state(&b, "streaming without a bootstrap", |s| {
+        *s == SlaveState::Streaming
+    })
+    .await;
+    m.put("c", b"after", b"v").unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    assert_eq!(listener.bootstraps(), 1, "only the initial bootstrap");
+}

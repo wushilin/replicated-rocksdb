@@ -126,6 +126,16 @@ async fn promotion_end_to_end() {
     assert_converged(&b, &[("f", &f)]).await;
     assert_eq!(lf.bootstraps(), 1);
     check_edge_cases(&f, "edge");
+
+    // DESIGN.md §21: `Full` verify matches on every link of the new topology.
+    for (name, s) in [("c", &cn), ("e", &e), ("f", &f)] {
+        let r = s
+            .verify_now(replicated_rocksdb::VerifyMode::Full)
+            .await
+            .unwrap();
+        assert!(r.is_clean(), "{name}: {} mismatches", r.mismatches.len());
+        assert_eq!(r.seq, b.last_seq(), "{name}");
+    }
 }
 
 /// The old master, restarted, is refused by new-epoch replicas with STALE_EPOCH; they keep

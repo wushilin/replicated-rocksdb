@@ -1376,3 +1376,126 @@ async fn a_divergence_repair_fallback_refuses_a_deeper_fork() {
     assert_converged(&a, &[("d", &d)]).await;
     scenario.teardown();
 }
+
+/// DESIGN.md §21: the slave is killed at random points while the master keeps writing, eight
+/// times. Each process resumes from the durable seq of its predecessor without a bootstrap;
+/// its listener sees consecutive seqs starting right after that seq (no gap, no duplicate,
+/// in order); and in the end the slave's log holds every entry exactly once.
+///
+/// The random points come from a seeded generator: set `RRDB_KILL_SEED` to replay a failure
+/// (the seed is in every assertion message and printed at the start).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn random_kills_while_writing_never_lose_or_repeat_an_entry() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const ROUNDS: usize = 8;
+    let seed: u64 = std::env::var("RRDB_KILL_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        });
+    eprintln!("random_kills seed = {seed} (RRDB_KILL_SEED={seed} replays it)");
+    // splitmix64
+    let mut state = seed;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_133E_11B1);
+        z ^ (z >> 31)
+    };
+
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let m = Arc::new(c.master("a").await);
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (m, stop) = (m.clone(), stop.clone());
+        tokio::task::spawn_blocking(move || {
+            let mut n = 0u32;
+            while !stop.load(Ordering::SeqCst) {
+                m.put("c", &n.to_be_bytes(), &n.to_le_bytes()).unwrap();
+                n += 1;
+            }
+            n
+        })
+    };
+
+    let (cfg, first) = c.slave_config("b", m.serve_addr().unwrap());
+    let mut b = Slave::open(cfg.clone()).await.unwrap();
+    wait_until("the initial bootstrap", || first.bootstraps() == 1).await;
+    // (listener of that process, the durable seq its process started from)
+    let mut processes = vec![(first, None::<u64>)];
+    for round in 0..ROUNDS {
+        // A random point: 1-60 entries further on, plus up to 15 ms.
+        let target = b.last_seq() + 1 + next() % 60;
+        wait_until("progress before the kill", || b.last_seq() >= target).await;
+        tokio::time::sleep(Duration::from_millis(next() % 16)).await;
+        b.kill().await.unwrap();
+        let durable = support::RawDb::open(&cfg.path).last_seq();
+        let (next_cfg, listener) = c.slave_config("b", m.serve_addr().unwrap());
+        b = Slave::open(next_cfg).await.unwrap();
+        wait_until("delivery resumed", || !listener.entries().is_empty()).await;
+        assert_eq!(
+            listener.entries()[0],
+            durable + 1,
+            "seed {seed}, round {round}: no gap and no repeat at the restart"
+        );
+        assert_eq!(
+            listener.bootstraps(),
+            0,
+            "seed {seed}, round {round}: resumed without a bootstrap"
+        );
+        processes.push((listener, Some(durable)));
+    }
+    stop.store(true, Ordering::SeqCst);
+    assert!(writer.await.unwrap() > 0);
+    assert_converged(&*m, &[("b", &b)]).await;
+
+    // Listener order: within each process the seqs are consecutive and in order, and a
+    // process starts right after the durable seq its predecessor left.
+    let mut previous_last = 0u64;
+    for (i, (listener, durable)) in processes.iter().enumerate() {
+        listener.assert_no_violations();
+        let seen = listener.entries();
+        assert!(!seen.is_empty(), "seed {seed}: process {i} saw nothing");
+        for w in seen.windows(2) {
+            assert_eq!(
+                w[1],
+                w[0] + 1,
+                "seed {seed}: process {i} has a gap or duplicate"
+            );
+        }
+        if let Some(d) = durable {
+            assert_eq!(seen[0], d + 1, "seed {seed}: process {i} start");
+            // Delivery follows the commit: everything the predecessor heard of is durable
+            // (the one committed-but-undelivered entry at a kill is the only one not heard of).
+            assert!(
+                *d >= previous_last,
+                "seed {seed}: process {i}: durable {d} vs last delivered {previous_last}"
+            );
+        }
+        previous_last = *seen.last().unwrap();
+    }
+
+    // The slave's log: every entry from the first retained one exactly once.
+    let first_retained = b.first_retained_seq();
+    let seqs: Vec<u64> = b
+        .entries_since(first_retained - 1)
+        .unwrap()
+        .map(|e| e.unwrap().seq)
+        .collect();
+    assert_eq!(
+        seqs,
+        (first_retained..=b.last_seq()).collect::<Vec<_>>(),
+        "seed {seed}: the slave's log has a gap or duplicate"
+    );
+    assert_eq!(b.last_seq(), m.last_seq());
+    scenario.teardown();
+}
