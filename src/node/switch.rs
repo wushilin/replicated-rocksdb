@@ -5,8 +5,15 @@
 
 use tokio::sync::RwLockWriteGuard;
 
+use super::fence;
 use super::handle::{Current, Node, open_current};
+use super::types::UnfenceOptions;
+use crate::background::blocking;
 use crate::error::{Error, Result};
+use crate::master::{DemoteRefused, Master};
+use crate::slave::{PromoteRefused, RejoinOptions, RepointOutcome, Slave, UpstreamConfig};
+use crate::store::offline::stored_meta;
+use crate::types::Role;
 
 /// `Error::NodeFailed`'s text after a dropped switch (its Display adds "call Node::reopen").
 const CANCELLED: &str = "a role switch was cancelled before it finished";
@@ -35,6 +42,24 @@ impl Drop for Switch<'_> {
             *self.guard = Current::Failed(CANCELLED.into());
             self.node.publish(&self.guard);
         }
+    }
+}
+
+/// `begin_switch` check: only a slave switches.
+fn slave_only(c: &Current) -> Result<()> {
+    match c {
+        Current::Slave(_) => Ok(()),
+        // A master answers `NotSlave`.
+        other => Err(other.unavailable()),
+    }
+}
+
+/// `begin_switch` check: only a running master switches.
+fn master_only(c: &Current) -> Result<()> {
+    match c {
+        Current::Master(_) => Ok(()),
+        // A slave answers `NotMaster`.
+        other => Err(other.unavailable()),
     }
 }
 
@@ -96,5 +121,199 @@ impl Node {
             _ => Ok(()),
         };
         sw.finish(Current::Stopped, result)
+    }
+
+    /// [`Slave::promote_checked`] with `cfg.peers` and `cfg.master`. **Refused by default**
+    /// (a later peer, a reachable master, a peer that would lose entries, an unverifiable
+    /// peer, the checks of [`promote`](Self::promote)): the slave keeps running and the node
+    /// stays a slave. Only a failure after the slave began shutting down (an I/O error, a live
+    /// `ReadSnapshot` from [`snapshot`](Self::snapshot)) leaves the node `Failed`
+    /// ([`reopen`](Self::reopen) opens the unchanged slave again). A refusal found on the
+    /// stopped store (a repair that committed its rewind meanwhile) reopens the slave with the
+    /// upstream it was opened with: an upstream set by [`repoint`](Self::repoint) since is not
+    /// kept, so repoint it again. `Err(NotSlave)` on a master; calls answer `Switching` while
+    /// the check runs.
+    pub async fn promote_checked(&self) -> Result<()> {
+        let (sw, old) = self.begin_switch(slave_only).await?;
+        let Current::Slave(slave) = old else {
+            return sw.finish(old, Err(Error::NotSlave));
+        };
+        let result = slave
+            .promote_checked(self.cfg.master.clone(), &self.cfg.peers)
+            .await;
+        self.after_promotion(sw, result)
+    }
+
+    /// Promotes without asking any peer, like [`Slave::promote`]: **the operator must stop or
+    /// fence the old master first** ([`promote_checked`](Self::promote_checked) is the safe
+    /// path). A refusal (bootstrapping, no data, a repair replaying, halted
+    /// `Corrupt`/`SpecMismatch`) keeps the slave running; as for `promote_checked`, only a
+    /// failure after the slave began shutting down leaves the node `Failed`. `Err(NotSlave)`
+    /// on a master.
+    pub async fn promote(&self) -> Result<()> {
+        let (sw, old) = self.begin_switch(slave_only).await?;
+        let Current::Slave(slave) = old else {
+            return sw.finish(old, Err(Error::NotSlave));
+        };
+        let result = slave.promote_keeping(self.cfg.master.clone()).await;
+        self.after_promotion(sw, result)
+    }
+
+    /// Stores the promoted master, the handed-back slave (recording the upstream it follows),
+    /// or `Failed` when the slave handle was lost.
+    fn after_promotion(
+        &self,
+        sw: Switch<'_>,
+        result: std::result::Result<Master, PromoteRefused>,
+    ) -> Result<()> {
+        match result {
+            Ok(master) => sw.finish(Current::Master(master), Ok(())),
+            Err(PromoteRefused {
+                error,
+                slave: Some(slave),
+            }) => {
+                self.record_upstream(&slave);
+                sw.finish(Current::Slave(*slave), Err(error))
+            }
+            Err(PromoteRefused { error, slave: None }) => {
+                sw.finish(Current::Failed(error.to_string()), Err(error))
+            }
+        }
+    }
+
+    /// [`Master::demote`] with the node's slave config (and the upstream later opens of the
+    /// slave role use): only undoes a promotion that has taken no writes (see
+    /// [`Master::can_demote`]). **Refused by default**: the master keeps running and the node
+    /// stays a master. Only a failure after the master began shutting down (an I/O error, a
+    /// live `ReadSnapshot`) leaves the node `Failed`. `Err(NotMaster)` on a slave.
+    pub async fn demote(&self) -> Result<()> {
+        let (sw, old) = self.begin_switch(master_only).await?;
+        let Current::Master(master) = old else {
+            return sw.finish(old, Err(Error::NotMaster));
+        };
+        match master.demote(self.slave_config()).await {
+            Ok(slave) => sw.finish(Current::Slave(slave), Ok(())),
+            Err(DemoteRefused {
+                error,
+                master: Some(m),
+            }) => sw.finish(Current::Master(*m), Err(error)),
+            Err(DemoteRefused {
+                error,
+                master: None,
+            }) => sw.finish(Current::Failed(error.to_string()), Err(error)),
+        }
+    }
+
+    /// Turns this master (running or fenced) into a slave of `upstream` (`None`: the node's
+    /// slave upstream) with [`Slave::rejoin`], **without wiping it**. Explicit operator
+    /// action. Returns the first handshake's result: `Ok(EpochAdvanced)` (the usual answer
+    /// after a failover), `Resumed`, ... when its log is a prefix of the upstream's;
+    /// `Err(Diverged)` under the default `RepointDivergence::Refuse`, with the node then a
+    /// slave halted `Diverged` (data intact, [`diverged_entries`](Self::diverged_entries);
+    /// resolve with [`repoint`](Self::repoint) and `AcceptDataLoss`). `opts.on_divergence` is
+    /// the only consent it uses, single-use as for `repoint`.
+    ///
+    /// A running master is shut down first (a live `ReadSnapshot` fails the call and leaves
+    /// the node `Failed`). A refusal before the directory is rewritten (it cannot be opened,
+    /// ...) keeps a fenced node fenced; a master that was shut down, or any failure after the
+    /// rewrite, leaves the node `Failed` ([`reopen`](Self::reopen) opens the stored role
+    /// again). On a successful rejoin, `upstream` is also the one later opens of the slave
+    /// role use. `Err(Config)` (nothing changes) for an invalid `upstream`; `Err(NotMaster)`
+    /// on a slave.
+    pub async fn rejoin_as_slave(
+        &self,
+        upstream: Option<UpstreamConfig>,
+        opts: RejoinOptions,
+    ) -> Result<RepointOutcome> {
+        let (sw, old) = self
+            .begin_switch(|c| match c {
+                Current::Master(_) | Current::Fenced(_) => Ok(()),
+                other => Err(other.unavailable()),
+            })
+            .await?;
+        let mut cfg = self.slave_config();
+        if let Some(u) = upstream {
+            cfg.upstream = u;
+        }
+        if let Err(e) = cfg.validate() {
+            return sw.finish(old, Err(e));
+        }
+        let fenced = match old {
+            Current::Master(master) => {
+                if let Err(e) = master.shutdown_released().await {
+                    return sw.finish(Current::Failed(e.to_string()), Err(e));
+                }
+                None
+            }
+            Current::Fenced(reason) => Some(reason),
+            other => return sw.finish(other, Err(Error::NotMaster)),
+        };
+        match Slave::rejoin(cfg, opts).await {
+            Ok((slave, outcome)) => {
+                self.record_upstream(&slave);
+                sw.finish(Current::Slave(slave), outcome)
+            }
+            Err(e) => {
+                // Refused before the rewrite iff the directory is still a stored master.
+                let path = self.cfg.master.path.clone();
+                let still_master = blocking(move || stored_meta(&path))
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|m| m.role == Role::Master);
+                match (fenced, still_master) {
+                    (Some(reason), true) => sw.finish(Current::Fenced(reason), Err(e)),
+                    _ => sw.finish(Current::Failed(e.to_string()), Err(e)),
+                }
+            }
+        }
+    }
+
+    /// Runs the fence check again (DESIGN.md §13.2). When it clears, the master opens (its
+    /// epoch starts) and this returns `Ok`. Otherwise `Err(Fenced { reason })` and the node
+    /// stays fenced with that reason; an `Err` of the check itself (the local store cannot be
+    /// read) is returned and the node stays fenced as it was. `opts.allow_unreachable`
+    /// (explicit `AcceptSplitBrainRisk`) skips peers that do not answer; every other reason
+    /// still blocks. `Err(Config)` if the node is not fenced (nothing changes). Calls answer
+    /// `Switching` while the check runs. A master that clears the check but fails to open
+    /// leaves the node `Failed`.
+    pub async fn unfence(&self, opts: UnfenceOptions) -> Result<()> {
+        let not_fenced = || Error::Config("the node is not fenced".into());
+        let (sw, old) = self
+            .begin_switch(|c| match c {
+                Current::Fenced(_) => Ok(()),
+                _ => Err(not_fenced()),
+            })
+            .await?;
+        let Current::Fenced(reason) = old else {
+            return sw.finish(old, Err(not_fenced()));
+        };
+        let c = &self.cfg;
+        let checked = fence::check(
+            &c.master.path,
+            &c.master.identifier,
+            &c.peers,
+            opts.allow_unreachable.is_some(),
+        )
+        .await;
+        match checked {
+            Err(e) => sw.finish(Current::Fenced(reason), Err(e)),
+            Ok(Some(reason)) => {
+                tracing::warn!(node = %c.master.identifier, %reason, "unfence: the master stays fenced");
+                sw.finish(
+                    Current::Fenced(reason.clone()),
+                    Err(Error::Fenced { reason }),
+                )
+            }
+            Ok(None) => {
+                if opts.allow_unreachable.is_some() {
+                    tracing::warn!(node = %c.master.identifier, "unfenced with AcceptSplitBrainRisk: unreachable peers were not checked");
+                }
+                match Master::open(c.master.clone()).await {
+                    Ok(master) => sw.finish(Current::Master(master), Ok(())),
+                    Err(e) => sw.finish(Current::Failed(e.to_string()), Err(e)),
+                }
+            }
+        }
     }
 }

@@ -320,6 +320,23 @@ impl Slave {
     }
 }
 
+impl Slave {
+    /// [`promote`](Self::promote) that hands the slave back, still running, on every refusal
+    /// before it changes anything (the checks of `promote_refusal`), like
+    /// [`promote_checked`](Self::promote_checked) without the peer check; the final check on
+    /// the stopped store reopens and hands it back too. Used by `Node::promote`, which must
+    /// never shut a refused slave down.
+    pub(crate) async fn promote_keeping(self, cfg: MasterConfig) -> Result<Master, PromoteRefused> {
+        if let Some(msg) = self.promote_refusal(&cfg) {
+            return Err(PromoteRefused {
+                error: Error::Config(msg),
+                slave: Some(Box::new(self)),
+            });
+        }
+        self.promote_now(cfg, 0, true).await
+    }
+}
+
 /// A refused or failed [`Slave::promote_checked`]. `slave` is the untouched, still-running
 /// slave for every refusal; it is `None` only when the promotion failed after the slave had
 /// started shutting down.

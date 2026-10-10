@@ -430,6 +430,20 @@ impl Master {
         crate::slave::Slave::open(cfg).await.map_err(lost)
     }
 
+    /// [`shutdown`](Self::shutdown), then `Err(Config)` if a `ReadSnapshot` still holds the
+    /// database (a role switch could not reopen the directory). Used by
+    /// `Node::rejoin_as_slave`.
+    pub(crate) async fn shutdown_released(self) -> Result<()> {
+        let db = Arc::downgrade(self.inner.store.db());
+        self.shutdown().await?;
+        if db.strong_count() > 0 {
+            return Err(crate::Error::Config(
+                "a ReadSnapshot of this master is still open and keeps the database open; drop it first".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Ends every replication stream with `SHUTTING_DOWN`, stops background work, and waits
     /// until the server and maintenance tasks are gone and every internal holder of the
     /// database has released it. `Err(Timeout)` if one still holds it after 10 s.

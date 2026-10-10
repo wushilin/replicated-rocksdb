@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, MutexGuard};
 
 use replicated_rocksdb::{
-    CfSpec, Error, HaltReason, LogApi, Master, MismatchPolicy, ReadApi, RejoinOptions,
+    CfSpec, Error, HaltReason, LogApi, Master, MismatchPolicy, NodeState, ReadApi, RejoinOptions,
     RepointOptions, RepointOutcome, Slave, SlaveState, UpstreamConfig, VerifyAbort, VerifyMode,
     WriteConcern,
 };
@@ -1815,5 +1815,180 @@ async fn a_crash_after_the_rejoin_rewrite_reopens_as_a_halting_slave() {
     })
     .await;
     assert_eq!(a.get("c", b"only on a").unwrap(), Some(b"2".to_vec()));
+    scenario.teardown();
+}
+
+/// `watch_state` shows Slave → Switching → Master, and calls fail fast with `Switching`
+/// while the switch runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_state_sees_the_switch() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let a = Master::open(c.master_config("a")).await.unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let a_addr = a.serve_addr().unwrap();
+    let b = std::sync::Arc::new(
+        replicated_rocksdb::Node::create_slave(support::node_cfg(&c, "b", a_addr, &[]))
+            .await
+            .unwrap(),
+    );
+    wait_until("b streaming", || {
+        matches!(
+            b.state(),
+            NodeState::Slave {
+                state: SlaveState::Streaming,
+                ..
+            }
+        )
+    })
+    .await;
+    a.shutdown().await.unwrap();
+    let mut rx = b.watch_state();
+    let seen = tokio::spawn(async move {
+        // The state at subscription comes first.
+        let mut seen = vec![rx.borrow_and_update().clone()];
+        while rx.changed().await.is_ok() {
+            let s = rx.borrow_and_update().clone();
+            let done = matches!(s, NodeState::Master { .. });
+            seen.push(s);
+            if done {
+                break;
+            }
+        }
+        seen
+    });
+    fail::cfg("slave-promote-before-shutdown", "pause").unwrap();
+    let promoting = tokio::spawn({
+        let b = b.clone();
+        async move { b.promote().await }
+    });
+    wait_until("switching", || b.state() == NodeState::Switching).await;
+    assert!(matches!(b.put("c", b"k", b"v"), Err(Error::Switching)));
+    assert!(matches!(b.get("c", b"k"), Err(Error::Switching)));
+    fail::remove("slave-promote-before-shutdown");
+    promoting.await.unwrap().unwrap();
+    let seen = seen.await.unwrap();
+    let switching = seen
+        .iter()
+        .position(|s| *s == NodeState::Switching)
+        .expect("Switching seen");
+    assert!(switching > 0, "a Slave state comes first: {seen:?}");
+    assert!(
+        seen[..switching]
+            .iter()
+            .all(|s| matches!(s, NodeState::Slave { .. })),
+        "{seen:?}"
+    );
+    assert!(matches!(seen.last(), Some(NodeState::Master { .. })));
+    assert!(
+        seen[switching..seen.len() - 1]
+            .iter()
+            .all(|s| *s == NodeState::Switching),
+        "only Switching between the roles: {seen:?}"
+    );
+    b.put("c", b"k", b"v").unwrap();
+    scenario.teardown();
+}
+
+/// Review focus: a switch future dropped mid-way leaves the node `Failed`, never `Switching`,
+/// and `reopen` restores it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_switch_leaves_the_node_failed_and_reopenable() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let a = Master::open(c.master_config("a")).await.unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let a_addr = a.serve_addr().unwrap();
+    let b = replicated_rocksdb::Node::create_slave(support::node_cfg(&c, "b", a_addr, &[]))
+        .await
+        .unwrap();
+    wait_until("b streaming", || {
+        matches!(
+            b.state(),
+            NodeState::Slave {
+                state: SlaveState::Streaming,
+                ..
+            }
+        )
+    })
+    .await;
+    fail::cfg("slave-promote-before-shutdown", "pause").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), b.promote())
+            .await
+            .is_err(),
+        "the promotion is held at the pause point"
+    );
+    assert!(
+        matches!(b.state(), NodeState::Failed { .. }),
+        "{:?}",
+        b.state()
+    );
+    assert!(matches!(b.get("c", b"k"), Err(Error::NodeFailed(_))));
+    fail::remove("slave-promote-before-shutdown");
+    // The dropped slave winds down asynchronously; its LOCK is released shortly.
+    let deadline = tokio::time::Instant::now() + support::WAIT;
+    loop {
+        match b.reopen().await {
+            Ok(()) => break,
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                tracing::debug!(error = %e, "reopen not yet possible");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("reopen failed: {e}"),
+        }
+    }
+    wait_until("b streaming again", || {
+        matches!(
+            b.state(),
+            NodeState::Slave {
+                state: SlaveState::Streaming,
+                ..
+            }
+        )
+    })
+    .await;
+    scenario.teardown();
+}
+
+/// A rejoin that fails after the rewrite (a crash before the slave opens) leaves a fenced
+/// node `Failed`, not fenced: the directory is a slave now, and `reopen` opens it as one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejoin_failing_after_the_rewrite_fails_the_node() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (_, b, _) = support::failover(&c, false).await;
+    let b_addr = b.serve_addr().unwrap();
+    let a = replicated_rocksdb::Node::open(support::node_cfg(&c, "a", b_addr, &[b_addr]))
+        .await
+        .unwrap();
+    assert!(
+        matches!(a.state(), NodeState::Fenced { .. }),
+        "{:?}",
+        a.state()
+    );
+    fail::cfg("rejoin-after-rewrite", "1*return").unwrap();
+    let err = a
+        .rejoin_as_slave(None, RejoinOptions::default())
+        .await
+        .unwrap_err();
+    fail::remove("rejoin-after-rewrite");
+    assert!(matches!(err, Error::Io(_)), "{err}");
+    assert!(
+        matches!(a.state(), NodeState::Failed { .. }),
+        "{:?}",
+        a.state()
+    );
+    a.reopen().await.unwrap();
+    wait_until("a streams from b", || {
+        matches!(
+            a.state(),
+            NodeState::Slave {
+                state: SlaveState::Streaming,
+                ..
+            }
+        )
+    })
+    .await;
     scenario.teardown();
 }
