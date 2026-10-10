@@ -30,7 +30,8 @@ use crate::verify::compare::{Budget, CfRun, LocalSide, Oracle, compare_cf, compa
 use crate::verify::range::{Bounds, KeyOrder, LocalRange, LocalRecord, Throttle};
 use crate::verify::scan::{chunk_cf, load_range};
 use crate::verify::{
-    LIST_SOFT_BYTES, MismatchPolicy, VERIFY_WINDOW, VerifyAbort, VerifyMode, VerifyReport,
+    LIST_SOFT_BYTES, MAX_LIST_LIMIT, MAX_RESUME_KEY_BYTES, MismatchPolicy, VERIFY_WINDOW,
+    VerifyAbort, VerifyMode, VerifyReport,
 };
 
 /// The longest the applier stays held waiting for `VerifyBegin` (bounded by `capture_timeout`
@@ -40,6 +41,9 @@ const BEGIN_TIMEOUT: Duration = Duration::from_secs(10);
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
 /// The longest `VerifyEnd` may take: it is best effort and delays the report.
 const END_TIMEOUT: Duration = Duration::from_secs(2);
+/// The most key bytes one `FetchKeys` request carries (the server accepts 4 MiB requests).
+#[allow(dead_code)] // used by repair
+pub(crate) const FETCH_REQUEST_BYTES: usize = 1 << 20;
 
 /// Sets the run's stop flag when the run ends or is dropped (cancelled, or its `verify_now`
 /// future was dropped): blocking scans check it, so none keeps the database open.
@@ -164,63 +168,114 @@ async fn session(
     stop: &Arc<AtomicBool>,
 ) -> Result<VerifyReport> {
     let started = Instant::now();
-    let limit = decode_limit(inner.max_entry_bytes.load(Ordering::SeqCst));
     // Connected before the applier is held, so the pause never includes TCP or TLS setup.
-    let mut client = client::connect_now(inner)
+    let client = client::connect_now(inner)
         .await
-        .map_err(|e| abort(VerifyAbort::Upstream(format!("connect: {e}"))))?
-        .max_decoding_message_size(limit);
-    let req = pb::VerifyBeginRequest {
-        client_id: inner.cfg.identifier.clone(),
-        mode: mode.to_pb() as i32,
-    };
+        .map_err(|e| abort(VerifyAbort::Upstream(format!("connect: {e}"))))?;
     // The applier commits nothing while the upstream pins its snapshot, so this slave cannot
     // pass the snapshot's seq before the capture is set up. The pause is bounded.
     let hold = inner.hold_applier();
     let bound = BEGIN_TIMEOUT.min(inner.cfg.verify.capture_timeout);
-    let begin = tokio::time::timeout(bound, client.verify_begin(req))
-        .await
-        .map_err(|_| {
+    let mut session = UpstreamSession::open(inner, &client, mode, bound).await?;
+    span.record("seq", session.begin.snapshot_seq);
+    let result = compare(inner, &mut session, hold, identity, mode, started, stop).await;
+    session.close().await;
+    result
+}
+
+/// An open session on the upstream (PROTOCOL.md §9): its `VerifyBegin` answer and the
+/// `VerifyRange` stream used for hashes, listings, fetches and entry CRCs.
+pub(crate) struct UpstreamSession {
+    client: Client,
+    pub begin: pb::VerifyBeginResponse,
+    pub upstream: Upstream,
+}
+
+impl UpstreamSession {
+    /// `VerifyBegin`, then the `VerifyRange` stream, both within `bound` altogether. `client`
+    /// should be connected already ([`client::connect_now`]).
+    pub(crate) async fn open(
+        inner: &Inner,
+        client: &Client,
+        mode: VerifyMode,
+        bound: Duration,
+    ) -> Result<UpstreamSession> {
+        let limit = decode_limit(inner.max_entry_bytes.load(Ordering::SeqCst));
+        let mut client = client.clone().max_decoding_message_size(limit);
+        let req = pb::VerifyBeginRequest {
+            client_id: inner.cfg.identifier.clone(),
+            mode: mode.to_pb() as i32,
+        };
+        let timed_out = || {
             abort(VerifyAbort::Upstream(format!(
                 "VerifyBegin got no answer within {bound:?}"
             )))
-        })?
-        .map_err(|s| status_abort(&s))?
-        .into_inner();
-    span.record("seq", begin.snapshot_seq);
-    let result = compare(
-        inner,
-        &mut client,
-        &begin,
-        hold,
-        identity,
-        mode,
-        started,
-        stop,
-    )
-    .await;
-    // Best effort and bounded: the upstream also expires idle sessions.
-    let _ = tokio::time::timeout(
-        END_TIMEOUT,
-        client.verify_end(pb::VerifyEndRequest {
+        };
+        let deadline = tokio::time::Instant::now() + bound;
+        let begin = tokio::time::timeout_at(deadline, client.verify_begin(req))
+            .await
+            .map_err(|_| timed_out())?
+            .map_err(|s| status_abort(&s))?
+            .into_inner();
+        let (tx, rx) = mpsc::channel(2 * VERIFY_WINDOW);
+        let opened =
+            tokio::time::timeout_at(deadline, client.verify_range(ReceiverStream::new(rx))).await;
+        let answers = match opened {
+            Ok(Ok(r)) => r.into_inner(),
+            failed => {
+                // Do not leave the snapshot pinned upstream until it expires.
+                let end = pb::VerifyEndRequest {
+                    session_id: begin.session_id.clone(),
+                };
+                let _ = tokio::time::timeout(END_TIMEOUT, client.verify_end(end)).await;
+                return Err(match failed {
+                    Ok(Err(s)) => status_abort(&s),
+                    _ => abort(VerifyAbort::Upstream(format!(
+                        "VerifyRange was not opened within {bound:?}"
+                    ))),
+                });
+            }
+        };
+        let upstream = Upstream {
+            tx,
+            answers,
             session_id: begin.session_id.clone(),
-        }),
-    )
-    .await;
-    result
+            snapshot_seq: begin.snapshot_seq,
+            next_id: 0,
+        };
+        Ok(UpstreamSession {
+            client,
+            begin,
+            upstream,
+        })
+    }
+
+    /// Ends the session. Best effort and bounded: the upstream also expires idle sessions.
+    pub(crate) async fn close(self) {
+        let UpstreamSession {
+            mut client,
+            begin,
+            upstream,
+        } = self;
+        drop(upstream);
+        let end = pb::VerifyEndRequest {
+            session_id: begin.session_id,
+        };
+        let _ = tokio::time::timeout(END_TIMEOUT, client.verify_end(end)).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn compare(
     inner: &Arc<Inner>,
-    client: &mut Client,
-    begin: &pb::VerifyBeginResponse,
+    session: &mut UpstreamSession,
     hold: CaptureHold,
     identity: DbIdentity,
     mode: VerifyMode,
     started: Instant,
     stop: &Arc<AtomicBool>,
 ) -> Result<VerifyReport> {
+    let begin = &session.begin;
     let upstream_identity = begin.identity.as_ref().map(identity_from_pb).transpose()?;
     if upstream_identity != Some(identity) {
         return Err(abort(VerifyAbort::IdentityChanged));
@@ -240,23 +295,7 @@ async fn compare(
     let upstream_cfs: Vec<CfEntry> = begin.cf_specs.iter().map(cf_from_pb).collect();
     let (mut mismatches, common) = compare_specs(&local_cfs, &upstream_cfs);
 
-    let (tx, rx) = mpsc::channel(2 * VERIFY_WINDOW);
-    let answers =
-        tokio::time::timeout(ANSWER_TIMEOUT, client.verify_range(ReceiverStream::new(rx)))
-            .await
-            .map_err(|_| {
-                abort(VerifyAbort::Upstream(format!(
-                    "VerifyRange was not opened within {ANSWER_TIMEOUT:?}"
-                )))
-            })?
-            .map_err(|s| status_abort(&s))?
-            .into_inner();
-    let mut upstream = Upstream {
-        tx,
-        answers,
-        session_id: begin.session_id.clone(),
-        next_id: 0,
-    };
+    let upstream = &mut session.upstream;
     let cfg = &inner.cfg.verify;
     let throttle = Arc::new(Mutex::new(Throttle::new(cfg.max_bytes_per_sec)));
     let mut budget = Budget::new(cfg.max_reported_keys);
@@ -315,7 +354,7 @@ async fn compare(
             budget: &mut budget,
             out: &mut mismatches,
         };
-        let compared = compare_cf(&mut upstream, &local, &mut run, &mut ranges).await;
+        let compared = compare_cf(upstream, &local, &mut run, &mut ranges).await;
         // Unblocks the producer if the comparison stopped early.
         drop(ranges);
         let keys = producer
@@ -370,14 +409,34 @@ async fn capture(inner: &Arc<Inner>, hold: CaptureHold, s: Seq) -> Result<ReadSn
     }
 }
 
+/// How many of `keys` the next `FetchKeys` request carries: at most `MAX_LIST_LIMIT` keys and
+/// [`FETCH_REQUEST_BYTES`] of keys, but always at least one.
+#[allow(dead_code)] // used by repair
+fn fetch_batch_len(keys: &[Vec<u8>]) -> usize {
+    let mut n = 0;
+    let mut bytes = 0;
+    for k in keys.iter().take(MAX_LIST_LIMIT as usize) {
+        if n > 0 && bytes + k.len() > FETCH_REQUEST_BYTES {
+            break;
+        }
+        n += 1;
+        bytes += k.len();
+    }
+    n
+}
+
 /// The upstream's half of a session, over one `VerifyRange` stream.
-struct Upstream {
+pub(crate) struct Upstream {
     tx: mpsc::Sender<pb::VerifyRangeRequest>,
     answers: Streaming<pb::VerifyRangeResponse>,
     session_id: Vec<u8>,
+    #[allow(dead_code)] // read by `entry_crc`, used by repair
+    snapshot_seq: Seq,
     next_id: u64,
 }
 
+// `fetch_keys`, `fetch_range` and `entry_crc` are used by repair (Task 10) and the tests.
+#[allow(dead_code)]
 impl Upstream {
     async fn send(&mut self, kind: ReqKind) -> Result<u64> {
         self.next_id += 1;
@@ -415,6 +474,129 @@ impl Upstream {
             Err(s) => Err(status_abort(&s)),
         }
     }
+
+    /// The upstream's envelopes of `keys` at the session's snapshot (`None`: no such key),
+    /// passed to `sink` in the order asked. Requests carry at most [`FETCH_REQUEST_BYTES`] of
+    /// keys (and at most `MAX_LIST_LIMIT` keys); a single larger key is sent alone (the caller
+    /// should not ask for keys near the server's 4 MiB request limit). Stops early, returning
+    /// `Ok(false)`, when `sink` returns `false`.
+    pub(crate) async fn fetch_keys(
+        &mut self,
+        cf: &str,
+        keys: &[Vec<u8>],
+        sink: &mut (dyn FnMut(Vec<u8>, Option<Vec<u8>>) -> bool + Send),
+    ) -> Result<bool> {
+        let mut rest = keys;
+        while !rest.is_empty() {
+            let ask = &rest[..fetch_batch_len(rest)];
+            let req = pb::FetchKeys {
+                cf: cf.to_string(),
+                keys: ask.to_vec(),
+            };
+            let id = self.send(ReqKind::FetchKeys(req)).await?;
+            let RespKind::Fetch(f) = self.answer(id).await? else {
+                return Err(abort(VerifyAbort::Upstream(
+                    "unexpected answer to FetchKeys".into(),
+                )));
+            };
+            let answered_others = f.records.is_empty()
+                || f.records.len() > ask.len()
+                || f.records.iter().zip(ask).any(|(r, k)| r.key != *k);
+            if answered_others {
+                return Err(abort(VerifyAbort::Upstream(
+                    "FetchKeys answered other keys".into(),
+                )));
+            }
+            rest = &rest[f.records.len()..];
+            for r in f.records {
+                if !sink(r.key, r.envelope) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Every key of `bounds` with its envelope at the session's snapshot, passed to `sink` in
+    /// key order, paging through truncated answers like a listing. Stops early, returning
+    /// `Ok(false)`, when `sink` returns `false`.
+    pub(crate) async fn fetch_range(
+        &mut self,
+        cf: &str,
+        bounds: &Bounds,
+        sink: &mut (dyn FnMut(Vec<u8>, Option<Vec<u8>>) -> bool + Send),
+    ) -> Result<bool> {
+        let mut page = bounds.clone();
+        let mut resume: Option<Vec<u8>> = None;
+        loop {
+            let req = pb::FetchRange {
+                range: Some(page.to_pb(cf)),
+                limit: MAX_LIST_LIMIT,
+            };
+            let id = self.send(ReqKind::FetchRange(req)).await?;
+            let RespKind::Fetch(f) = self.answer(id).await? else {
+                return Err(abort(VerifyAbort::Upstream(
+                    "unexpected answer to FetchRange".into(),
+                )));
+            };
+            if f.records.len() > MAX_LIST_LIMIT as usize {
+                return Err(abort(VerifyAbort::Upstream(
+                    "FetchRange answered more records than asked".into(),
+                )));
+            }
+            let mut last = None;
+            for r in f.records {
+                if resume.as_deref() == Some(r.key.as_slice()) {
+                    continue;
+                }
+                if r.envelope.is_none() {
+                    return Err(abort(VerifyAbort::Upstream(
+                        "FetchRange record without envelope".into(),
+                    )));
+                }
+                last = Some(r.key.clone());
+                if !sink(r.key, r.envelope) {
+                    return Ok(false);
+                }
+            }
+            if !f.truncated {
+                return Ok(true);
+            }
+            match last {
+                Some(k) if k.len() <= MAX_RESUME_KEY_BYTES => {
+                    page.lower = Some(k.clone());
+                    resume = Some(k);
+                }
+                _ => {
+                    return Err(abort(VerifyAbort::Upstream(
+                        "FetchRange cannot be continued".into(),
+                    )));
+                }
+            }
+        }
+    }
+
+    /// The `crc32c` of the upstream's entry `seq`, if it still holds it and `seq <= S`.
+    pub(crate) async fn entry_crc(&mut self, seq: Seq) -> Result<Option<u32>> {
+        // The upstream refuses seqs past the snapshot; they are known not to be held.
+        if seq == 0 || seq > self.snapshot_seq {
+            return Ok(None);
+        }
+        let req = pb::EntryCrcs {
+            from_seq: seq,
+            to_seq: seq,
+        };
+        let id = self.send(ReqKind::EntryCrcs(req)).await?;
+        let RespKind::EntryCrcs(r) = self.answer(id).await? else {
+            return Err(abort(VerifyAbort::Upstream(
+                "unexpected answer to EntryCrcs".into(),
+            )));
+        };
+        Ok(r.entries
+            .into_iter()
+            .find(|e| e.seq == seq)
+            .map(|e| e.crc32c))
+    }
 }
 
 impl Oracle for Upstream {
@@ -432,9 +614,9 @@ impl Oracle for Upstream {
         for id in ids {
             match self.answer(id).await? {
                 RespKind::Hash(h) => matched.push(h.matched),
-                RespKind::List(_) => {
+                _ => {
                     return Err(abort(VerifyAbort::Upstream(
-                        "a listing answered a hash request".into(),
+                        "unexpected answer to HashRange".into(),
                     )));
                 }
             }
@@ -456,8 +638,8 @@ impl Oracle for Upstream {
             .await?;
         match self.answer(id).await? {
             RespKind::List(l) => Ok((l.keys, l.truncated)),
-            RespKind::Hash(_) => Err(abort(VerifyAbort::Upstream(
-                "a hash answered a listing request".into(),
+            _ => Err(abort(VerifyAbort::Upstream(
+                "unexpected answer to ListRange".into(),
             ))),
         }
     }
@@ -524,6 +706,170 @@ pub(crate) fn spawn(inner: &Arc<Inner>) -> Option<JoinHandle<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_requests_are_bounded_by_count_and_bytes() {
+        let small = vec![vec![0u8; 10]; 3000];
+        assert_eq!(fetch_batch_len(&small), MAX_LIST_LIMIT as usize);
+        let big = vec![vec![0u8; 400 << 10]; 5];
+        assert_eq!(
+            fetch_batch_len(&big),
+            2,
+            "two 400 KiB keys fit in 1 MiB, three do not"
+        );
+        let huge = vec![vec![0u8; 3 << 20], vec![0u8; 1]];
+        assert_eq!(
+            fetch_batch_len(&huge),
+            1,
+            "a single large key is sent alone"
+        );
+        assert_eq!(fetch_batch_len(&[]), 0);
+    }
+
+    /// An `Inner` that connects to `addr` (nothing runs: the tests only open sessions).
+    fn inner_for(dir: &std::path::Path, addr: std::net::SocketAddr) -> Arc<Inner> {
+        use crate::slave::config::{SlaveConfig, UpstreamConfig};
+        use crate::tuning::RocksTuning;
+        use crate::types::Role;
+        let (store, meta) =
+            crate::store::Store::open(dir, Role::Slave, RocksTuning::new()).unwrap();
+        let cfg = SlaveConfig::new("t", dir, UpstreamConfig::from_addr(addr));
+        Arc::new(Inner::new(store, cfg, &meta).unwrap())
+    }
+
+    async fn open_session(inner: &Arc<Inner>) -> UpstreamSession {
+        let client = client::connect_now(inner).await.unwrap();
+        UpstreamSession::open(inner, &client, VerifyMode::Full, Duration::from_secs(10))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_upstream_session_fetches_keys_ranges_and_entry_crcs() {
+        use crate::log::LogApi;
+        use crate::server::test_client::serving_master;
+        use crate::types::{Batch, CfSpec};
+        let mdir = tempfile::tempdir().unwrap();
+        let sdir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(mdir.path(), |_| {}).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        let mut batch = Batch::new();
+        for i in 0..2500u32 {
+            batch.put("c", &i.to_be_bytes(), &i.to_le_bytes());
+        }
+        let s = m.write(batch).unwrap(); // seq 2
+        let inner = inner_for(sdir.path(), m.serve_addr().unwrap());
+        let mut session = open_session(&inner).await;
+        assert_eq!(session.begin.snapshot_seq, s);
+        m.put("c", &0u32.to_be_bytes(), b"later").unwrap(); // after the snapshot
+
+        // Keys: more than one request's worth, in the order asked, with absent ones.
+        let mut keys: Vec<Vec<u8>> = (0..1500u32)
+            .rev()
+            .map(|i| i.to_be_bytes().to_vec())
+            .collect();
+        keys.push(b"absent".to_vec());
+        let mut got = Vec::new();
+        let done = session
+            .upstream
+            .fetch_keys("c", &keys, &mut |k, e| {
+                got.push((k, e));
+                true
+            })
+            .await
+            .unwrap();
+        assert!(done);
+        assert_eq!(got.len(), keys.len());
+        assert!(got.iter().zip(&keys).all(|((k, _), want)| k == want));
+        let want = crate::codec::envelope::encode(s, None, &1499u32.to_le_bytes());
+        assert_eq!(got[0].1.as_deref(), Some(want.as_slice()));
+        assert_eq!(got[1500].1, None);
+        let old = crate::codec::envelope::encode(s, None, &0u32.to_le_bytes());
+        assert_eq!(
+            got[1499].1.as_deref(),
+            Some(old.as_slice()),
+            "the snapshot's value"
+        );
+
+        // A sink that stops early stops the fetch.
+        let mut n = 0;
+        let done = session
+            .upstream
+            .fetch_keys("c", &keys, &mut |_, _| {
+                n += 1;
+                n < 3
+            })
+            .await
+            .unwrap();
+        assert!(!done);
+        assert_eq!(n, 3);
+
+        // A range: three pages, every key once, in order.
+        let mut seen = Vec::new();
+        let done = session
+            .upstream
+            .fetch_range("c", &Bounds::default(), &mut |k, e| {
+                assert!(e.is_some());
+                seen.push(k);
+                true
+            })
+            .await
+            .unwrap();
+        assert!(done);
+        let all: Vec<Vec<u8>> = (0..2500u32).map(|i| i.to_be_bytes().to_vec()).collect();
+        assert_eq!(seen, all);
+        let sub = Bounds {
+            lower: Some(10u32.to_be_bytes().to_vec()),
+            upper: Some(20u32.to_be_bytes().to_vec()),
+        };
+        let mut n = 0;
+        session
+            .upstream
+            .fetch_range("c", &sub, &mut |_, _| {
+                n += 1;
+                true
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 10);
+
+        // Entry CRCs: the entry at S, one before it, and none past the snapshot.
+        let entries: Vec<_> = m.entries_since(0).unwrap().map(Result::unwrap).collect();
+        for e in entries.iter().filter(|e| e.seq <= s) {
+            assert_eq!(
+                session.upstream.entry_crc(e.seq).await.unwrap(),
+                Some(e.crc32c)
+            );
+        }
+        assert_eq!(session.upstream.entry_crc(s + 1).await.unwrap(), None);
+        assert_eq!(session.upstream.entry_crc(0).await.unwrap(), None);
+        // The session is still usable after those, and closes cleanly.
+        session.close().await;
+        drop(inner);
+        m.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fetch_of_an_unknown_cf_aborts_the_run() {
+        use crate::server::test_client::serving_master;
+        let mdir = tempfile::tempdir().unwrap();
+        let sdir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(mdir.path(), |_| {}).await;
+        let inner = inner_for(sdir.path(), m.serve_addr().unwrap());
+        let mut session = open_session(&inner).await;
+        let err = session
+            .upstream
+            .fetch_keys("nope", &[vec![1]], &mut |_, _| true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::VerifyAborted(VerifyAbort::Upstream(ref m)) if m.contains("InvalidArgument")),
+            "{err:?}"
+        );
+        session.close().await;
+        drop(inner);
+        m.shutdown().await.unwrap();
+    }
 
     #[test]
     fn answers_are_sized_for_two_maximal_keys() {

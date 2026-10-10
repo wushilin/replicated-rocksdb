@@ -569,13 +569,23 @@ message KeyRange  { string cf = 1; optional bytes lower = 2; optional bytes uppe
 message HashRange { KeyRange range = 1; uint64 count = 2; bytes hash = 3; }
 message ListRange { KeyRange range = 1; uint32 limit = 2; }
 
+message FetchKeys  { string cf = 1; repeated bytes keys = 2; }
+message FetchRange { KeyRange range = 1; uint32 limit = 2; }
+message EntryCrcs  { uint64 from_seq = 1; uint64 to_seq = 2; }
+
 message VerifyRangeRequest  { bytes session_id = 1; uint64 request_id = 2;
-                              oneof kind { HashRange hash = 3; ListRange list = 4; } }
+                              oneof kind { HashRange hash = 3; ListRange list = 4; FetchKeys fetch_keys = 5;
+                                           FetchRange fetch_range = 6; EntryCrcs entry_crcs = 7; } }
 message VerifyRangeResponse { uint64 request_id = 1;
-                              oneof kind { HashResult hash = 2; ListResult list = 3; } }
-message HashResult { bool matched = 1; uint64 count = 2; bytes hash = 3; }
-message ListResult { repeated KeyDigest keys = 1; bool truncated = 2; }
-message KeyDigest  { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3; }
+                              oneof kind { HashResult hash = 2; ListResult list = 3; FetchResult fetch = 4;
+                                           EntryCrcResult entry_crcs = 5; } }
+message HashResult     { bool matched = 1; uint64 count = 2; bytes hash = 3; }
+message ListResult     { repeated KeyDigest keys = 1; bool truncated = 2; }
+message KeyDigest      { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3; }
+message FetchResult    { repeated FetchedRecord records = 1; bool truncated = 2; }
+message FetchedRecord  { bytes key = 1; optional bytes envelope = 2; }   // no envelope: no such key
+message EntryCrcResult { repeated SeqCrc entries = 1; }
+message SeqCrc         { uint64 seq = 1; fixed32 crc32c = 2; }
 ```
 
 - A `KeyRange` is half-open, `[lower, upper)`, under the CF's comparator. An absent `lower` means unbounded below, and an absent `upper` means unbounded above. An empty byte string is a valid key and is **not** the same as absent.
@@ -585,6 +595,10 @@ message KeyDigest  { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3
 - To continue a truncated listing, the client sends the same range with `lower` set to the last key it received, and skips that key when the answer repeats it first. This works under any comparator (appending a byte to a key gives its successor only under bytewise order), and the two-key rule guarantees progress.
 - A request whose `cf` is not in the session's snapshot, whose `range` or `kind` is missing, or whose `limit` is out of bounds fails with `INVALID_ARGUMENT`. A `VerifyBegin` with `mode = VERIFY_MODE_UNSPECIFIED` fails the same way.
 - When its state is replaced (it starts bootstrapping itself, or its identity changes), the server ends every `VerifyRange` stream with `UNAVAILABLE` / `UPSTREAM_RESET`, as it does for `Tail` (§7.3), and drops every session. A later request on a dropped session fails with `UPSTREAM_RESET` or `SESSION_NOT_FOUND`; a client MUST treat both as "start a new run".
+- `FetchKeys` (repair): the server returns, in the order asked, a `FetchedRecord` per key with its whole envelope as of the session's snapshot, or without `envelope` when the key does not exist. `keys` MUST NOT be empty and MUST NOT hold more than 1024 keys (`INVALID_ARGUMENT` otherwise). The server MAY answer only a prefix of the keys (setting `truncated`) to bound the answer (RECOMMENDED: stop once ~1 MiB of envelopes is reached), but answers at least one; the client asks again for the rest.
+- `FetchRange` (repair): like `ListRange`, but each record carries the whole envelope. The same limits, paging rule and two-record minimum apply.
+- `EntryCrcs` (repair): `from_seq ≤ to_seq ≤ snapshot_seq` is required (`INVALID_ARGUMENT` otherwise). The server returns `(seq, crc32c)` for every entry with `from_seq ≤ seq ≤ min(to_seq, from_seq + 1023)` that it held at the snapshot (entry `snapshot_seq` is always known). They are read through the session's snapshot, so they never change during the session; a client compares them with its own entries (repair checks the entry before the fork its epoch history shows).
+- Envelopes expired but not yet reaped are returned like any other: repair copies what is stored.
 - The client MAY pipeline up to `verify_window` requests (RECOMMENDED: 16). The server answers in request order, and `request_id` echoes the request.
 
 ### 9.3 Modes
@@ -697,7 +711,7 @@ Only the master enforces `max_entry_bytes`, at write time. Replicas accept and f
 ## 13. Security considerations
 
 - **Confidentiality.** `Bootstrap` and `Tail` carry every key and value. Without TLS they are exposed to anyone on the network path. Plaintext SHOULD be limited to loopback.
-- **Authorisation scope.** A credential that can call `Bootstrap` can read the whole database. Deployments SHOULD issue replication credentials only to replica nodes and SHOULD NOT reuse them elsewhere.
+- **Authorisation scope.** A credential that can call `Bootstrap`, or `VerifyRange` with `FetchKeys` or `FetchRange`, can read the whole database. Deployments SHOULD issue replication credentials only to replica nodes and SHOULD NOT reuse them elsewhere.
 - **Tokens.** Tokens MUST be compared in constant time, and MUST NOT be logged or included in error details. Support at least two concurrently valid tokens so they can be rotated without downtime.
 - **Node ids are not credentials.** `client_id`, `server_id` and `upstream_chain` are self-asserted. They are used for loop detection and diagnostics only.
 - **Integrity.** CRC-32C protects against accidental corruption only. Against active tampering, rely on TLS. The BLAKE3 digests detect divergence between honest nodes. They do not authenticate the data.
@@ -878,20 +892,39 @@ message KeyRange  { string cf = 1; optional bytes lower = 2; optional bytes uppe
 message HashRange { KeyRange range = 1; uint64 count = 2; bytes hash = 3; }
 message ListRange { KeyRange range = 1; uint32 limit = 2; }
 
+message FetchKeys  { string cf = 1; repeated bytes keys = 2; }
+message FetchRange { KeyRange range = 1; uint32 limit = 2; }
+message EntryCrcs  { uint64 from_seq = 1; uint64 to_seq = 2; }
+
 message VerifyRangeRequest {
   bytes  session_id = 1;
   uint64 request_id = 2;
-  oneof kind { HashRange hash = 3; ListRange list = 4; }
+  oneof kind {
+    HashRange  hash        = 3;
+    ListRange  list        = 4;
+    FetchKeys  fetch_keys  = 5;
+    FetchRange fetch_range = 6;
+    EntryCrcs  entry_crcs  = 7;
+  }
 }
 
 message VerifyRangeResponse {
   uint64 request_id = 1;
-  oneof kind { HashResult hash = 2; ListResult list = 3; }
+  oneof kind {
+    HashResult     hash       = 2;
+    ListResult     list       = 3;
+    FetchResult    fetch      = 4;
+    EntryCrcResult entry_crcs = 5;
+  }
 }
 
-message HashResult { bool matched = 1; uint64 count = 2; bytes hash = 3; }
-message ListResult { repeated KeyDigest keys = 1; bool truncated = 2; }
-message KeyDigest  { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3; }
+message HashResult     { bool matched = 1; uint64 count = 2; bytes hash = 3; }
+message ListResult     { repeated KeyDigest keys = 1; bool truncated = 2; }
+message KeyDigest      { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3; }
+message FetchResult    { repeated FetchedRecord records = 1; bool truncated = 2; }
+message FetchedRecord  { bytes key = 1; optional bytes envelope = 2; }   // no envelope: no such key
+message EntryCrcResult { repeated SeqCrc entries = 1; }
+message SeqCrc         { uint64 seq = 1; fixed32 crc32c = 2; }
 
 message VerifyEndRequest  { bytes session_id = 1; }
 message VerifyEndResponse {}

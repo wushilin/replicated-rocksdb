@@ -9,7 +9,6 @@ use super::range::{Bounds, Chunker, KeyOrder, LocalRange, LocalRecord, Throttle}
 #[cfg(test)]
 use super::range::{Lister, RangeHasher};
 use crate::error::Result;
-#[cfg(test)]
 use crate::pb;
 use crate::read::ReadSnapshot;
 use crate::store::cfs::PhysCf;
@@ -48,6 +47,34 @@ pub(crate) fn scan_until(
         }
     }
     Ok(true)
+}
+
+/// Up to `limit` keys of a range with their whole envelopes, for repair; `true` if there are
+/// more. Like a listing, the answer is cut at about `soft_bytes`, but never below two keys.
+/// Checks `cancel` before every key; `None` if it was set (discard the result).
+pub(crate) fn fetch_range(
+    snap: &ReadSnapshot,
+    cf: Arc<PhysCf>,
+    order: &KeyOrder,
+    bounds: &Bounds,
+    limit: usize,
+    soft_bytes: usize,
+    cancel: &AtomicBool,
+) -> Result<Option<(Vec<pb::FetchedRecord>, bool)>> {
+    let (mut records, mut bytes, mut truncated) = (Vec::new(), 0usize, false);
+    let done = scan_until(snap, cf, order, bounds, Some(cancel), |k, v| {
+        if records.len() >= limit || (records.len() >= 2 && bytes >= soft_bytes) {
+            truncated = true;
+            return Ok(false);
+        }
+        bytes += k.len() + v.len();
+        records.push(pb::FetchedRecord {
+            key: k.to_vec(),
+            envelope: Some(v.to_vec()),
+        });
+        Ok(true)
+    })?;
+    Ok(done.then_some((records, truncated)))
 }
 
 /// `(count, hash)` of a range (PROTOCOL.md §5.4, §9.3). The server hashes through `scan_until`
@@ -454,6 +481,67 @@ mod tests {
         assert!(
             matches!(&e, crate::error::Error::Io(io) if io.kind() == std::io::ErrorKind::Interrupted),
             "{e:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_range_returns_whole_envelopes_in_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        apply(
+            &store,
+            vec![Op::CreateCf {
+                spec: CfSpec::new("c"),
+            }],
+        )
+        .unwrap();
+        apply(
+            &store,
+            (b'a'..=b'e').map(|k| put("c", &[k], &[k; 3])).collect(),
+        )
+        .unwrap();
+        let snap = store.read_snapshot(0).unwrap();
+        let cf = snap.phys("c").unwrap();
+        let o = KeyOrder::bytewise();
+        let live = AtomicBool::new(false);
+        let (all_in, more) = fetch_range(
+            &snap,
+            cf.clone(),
+            &o,
+            &b(Some(b"b"), Some(b"e")),
+            1024,
+            usize::MAX,
+            &live,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!more);
+        assert_eq!(
+            all_in.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+            vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
+        );
+        assert_eq!(
+            all_in[0].envelope.as_deref(),
+            Some(envelope::encode(2, None, b"bbb").as_slice())
+        );
+        let (page, more) = fetch_range(&snap, cf.clone(), &o, &all(), 1024, 1, &live)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (page.len(), more),
+            (2, true),
+            "two records even past the soft size"
+        );
+        let (page, more) = fetch_range(&snap, cf.clone(), &o, &all(), 3, usize::MAX, &live)
+            .unwrap()
+            .unwrap();
+        assert_eq!((page.len(), more), (3, true), "cut at the limit");
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            fetch_range(&snap, cf, &o, &all(), 1024, usize::MAX, &cancelled)
+                .unwrap()
+                .is_none(),
+            "a set cancel flag stops the scan"
         );
     }
 

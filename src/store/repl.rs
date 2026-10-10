@@ -72,6 +72,23 @@ impl ReadSnapshot {
             .ok_or_else(|| Error::corrupt("__meta is empty in snapshot"))
     }
 
+    /// The `crc32c` of changelog entry `seq` as of this snapshot (`None` if it was not
+    /// retained then, or `seq` is 0 or after the snapshot's seq).
+    pub(crate) fn entry_crc(&self, seq: Seq) -> Result<Option<u32>> {
+        if seq == 0 || seq > self.seq {
+            return Ok(None);
+        }
+        let cf = self
+            .snap
+            .db()
+            .cf_handle(CF_CHANGELOG)
+            .ok_or_else(|| Error::corrupt("__changelog is not open"))?;
+        self.snap
+            .get_cf(&cf, &seq.to_be_bytes())?
+            .map(|v| LogEntry::decode(&v).map(|e| e.crc32c))
+            .transpose()
+    }
+
     /// The physical CF this snapshot holds for logical CF `name`.
     pub(crate) fn phys(&self, name: &str) -> Option<Arc<PhysCf>> {
         self.cfs.get(name).cloned()

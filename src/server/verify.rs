@@ -22,6 +22,7 @@ use crate::pb::verify_range_request::Kind as ReqKind;
 use crate::pb::verify_range_response::Kind as RespKind;
 use crate::read::ReadSnapshot;
 use crate::store::cfs::PhysCf;
+use crate::types::Seq;
 use crate::verify::range::{Bounds, KeyOrder, Lister, RangeHasher};
 use crate::verify::scan;
 use crate::verify::{LIST_SOFT_BYTES, MAX_LIST_LIMIT, VerifyMode};
@@ -38,6 +39,9 @@ pub(crate) struct Session {
     id: [u8; 16],
     snap: ReadSnapshot,
     mode: VerifyMode,
+    /// `S` and the CRC of entry `S`, read through the snapshot.
+    seq: Seq,
+    last_crc: Option<u32>,
     cfs: HashMap<String, (Arc<PhysCf>, KeyOrder)>,
     /// The node's reset generation when the session was opened; a later reset ends it.
     reset_gen: u64,
@@ -217,6 +221,8 @@ pub(super) async fn begin(
         id,
         snap,
         mode,
+        seq: meta.last_seq,
+        last_crc: meta.last_entry_crc,
         cfs,
         reset_gen,
         span,
@@ -349,7 +355,7 @@ async fn answer(
     }
     let kind = req
         .kind
-        .ok_or_else(|| net::invalid_argument("VerifyRangeRequest needs hash or list"))?;
+        .ok_or_else(|| net::invalid_argument("VerifyRangeRequest needs a request kind"))?;
     let cancel = state.cancel.clone();
     // The closure owns the session and the permit and drops the session first, so once
     // `shutdown` holds every permit no computation references the database any more.
@@ -442,6 +448,84 @@ fn compute(s: &Session, kind: ReqKind, cancel: &AtomicBool) -> Result<RespKind, 
                 truncated: lister.truncated,
             }))
         }
+        ReqKind::FetchKeys(f) => {
+            if f.keys.is_empty() || f.keys.len() > MAX_LIST_LIMIT as usize {
+                return Err(net::invalid_argument(format!(
+                    "FetchKeys takes 1..={MAX_LIST_LIMIT} keys"
+                )));
+            }
+            let range = pb::KeyRange {
+                cf: f.cf,
+                lower: None,
+                upper: None,
+            };
+            let (phys, _, _) = target(s, Some(&range))?;
+            let ctx = s.snap.raw_ctx();
+            let (mut records, mut bytes, mut truncated) = (Vec::new(), 0usize, false);
+            for key in f.keys {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(stopped());
+                }
+                // Cut the answer at about `LIST_SOFT_BYTES`, but always answer one key.
+                if !records.is_empty() && bytes >= LIST_SOFT_BYTES {
+                    truncated = true;
+                    break;
+                }
+                let envelope = ctx.get_raw(phys, &key).map_err(store_status)?;
+                bytes += key.len() + envelope.as_ref().map_or(0, Vec::len);
+                records.push(pb::FetchedRecord { key, envelope });
+            }
+            Ok(RespKind::Fetch(pb::FetchResult { records, truncated }))
+        }
+        ReqKind::FetchRange(f) => {
+            if f.limit == 0 || f.limit > MAX_LIST_LIMIT {
+                return Err(net::invalid_argument(format!(
+                    "FetchRange.limit must be 1..={MAX_LIST_LIMIT}"
+                )));
+            }
+            let (phys, order, bounds) = target(s, f.range.as_ref())?;
+            let fetched = scan::fetch_range(
+                &s.snap,
+                phys.clone(),
+                order,
+                &bounds,
+                f.limit as usize,
+                LIST_SOFT_BYTES,
+                cancel,
+            )
+            .map_err(store_status)?;
+            let Some((records, truncated)) = fetched else {
+                return Err(stopped());
+            };
+            Ok(RespKind::Fetch(pb::FetchResult { records, truncated }))
+        }
+        ReqKind::EntryCrcs(e) => {
+            if e.from_seq > e.to_seq || e.to_seq > s.seq {
+                return Err(net::invalid_argument(format!(
+                    "EntryCrcs needs from_seq <= to_seq <= {} (the snapshot's seq)",
+                    s.seq
+                )));
+            }
+            // Read through the session's snapshot: entries up to S never change, and a log
+            // that moves on (retention, a repair or bootstrap of this node) does not matter.
+            let last = e
+                .to_seq
+                .min(e.from_seq.saturating_add(u64::from(MAX_LIST_LIMIT) - 1));
+            let mut entries = Vec::new();
+            for seq in e.from_seq.max(1)..=last {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(stopped());
+                }
+                let crc = match s.snap.entry_crc(seq).map_err(store_status)? {
+                    None if seq == s.seq => s.last_crc,
+                    other => other,
+                };
+                if let Some(crc32c) = crc {
+                    entries.push(pb::SeqCrc { seq, crc32c });
+                }
+            }
+            Ok(RespKind::EntryCrcs(pb::EntryCrcResult { entries }))
+        }
     }
 }
 /// Test hook: makes the computations of chosen sessions slow.
@@ -495,6 +579,7 @@ mod tests {
     use tonic::Code;
 
     use crate::codec::envelope;
+    use crate::log::LogApi;
     use crate::net::convert::identity_to_pb;
     use crate::net::reason_of;
     use crate::pb;
@@ -659,6 +744,234 @@ mod tests {
             reason(&err.unwrap()),
             (Code::NotFound, Some(pb::Reason::SessionNotFound))
         );
+    }
+
+    fn request(session: &[u8], id: u64, kind: Req) -> pb::VerifyRangeRequest {
+        pb::VerifyRangeRequest {
+            session_id: session.to_vec(),
+            request_id: id,
+            kind: Some(kind),
+        }
+    }
+
+    /// Fetches answer from the session's snapshot; entry CRCs from the log, up to `S`.
+    #[tokio::test]
+    async fn fetches_and_entry_crcs_answer_at_the_snapshot_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(dir.path(), |_| {}).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        for k in [&b"a"[..], b"b", b"c"] {
+            m.put("c", k, b"v").unwrap(); // seqs 2..=4
+        }
+        let mut c = client(m.serve_addr().unwrap(), "b");
+        let sid = begin(&mut c, pb::VerifyMode::Quick)
+            .await
+            .unwrap()
+            .session_id;
+        m.put("c", b"a", b"later").unwrap(); // seq 5: after the snapshot
+        let keys = vec![b"a".to_vec(), b"zz".to_vec()];
+        let (answers, err) = exchange(
+            &mut c,
+            vec![
+                request(
+                    &sid,
+                    1,
+                    Req::FetchKeys(pb::FetchKeys {
+                        cf: "c".into(),
+                        keys,
+                    }),
+                ),
+                request(
+                    &sid,
+                    2,
+                    Req::FetchRange(pb::FetchRange {
+                        range: Some(range(Some(b"b"), None)),
+                        limit: 1024,
+                    }),
+                ),
+                request(
+                    &sid,
+                    3,
+                    Req::EntryCrcs(pb::EntryCrcs {
+                        from_seq: 3,
+                        to_seq: 4,
+                    }),
+                ),
+            ],
+        )
+        .await;
+        assert!(err.is_none(), "{err:?}");
+        match &answers[0].kind {
+            Some(Resp::Fetch(f)) => {
+                assert_eq!(f.records.len(), 2);
+                assert_eq!(
+                    f.records[0].envelope.as_deref(),
+                    Some(envelope::encode(2, None, b"v").as_slice()),
+                    "the snapshot's value"
+                );
+                assert_eq!(f.records[1].envelope, None, "no such key");
+                assert!(!f.truncated);
+            }
+            other => panic!("{other:?}"),
+        }
+        match &answers[1].kind {
+            Some(Resp::Fetch(f)) => {
+                assert_eq!(
+                    f.records.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+                    vec![b"b".to_vec(), b"c".to_vec()]
+                );
+                assert!(f.records.iter().all(|r| r.envelope.is_some()));
+            }
+            other => panic!("{other:?}"),
+        }
+        let expected: Vec<pb::SeqCrc> = m
+            .entries_since(2)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|e| e.seq <= 4)
+            .map(|e| pb::SeqCrc {
+                seq: e.seq,
+                crc32c: e.crc32c,
+            })
+            .collect();
+        assert_eq!(expected.len(), 2);
+        match &answers[2].kind {
+            Some(Resp::EntryCrcs(r)) => assert_eq!(r.entries, expected),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Malformed fetches end the stream with INVALID_ARGUMENT.
+    #[tokio::test]
+    async fn malformed_fetches_are_invalid_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(dir.path(), |_| {}).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        m.put("c", b"a", b"v").unwrap(); // S = 2
+        let mut c = client(m.serve_addr().unwrap(), "b");
+        let sid = begin(&mut c, pb::VerifyMode::Quick)
+            .await
+            .unwrap()
+            .session_id;
+        let keys = |cf: &str, n: usize| {
+            Req::FetchKeys(pb::FetchKeys {
+                cf: cf.into(),
+                keys: vec![vec![1]; n],
+            })
+        };
+        let fetch_range = |limit: u32, range: Option<pb::KeyRange>| {
+            Req::FetchRange(pb::FetchRange { range, limit })
+        };
+        let crcs = |from_seq: u64, to_seq: u64| Req::EntryCrcs(pb::EntryCrcs { from_seq, to_seq });
+        let bad = [
+            ("empty keys", keys("c", 0)),
+            ("too many keys", keys("c", 1025)),
+            ("unknown cf", keys("nope", 1)),
+            ("zero limit", fetch_range(0, Some(range(None, None)))),
+            ("huge limit", fetch_range(1025, Some(range(None, None)))),
+            ("no range", fetch_range(10, None)),
+            ("unknown range cf", {
+                let mut r = range(None, None);
+                r.cf = "nope".into();
+                fetch_range(10, Some(r))
+            }),
+            ("from > to", crcs(2, 1)),
+            ("to > S", crcs(1, 3)),
+        ];
+        for (what, kind) in bad {
+            let (_, err) = exchange(&mut c, vec![request(&sid, 1, kind)]).await;
+            assert_eq!(err.map(|e| e.code()), Some(Code::InvalidArgument), "{what}");
+        }
+        // The edge of the valid: 1024 keys, the whole log.
+        let (answers, err) = exchange(
+            &mut c,
+            vec![
+                request(&sid, 1, keys("c", 1024)),
+                request(&sid, 2, crcs(0, 2)),
+            ],
+        )
+        .await;
+        assert!(err.is_none(), "{err:?}");
+        match &answers[0].kind {
+            Some(Resp::Fetch(f)) => assert_eq!(f.records.len(), 1024),
+            other => panic!("{other:?}"),
+        }
+        match &answers[1].kind {
+            Some(Resp::EntryCrcs(r)) => {
+                assert_eq!(r.entries.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2])
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A single entry at `S` is answered.
+    #[tokio::test]
+    async fn the_entry_at_s_is_answered_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(dir.path(), |_| {}).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        m.put("c", b"a", b"v").unwrap();
+        let last = m.entries_since(1).unwrap().last().unwrap().unwrap();
+        let mut c = client(m.serve_addr().unwrap(), "b");
+        let sid = begin(&mut c, pb::VerifyMode::Quick)
+            .await
+            .unwrap()
+            .session_id;
+        let req = Req::EntryCrcs(pb::EntryCrcs {
+            from_seq: last.seq,
+            to_seq: last.seq,
+        });
+        let (answers, err) = exchange(&mut c, vec![request(&sid, 1, req)]).await;
+        assert!(err.is_none(), "{err:?}");
+        match &answers[0].kind {
+            Some(Resp::EntryCrcs(r)) => assert_eq!(
+                r.entries,
+                vec![pb::SeqCrc {
+                    seq: last.seq,
+                    crc32c: last.crc32c
+                }]
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A fetch is a computation: it holds a permit, and shutdown cancels it.
+    #[tokio::test]
+    async fn fetches_hold_a_permit_and_stop_at_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, h, state) = standalone_server(dir.path()).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        m.put("c", b"a", b"v").unwrap();
+        let mut c = client(h.addr(), "b");
+        let s = begin(&mut c, pb::VerifyMode::Full).await.unwrap();
+        let started = super::hooks::slow(&s.session_id, false);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut stream = c
+            .verify_range(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .unwrap()
+            .into_inner();
+        let kind = Req::FetchRange(pb::FetchRange {
+            range: Some(range(None, None)),
+            limit: 10,
+        });
+        tx.send(request(&s.session_id, 1, kind)).await.unwrap();
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.compute_permits.available_permits(),
+            super::MAX_COMPUTATIONS - 1
+        );
+        h.shutdown().await.unwrap();
+        drop(stream.message().await);
+        assert_eq!(
+            state.compute_permits.available_permits(),
+            super::MAX_COMPUTATIONS,
+            "every permit is back after shutdown"
+        );
+        drop(state);
+        m.shutdown().await.unwrap();
     }
 
     #[tokio::test]
