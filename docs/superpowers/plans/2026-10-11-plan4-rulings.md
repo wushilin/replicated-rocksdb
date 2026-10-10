@@ -49,3 +49,10 @@ Fixes for `final-review.md` (findings 1-6) and the Task 7 doc minors:
 - 5: `reopen` and the switch.rs module doc: after a cancelled switch, `reopen` may return a lock error for a few seconds; retry. The `Master::open` cancel-safety follow-up is closed above.
 - 6: `promotion_under_concurrent_writers` uses atomic counters and `wait_until` instead of fixed sleeps.
 - Task 7 minors: example and DESIGN §13.2 state wording; state lag recorded as fixed; CLAUDE.md fenced-reopen bullet (only `unchecked_master` skips the check; `unfence` consent waives only unreachable peers); DESIGN §13.2 rejoin failure outcomes and the `unfence` fence-check `Err`.
+
+## Test stability note
+
+- The fix wave saw one hang in 12 runs of `tests/failpoints.rs` (probably
+  `the_leader_lost_mid_replay_keeps_the_repair_target_and_resumes`, a Plan 3 core-repair test).
+  It did not reproduce in 25 more serial runs at ad281b7 (25/25 green). Follow-up: give the
+  failpoint suite a per-test timeout so a recurrence names the test and fails instead of hanging.
