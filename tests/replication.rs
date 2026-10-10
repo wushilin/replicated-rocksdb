@@ -2,7 +2,6 @@
 
 mod support;
 
-use std::net::TcpListener;
 use std::time::Duration;
 
 use replicated_rocksdb::{
@@ -253,10 +252,7 @@ async fn status_and_wait_for_seq() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slave_without_data_is_not_ready_and_reports_the_connection_error() {
     let c = Cluster::new();
-    let nobody = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap(); // closed again at once
+    let nobody = std::net::SocketAddr::from(([127, 0, 0, 1], support::reserved_port())); // nothing binds it
     let (b, _) = c.slave("b", nobody).await;
     assert!(matches!(b.get("c", b"k"), Err(Error::NotReady)));
     assert!(matches!(b.snapshot(), Err(Error::NotReady)));

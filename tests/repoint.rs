@@ -268,11 +268,7 @@ async fn a_refusing_repoint_still_refuses_after_retrying() {
     a.shutdown().await.unwrap();
 
     // A free port: nothing listens there until B is promoted onto it.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = support::reserved_port();
     let target = UpstreamConfig::new("127.0.0.1", port);
     assert!(matches!(
         repoint(&d, target, RepointOptions::default())
@@ -328,21 +324,13 @@ async fn diverged_pair(
     (b_cfg, d, d_cfg, ld)
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// A forced bootstrap left over from `clear_halt(Rebootstrap)` (or a gap) is not consent to
 /// discard data on a later repoint: the repoint's own mode decides.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_leftover_forced_bootstrap_does_not_override_a_refusing_repoint() {
     let c = Cluster::new();
     let (b_cfg, d, _, ld) = diverged_pair(&c).await;
-    let (p1, p2) = (free_port(), free_port());
+    let (p1, p2) = (support::reserved_port(), support::reserved_port());
     assert!(matches!(
         repoint(
             &d,
@@ -404,7 +392,7 @@ async fn a_leftover_forced_bootstrap_does_not_override_a_refusing_repoint() {
 async fn a_restart_before_the_repoint_settles_reopens_halted() {
     let c = Cluster::new();
     let (b_cfg, d, d_cfg, _) = diverged_pair(&c).await;
-    let port = free_port();
+    let port = support::reserved_port();
     repoint(
         &d,
         UpstreamConfig::new("127.0.0.1", port),
@@ -423,7 +411,7 @@ async fn a_restart_before_the_repoint_settles_reopens_halted() {
     // Repoint again at a dead address and restart before anything settles successfully.
     let r = repoint(
         &d,
-        UpstreamConfig::new("127.0.0.1", free_port()),
+        UpstreamConfig::new("127.0.0.1", support::reserved_port()),
         RepointOptions::default(),
     )
     .await
@@ -455,7 +443,7 @@ async fn status_reports_the_current_upstream() {
         b.status().upstream,
         format!("http://{}", a.serve_addr().unwrap())
     );
-    let port = free_port();
+    let port = support::reserved_port();
     let target = UpstreamConfig::new("127.0.0.1", port);
     let uri = format!("http://127.0.0.1:{port}");
     assert!(matches!(

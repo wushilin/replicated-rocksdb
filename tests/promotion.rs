@@ -191,10 +191,7 @@ async fn the_old_master_is_refused_with_stale_epoch_and_the_client_retries() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn promotion_is_refused_without_data_and_needs_released_snapshots() {
     let c = Cluster::new();
-    let nobody = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    let nobody = std::net::SocketAddr::from(([127, 0, 0, 1], support::reserved_port())); // nothing binds it
     let (empty, _) = c.slave("empty", nobody).await;
     assert!(matches!(
         empty.promote(c.master_config("empty")).await,

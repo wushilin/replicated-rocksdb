@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -17,6 +17,32 @@ use replicated_rocksdb::{
 pub const T0: u64 = 1_700_000_000_000;
 pub const HEARTBEAT: Duration = Duration::from_millis(500);
 pub const WAIT: Duration = Duration::from_secs(30);
+
+/// A port nobody else will take, for tests that need the number before the listener exists
+/// (repointing a slave at a master that is started later, "unreachable" upstreams, restarts
+/// on a known address).
+///
+/// Binding port 0 and dropping the listener is a race: the kernel hands such ports out again
+/// as ephemeral source ports of outgoing connections (range 32768-60999 here) or to another
+/// test binding port 0. This allocator therefore stays in 20000-31999, below the ephemeral
+/// range, where the kernel never assigns ports on its own: a port stays free until we bind
+/// it ourselves. The sequence starts at an offset derived from the process id so concurrent
+/// test binaries do not collide, advances with an atomic counter, and each candidate is
+/// probed by binding (and dropping) a listener, skipping it on failure.
+pub fn reserved_port() -> u16 {
+    const BASE: u32 = 20_000;
+    const SPAN: u32 = 12_000; // 20000..=31999
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let start = std::process::id().wrapping_mul(97) % SPAN;
+    for _ in 0..SPAN {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let port = (BASE + (start + n) % SPAN) as u16;
+        if std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port in 20000-31999");
+}
 
 pub fn localhost() -> IpAddr {
     IpAddr::from([127, 0, 0, 1])

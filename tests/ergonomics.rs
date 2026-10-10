@@ -14,7 +14,12 @@ use support::{Cluster, WAIT, assert_converged};
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wait_streaming_resolves_or_reports_the_halt() {
     let c = Cluster::new();
-    let m = c.master("a").await;
+    // The second master reuses this master's address, so it is picked up front from the
+    // reserved band (a released ephemeral port could be taken by someone else meanwhile).
+    let port = support::reserved_port();
+    let mut m_cfg = c.master_config("a");
+    m_cfg.serve.as_mut().unwrap().port = port;
+    let m = replicated_rocksdb::Master::open(m_cfg).await.unwrap();
     m.create_cf(CfSpec::new("c")).unwrap();
     let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
     b.wait_streaming(WAIT).await.unwrap();
@@ -24,7 +29,6 @@ async fn wait_streaming_resolves_or_reports_the_halt() {
     assert_eq!(b.last_seq(), m.last_seq());
 
     // Another database at the same address, refused by policy: the wait reports the halt.
-    let port = m.serve_addr().unwrap().port();
     m.shutdown().await.unwrap();
     let mut other = c.master_config("other");
     other.serve.as_mut().unwrap().port = port;
@@ -39,7 +43,8 @@ async fn wait_streaming_resolves_or_reports_the_halt() {
     ));
     drop(other);
     // A short wait on a slave that cannot get there times out.
-    let (lonely, _) = c.slave("lonely", "127.0.0.1:9".parse().unwrap()).await;
+    let unreachable = std::net::SocketAddr::from(([127, 0, 0, 1], support::reserved_port()));
+    let (lonely, _) = c.slave("lonely", unreachable).await;
     assert!(matches!(
         lonely.wait_streaming(Duration::from_millis(100)).await,
         Err(Error::Timeout)
