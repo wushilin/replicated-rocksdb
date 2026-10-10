@@ -4,13 +4,13 @@
 mod support;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use replicated_rocksdb::codec::envelope;
 use replicated_rocksdb::{
-    CfSpec, DivergencePolicy, Error, HaltReason, LogApi, Master, MismatchPolicy, ReadApi, Slave,
-    SlaveConfig, SlaveState, VerifyMode,
+    AuthError, Authenticator, CfSpec, DivergencePolicy, Error, HaltReason, LogApi, Master, Method,
+    MismatchPolicy, PeerInfo, ReadApi, Slave, SlaveConfig, SlaveState, VerifyMode,
 };
 use support::{
     Cluster, RawDb, RecordingListener, assert_converged, restore_dir, wait_state, wait_until,
@@ -403,4 +403,78 @@ async fn a_verify_repair_fallback_on_the_same_history_bootstraps() {
     assert_converged(&a, &[("d", &d)]).await;
     assert!(d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
     assert_eq!(ld.rewinds(), 0);
+}
+
+/// Allows the first `allowed` `Method::Verify` calls and refuses every later one with
+/// `PERMISSION_DENIED`; counts them.
+struct VerifyAllowedFor {
+    allowed: usize,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Authenticator for VerifyAllowedFor {
+    async fn authenticate(
+        &self,
+        _peer: &PeerInfo,
+        method: Method,
+        _token: Option<&[u8]>,
+    ) -> std::result::Result<(), AuthError> {
+        if method == Method::Verify && self.calls.fetch_add(1, Ordering::SeqCst) >= self.allowed {
+            return Err(AuthError::PermissionDenied);
+        }
+        Ok(())
+    }
+}
+
+/// Final fix wave, I1 / A-M6: a queued verify repair that the upstream refuses for good
+/// (`PERMISSION_DENIED` on `VerifyBegin`) is dropped after one attempt, recorded in the log,
+/// and replication goes on; it is not retried forever, and it never stops the tail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_verify_repair_refused_for_good_is_dropped_and_replication_goes_on() {
+    let c = Cluster::new();
+    // The verify run itself makes three Verify calls (begin, range, end); the repair's
+    // `VerifyBegin` is the fourth.
+    let auth = Arc::new(VerifyAllowedFor {
+        allowed: 3,
+        calls: AtomicUsize::new(0),
+    });
+    let mut mcfg = c.master_config("a");
+    mcfg.serve.as_mut().unwrap().authenticator = auth.clone();
+    let a = Master::open(mcfg).await.unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..20u32 {
+        a.put("c", &key(i), b"base").unwrap();
+    }
+    let (mut cfg, ld) = c.slave_config("d", a.serve_addr().unwrap());
+    cfg.verify.on_mismatch = MismatchPolicy::Repair;
+    let d = Slave::open(cfg.clone()).await.unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    d.shutdown().await.unwrap();
+    RawDb::open(&cfg.path).corrupt_value("c", &key(5));
+    let d = Slave::open(cfg).await.unwrap();
+    wait_state(&d, "streaming", |s| *s == SlaveState::Streaming).await;
+    let report = d.verify_now(VerifyMode::Full).await.unwrap();
+    assert_eq!(report.mismatches.len(), 1, "{:?}", report.mismatches);
+    wait_until("the repair was attempted", || {
+        auth.calls.load(Ordering::SeqCst) >= 4
+    })
+    .await;
+    // Replication goes on.
+    for i in 100..110u32 {
+        a.put("c", &key(i), b"new").unwrap();
+    }
+    d.wait_for_seq(a.last_seq(), Duration::from_secs(10))
+        .await
+        .expect("the slave keeps applying new entries");
+    // Several reconnect backoffs (20..200 ms) later, nothing retried the refused repair.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        auth.calls.load(Ordering::SeqCst),
+        4,
+        "a permanent refusal is not retried"
+    );
+    assert_eq!(ld.rewinds(), 0);
+    assert_eq!(ld.bootstraps(), 1, "and does not turn into a bootstrap");
+    assert_eq!(d.status().state, SlaveState::Streaming);
 }

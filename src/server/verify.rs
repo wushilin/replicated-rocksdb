@@ -146,6 +146,13 @@ pub(super) async fn begin(
 ) -> Result<Response<pb::VerifyBeginResponse>, Status> {
     // Test hook: a stalled upstream.
     crate::failpoint::pause("server-verify-begin").await;
+    // Test hook: every verify session of this upstream is taken.
+    if crate::failpoint::fire("server-verify-begin-busy") {
+        return Err(reason_status(
+            pb::Reason::Busy,
+            "failpoint: max_verify_sessions reached",
+        ));
+    }
     let call = call_info(&req, Method::Verify)?;
     let src = state.authorize(&call, Method::Verify).await?;
     let r = req.into_inner();

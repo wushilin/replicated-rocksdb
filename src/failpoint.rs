@@ -8,6 +8,7 @@
 //! `slave-commit-io` (a slave's commit of a received entry fails with an I/O error),
 //! `verify-before-finish` (a slave's verify run, after the comparison, before its report is acted on; `pause`),
 //! `server-verify-begin` (the server's VerifyBegin handler, before it answers; `pause`),
+//! `server-verify-begin-busy` (the server's VerifyBegin handler answers `BUSY`; `return`),
 //! `slave-before-apply` (a received entry, before its commit; `pause`),
 //! `slave-before-halt` (a session ended in a halt, before it is persisted; use `cfg_callback`),
 //! `slave-repair-before-fetch` (a repair's verify session is open, nothing fetched yet;

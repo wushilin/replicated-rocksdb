@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use tokio::sync::{Notify, oneshot, watch};
 
-use super::config::{SlaveConfig, UpstreamConfig};
+use super::config::{BackoffState, SlaveConfig, UpstreamConfig};
 use super::policy::Policies;
 use super::repair::AffectedSet;
 use super::repoint::PendingRepoint;
@@ -203,10 +203,17 @@ pub(crate) struct Inner {
     repair_until: AtomicU64,
     /// Keys a verify asked to repair (`MismatchPolicy::Repair`), done at the next RESUME.
     pending_repair: Mutex<Option<PendingRepair>>,
+    /// When a queued repair that could not run may be tried again (`None`: at the next
+    /// RESUME), and the backoff that spaces the attempts. Replication goes on meanwhile.
+    repair_retry: Mutex<(Option<tokio::time::Instant>, BackoffState)>,
+    /// `generation + 1` once a probe found that the queued repair can run against that
+    /// generation's upstream (0: none): the next RESUME of that generation runs it.
+    repair_probed: AtomicU64,
 }
 
 impl Inner {
     pub(crate) fn new(store: Store, cfg: SlaveConfig, meta: &MetaSnapshot) -> Result<Inner> {
+        let repair_backoff = BackoffState::new(cfg.reconnect.clone());
         let node_state = NodeState::decode(meta.node_state.as_deref())?;
         let ident = match (meta.identity, node_state) {
             (_, NodeState::Bootstrapping) | (None, _) => None,
@@ -280,6 +287,8 @@ impl Inner {
             verify_work: Arc::default(),
             repair_until: AtomicU64::new(repair_until),
             pending_repair: Mutex::new(None),
+            repair_retry: Mutex::new((None, repair_backoff)),
+            repair_probed: AtomicU64::new(0),
         })
     }
 
@@ -750,7 +759,8 @@ impl Inner {
                     db_uuid,
                     version: 0,
                     set,
-                })
+                });
+                self.reset_repair_retry();
             }
         }
     }
@@ -794,13 +804,63 @@ impl Inner {
         let mut pending = self.pending();
         if pending.as_ref().is_some_and(|p| p.version == version) {
             *pending = None;
+            self.reset_repair_retry();
         }
     }
 
     /// Drops any queued request (a bootstrap replaces everything it would fix; a halt means
-    /// the operator decides).
+    /// the operator decides; a repair that can never run is given up).
     pub(crate) fn clear_pending_repair(&self) {
-        *self.pending() = None;
+        let mut pending = self.pending();
+        *pending = None;
+        self.reset_repair_retry();
+    }
+
+    fn repair_retry(
+        &self,
+    ) -> std::sync::MutexGuard<'_, (Option<tokio::time::Instant>, BackoffState)> {
+        self.repair_retry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether a queued repair may be attempted now (not waiting out a backoff).
+    pub(crate) fn repair_due(&self) -> bool {
+        self.repair_retry()
+            .0
+            .is_none_or(|at| tokio::time::Instant::now() >= at)
+    }
+
+    /// When a queued repair that failed may be tried again, if it is waiting.
+    pub(crate) fn repair_retry_at(&self) -> Option<tokio::time::Instant> {
+        self.repair_retry().0
+    }
+
+    /// A queued repair could not run now: the next attempt waits for the returned backoff
+    /// (growing like the reconnect backoff), and replication goes on meanwhile.
+    pub(crate) fn defer_repair(&self) -> std::time::Duration {
+        let mut retry = self.repair_retry();
+        let delay = retry.1.next_delay();
+        retry.0 = Some(tokio::time::Instant::now() + delay);
+        delay
+    }
+
+    /// A probe found that the queued repair can run against the upstream of `generation`.
+    pub(crate) fn repair_probed(&self, generation: u64) {
+        self.repair_probed.store(generation + 1, Ordering::SeqCst);
+    }
+
+    /// Whether a probe of `generation` cleared the queued repair to run (consumed).
+    pub(crate) fn take_repair_probed(&self, generation: u64) -> bool {
+        self.repair_probed
+            .compare_exchange(generation + 1, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn reset_repair_retry(&self) {
+        let mut retry = self.repair_retry();
+        retry.0 = None;
+        retry.1.reset();
     }
 }
 

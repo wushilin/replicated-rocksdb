@@ -40,7 +40,7 @@ use crate::store::cfs::PhysCf;
 use crate::store::repair::{KeyWrite, Rewind};
 use crate::types::{CfEntry, DbIdentity, EpochStart, LogEntry, Op, Seq, fork_from};
 use crate::verify::range::{Bounds, KeyOrder};
-use crate::verify::{MAX_RESUME_KEY_BYTES, Mismatch, VerifyMode};
+use crate::verify::{MAX_RESUME_KEY_BYTES, Mismatch, VerifyAbort, VerifyMode};
 
 /// The network phase of a repair (session, fetches) must finish within this time.
 pub(crate) const REPAIR_TIMEOUT: Duration = Duration::from_secs(120);
@@ -52,13 +52,25 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) enum RepairError {
     /// Repair cannot handle this case: bootstrap from the same upstream instead.
     Fallback(String),
-    /// A transient failure (upstream unreachable, session lost): try again later.
+    /// A transient failure (upstream unreachable or busy, session lost, upstream behind): try
+    /// again later.
     Retry(String),
+    /// A failure that retrying cannot fix: the upstream refuses verify sessions
+    /// (`PERMISSION_DENIED`, `UNAUTHENTICATED`) or rejects a request as invalid
+    /// (`INVALID_ARGUMENT`), it sent an invalid identity or epoch history, or a comparator is
+    /// not registered here. A divergence repair falls back to a bootstrap (its consent covers
+    /// that); a verify repair is dropped until the operator verifies again.
+    Refused(String),
 }
 
 impl From<Error> for RepairError {
     fn from(e: Error) -> Self {
-        RepairError::Retry(e.to_string())
+        match e {
+            Error::VerifyAborted(VerifyAbort::Refused(_)) | Error::UnknownComparator(_) => {
+                RepairError::Refused(e.to_string())
+            }
+            e => RepairError::Retry(e.to_string()),
+        }
     }
 }
 
@@ -352,6 +364,23 @@ pub(crate) async fn prepare_pending(
     })
 }
 
+/// Whether the queued verify repair could run against the upstream that answered `hs` now:
+/// opens a verify session as the repair would (`VerifyBegin`, the identity check, an upstream
+/// not behind this slave) and closes it again. The driver runs it while it keeps tailing, so a
+/// repair the upstream cannot serve now (BUSY, a timeout, an upstream behind) or ever (a
+/// refusal) never ends the tail stream. Writes nothing.
+pub(crate) async fn probe(
+    inner: &Arc<Inner>,
+    client: &Client,
+    hs: &pb::HandshakeResponse,
+) -> std::result::Result<(), RepairError> {
+    let session = open(inner, client, hs).await?;
+    let s = session.begin.snapshot_seq;
+    let ready = pending_target(inner.store.position().last_seq, s, inner.repairing()).map(|_| ());
+    session.close().await;
+    ready
+}
+
 /// A divergence repair rewinds to `fork - 1` and replays the upstream's entries from `fork`
 /// up to its snapshot `s`: the upstream must hold `fork - 1` (else retried later).
 fn divergence_target(fork: Seq, s: Seq) -> std::result::Result<Seq, RepairError> {
@@ -389,17 +418,20 @@ fn snapshot_history(
     hs: &pb::HandshakeResponse,
     begin: &pb::VerifyBeginResponse,
 ) -> std::result::Result<(DbIdentity, Vec<EpochStart>), RepairError> {
+    let invalid = |why: String| RepairError::Refused(format!("the upstream sent {why}"));
     let identity = begin
         .identity
         .as_ref()
-        .ok_or_else(|| RepairError::Retry("VerifyBegin without identity".into()))?;
-    let identity: DbIdentity = identity_from_pb(identity)?;
+        .ok_or_else(|| invalid("no identity in VerifyBegin".into()))?;
+    let identity: DbIdentity =
+        identity_from_pb(identity).map_err(|e| invalid(format!("an invalid identity: {e}")))?;
     if begin.identity != hs.identity || begin.epoch_history != hs.epoch_history {
         return Err(fallback(
             "the upstream's epoch history at the snapshot differs from its handshake",
         ));
     }
-    let history = checked_history(&identity, &begin.epoch_history)?;
+    let history = checked_history(&identity, &begin.epoch_history)
+        .map_err(|e| invalid(format!("an invalid epoch history: {e}")))?;
     Ok((identity, history))
 }
 
@@ -624,6 +656,22 @@ mod tests {
             start_seq,
             nonce,
         }
+    }
+
+    /// Final fix wave, I1 / A-M6: failures retrying cannot fix are told apart from transient
+    /// ones, so a verify repair is dropped instead of retried forever.
+    #[test]
+    fn refusals_and_unregistered_comparators_are_permanent() {
+        let refused = |e: Error| matches!(RepairError::from(e), RepairError::Refused(_));
+        assert!(refused(Error::VerifyAborted(VerifyAbort::Refused(
+            "PermissionDenied".into()
+        ))));
+        assert!(refused(Error::UnknownComparator("rev".into())));
+        assert!(!refused(Error::VerifyAborted(VerifyAbort::Busy)));
+        assert!(!refused(Error::VerifyAborted(VerifyAbort::Upstream(
+            "no answer".into()
+        ))));
+        assert!(!refused(Error::Timeout));
     }
 
     #[test]

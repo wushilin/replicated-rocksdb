@@ -2,6 +2,7 @@
 //! answer, forever (PROTOCOL.md §11.3).
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -71,11 +72,13 @@ pub(crate) fn end_for(inner: &Inner, generation: u64, action: Action) -> Session
 enum RepairEnd {
     /// It cannot be done: bootstrap from the upstream that answered, in this session.
     Fallback,
+    /// It can never be done against this upstream as things stand ([`RepairError::Refused`]).
+    Refused(String),
     End(SessionEnd),
 }
 
 /// A fallback bootstraps (from the same upstream, in this session); a transient failure is
-/// retried with backoff.
+/// retried with backoff; a refusal is for the caller to decide.
 fn repair_failed(inner: &Inner, e: RepairError) -> RepairEnd {
     match e {
         RepairError::Fallback(why) => {
@@ -85,6 +88,7 @@ fn repair_failed(inner: &Inner, e: RepairError) -> RepairEnd {
         RepairError::Retry(why) => {
             RepairEnd::End(SessionEnd::Retry(format!("repair failed: {why}")))
         }
+        RepairError::Refused(why) => RepairEnd::Refused(format!("repair refused: {why}")),
     }
 }
 
@@ -386,17 +390,8 @@ async fn session(
     match action {
         Action::Tail => {
             commit_halt_clear(inner).await;
-            if inner.pending_repair(generation, hs_uuid).is_some() {
-                // A verify reported keys to repair (`MismatchPolicy::Repair`) and this is the
-                // upstream it verified: fix them, then handshake again from the new position.
-                let fetch = repair::prepare_pending(inner, generation, &c, &hs);
-                return match run_repair(inner, generation, fetch).await {
-                    Ok(_) => SessionEnd::Again,
-                    Err(RepairEnd::Fallback) => {
-                        fallback_bootstrap(inner, generation, &c, &hs, hs_uuid, backoff).await
-                    }
-                    Err(RepairEnd::End(end)) => end,
-                };
+            if let Some(end) = queued_repair(inner, generation, &c, &hs, hs_uuid, backoff).await {
+                return end;
             }
             inner.settle_repoint(generation, Ok(RepointOutcome::Resumed));
             tail(inner, generation, &c, &hs, None, backoff).await
@@ -405,6 +400,12 @@ async fn session(
             Ok(()) => {
                 commit_halt_clear(inner).await;
                 inner.settle_repoint(generation, Ok(RepointOutcome::EpochAdvanced));
+                // Every master open starts an epoch: a queued repair must not wait for the
+                // next unrelated session end (final review m1).
+                if let Some(end) = queued_repair(inner, generation, &c, &hs, hs_uuid, backoff).await
+                {
+                    return end;
+                }
                 tail(inner, generation, &c, &hs, None, backoff).await
             }
             Err(end) => end,
@@ -430,6 +431,11 @@ async fn session(
                 Err(RepairEnd::Fallback) => {
                     fallback_bootstrap(inner, generation, &c, &hs, hs_uuid, backoff).await
                 }
+                // Retrying cannot fix it: fall back the same way.
+                Err(RepairEnd::Refused(why)) => {
+                    tracing::warn!(node = %inner.cfg.identifier, reason = %why, "repair not possible; bootstrapping instead");
+                    fallback_bootstrap(inner, generation, &c, &hs, hs_uuid, backoff).await
+                }
                 Err(RepairEnd::End(end)) => end,
             }
         }
@@ -442,6 +448,59 @@ async fn session(
         Action::Retry(m) => SessionEnd::Retry(m),
         Action::Again => SessionEnd::Again,
     }
+}
+
+/// Runs the repair a verify queued (`MismatchPolicy::Repair`) when this is the upstream it
+/// verified (`hs` answered RESUME from that database) and a probe from the tail loop found that
+/// it can run ([`repair::probe`]): repairs are only attempted from a running stream, so one the
+/// upstream cannot serve never keeps this slave from tailing. `Some(end)` ends the session:
+/// repaired (handshake again from the new position), a fallback bootstrap, or a repoint.
+/// `None` means tail on: a repair that cannot run now (BUSY, a timeout, an upstream behind this
+/// slave, a lost session) stays queued and is probed again after a backoff, and one that can
+/// never run ([`RepairError::Refused`]) is dropped with an error log and `last_error`.
+async fn queued_repair(
+    inner: &Arc<Inner>,
+    generation: u64,
+    c: &Client,
+    hs: &pb::HandshakeResponse,
+    hs_uuid: Option<uuid::Uuid>,
+    backoff: &mut BackoffState,
+) -> Option<SessionEnd> {
+    if inner.pending_repair(generation, hs_uuid).is_none() || !inner.take_repair_probed(generation)
+    {
+        return None;
+    }
+    let fetch = repair::prepare_pending(inner, generation, c, hs);
+    match run_repair(inner, generation, fetch).await {
+        Ok(_) => Some(SessionEnd::Again),
+        Err(RepairEnd::Fallback) => {
+            Some(fallback_bootstrap(inner, generation, c, hs, hs_uuid, backoff).await)
+        }
+        Err(RepairEnd::End(SessionEnd::Retry(msg))) => {
+            postpone_repair(inner, msg);
+            None
+        }
+        Err(RepairEnd::Refused(why)) => {
+            drop_repair(inner, why);
+            None
+        }
+        Err(RepairEnd::End(end)) => Some(end),
+    }
+}
+
+/// A queued repair cannot run now: it stays queued, and the next probe waits for a backoff.
+fn postpone_repair(inner: &Inner, msg: String) {
+    let delay = inner.defer_repair();
+    tracing::warn!(node = %inner.cfg.identifier, upstream = %inner.upstream_uri(), error = %msg, retry_in = ?delay, "verify repair postponed; replication goes on");
+    inner.set_last_error(Some(format!("verify repair postponed: {msg}")));
+}
+
+/// A queued repair can never run against this upstream as things stand: dropped. The operator
+/// fixes the cause and verifies again.
+fn drop_repair(inner: &Inner, why: String) {
+    tracing::error!(node = %inner.cfg.identifier, upstream = %inner.upstream_uri(), error = %why, "verify repair dropped: it cannot run against this upstream; fix the cause and verify again");
+    inner.set_last_error(Some(format!("verify repair dropped: {why}")));
+    inner.clear_pending_repair();
 }
 
 /// Bootstraps from the upstream that answered `hs`, then tails. With `expected`, only from
@@ -641,18 +700,41 @@ async fn tail(
     let idle = (Duration::from_millis(u64::from(hs.heartbeat_ms)) * 3).max(inner.cfg.heartbeat);
     let mut cleared = false;
     let started = Instant::now();
+    // A probe of a queued verify repair, run while the stream keeps going.
+    let mut probe: Option<Probe<'_>> = None;
     loop {
+        // A queued repair is probed when due: right away, then after each backoff.
+        if probe.is_none() && inner.has_pending_repair(generation) && inner.repair_due() {
+            probe = Some(Box::pin(repair::probe(inner, c, hs)));
+        }
+        let retry_at = inner
+            .repair_retry_at()
+            .filter(|_| probe.is_none() && inner.has_pending_repair(generation));
         let received = tokio::select! {
             r = unless_repointed(inner, generation, tokio::time::timeout(idle, stream.message())) => r,
-            // A verify asked for a re-bootstrap (`MismatchPolicy::Rebootstrap`) or a repair
-            // (`MismatchPolicy::Repair`): handshake again, which bootstraps or repairs because
-            // the request is set. A stale wake-up is ignored.
+            // A verify asked for a re-bootstrap (`MismatchPolicy::Rebootstrap`): handshake
+            // again, which bootstraps because the request is set. A repair request
+            // (`MismatchPolicy::Repair`) is probed at the top of the loop. A stale wake-up is
+            // ignored.
             _ = inner.rebootstrap.notified() => {
                 if inner.force_bootstrap.is_requested_for(generation)
                     || inner.verify_rebootstrap.pending_for(generation)
-                    || inner.has_pending_repair(generation)
                 {
                     return SessionEnd::Again;
+                }
+                continue;
+            }
+            _ = sleep_until(retry_at), if retry_at.is_some() => continue,
+            r = async { probe.as_mut().expect("guarded").await }, if probe.is_some() => {
+                probe = None;
+                match r {
+                    // The repair can run: handshake again, and the RESUME runs it.
+                    Ok(()) | Err(RepairError::Fallback(_)) => {
+                        inner.repair_probed(generation);
+                        return SessionEnd::Again;
+                    }
+                    Err(RepairError::Retry(msg)) => postpone_repair(inner, msg),
+                    Err(RepairError::Refused(why)) => drop_repair(inner, why),
                 }
                 continue;
             }
@@ -711,6 +793,17 @@ async fn tail(
             }
             None => return SessionEnd::Retry("tail message without content".into()),
         }
+    }
+}
+
+/// A running [`repair::probe`].
+type Probe<'a> = Pin<Box<dyn Future<Output = Result<(), RepairError>> + Send + 'a>>;
+
+/// Sleeps until `at` (forever when `None`; the caller disables that branch).
+async fn sleep_until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 

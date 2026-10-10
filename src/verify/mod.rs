@@ -217,6 +217,9 @@ pub enum VerifyAbort {
     /// This slave did not reach the upstream's snapshot seq within `capture_timeout` (it is
     /// halted, far behind, or started a bootstrap).
     CaptureTimeout { snapshot_seq: Seq },
+    /// The upstream refused the session for good (`PERMISSION_DENIED`, `UNAUTHENTICATED` or
+    /// `INVALID_ARGUMENT`): retrying does not help until the cause is fixed.
+    Refused(String),
     /// Any other failure talking to the upstream.
     Upstream(String),
 }

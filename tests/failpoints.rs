@@ -1499,3 +1499,63 @@ async fn random_kills_while_writing_never_lose_or_repeat_an_entry() {
     assert_eq!(b.last_seq(), m.last_seq());
     scenario.teardown();
 }
+
+/// Final fix wave, I1: a queued verify repair that cannot run (every later `VerifyBegin`
+/// answers `BUSY`, as when other replicas hold the upstream's verify sessions) never stops
+/// replication: the slave keeps applying and acknowledging new entries (write concern 1 with
+/// it as the only replica), retries the repair with backoff, and repairs once a session is
+/// free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_verify_repair_that_keeps_failing_does_not_stop_replication() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let mut mcfg = c.master_config("a");
+    mcfg.write_concern = WriteConcern::in_sync(1);
+    let a = Master::open(mcfg).await.unwrap();
+    let (mut cfg, ld) = c.slave_config("d", a.serve_addr().unwrap());
+    cfg.verify.on_mismatch = MismatchPolicy::Repair;
+    let d = Slave::open(cfg.clone()).await.unwrap();
+    a.wait_in_sync(1, support::WAIT).await.unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..20u8 {
+        a.put("c", &[i], b"base").unwrap();
+    }
+    assert_converged(&a, &[("d", &d)]).await;
+    d.shutdown().await.unwrap();
+    support::RawDb::open(&cfg.path).corrupt_value("c", &[5]);
+    let d = Slave::open(cfg).await.unwrap();
+    a.wait_in_sync(1, support::WAIT).await.unwrap();
+
+    let begins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n = begins.clone();
+    fail::cfg_callback("server-verify-begin", move || {
+        n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    })
+    .unwrap();
+    // The verify's own `VerifyBegin` is served; every later one (the repair's) is BUSY.
+    fail::cfg("server-verify-begin-busy", "1*off->return").unwrap();
+    let report = d.verify_now(VerifyMode::Full).await.unwrap();
+    assert_eq!(report.mismatches.len(), 1, "{:?}", report.mismatches);
+    let attempts = || begins.load(std::sync::atomic::Ordering::SeqCst) - 1;
+    wait_until("the repair was attempted", || attempts() >= 1).await;
+    // Each write waits for the slave's acknowledgement.
+    for i in 0..20u8 {
+        a.put("c", &[100 + i], b"new")
+            .expect("the replica stays in sync");
+    }
+    d.wait_for_seq(a.last_seq(), Duration::from_secs(5))
+        .await
+        .expect("the slave keeps applying new entries");
+    wait_until("the repair is retried", || attempts() >= 3).await;
+    a.put("c", b"after-retries", b"x").expect("still in sync");
+    assert_eq!(ld.rewinds(), 0, "not repaired while BUSY");
+    assert_eq!(d.status().state, SlaveState::Streaming);
+
+    fail::remove("server-verify-begin-busy");
+    wait_until("repaired once a session is free", || ld.rewinds() == 1).await;
+    assert_converged(&a, &[("d", &d)]).await;
+    assert!(d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
+    assert_eq!(ld.bootstraps(), 1, "no bootstrap");
+    fail::remove("server-verify-begin");
+    scenario.teardown();
+}

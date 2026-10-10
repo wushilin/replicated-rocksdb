@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval_at};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Status, Streaming};
+use tonic::{Code, Status, Streaming};
 use tracing::Instrument;
 
 use super::client::{self, Client};
@@ -65,6 +65,13 @@ fn status_abort(s: &Status) -> Error {
         // The session is gone: expired, or dropped by a reset of the upstream's state.
         Some(pb::Reason::SessionNotFound | pb::Reason::UpstreamReset) => {
             VerifyAbort::SessionExpired
+        }
+        _ if matches!(
+            s.code(),
+            Code::PermissionDenied | Code::Unauthenticated | Code::InvalidArgument
+        ) =>
+        {
+            VerifyAbort::Refused(format!("{:?}: {}", s.code(), s.message()))
         }
         _ => VerifyAbort::Upstream(format!("{:?}: {}", s.code(), s.message())),
     })
@@ -756,6 +763,25 @@ pub(crate) fn spawn(inner: &Arc<Inner>) -> Option<JoinHandle<()>> {
 mod tests {
     use super::*;
 
+    /// Final fix wave, I1: refusals that retrying cannot fix are their own abort kind.
+    #[test]
+    fn permission_and_invalid_argument_answers_are_refusals() {
+        let refused = |s: Status| {
+            matches!(
+                status_abort(&s),
+                Error::VerifyAborted(VerifyAbort::Refused(_))
+            )
+        };
+        assert!(refused(Status::permission_denied("no")));
+        assert!(refused(Status::unauthenticated("no")));
+        assert!(refused(Status::invalid_argument("bad")));
+        assert!(!refused(Status::unavailable("down")));
+        assert!(matches!(
+            status_abort(&crate::net::reason_status(pb::Reason::Busy, "full")),
+            Error::VerifyAborted(VerifyAbort::Busy)
+        ));
+    }
+
     #[test]
     fn fetch_requests_are_bounded_by_count_and_bytes() {
         let small = vec![vec![0u8; 10]; 3000];
@@ -1120,7 +1146,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, Error::VerifyAborted(VerifyAbort::Upstream(ref m)) if m.contains("InvalidArgument")),
+            matches!(err, Error::VerifyAborted(VerifyAbort::Refused(ref m)) if m.contains("InvalidArgument")),
             "{err:?}"
         );
         session.close().await;
