@@ -208,14 +208,30 @@ impl Node {
         node
     }
 
-    /// The current state. While a switch waits for running slave-admin calls (for example a
-    /// `shutdown` behind a long `wait_for_seq`), this still shows the old role, but sync calls
-    /// already return `Error::Switching`; the state turns `Switching` once the switch begins.
+    /// The current state, exact at the time of the call: a running slave's state is read from
+    /// the slave itself, so after [`wait_streaming`](Self::wait_streaming) returns this is
+    /// `Streaming` (or a later state). While a switch waits for running slave-admin calls (for
+    /// example a `shutdown` behind a long `wait_for_seq`), this still shows the old role, but
+    /// sync calls already return `Error::Switching`; the state turns `Switching` once the
+    /// switch begins.
     pub fn state(&self) -> NodeState {
+        if let Ok(g) = self.role.try_read()
+            && let Current::Slave(s) = &*g
+        {
+            let st = s.status();
+            return NodeState::Slave {
+                state: st.state,
+                upstream: st.upstream,
+            };
+        }
+        // A switch holds or waits for the lock: the published state is right by construction
+        // (`Switching`, or the old role as documented above).
         self.state_tx.borrow().clone()
     }
 
-    /// Every state change, including the slave's own states (forwarded live).
+    /// Every state change, including the slave's own states. Those are forwarded
+    /// **asynchronously** by a background task: a receiver can see a slave transition after
+    /// `Node::wait_*` has already returned. Use [`state`](Self::state) for the exact state.
     pub fn watch_state(&self) -> watch::Receiver<NodeState> {
         self.state_tx.subscribe()
     }
@@ -542,11 +558,13 @@ fn forward_slave_states(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while rx.changed().await.is_ok() {
-            let state = rx.borrow_and_update().clone();
+            // Mutex first, then read: a newer state published under the mutex (by
+            // `refresh_slave`) is never overwritten with an older one read before it.
             let fwd = forward.lock().unwrap_or_else(PoisonError::into_inner);
             if fwd.generation != generation {
                 return;
             }
+            let state = rx.borrow_and_update().clone();
             let Some(upstream) = upstream() else {
                 return;
             };

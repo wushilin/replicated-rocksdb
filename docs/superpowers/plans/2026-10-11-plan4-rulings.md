@@ -34,5 +34,18 @@ Decisions made during subagent-driven execution of Plan 4 (`2026-10-11-plan4-nod
 ## Follow-ups (not done; for the maintainer)
 
 - TLS classification: with TLS 1.3 a missing-client-certificate rejection surfaces as `BrokenPipe` on first use and is still treated as unreachable. A peer that rejects our certificate can therefore be waived by `AcceptSplitBrainRisk` and does not block `promote_checked`.
-- `Master::open` cancel-safety when an `unfence` / `open` / `reopen` future is dropped mid-open is unverified. The node ends `Failed` and `reopen` recovers, but a half-started epoch or port was not examined.
+- Closed (final review): `Master::open` cancel-safety. Everything before its only await (`TcpListener::bind` in `server::start`) is synchronous, and the server and maintenance tasks are spawned after the last await, so a dropped open drops the store (LOCK released) and leaves no served port or detached task. The worst case is a bumped, persisted epoch that was never served: a burned, empty epoch, equivalent to a failed open. `Slave::start` has the same shape. `Slave::rejoin` and the consuming switches (`promote*`, `shutdown`, `demote`) move the role into the future, so a drop runs `Drop` (signal only) and the role's tasks wind down detached, holding the LOCK for up to their shutdown time: `reopen` right after a cancelled switch can return a lock error; retry (documented on `reopen` and in the switch.rs module doc).
+- Fixed (final review): `Node::state()` lagged the slave by one transition (a mirror updated by a forwarder task that ran after the `wait_*` caller). `state()` now reads a running slave live.
 - Plan 3 follow-ups remain in `2026-10-09-plan3-rulings.md`.
+
+## Final review
+
+Fixes for `final-review.md` (findings 1-6) and the Task 7 doc minors:
+
+- 1 (Important): `Node::state()` reads a running slave's status live (mirror only while a switch holds or waits for the lock). Test `state_is_exact_right_after_wait_streaming` (20 rounds, no polling) was RED before the fix.
+- 2: the forwarder takes the forward mutex and checks its generation before reading the slave state, so a newer `refresh_slave` publish is never overwritten.
+- 3: `watch_state` documents that slave sub-states arrive asynchronously; `state()` is exact.
+- 4: `rejoin_as_slave` records the target upstream before `finish(Failed)` when it fails after the rewrite. Test `a_rejoin_failing_after_the_rewrite_keeps_the_target_upstream` (serve port taken; RED before the fix).
+- 5: `reopen` and the switch.rs module doc: after a cancelled switch, `reopen` may return a lock error for a few seconds; retry. The `Master::open` cancel-safety follow-up is closed above.
+- 6: `promotion_under_concurrent_writers` uses atomic counters and `wait_until` instead of fixed sleeps.
+- Task 7 minors: example and DESIGN §13.2 state wording; state lag recorded as fixed; CLAUDE.md fenced-reopen bullet (only `unchecked_master` skips the check; `unfence` consent waives only unreachable peers); DESIGN §13.2 rejoin failure outcomes and the `unfence` fence-check `Err`.

@@ -64,6 +64,7 @@ async fn main() -> Res<()> {
     let seq = a.put("kv", b"k1", b"everyone has this")?;
     b.wait_for_seq(seq, WAIT).await?;
     b.wait_streaming(WAIT).await?;
+    // `state()` is exact: it reads the running slave, so this prints `Streaming`.
     println!("   B state: {:?}", b.state());
 
     println!("2. B drops out, A writes k2 alone, then A dies");

@@ -4,7 +4,7 @@ mod support;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use replicated_rocksdb::{
@@ -240,8 +240,8 @@ async fn running_handles_can_be_wrapped() {
         .unwrap();
 }
 
-/// Slave sub-states are forwarded live; `repoint` updates the upstream used by later reopens;
-/// review focus: a refused repoint (invalid address) does not.
+/// Slave sub-states are forwarded to `watch_state`; `repoint` updates the upstream used by
+/// later reopens; review focus: a refused repoint (invalid address) does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn watch_state_forwards_slave_states_and_repoint_updates_the_upstream() {
     let c = Cluster::new();
@@ -280,6 +280,28 @@ async fn watch_state_forwards_slave_states_and_repoint_updates_the_upstream() {
     b.shutdown().await.unwrap();
     b.reopen().await.unwrap();
     wait_node(&b, "b streams from a after reopen", streaming).await;
+}
+
+/// Final review: `state()` is exact. Right after `wait_streaming` returns (no polling), the node
+/// reports `Streaming`, across a bootstrap and across reopens (Connecting → Streaming).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_is_exact_right_after_wait_streaming() {
+    let c = Cluster::new();
+    let a = Node::create_master(node_cfg(&c, "a", dead_addr(), &[]))
+        .await
+        .unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    a.put("c", b"k", b"v").unwrap();
+    let a_addr = a.serve_addr().unwrap();
+    let b = Node::create_slave(node_cfg(&c, "b", a_addr, &[]))
+        .await
+        .unwrap();
+    for i in 0..20 {
+        b.wait_streaming(WAIT).await.unwrap();
+        assert!(streaming(&b.state()), "round {i}: {:?}", b.state());
+        b.shutdown().await.unwrap();
+        b.reopen().await.unwrap();
+    }
 }
 
 /// `reopen` only acts on a failed or shut-down node; `shutdown` of a fenced node stops it, and
@@ -398,39 +420,44 @@ async fn promotion_under_concurrent_writers() {
     a.shutdown().await.unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
+    let ok = Arc::new(AtomicU64::new(0));
+    let refused = Arc::new(AtomicU64::new(0));
     let writers: Vec<_> = (0..4)
         .map(|w| {
-            let (b, stop) = (b.clone(), stop.clone());
+            let (b, stop, ok, refused) = (b.clone(), stop.clone(), ok.clone(), refused.clone());
             tokio::task::spawn_blocking(move || {
-                let (mut ok, mut refused, mut i) = (0u64, 0u64, 0u64);
+                let mut i = 0u64;
                 while !stop.load(Ordering::SeqCst) {
                     match b.put("c", format!("{w}-{i}").as_bytes(), b"v") {
-                        Ok(_) => ok += 1,
+                        Ok(_) => {
+                            ok.fetch_add(1, Ordering::SeqCst);
+                        }
                         Err(Error::NotMaster | Error::Switching) => {
-                            refused += 1;
+                            refused.fetch_add(1, Ordering::SeqCst);
                             std::thread::sleep(Duration::from_millis(1));
                         }
                         Err(e) => panic!("writer {w}: unexpected error {e}"),
                     }
                     i += 1;
                 }
-                (ok, refused)
             })
         })
         .collect();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until("a write refused before the promotion", || {
+        refused.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    assert_eq!(ok.load(Ordering::SeqCst), 0, "no write succeeds on a slave");
     b.promote().await.unwrap();
     assert!(is_master(&b.state()));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_until("a write succeeded after the promotion", || {
+        ok.load(Ordering::SeqCst) > 0
+    })
+    .await;
     stop.store(true, Ordering::SeqCst);
-    let (mut ok, mut refused) = (0, 0);
     for w in writers {
-        let (o, r) = w.await.unwrap();
-        ok += o;
-        refused += r;
+        w.await.unwrap();
     }
-    assert!(refused > 0, "writes before the promotion were refused");
-    assert!(ok > 0, "writes after the promotion succeeded");
     b.put("c", b"after", b"1").unwrap();
 }
 
@@ -566,6 +593,54 @@ async fn a_running_master_rejoins_a_given_upstream() {
     a.wait_for_seq(b.last_seq().unwrap(), WAIT).await.unwrap();
     assert_eq!(a.get("c", b"on b").unwrap(), Some(b"2".to_vec()));
     a.shutdown().await.unwrap();
+    a.reopen().await.unwrap();
+    wait_node(&a, "a streams from b after reopen", streaming).await;
+    match a.state() {
+        NodeState::Slave { upstream, .. } => assert_eq!(upstream, format!("http://{b_addr}")),
+        s => panic!("expected Slave, got {s:?}"),
+    }
+}
+
+/// Final review: a rejoin that fails after the rewrite (here its serve port is taken) leaves
+/// the node `Failed` with the target upstream recorded, so `reopen` follows the upstream the
+/// operator named, not the configured one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejoin_failing_after_the_rewrite_keeps_the_target_upstream() {
+    let c = Cluster::new();
+    let a = Node::create_master(node_cfg(&c, "a", dead_addr(), &[]))
+        .await
+        .unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let a_addr = a.serve_addr().unwrap();
+    let b = Node::create_slave(node_cfg(&c, "b", a_addr, &[]))
+        .await
+        .unwrap();
+    a.put("c", b"k", b"1").unwrap();
+    b.wait_for_seq(a.last_seq().unwrap(), WAIT).await.unwrap();
+    a.shutdown().await.unwrap();
+    b.promote().await.unwrap();
+    let b_addr = b.serve_addr().unwrap();
+
+    // Configured upstream: nothing listens there. Peers: b, so `a` opens fenced.
+    let cfg = node_cfg(&c, "a", dead_addr(), &[b_addr]);
+    let serve = cfg.master.serve.clone().unwrap();
+    let a = Node::open(cfg).await.unwrap();
+    assert!(
+        matches!(a.state(), NodeState::Fenced { .. }),
+        "{:?}",
+        a.state()
+    );
+    let taken = std::net::TcpListener::bind((serve.bind, serve.port)).unwrap();
+    let err = a
+        .rejoin_as_slave(Some(up(b_addr)), RejoinOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(a.state(), NodeState::Failed { .. }),
+        "{err}: {:?}",
+        a.state()
+    );
+    drop(taken);
     a.reopen().await.unwrap();
     wait_node(&a, "a streams from b after reopen", streaming).await;
     match a.state() {

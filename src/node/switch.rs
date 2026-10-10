@@ -2,6 +2,12 @@
 //! handle out (the role reads `Switching`), runs the consuming operation, and stores what it
 //! returned: the new role, the handed-back old one on a refusal, or `Failed` when the handle
 //! was lost. A switch future dropped before it finishes leaves `Failed` (never `Switching`).
+//!
+//! After a cancelled switch, the dropped role releases the directory asynchronously (its
+//! tasks wind down detached): [`Node::reopen`] may return a RocksDB lock error for a few
+//! seconds. Retry it.
+
+use std::sync::PoisonError;
 
 use tokio::sync::RwLockWriteGuard;
 
@@ -94,6 +100,10 @@ impl Node {
     /// like [`Node::open`] (a stored master is fence-checked and may come back fenced). `Ok`
     /// does not say which role: see [`state`](Self::state). On `Err` the node stays as it
     /// was. `Err(Config)` in any other state.
+    ///
+    /// After a cancelled switch (a dropped switch future), the dropped role releases the
+    /// directory asynchronously: `reopen` may return a RocksDB lock error for a few seconds
+    /// (the node stays `Failed`). Retry it.
     pub async fn reopen(&self) -> Result<()> {
         let (sw, old) = self
             .begin_switch(|c| match c {
@@ -216,9 +226,9 @@ impl Node {
     /// the node `Failed`). A refusal before the directory is rewritten (it cannot be opened,
     /// ...) keeps a fenced node fenced; a master that was shut down, or any failure after the
     /// rewrite, leaves the node `Failed` ([`reopen`](Self::reopen) opens the stored role
-    /// again). On a successful rejoin, `upstream` is also the one later opens of the slave
-    /// role use. `Err(Config)` (nothing changes) for an invalid `upstream`; `Err(NotMaster)`
-    /// on a slave.
+    /// again). On a successful rejoin, and on a failure after the rewrite, `upstream` is also
+    /// the one later opens of the slave role use. `Err(Config)` (nothing changes) for an
+    /// invalid `upstream`; `Err(NotMaster)` on a slave.
     pub async fn rejoin_as_slave(
         &self,
         upstream: Option<UpstreamConfig>,
@@ -246,6 +256,7 @@ impl Node {
             Current::Fenced(reason) => Some(reason),
             other => return sw.finish(other, Err(Error::NotMaster)),
         };
+        let target = cfg.upstream.clone();
         match Slave::rejoin(cfg, opts).await {
             Ok((slave, outcome)) => {
                 self.record_upstream(&slave);
@@ -259,6 +270,11 @@ impl Node {
                     .ok()
                     .flatten()
                     .is_some_and(|m| m.role == Role::Master);
+                if !still_master {
+                    // The directory is a slave of `target` now: `reopen` must follow it, not
+                    // the configured upstream.
+                    *self.upstream.lock().unwrap_or_else(PoisonError::into_inner) = target;
+                }
                 match (fenced, still_master) {
                     (Some(reason), true) => sw.finish(Current::Fenced(reason), Err(e)),
                     _ => sw.finish(Current::Failed(e.to_string()), Err(e)),
