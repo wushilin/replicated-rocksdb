@@ -5,8 +5,12 @@ pub(crate) mod bootstrap;
 pub(crate) mod cfs;
 pub(crate) mod log;
 pub(crate) mod meta;
+#[allow(dead_code)] // consumed by the Node fenced open (Plan 4); remove then
+pub(crate) mod offline;
 pub(crate) mod promote;
 pub(crate) mod read;
+#[allow(dead_code)] // consumed by Slave::rejoin (Plan 4 Task 3); remove then
+pub(crate) mod rejoin;
 pub(crate) mod repair;
 pub(crate) mod repl;
 pub(crate) mod retention;
