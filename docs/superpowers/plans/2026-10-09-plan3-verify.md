@@ -1,19 +1,21 @@
 # Plan 3 of 3 — Integrity Verification, Repair, Observability and the Full Test Sweep Implementation Plan
 
+> **Split:** this file holds Tasks 0–7; Tasks 8–11 are in [part 2](2026-10-09-plan3-verify-part2.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement Verify end to end — server sessions pinned to a snapshot with `HashRange`/`ListRange`, and a slave verifier that captures its own snapshot at exactly the upstream's seq, compares contiguous ranges, bisects and lists mismatches down to the key, and reports, repairs or re-bootstraps — plus divergence repair (addendum §5), `lag_ms`, tracing spans, and a sweep that gives every DESIGN.md §21 test item a real test. Task 0 first fixes four findings carried over from Plan 2's final review.
+**Goal:** Implement Verify end to end — server sessions pinned to a snapshot with `HashRange`/`ListRange`, and a slave verifier that captures its own snapshot at exactly the upstream's seq, compares contiguous ranges, bisects and lists mismatches down to the key, and reports, repairs or re-bootstraps — plus divergence repair (addendum §5), `lag_ms`, tracing spans, and a sweep that gives every DESIGN.md §21 test item a real test. First, Task 0 fixes four findings carried over from Plan 2's final review, Task 1 gives every epoch a random nonce and starts a new epoch on every master open (addendum §7, so histories are compared exactly), and Task 2 adds the API helpers the examples asked for (addendum §8).
 
-**Architecture:** A new crate-private `src/verify/` module holds everything both sides share: key order, half-open bounds, per-mode payloads, range hashes, listings, the chunker, the throttle (`range.rs`), range reads through a `ReadSnapshot` (`scan.rs`), and the comparison algorithm (`compare.rs`) written against two small traits (`Oracle` = the upstream, `LocalSide` = local records) so bisection, paging and the key-by-key diff are unit-tested without a network. The server (`src/server/verify.rs`) keeps sessions that own a `ReadSnapshot`; the slave (`src/slave/verifier.rs`) implements `Oracle` over the `VerifyRange` bidi stream and gets its snapshot from the applier right after it commits seq `S`; it pauses the applier before asking for the session, so it cannot run past `S` meanwhile. Repair reuses the session: three more request kinds (`EntryCrcs` to find a fork point, `FetchKeys`/`FetchRange` to read envelopes at `S`) let a diverged slave — or one a verify found damaged — rewind to a common seq in one synced batch with only the affected keys taken from the upstream, then replay (`src/slave/repair.rs`, `src/store/repair.rs`). Observability adds `lag_ms` from the last applied entry's `ts_ms` and `tracing` spans on both ends of every handshake, bootstrap and verify session and on each reaper round. Every integrity test is real: nodes in one process over gRPC on 127.0.0.1, corruption injected by opening a stopped slave's directory with plain RocksDB.
+**Architecture:** A new crate-private `src/verify/` module holds everything both sides share: key order, half-open bounds, per-mode payloads, range hashes, listings, the chunker, the throttle (`range.rs`), range reads through a `ReadSnapshot` (`scan.rs`), and the comparison algorithm (`compare.rs`) written against two small traits (`Oracle` = the upstream, `LocalSide` = local records) so bisection, paging and the key-by-key diff are unit-tested without a network. The server (`src/server/verify.rs`) keeps sessions that own a `ReadSnapshot`; the slave (`src/slave/verifier.rs`) implements `Oracle` over the `VerifyRange` bidi stream and gets its snapshot from the applier right after it commits seq `S`; it pauses the applier before asking for the session, so it cannot run past `S` meanwhile. Repair reuses the session: three more request kinds (`FetchKeys`/`FetchRange` to read envelopes at `S`, `EntryCrcs` to check the entry before a fork) let a diverged slave — or one a verify found damaged — rewind to a common seq in one synced batch with only the affected keys taken from the upstream, then replay (`src/slave/repair.rs`, `src/store/repair.rs`); the fork point itself comes from the epoch histories, which carry nonces from Task 1. Observability adds `lag_ms` from the last applied entry's `ts_ms` and `tracing` spans on both ends of every handshake, bootstrap and verify session and on each reaper round. Every integrity test is real: nodes in one process over gRPC on 127.0.0.1, corruption injected by opening a stopped slave's directory with plain RocksDB.
 
 **Tech Stack:** Plan 1 and Plan 2's stack (Rust 1.99 toolchain, edition 2024, MSRV 1.85, rocksdb 0.25.0 with `multi-threaded-cf`, prost 0.14.4, tokio 1.53, tonic 0.14.6, tonic-types, tokio-stream 0.1.19, blake3 1.8, tracing 0.1.44, …). No new dependencies. Tests use `rocksdb` (a normal dependency) to tamper with stopped node directories, and implement a tiny `tracing::Subscriber` to capture spans.
 
-**Spec:** [DESIGN.md](../../../DESIGN.md) §12, §15, §16, §18, §19, §21; [PROTOCOL.md](../../../PROTOCOL.md) §5.4, §9, §10, §11.2, §12, §13, §14, §15; the "Plan 3: Verify" section of [the Plan 2/3 design notes](../specs/2026-10-09-plan2-3-design-notes.md); §5 (and the §3–§5 tests) of [the acks/failover/repair addendum](../specs/2026-10-09-failover-acks-repair.md), which wins over DESIGN/PROTOCOL until merged (Task 8 merges §5). Read DESIGN.md §12 and PROTOCOL.md §9 before starting. This plan builds on [Plan 1](2026-10-09-plan1-storage-and-master.md) and [Plan 2](2026-10-09-plan2-replication.md) (with its addendum §1–§4 amendment: acks over a bidirectional Tail, `ReplicaStatus` / `replicas()`, write concern, `repoint`, `Status`, `promote_checked`, `demote`), **both fully implemented: the code at commit `fae88e4` (branch `feat/storage-and-master`) is the source of truth.** Every snippet below that is quoted for replacement is quoted from that tree with this plan's earlier tasks applied, and was applied and tested in that order: each task compiles, passes its tests and leaves `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` (with and without `--features failpoints`) clean. If an edit does not apply verbatim, the tree has moved on since `fae88e4`: apply the same change to the equivalent lines.
+**Spec:** [DESIGN.md](../../../DESIGN.md) §5.2, §12, §13, §15, §16, §18, §19, §21; [PROTOCOL.md](../../../PROTOCOL.md) §5.4, §5.5, §6, §9, §10, §11.2, §12, §13, §14, §15; the "Plan 3: Verify" section of [the Plan 2/3 design notes](../specs/2026-10-09-plan2-3-design-notes.md); §5, §7 and §8 (and the §3–§5 tests) of [the acks/failover/repair addendum](../specs/2026-10-09-failover-acks-repair.md), which wins over DESIGN/PROTOCOL until merged (Tasks 1, 2 and 10 merge §7, §8 and §5). Read DESIGN.md §12 and PROTOCOL.md §9 before starting. This plan builds on [Plan 1](2026-10-09-plan1-storage-and-master.md) and [Plan 2](2026-10-09-plan2-replication.md) (with its addendum §1–§4 amendment: acks over a bidirectional Tail, `ReplicaStatus` / `replicas()`, write concern, `repoint`, `Status`, `promote_checked`, `demote`), **both fully implemented: the code at commit `f4ddca1` (branch `feat/storage-and-master`; the code is unchanged since `fae88e4`, and `examples/` came in `57c37b2`) is the source of truth.** Every snippet below that is quoted for replacement is quoted from that tree with this plan's earlier tasks applied, and was applied and tested in that order: each task compiles, passes its tests and leaves `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` (with and without `--features failpoints`) clean. If an edit does not apply verbatim, the tree has moved on since `f4ddca1`: apply the same change to the equivalent lines. Several edits are given as exact before/after excerpts generated from the tested tree; apply them top to bottom within a file.
 
 **Series:**
 - Plan 1: storage engine and master (done).
 - Plan 2: replication server, auth/TLS, `Slave`, chaining, promotion, failure/resume (done before this plan).
-- **Plan 3 (this):** carried review fixes, Verify, repair (divergence and verify mismatches; the `repoint` `Repair` arm), `lag_ms`, `last_verify`, tracing spans, DESIGN.md §21 sweep. (`replicas()` / `ReplicaStatus` and the addendum §3–§4 failover tests — `promote_checked`, `demote`, the chooser, `repoint` refusal — already exist from Plan 2: `tests/promotion.rs`, `tests/repoint.rs`, `src/admin.rs`.)
+- **Plan 3 (this):** carried review fixes, epoch nonces and per-open epochs, API ergonomics, Verify, repair (divergence and verify mismatches; the `repoint` `Repair` arm), `lag_ms`, `last_verify`, tracing spans, DESIGN.md §21 sweep. (`replicas()` / `ReplicaStatus` and the addendum §3–§4 failover tests — `promote_checked`, `demote`, the chooser, `repoint` refusal — already exist from Plan 2: `tests/promotion.rs`, `tests/repoint.rs`, `src/admin.rs`.)
 
 ## Global Constraints
 
@@ -27,89 +29,86 @@
 - At most 16 range requests in flight per session (`VERIFY_WINDOW`); answers come in request order with `request_id` echoed.
 - Defaults (DESIGN.md §16, §18 as amended here): `VerifyConfig { interval: None, mode: Quick, chunk_keys: 1 000, chunk_bytes: 4 MiB, min_chunk_keys: 16, max_bytes_per_sec: None, on_mismatch: Report, capture_timeout: 60 s, max_reported_keys: 10 000 }`; server `max_verify_sessions: 4`, `verify_session_timeout: 5 min`.
 - **Repair is one synced batch**: affected keys, removal of the local log suffix, `last_seq`/`last_entry_crc`, identity and epoch history, and `node_state = repairing:<S>` commit together; reads answer `NotReady` (and the node serves no replicas) until replay reaches `S`. Anything repair cannot prove or handle falls back to a full bootstrap; it never guesses.
-- **RocksDB is never read on an async worker** in new or touched server code: reads go through `tokio::task::spawn_blocking` or `background::blocking` (Task 6 moves the remaining Plan 2 cases).
+- **Every master open starts a new epoch** with a random nonce (Task 1); ordering uses only the numbers (epoch, then `last_seq`), the nonce only identity. Anything that compares histories (the handshake, `admin::compare`, `check_promotion`, repair) compares records with their nonces; entry CRCs are a second line of defence, never a requirement.
+- **One writer per epoch, mutations serialized.** The master commits one entry at a time under its writer lock (each write is one log entry with the next seq; concurrent callers queue, and only acknowledgement waits run outside the lock). Nothing in this plan adds a second writer or a concurrent commit path.
+- **RocksDB is never read on an async worker** in new or touched server code: reads go through `tokio::task::spawn_blocking` or `background::blocking` (Task 8 moves the remaining Plan 2 cases).
 - A verify session (server) or verify run (slave) must never keep a node's database open after `shutdown()`: sessions are cleared on shutdown and on reset, and background tasks hold `Weak<Inner>` between runs (Plan 2's rule).
 - Tests that matter are **real**: nodes in one process, gRPC over `127.0.0.1` port 0, corruption injected by opening a **stopped** node's directory with plain `rocksdb::DB`. Failpoint tests live only in `tests/failpoints.rs` and need `--features failpoints`.
 - Every commit message ends with the line `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Review Focus
 
-1. **Capturing exactly `S`.** The verifier pauses the applier (`Inner::hold_applier`) *before* `VerifyBegin`, then lets it run to `S` and snapshot right after that commit. Without the hold, a slave following a busy master is past `S` by the time the answer arrives and every run aborts. A slave genuinely ahead of its upstream's snapshot (C ahead of B after B lost unflushed entries, DESIGN.md §6) must still abandon the run with `VerifyAbort::PassedSnapshot`, never compare different seqs and report phantom mismatches. (Tests `verify_pins_the_snapshot_while_concurrent_writes_continue` in Task 3, `a_slave_ahead_of_the_upstream_snapshot_abandons_the_run` in Task 4.)
-2. **A halted slave behind `S`** can never reach the snapshot seq: `verify_now` must return `CaptureTimeout` as soon as the slave is halted, not hang for `capture_timeout` (60 s). (Test `a_halted_slave_behind_the_snapshot_gives_up_at_once` in Task 4.)
-3. **Very long keys** (the protocol allows keys up to `max_entry_bytes`, but the server accepts 4 MiB requests): keys longer than 1 MiB never become range bounds, a listing whose last key is over 2 MiB is reported as `Mismatch::Range` instead of sending an oversized request, and the server always returns at least two keys per `ListResult` so paging never stalls. (Tests `oversized_keys_never_become_boundaries` and `split_points_avoid_long_keys_and_small_ranges`, `a_listing_that_cannot_progress_is_reported_as_a_range` in Task 1; the 1 MiB edge-case key in `edge_case_data_verifies_and_its_corruption_is_found` in Task 4.)
-4. **Open verify sessions must not pin the database**: a client that opens a session and walks away must not make `Master::shutdown` time out, and an epoch bump or re-bootstrap must end verify streams with `UPSTREAM_RESET` and drop their snapshots. (Tests `open_sessions_do_not_keep_the_database_open`, `an_epoch_bump_ends_verify_streams_and_sessions` in Task 2.)
-5. **A crash between a repair's rewind and replay reaching `S`** leaves keys at `S` next to keys at `F − 1`: that mixed state must never be read or served, before or after a restart, and the slave must converge without a bootstrap. Repair must also refuse (fall back to a bootstrap) whenever entry `F − 1` is not held by both sides with the same CRC, since nothing else proves the histories agree up to it. (Tests `crash_mid_repair_then_converge`, `a_trimmed_local_suffix_falls_back_to_a_bootstrap`, `an_upstream_without_the_fork_point_falls_back_to_a_bootstrap` in Task 8.)
+1. **Epochs with nonces** (Task 1): every master open adds a record, so all existing tests that restart a master now see `EPOCH_ADVANCED`; a restarted old master starts its own epoch (same number as the new master's ⇒ `DIVERGED`, lower ⇒ `STALE_EPOCH`). The handshake checks up to five newest client records, and continuity proven by the history needs no retained entry. (Tests in Task 1; the restore-without-bump and trimmed-peer cases would silently resume or block as "unverifiable" without it.)
+2. **Capturing exactly `S`.** The verifier connects first, pauses the applier (`Inner::hold_applier`) *before* `VerifyBegin` (bounded by `min(10 s, capture_timeout)`: a held slave acknowledges nothing), then lets it run to `S` and snapshot right after that commit. Without the hold, a slave following a busy master is past `S` by the time the answer arrives and every run aborts. A slave genuinely ahead of its upstream's snapshot (C ahead of B after B lost unflushed entries, DESIGN.md §6) must still abandon the run with `VerifyAbort::PassedSnapshot`, never compare different seqs and report phantom mismatches. (Tests `verify_pins_the_snapshot_while_concurrent_writes_continue` in Task 5, `a_slave_ahead_of_the_upstream_snapshot_abandons_the_run` in Task 6.)
+3. **A halted slave behind `S`** can never reach the snapshot seq: `verify_now` must return `CaptureTimeout` as soon as the slave is halted, not hang for `capture_timeout` (60 s). (Test `a_halted_slave_behind_the_snapshot_gives_up_at_once` in Task 6.)
+4. **Very long keys** (the protocol allows keys up to `max_entry_bytes`, but the server accepts 4 MiB requests): keys longer than 1 MiB never become range bounds, a listing whose last key is over 2 MiB is reported as `Mismatch::Range` instead of sending an oversized request, and the server always returns at least two keys per `ListResult` so paging never stalls. (Tests `oversized_keys_never_become_boundaries` and `split_points_avoid_long_keys_and_small_ranges`, `a_listing_that_cannot_progress_is_reported_as_a_range` in Task 3; the 1 MiB edge-case key in `edge_case_data_verifies_and_its_corruption_is_found` in Task 6.)
+5. **Open verify sessions must not pin the database**: a client that opens a session and walks away must not make `Master::shutdown` time out, and an epoch bump or re-bootstrap must end verify streams with `UPSTREAM_RESET` and drop their snapshots. (Tests `open_sessions_do_not_keep_the_database_open`, `an_epoch_bump_ends_verify_streams_and_sessions` in Task 4.)
+6. **A crash between a repair's rewind and replay reaching `S`** leaves keys at `S` next to keys at `F − 1`: that mixed state must never be read or served, before or after a restart, and the slave must converge without a bootstrap. The target is persisted as its own `__meta.repair_until` key, because a halt during the replay rewrites `node_state`. Repair must fall back to a bootstrap whenever it cannot prove the result (no fork in the histories, a CF op, a trimmed suffix, too many bytes) and must never drop entries a verify did not report (`S < L` is retried). (Tests `crash_mid_repair_then_converge`, the fallbacks in `tests/repair.rs`, Task 10.)
 
 ## Design deltas this plan introduces
 
 Each owning task updates DESIGN.md or PROTOCOL.md with the exact text given there.
 
-- **The verifier holds the applier before `VerifyBegin`** (Task 3, DESIGN.md §12 step 2): the design notes had the applier simply "capture at `S`", which a slave keeping up with a busy master never manages (it is already past `S` when the answer arrives). The applier waits while held, then runs exactly to `S`.
-- **`ListRange` paging and size** (Task 2, PROTOCOL.md §9.2, §9.4, §12): `limit` must be 1..=1024; the server may stop early to bound the answer (~1 MiB) but returns at least two keys when the range has two; a client continues a truncated listing with `lower` = the last key received and skips that key when it is repeated. This replaces the design notes' "`lower = last key + \0`", which is only a successor under bytewise order (under a reverse comparator it would re-list or skip keys).
-- **Long keys are never bounds** (Task 2, PROTOCOL.md §9.4; DESIGN.md §12): keys over 1 MiB are not used as range boundaries; listing resumes only from keys of at most 2 MiB.
-- **Result and failure types** (Task 3, DESIGN.md §12, §16, §16.2): `Mismatch::CfSpec { name, local: Option<CfVersion>, upstream: Option<CfVersion> }` (`CfVersion { spec, create_seq }`, so a `create_seq` difference is visible; the notes had `Option<CfSpec>`); `Mismatch::Range` is also used once `max_reported_keys` is reached; `Error::VerifyAborted(VerifyAbort)` with `Busy`, `SessionExpired`, `IdentityChanged`, `PassedSnapshot`, `CaptureTimeout`, `Upstream`; `VerifyConfig` gains `capture_timeout` and `max_reported_keys`; `VerifyReport::is_clean()`.
+- **Epoch nonces and per-open epochs** (Task 1, addendum §7; PROTOCOL.md §5.5, §6.1, §6.3, §6.4, §14, §15; DESIGN.md §3.2, §13, §13.1, §16, §21, §22): `EpochStart.nonce` (proto field 3); `HandshakeRequest.known_epochs` (field 8: the client's newest records, at most 5; field 7 `known_epoch_start` reserved); rule 9 `EPOCH_ADVANCED` when every record is in the server's history, 10a (proven CRC mismatch) checked first; `Comparison::Unverifiable` and `PromotionCheck::unverifiable` removed, `PromotionUnverifiable` only for peers that answered `Status` with an error; `bump_epoch_on_open` redundant.
+- **API ergonomics** (Task 2, addendum §8; DESIGN.md §5.2, §13.1, §16, §16.2): CF operations ignore the write concern; `Master::wait_in_sync`, `Slave::wait_streaming`, `PromoteRefused::into_parts` / `DemoteRefused::into_parts`, `MasterConfig::from_slave_config`, inherent `last_seq()`; `Error::PeerUnreachable` gains `source`, its `reason` is one line; the examples use them.
+- **The verifier holds the applier before `VerifyBegin`** (Task 5, DESIGN.md §12 step 2): the design notes had the applier simply "capture at `S`", which a slave keeping up with a busy master never manages (it is already past `S` when the answer arrives). It connects first and bounds `VerifyBegin` by `min(10 s, capture_timeout)`; every later answer by 60 s. A held verify that a bootstrap or repair overtakes gets `Cancelled`; a report never triggers `on_mismatch` while the slave is halted.
+- **`ListRange` paging and size** (Task 4, PROTOCOL.md §9.2, §9.4, §12): `limit` must be 1..=1024; the server may stop early to bound the answer (~1 MiB) but returns at least two keys when the range has two; a client continues a truncated listing with `lower` = the last key received and skips that key when it is repeated. This replaces the design notes' "`lower = last key + \0`", which is only a successor under bytewise order (under a reverse comparator it would re-list or skip keys).
+- **Long keys are never bounds** (Task 4, PROTOCOL.md §9.4; DESIGN.md §12): keys over 1 MiB are not used as range boundaries; listing resumes only from keys of at most 2 MiB.
+- **Result and failure types** (Task 5, DESIGN.md §12, §16, §16.2): `Mismatch::CfSpec { name, local: Option<CfVersion>, upstream: Option<CfVersion> }` (`CfVersion { spec, create_seq }`, so a `create_seq` difference is visible; the notes had `Option<CfSpec>`); `Mismatch::Range` is also used once `max_reported_keys` is reached; `Error::VerifyAborted(VerifyAbort)` with `Busy`, `SessionExpired`, `IdentityChanged`, `PassedSnapshot`, `CaptureTimeout`, `Upstream`; `VerifyConfig` gains `capture_timeout` and `max_reported_keys`; `VerifyReport::is_clean()`.
 - **`replicas()` / `ReplicaStatus` move to Plan 2's acks amendment** (addendum §1 defines them with real acks); the design notes' Plan 3 version (`acked_seq = last sent`) is dropped.
-- **Repair** (Tasks 7–8, PROTOCOL.md §6.5, §9.2, §11.2, §13, §14; DESIGN.md §3.2, §12.1 new, §13, §13.1, §15, §16, §16.3, §21, §22): `FetchKeys`, `FetchRange`, `EntryCrcs` request kinds on `VerifyRange`; `DivergencePolicy::Repair`, `MismatchPolicy::Repair`, `SlaveConfig.repair_max_bytes` (64 MiB), `Slave::diverged_entries` (fork point persisted as `__meta.diverged_at` when the slave halts `Diverged`), listener `on_rewind`, `node_state = repairing:<seq>` (also in `Status`). The fork point is found by binary search over entry CRCs and needs entry `F − 1` on both sides; verify repair rewinds to `min(L, S)` so it can reuse the same replay argument. `repoint(.., RepointDivergence::Repair { accept_loss })` now returns `Repaired { discarded }` (Plan 2 returned `Error::Unsupported`) and `repoint::mode_error` goes away. After a repair the driver handshakes again rather than tailing on the `DIVERGED` answer.
-- **`lag_ms`** (Task 5, DESIGN.md §16): `Some(0)` when `applied_seq >= origin_last_seq`; while behind, `now − ts_ms` of the last applied entry; `None` while that `ts_ms` is unknown (after a bootstrap, until the next entry).
-- **Span names and fields** (Task 6, DESIGN.md §19): `handshake`, `bootstrap`, `verify`, `reaper`, each with `node_id`, `upstream` (absent on the master), `seq`, `epoch`; server-side spans add `client`, `verify` adds `mode`.
-- **Plan 2 review items** (Task 0, Task 6): the Tail junction race, an orphan CF of another name, BUSY peers in `check_promotion` (test only), the `RepointDivergence` rustdoc; RocksDB reads off async workers and `ReplicaRegistry::status` outside its locks. No spec change.
-- **`MismatchPolicy::Rebootstrap`** ends the current Tail stream (a `Notify` the tail loop selects on) so the bootstrap starts at once, not at the next disconnect (Task 3). A halted slave stays halted.
+- **Repair** (Tasks 9–10, PROTOCOL.md §6.5, §9.2, §11.2, §13, §14; DESIGN.md §3.2, §12.1 new, §13, §13.1, §15, §16, §16.3, §21, §22): `FetchKeys`, `FetchRange`, `EntryCrcs` request kinds on `VerifyRange`; `DivergencePolicy::Repair`, `MismatchPolicy::Repair`, `SlaveConfig.repair_max_bytes` (64 MiB), `Slave::diverged_entries` (fork point persisted as `__meta.diverged_at` when the slave halts `Diverged`), listener `on_rewind`, `Status.node_state = repairing:<seq>` (from `__meta.repair_until`, not persisted in `node_state`). The fork point comes from the epoch histories (no CRC search); the CRC of entry `F − 1` is checked where both sides hold it. `NotReady` until replay passes `S` rests on `__meta.repair_until`. The network phase is bounded (120 s) and abandoned on a repoint; the commit always completes. Verify repair keeps every local entry and retries when `S < L`. `MismatchPolicy::Repair` documents that verify cannot tell which side is damaged. `repoint(.., RepointDivergence::Repair { accept_loss })` now returns `Repaired { discarded }` (Plan 2 returned `Error::Unsupported`) and `repoint::mode_error` goes away. After a repair the driver handshakes again rather than tailing on the `DIVERGED` answer.
+- **`lag_ms`** (Task 7, DESIGN.md §16): `Some(0)` when `applied_seq >= origin_last_seq`; while behind, `now − ts_ms` of the last applied entry; `None` while that `ts_ms` is unknown (after a bootstrap, until the next entry).
+- **Span names and fields** (Task 8, DESIGN.md §19): `handshake`, `bootstrap`, `verify`, `reaper`, each with `node_id`, `upstream` (absent on the master), `seq`, `epoch`; server-side spans add `client`, `verify` adds `mode`.
+- **Plan 2 review items** (Task 0, Task 8): the Tail junction race, an orphan CF of another name, BUSY peers in `check_promotion` (test only), the `RepointDivergence` rustdoc; RocksDB reads off async workers and `ReplicaRegistry::status` outside its locks. No spec change.
+- **`MismatchPolicy::Rebootstrap`** ends the current Tail stream (a `Notify` the tail loop selects on) so the bootstrap starts at once, not at the next disconnect (Task 5). A halted slave stays halted.
 
 ## File Structure
 
 ```
-src/server/tail.rs            junction race (Task 0); validation and junction reads on blocking threads (Task 6)
+src/server/tail.rs            junction race (Task 0); validation and junction reads on blocking threads (Task 8)
 src/store/apply.rs            orphan CF of another name is dropped before its intent is replaced (Task 0)
-src/admin.rs                  + test: a BUSY Status answer is not a transport failure (Task 0)
-src/slave/repoint.rs          RepointDivergence docs (Task 0); Repair arm, mode_error removed (Task 8)
+src/admin.rs                  BUSY test (Task 0); history-based compare, no Unverifiable (Task 1); one-line
+                              unreachable reasons (Task 2)
+src/types.rs, src/net/convert.rs, src/store/meta.rs   EpochStart.nonce, fork_from, newest_records (Task 1)
+src/server/handshake.rs       known_epochs, rules 8–10 with nonces (Task 1)
+src/master/{mod,writer}.rs    a new epoch on every open, open_promoted (Task 1); wait_in_sync, last_seq,
+                              CF ops exempt from the write concern, DemoteRefused::into_parts (Task 2)
+src/config.rs                 bump_epoch_on_open redundant (Task 1); MasterConfig::from_slave_config (Task 2)
+src/slave/promote.rs          history-based check (Task 1); PromoteRefused::into_parts (Task 2)
+src/slave/repoint.rs          RepointDivergence docs (Task 0); divergence from records (Task 1); Repair arm,
+                              mode_error removed (Task 10)
 src/verify/mod.rs             public types (VerifyMode, VerifyConfig, MismatchPolicy, CfVersion, Mismatch,
-                              VerifyReport, VerifyAbort), protocol constants (Task 1); MismatchPolicy::Repair (Task 8)
+                              VerifyReport, VerifyAbort), protocol constants (Task 3); MismatchPolicy::Repair (Task 10)
 src/verify/range.rs           KeyOrder, Bounds, payload, RangeHasher, Lister, LocalRange, LocalRecord,
-                              Chunker, Throttle (Task 1)
-src/verify/scan.rs            range reads through a ReadSnapshot: scan, hash_range, list_range, load_range,
-                              chunk_cf, pace (Task 1); fetch_range (Task 7)
-src/verify/compare.rs         Oracle / LocalSide traits, compare_cf (pipelined hashes, bisection, paged
-                              listing, key diff), compare_specs, Budget, CfRun (Task 1)
-src/store/repl.rs             + ReadCtx::iter_raw_from (Task 1)
-src/store/repair.rs           Rewind, Store::{rewind, set_diverged_at, diverged_at} (Task 8)
-src/store/{mod,meta,bootstrap}.rs  repair module, __meta.diverged_at, cleared by a bootstrap reset (Task 8)
-src/error.rs                  + Error::VerifyAborted (Task 1)
-src/lib.rs                    module + re-exports (Task 1)
-src/server/verify.rs          Sessions, VerifyBegin / VerifyRange / VerifyEnd handlers, server tests (Task 2);
-                              FetchKeys / FetchRange / EntryCrcs (Task 7)
-src/server/mod.rs             ServerState field, Svc delegates, sweep, shutdown clears sessions (Task 2);
-                              handshake and Status spans and blocking reads (Task 6)
-src/server/tests.rs           - verify_is_not_implemented_yet (Task 2)
-src/server/{bootstrap,replicas}.rs  bootstrap span; ReplicaRegistry::status computes outside its locks (Task 6)
-src/slave/verifier.rs         verify run, applier hold and capture, Upstream oracle, scheduling (Task 3);
-                              UpstreamSession and fetches (Task 7); MismatchPolicy::Repair (Task 8)
-src/slave/repair.rs           AffectedSet, fork search, divergence and verify repair, record_fork (Task 8)
-src/slave/inner.rs            + capture slot and applier hold, verify lock, last_verify, last_applied_ts,
-                              rebootstrap notify (Task 3); status() with lag_ms (Task 5); repair state,
-                              is_ready false while repairing (Task 8)
-src/slave/apply.rs            + wait while held, capture right after commit (Task 3), last_applied_ts (Task 5),
-                              end of repair (Task 8)
-src/slave/bootstrap.rs        + cancel capture (Task 3), reset ts (Task 5), clear repair state (Task 8)
-src/slave/driver.rs           + tail loop wakes for verify actions (Task 3); spans (Task 6); repair actions (Task 8)
-src/slave/{policy,source}.rs  + Action::Repair; node_state "repairing:<seq>" (Task 8)
-src/slave/config.rs           + SlaveConfig.verify (Task 3); DivergencePolicy::Repair, repair_max_bytes (Task 8)
-src/slave/state.rs            + SlaveStatus.last_verify (Task 3), lag_ms (Task 5); NodeState::Repairing (Task 8)
-src/slave/mod.rs              + verify_now, verifier task (Task 3); diverged_entries (Task 8)
-src/listener.rs               + on_verify_complete (Task 3), on_rewind (Task 8)
-src/master/reaper.rs          + reaper span (Task 6)
-proto/replication.proto       + FetchKeys, FetchRange, EntryCrcs and their results (Task 7); node_state comment (Task 8)
-tests/support/mod.rs          + RecordingListener::{verifies, rewinds}, RawDb (Tasks 3, 4, 8), RawDb::last_seq (Task 9)
-tests/verify.rs               verify end to end (Task 3)
-tests/integrity.rs            on-disk corruption, chains, policies, limits (Task 4)
-tests/observability.rs        lag_ms (Task 5)
-tests/spans.rs                tracing spans, with a recording subscriber (Task 6)
-tests/repair.rs               divergence and verify repair, fallbacks, diverged_entries (Task 8)
-tests/repoint.rs              Repair arm now repairs (Task 8)
-tests/failure_resume.rs       + quiet master with an empty log (Task 9)
-tests/replication.rs          + CF drop while a slave snapshot is open (Task 9)
-tests/failpoints.rs           + crash mid-repair (Task 8), random kills while writing (Task 9)
-tests/promotion.rs            + a throttled peer blocks a checked promotion (Task 0); Full verify after promotion (Task 9)
-DESIGN.md, PROTOCOL.md        amendments (Tasks 2, 3, 5, 6, 7, 8)
+                              Chunker, Throttle (Task 3)
+src/verify/scan.rs            range reads through a ReadSnapshot (Task 3); fetch_range (Task 9)
+src/verify/compare.rs         Oracle / LocalSide traits, compare_cf, compare_specs, Budget, CfRun (Task 3)
+src/store/repl.rs             + ReadCtx::iter_raw_from (Task 3); ReadSnapshot::entry_crc (Task 9)
+src/store/repair.rs           Rewind, Store::{rewind, range_bytes, repair_until, set_diverged_at, ...} (Task 10)
+src/error.rs                  + Error::VerifyAborted (Task 3); PeerUnreachable.source (Task 2)
+src/lib.rs                    module + re-exports (Task 3)
+src/server/verify.rs          Sessions, VerifyBegin / VerifyRange / VerifyEnd (Task 4); FetchKeys / FetchRange /
+                              EntryCrcs through the session snapshot (Task 9)
+src/server/mod.rs             ServerState field, Svc delegates, sweep, shutdown (Task 4); spans, blocking reads (Task 8)
+src/slave/client.rs           connect_now (Task 5)
+src/slave/verifier.rs         verify run, applier hold and capture, Upstream oracle, scheduling (Task 5);
+                              UpstreamSession and fetches with sinks (Task 9); MismatchPolicy::Repair (Task 10)
+src/slave/repair.rs           AffectedSet, history fork, prepare/commit of both repairs, record_fork (Task 10)
+src/slave/inner.rs            known_epochs (Task 1); capture slot, verify state (Task 5); lag (Task 7);
+                              repair state, is_ready false while repairing (Task 10)
+src/slave/{apply,bootstrap,driver}.rs  capture, hold (Task 5); lag (Task 7); spans (Task 8); repair (Task 10)
+src/slave/{policy,source,config,state,mod}.rs  as listed in each task
+src/listener.rs               + on_verify_complete (Task 5), on_rewind (Task 10)
+proto/replication.proto       EpochStart.nonce, known_epochs (Task 1); FetchKeys, FetchRange, EntryCrcs (Task 9);
+                              node_state comment (Task 10)
+tests/ergonomics.rs           wait_streaming, from_slave_config, into_parts (Task 2)
+tests/verify.rs, tests/integrity.rs, tests/observability.rs, tests/spans.rs   (Tasks 5, 6, 7, 8)
+tests/repair.rs               divergence and verify repair, fallbacks, diverged_entries (Task 10)
+tests/{promotion,repoint,rebootstrap,failure_resume,master_write,write_concern,failpoints,replication}.rs
+                              updated and extended (Tasks 0, 1, 2, 10, 11)
+tests/support/mod.rs          RecordingListener::{verifies, rewinds}, RawDb, RawDb::last_seq (Tasks 5, 6, 10)
+examples/                     helpers of Task 2 in the existing examples; verify.rs, repair.rs (Task 11)
+DESIGN.md, PROTOCOL.md, docs/superpowers/specs/   amendments (Tasks 1, 2, 4, 5, 7, 8, 9, 10)
 ```
 
 ## Tasks
@@ -117,15 +116,18 @@ DESIGN.md, PROTOCOL.md        amendments (Tasks 2, 3, 5, 6, 7, 8)
 | # | Task | Main output |
 |---|---|---|
 | 0 | Carried fixes from Plan 2's final review | tail junction, orphan CF, BUSY peers, repoint docs |
-| 1 | Verify core | `src/verify/` |
-| 2 | Server Verify RPCs | `src/server/verify.rs` |
-| 3 | Slave verifier | `src/slave/verifier.rs`, `verify_now` |
-| 4 | Integrity tests with on-disk damage | `tests/integrity.rs` |
-| 5 | `lag_ms` | `SlaveStatus.lag_ms` |
-| 6 | Spans and blocking reads | `tests/spans.rs` |
-| 7 | Repair fetches on the verify session | `FetchKeys`, `FetchRange`, `EntryCrcs` |
-| 8 | Divergence repair and `MismatchPolicy::Repair` | `src/slave/repair.rs`, `tests/repair.rs` |
-| 9 | DESIGN.md §21 sweep | coverage map and four new tests |
+| 1 | Epoch nonces and per-open epochs | `EpochStart.nonce`, `known_epochs`, history-based compare |
+| 2 | API ergonomics | wait helpers, `into_parts`, `from_slave_config`, CF ops exempt from the write concern, examples |
+| 3 | Verify core | `src/verify/` |
+| 4 | Server Verify RPCs | `src/server/verify.rs` |
+| 5 | Slave verifier | `src/slave/verifier.rs`, `verify_now` |
+| 6 | Integrity tests with on-disk damage | `tests/integrity.rs` |
+| 7 | `lag_ms` | `SlaveStatus.lag_ms` |
+| 8 | Spans and blocking reads | `tests/spans.rs` |
+| 9 | Repair fetches on the verify session | `FetchKeys`, `FetchRange`, `EntryCrcs` |
+| 10 | Divergence repair and `MismatchPolicy::Repair` | `src/slave/repair.rs`, `tests/repair.rs` |
+| 11 | DESIGN.md §21 sweep | coverage map, four new tests, verify and repair examples |
+
 
 ---
 
@@ -447,7 +449,4463 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 1: Verify core — types, range arithmetic, snapshot scans and the comparison algorithm
+### Task 1: Epoch nonces and per-open epochs
+
+**Files:**
+- Modify: `proto/replication.proto`, `tests/failpoints.rs`, `src/types.rs`, `src/net/convert.rs`, `src/store/meta.rs`, `src/master/{mod,writer}.rs`, `src/config.rs`, `src/store/promote.rs`, `src/slave/{promote,driver,inner,repoint}.rs`, `src/server/handshake.rs`, `src/server/test_client.rs`, `src/admin.rs`, `src/error.rs`; unit-test literals in `src/server/tests.rs`, `src/slave/apply.rs`, `src/store/{bootstrap,mod}.rs`; `tests/master_write.rs`, `tests/promotion.rs`, `tests/repoint.rs`, `tests/rebootstrap.rs`, `tests/failure_resume.rs`; `PROTOCOL.md` (§5.5, §6.1, §6.3, §6.4, §14, §15), `DESIGN.md` (§3.2, §13, §13.1, §16, §21, §22)
+
+Spec addendum §7 (agreed 2026-10-10). Compatibility of two histories is decided exactly from the epoch history, so a peer whose entries were trimmed is never "unverifiable":
+
+- `EpochStart` gains `nonce: u64` (proto field 3; the local `__meta` history uses the same message). It is random, made when the epoch starts (`EpochStart::fresh`). **Ordering uses only the numbers** (epoch, then `last_seq`); the nonce only says whether two records with the same number are the same epoch. Same number, different nonce ⇒ the histories forked at the lower start seq.
+- **Every master open starts a new epoch** (`bump_epoch` before the replication port opens), so one epoch has exactly one writer process and a restored backup needs no flag (`bump_epoch_on_open` is kept, documented as redundant). A promotion starts its own epoch, so `promote` opens the master with `Master::open_promoted`, which does not add a second one.
+- The handshake sends the client's newest epoch records as `known_epochs` (field 8, oldest first, ending with its own epoch: the last 5, or all when it has fewer; field 7 `known_epoch_start` is reserved). The server checks every one of them: any record it does not hold identically (start seq or nonce) changes the client's epoch and lowers the fork to that record's start. Rule 9 (`EPOCH_ADVANCED`) holds when all of them are in the server's history (no CRC needed) or the CRCs match; a proven CRC mismatch (10a) is checked first; 10b only without records.
+- `admin::compare` decides by the whole histories (nonces included), with CRC probes only as a second line of defence: `Comparison::Unverifiable` and `PromotionCheck::unverifiable` are removed. `PromotionUnverifiable` remains only for a peer that answered `Status` with an error. `repoint::divergence` uses the same history fork (`types::fork_from` over the slave's newest records).
+
+Consequence for existing tests: a master restart (also `a_failed_epoch_bump_fences_the_master_writer`'s reopen) now advances followers by one epoch (`EPOCH_ADVANCED`), and a restarted old master starts its own epoch, which can carry the number the new master already uses (then `DIVERGED`, not `STALE_EPOCH`). The two `STALE_EPOCH` tests bump the new master's epoch first so they still exercise rule 7. Histories are compared as `(epoch, start_seq)` pairs where nonces are random.
+
+**Interfaces:**
+- Consumes: Plan 2 `server::handshake::{ServerView, decide, changed_epoch_fork}`, `slave::driver::handshake_request`, `slave::repoint::{divergence, mode_error}`, `admin::{compare, fork_between, choose_promotion_candidate}`, `Slave::check_promotion`, `master::writer::Inner::bump_epoch`, `Store::promote_to_master`, `meta::{encode_epoch_history, decode_epoch_history}`, `net::convert::{epochs_to_pb, epochs_from_pb}`; harness `Cluster::{master, master_config, slave, slave_config, restart_master, restart_master_after_backup, path}`, `restore_dir`, `wait_state`, `wait_until`, `assert_converged`.
+- Produces:
+  - `pub struct EpochStart { pub epoch: u64, pub start_seq: Seq, pub nonce: u64 }`, `EpochStart::fresh(epoch, start_seq) -> EpochStart` (crate); `types::{KNOWN_EPOCHS = 5, newest_records(history, epoch) -> &[EpochStart], fork_from(history, newest: &[EpochStart]) -> Option<Seq>}` (crate).
+  - `pb::EpochStart.nonce`, `pb::HandshakeRequest.known_epochs: Vec<pb::EpochStart>` (field 8, 7 reserved).
+  - `net::convert::{epoch_to_pb, epoch_from_pb}`; `Inner::known_epochs() -> Vec<EpochStart>` (slave); `repoint::divergence(local: &[EpochStart], local_last: Seq, hs) -> Error`.
+  - `Master::open` starts a new epoch on every open of an existing database; `Master::open_promoted(cfg)` (crate) does not.
+  - `admin::Comparison` without `Unverifiable`; `PromotionCheck` without `unverifiable`.
+  - Tests: units `rule_09_the_history_proves_continuity_without_the_entry`, `the_same_epoch_with_another_nonce_is_another_epoch`, `every_record_the_client_sends_is_checked`, `up_to_five_newest_records_up_to_an_epoch`, `the_fork_from_a_set_of_records_is_the_lowest_difference`; e2e `a_trimmed_compatible_peer_does_not_block_a_checked_promotion`, `a_peer_on_another_history_blocks_a_checked_promotion_without_its_entries`, `a_restore_without_a_bump_is_diverged_by_the_history_alone`, `a_master_restart_moves_followers_to_the_new_epoch_without_a_bootstrap`.
+
+Every edit below was generated from the tested tree; apply them in order. `cargo fmt` leaves them unchanged.
+
+- [ ] **Step 1: Write the failing end-to-end tests**
+
+Append the new tests (and update the assertions that compare histories with literal records, whose nonces are now random):
+
+In `tests/promotion.rs`, replace:
+
+```rust
+use replicated_rocksdb::{
+    AllowAll, AllowMethods, CfSpec, DivergencePolicy, EpochStart, Error, HaltReason, LogApi,
+    Master, Method, Op, ReadApi, Role, Slave, SlaveState, UpstreamConfig,
+};
+```
+
+with:
+
+```rust
+use replicated_rocksdb::{
+    AllowAll, AllowMethods, CfSpec, DivergencePolicy, Error, HaltReason, LogApi, Master, Method,
+    Op, ReadApi, Role, Slave, SlaveState, UpstreamConfig,
+};
+```
+
+In `tests/promotion.rs`, replace:
+
+```rust
+    assert_eq!(
+        b.epoch_history(),
+        vec![
+            EpochStart {
+                epoch: 1,
+                start_seq: 1
+            },
+            EpochStart {
+                epoch: 2,
+                start_seq: fork
+            }
+        ]
+    );
+```
+
+with:
+
+```rust
+    assert_eq!(
+        b.epoch_history()
+            .iter()
+            .map(|e| (e.epoch, e.start_seq))
+            .collect::<Vec<_>>(),
+        vec![(1, 1), (2, fork)]
+    );
+```
+
+In `tests/promotion.rs`, replace:
+
+```rust
+    assert_eq!(cn.status().origin_identity.unwrap().epoch, 2);
+```
+
+with:
+
+```rust
+    assert_eq!(cn.status().origin_identity.unwrap().epoch, 2);
+    // A reopened old master starts an epoch of its own (here number 2, B's number, with
+    // another nonce: the handshake answers DIVERGED, see the handshake unit tests). B moves on to
+    // epoch 3, so the old master is behind by number: STALE_EPOCH.
+    b.bump_epoch().unwrap();
+    b.put("c", b"k1", b"v1").unwrap();
+    assert_converged(&b, &[("c", &cn)]).await;
+    assert_eq!(cn.status().origin_identity.unwrap().epoch, 3);
+```
+
+In `tests/promotion.rs`, replace:
+
+```rust
+    // B and C tail every entry, so C still holds B's last entry for the CRC probe. D joins
+    // later: it is bootstrapped past entry 1 and cannot prove it holds B's history.
+    let (b, _) = c.slave("b", a_addr).await;
+```
+
+with:
+
+```rust
+    // B and C tail every entry, so C still holds B's last entry for the CRC probe. D joins
+    // later: it is bootstrapped past entry 1 and does not hold it.
+    let (b, _) = c.slave("b", a_addr).await;
+```
+
+In `tests/promotion.rs`, replace:
+
+```rust
+    let b = refused.into_slave().expect("a refusal returns the slave");
+    // D is ahead too, but its history cannot be verified (bootstrapped past B's last entry):
+    // refused as well, not treated as diverged and ignored.
+    let d_addr = UpstreamConfig::from_addr(d.serve_addr().unwrap());
+```
+
+with:
+
+```rust
+    let b = refused.into_slave().expect("a refusal returns the slave");
+    // D is ahead too. It no longer holds B's last entry (bootstrapped past it), but the
+    // epoch histories (nonces included) prove it holds B's history: later, not unverifiable.
+    let d_addr = UpstreamConfig::from_addr(d.serve_addr().unwrap());
+```
+
+In `tests/promotion.rs`, replace:
+
+```rust
+        .err()
+        .expect("d is unverifiable");
+    assert!(
+        matches!(&refused.error, Error::PromotionUnverifiable { peer, seq: 2, .. } if peer == "d"),
+        "{refused}"
+```
+
+with:
+
+```rust
+        .err()
+        .expect("d is later");
+    assert!(
+        matches!(&refused.error, Error::NotMostAdvanced { leader, seq: 2, .. } if leader == "d"),
+        "{refused}"
+```
+
+In `tests/promotion.rs`, replace:
+
+```rust
+    assert_eq!(check.unreachable.len(), 1);
+    assert!(check.diverged.is_empty() && check.foreign.is_empty() && check.unverifiable.is_empty());
+    let new_master = cn
+```
+
+with:
+
+```rust
+    assert_eq!(check.unreachable.len(), 1);
+    assert!(check.diverged.is_empty() && check.foreign.is_empty());
+    let new_master = cn
+```
+
+In `tests/promotion.rs`, replace:
+
+```rust
+    assert_eq!(
+        w_master.epoch_history().last(),
+        Some(&EpochStart {
+            epoch: 2,
+            start_seq: s_w + 1
+        })
+    );
+```
+
+with:
+
+```rust
+    assert_eq!(
+        w_master
+            .epoch_history()
+            .last()
+            .map(|e| (e.epoch, e.start_seq)),
+        Some((2, s_w + 1))
+    );
+```
+
+In `tests/promotion.rs`, replace:
+
+```rust
+    assert_eq!(
+        x.promotion_info().epoch_history.last(),
+        Some(&EpochStart {
+            epoch: 2,
+            start_seq: s_w + 1
+        })
+    );
+```
+
+with:
+
+```rust
+    assert_eq!(
+        x.promotion_info()
+            .epoch_history
+            .last()
+            .map(|e| (e.epoch, e.start_seq)),
+        Some((2, s_w + 1))
+    );
+```
+
+In `tests/promotion.rs`, replace:
+
+```rust
+
+/// Plain `promote` asks no peer and picks epoch 2 again (from another seq). The handshake's
+/// `known_epoch_start` tells the two epochs 2 apart: X is not resumed into a history that
+/// contradicts its own (which looped every 50 ms before), it advances to R's epoch 2 and
+```
+
+with:
+
+```rust
+
+/// Plain `promote` asks no peer and picks epoch 2 again (from another seq, with another
+/// nonce). The handshake's `known_epochs` tells the two epochs 2 apart: X is not resumed into a history that
+/// contradicts its own (which looped every 50 ms before), it advances to R's epoch 2 and
+```
+
+In `tests/promotion.rs`, replace:
+
+```rust
+    assert_eq!(
+        r.epoch_history().last(),
+        Some(&EpochStart {
+            epoch: 2,
+            start_seq: s_r + 1
+        }),
+        "same number, other start"
+```
+
+with:
+
+```rust
+    assert_eq!(
+        r.epoch_history().last().map(|e| (e.epoch, e.start_seq)),
+        Some((2, s_r + 1)),
+        "same number, other start"
+```
+
+Append to `tests/promotion.rs`:
+
+```rust
+/// Addendum §7: a peer that no longer holds the entry that would prove compatibility is still
+/// compared exactly, by its epoch history (nonces included). C is behind B and B has trimmed
+/// C's last entry: C does not block `promote_checked`, and then follows the new master
+/// without a bootstrap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trimmed_compatible_peer_does_not_block_a_checked_promotion() {
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    let a_addr = a.serve_addr().unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (b, _) = reopen(&c, "b", a_addr, |cfg| {
+        cfg.retention.max_entries = Some(5);
+        cfg.retention.check_interval = Duration::from_millis(20);
+    })
+    .await;
+    let (cn, _) = c.slave("c", a_addr).await;
+    for (name, s) in [("b", &b), ("c", &cn)] {
+        wait_state(s, name, |st| *st == SlaveState::Streaming).await;
+    }
+    a.put("c", b"seen by c", b"v").unwrap();
+    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
+    let c_last = cn.last_seq();
+    cn.shutdown().await.unwrap();
+    for i in 0..5u8 {
+        a.put("c", &[i], b"only b").unwrap();
+    }
+    assert_converged(&a, &[("b", &b)]).await;
+    wait_until("b keeps only the entries after c's last one", || {
+        b.first_retained_seq() == c_last + 1
+    })
+    .await;
+    a.shutdown().await.unwrap();
+
+    // C answers Status (its upstream is gone).
+    let (cn, lc) = reopen(&c, "c", a_addr, |_| {}).await;
+    let c_up = UpstreamConfig::from_addr(cn.serve_addr().unwrap());
+    let check = b
+        .check_promotion(std::slice::from_ref(&c_up))
+        .await
+        .unwrap();
+    assert!(
+        check.diverged.is_empty() && check.foreign.is_empty() && check.unreachable.is_empty(),
+        "{check:?}"
+    );
+    let b = b
+        .promote_checked(c.master_config("b"), std::slice::from_ref(&c_up))
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(
+        support::WAIT,
+        cn.repoint(
+            UpstreamConfig::from_addr(b.serve_addr().unwrap()),
+            replicated_rocksdb::RepointOptions::default(),
+        ),
+    )
+    .await
+    .expect("repoint settles")
+    .unwrap();
+    assert_eq!(outcome, replicated_rocksdb::RepointOutcome::EpochAdvanced);
+    b.put("c", b"after", b"v").unwrap();
+    assert_converged(&b, &[("c", &cn)]).await;
+    assert_eq!(lc.bootstraps(), 0, "the history proved continuity");
+}
+
+/// Addendum §7: B followed a master that was then restored from a backup. The restored
+/// master's open started epoch 2 again, with another nonce, and D bootstrapped from it past
+/// every entry B holds. The histories alone prove that D holds entries B's history lacks:
+/// promoting B would discard them (`PromotionWouldDiscard`), not "unverifiable".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_on_another_history_blocks_a_checked_promotion_without_its_entries() {
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    a.create_cf(CfSpec::new("c")).unwrap();
+    a.put("c", b"k", b"1").unwrap();
+    let a = c.restart_master_after_backup(a, "a", "a-backup").await;
+    let fork = a.last_seq() + 1;
+    let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
+    for i in 0..3u8 {
+        a.put("c", &[i], b"lost").unwrap();
+    }
+    assert_converged(&a, &[("b", &b)]).await;
+    b.shutdown().await.unwrap();
+    let port = a.serve_addr().unwrap().port();
+    a.shutdown().await.unwrap();
+
+    support::restore_dir(&c.path("a-backup"), &c.path("a"));
+    let mut mcfg = c.master_config("a");
+    mcfg.serve.as_mut().unwrap().port = port;
+    let a = Master::open(mcfg).await.unwrap();
+    assert_eq!(a.identity().epoch, 2, "the same number as the lost epoch");
+    for i in 0..5u8 {
+        a.put("c", &[i], b"new").unwrap();
+    }
+    let (d, _) = c.slave("d", a.serve_addr().unwrap()).await;
+    assert_converged(&a, &[("d", &d)]).await;
+    let d_last = d.last_seq();
+    a.shutdown().await.unwrap();
+
+    let (b, _) = reopen(&c, "b", SocketAddr::from(([127, 0, 0, 1], port)), |_| {}).await;
+    let d_up = UpstreamConfig::from_addr(d.serve_addr().unwrap());
+    let refused = b
+        .promote_checked(c.master_config("b"), std::slice::from_ref(&d_up))
+        .await
+        .err()
+        .expect("d holds entries past the fork");
+    match refused.error {
+        Error::PromotionWouldDiscard {
+            ref peer,
+            fork: f,
+            peer_last_seq,
+        } => assert_eq!((peer.as_str(), f, peer_last_seq), ("d", fork, d_last)),
+        ref e => panic!("expected PromotionWouldDiscard, got {e}"),
+    }
+}
+```
+
+In `tests/rebootstrap.rs`, replace:
+
+```rust
+
+/// A master restored from an older backup without an epoch bump: a slave that is ahead is
+/// DIVERGED (rule 11) and halts by default, or re-bootstraps with `DivergencePolicy::Rebootstrap`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+```
+
+with:
+
+```rust
+
+/// A master restored from an older backup without an epoch bump: its open starts a new epoch at
+/// the restore point, so a slave that holds entries past it is DIVERGED (rule 8) and halts by
+/// default, or re-bootstraps with `DivergencePolicy::Rebootstrap`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+```
+
+Append to `tests/rebootstrap.rs`:
+
+```rust
+/// Addendum §7: a restore without `bump_epoch_on_open` is detected by the epoch history alone.
+/// The restored master writes past the slave's position (so rule 11 does not apply) and trims
+/// the slave's last entry (so no CRC can be compared): only the new epoch its open started
+/// tells the histories apart. Before per-open epochs this resumed silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_without_a_bump_is_diverged_by_the_history_alone() {
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", b"k", b"1").unwrap();
+    let m = c.restart_master_after_backup(m, "a", "a-backup").await;
+    let (s, _) = c.slave("s", m.serve_addr().unwrap()).await;
+    for i in 0..3u8 {
+        m.put("c", &[i], b"lost").unwrap();
+    }
+    assert_converged(&m, &[("s", &s)]).await;
+    let s_last = s.last_seq();
+    let s_cfg = c.slave_config("s", m.serve_addr().unwrap()).0;
+    s.shutdown().await.unwrap();
+    let port = m.serve_addr().unwrap().port();
+    m.shutdown().await.unwrap();
+
+    restore_dir(&c.path("a-backup"), &c.path("a"));
+    let mut mcfg = c.master_config("a");
+    mcfg.serve.as_mut().unwrap().port = port;
+    mcfg.retention.max_entries = Some(1);
+    mcfg.retention.check_interval = Duration::from_millis(20);
+    let m = Master::open(mcfg).await.unwrap();
+    for i in 0..10u8 {
+        m.put("c", &[i], b"new history").unwrap();
+    }
+    assert!(m.last_seq() > s_last);
+    wait_until("the restored master trims the slave's last entry", || {
+        m.first_retained_seq() > s_last
+    })
+    .await;
+
+    let s = Slave::open(s_cfg).await.unwrap();
+    wait_state(&s, "Diverged halt", halted(HaltReason::Diverged)).await;
+    assert_eq!(
+        s.get("c", &[0]).unwrap(),
+        Some(b"lost".to_vec()),
+        "data intact"
+    );
+}
+```
+
+Append to `tests/failure_resume.rs`:
+
+```rust
+/// Addendum §7: every master open starts a new epoch, and its followers move to it with
+/// `EPOCH_ADVANCED`, without a bootstrap, even when the master no longer holds a follower's
+/// last entry (the history proves continuity; no CRC is needed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_master_restart_moves_followers_to_the_new_epoch_without_a_bootstrap() {
+    let c = Cluster::new();
+    let mut mcfg = c.master_config("a");
+    mcfg.retention.max_entries = Some(3);
+    mcfg.retention.check_interval = Duration::from_millis(20);
+    let m = Master::open(mcfg.clone()).await.unwrap();
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (b_cfg, listener) = c.slave_config("b", m.serve_addr().unwrap());
+    let b = Slave::open(b_cfg.clone()).await.unwrap();
+    wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
+    m.put("c", b"k", b"v").unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    let b_last = b.last_seq();
+    b.shutdown().await.unwrap();
+    for i in 0..3u8 {
+        m.put("c", &[i], b"w").unwrap();
+    }
+    wait_until("the master keeps only the entries after b's", || {
+        m.first_retained_seq() == b_last + 1
+    })
+    .await;
+    let m = c.restart_master(m, mcfg).await;
+    assert_eq!(m.identity().epoch, 2);
+
+    let b = Slave::open(b_cfg).await.unwrap();
+    wait_until("b adopts the new epoch", || {
+        b.status().origin_identity == Some(m.identity())
+    })
+    .await;
+    wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
+    m.put("c", b"after the restart", b"v").unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    assert_eq!(b.status().origin_identity, Some(m.identity()));
+    assert_eq!(b.promotion_info().epoch_history, m.epoch_history());
+    assert_eq!(listener.bootstraps(), 1, "only the initial bootstrap");
+    listener.assert_no_violations();
+}
+```
+
+In `tests/master_write.rs`, replace:
+
+```rust
+use common::{T0, clock, config, log};
+use replicated_rocksdb::{Batch, CfSpec, EpochStart, Error, IterMode, LogApi, Master, Op, ReadApi};
+
+#[tokio::test]
+async fn first_open_creates_identity_and_reopen_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+```
+
+with:
+
+```rust
+use common::{T0, clock, config, log};
+use replicated_rocksdb::{Batch, CfSpec, Error, IterMode, LogApi, Master, Op, ReadApi};
+
+/// Every open of an existing database starts a new epoch (addendum §7): same `db_uuid`, the
+/// next epoch number, starting at `last_seq + 1`, with a fresh nonce.
+#[tokio::test]
+async fn first_open_creates_identity_and_reopen_starts_a_new_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+```
+
+In `tests/master_write.rs`, replace:
+
+```rust
+    assert_eq!(
+        m.epoch_history(),
+        vec![EpochStart {
+            epoch: 1,
+            start_seq: 1
+        }]
+    );
+    m.create_cf(CfSpec::new("users")).unwrap();
+    m.put("users", b"k", b"v").unwrap();
+    m.shutdown().await.unwrap();
+
+    let m = Master::open(config(dir.path(), &c)).await.unwrap();
+    assert_eq!(m.identity(), id);
+    assert_eq!(m.last_seq(), 2);
+    assert_eq!(m.get("users", b"k").unwrap().unwrap(), b"v");
+    assert_eq!(m.put("users", b"k2", b"v").unwrap(), 3);
+}
+```
+
+with:
+
+```rust
+    assert_eq!(
+        m.epoch_history()
+            .iter()
+            .map(|e| (e.epoch, e.start_seq))
+            .collect::<Vec<_>>(),
+        vec![(1, 1)]
+    );
+    m.create_cf(CfSpec::new("users")).unwrap();
+    m.put("users", b"k", b"v").unwrap();
+    let first = m.epoch_history()[0];
+    m.shutdown().await.unwrap();
+
+    let m = Master::open(config(dir.path(), &c)).await.unwrap();
+    assert_eq!(m.identity().db_uuid, id.db_uuid);
+    assert_eq!(m.identity().epoch, 2);
+    let history = m.epoch_history();
+    assert_eq!(history[0], first, "the old record is kept as it was");
+    assert_eq!((history[1].epoch, history[1].start_seq), (2, 3));
+    assert_ne!(history[1].nonce, first.nonce);
+    assert_eq!(m.last_seq(), 2);
+    assert_eq!(m.get("users", b"k").unwrap().unwrap(), b"v");
+    assert_eq!(m.put("users", b"k2", b"v").unwrap(), 3);
+    assert_eq!(log(&m).last().unwrap().epoch, 2);
+    m.shutdown().await.unwrap();
+    // An open without writes still starts an epoch (empty epochs share their start seq).
+    Master::open(config(dir.path(), &c))
+        .await
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    let m = Master::open(config(dir.path(), &c)).await.unwrap();
+    assert_eq!(
+        m.epoch_history()
+            .iter()
+            .map(|e| (e.epoch, e.start_seq))
+            .collect::<Vec<_>>(),
+        vec![(1, 1), (2, 3), (3, 4), (4, 4)]
+    );
+}
+```
+
+In `tests/master_write.rs`, replace:
+
+```rust
+    assert_eq!(
+        m.epoch_history(),
+        vec![
+            EpochStart {
+                epoch: 1,
+                start_seq: 1
+            },
+            EpochStart {
+                epoch: 2,
+                start_seq: 2
+            }
+        ]
+    );
+```
+
+with:
+
+```rust
+    assert_eq!(
+        m.epoch_history()
+            .iter()
+            .map(|e| (e.epoch, e.start_seq))
+            .collect::<Vec<_>>(),
+        vec![(1, 1), (2, 2)]
+    );
+```
+
+In `tests/master_write.rs`, replace:
+
+```rust
+    assert_eq!(
+        m.epoch_history().last(),
+        Some(&EpochStart {
+            epoch: 3,
+            start_seq: 3
+        })
+    );
+```
+
+with:
+
+```rust
+    assert_eq!(
+        m.epoch_history().last().map(|e| (e.epoch, e.start_seq)),
+        Some((3, 3))
+    );
+```
+
+In `tests/master_write.rs`, replace:
+
+```rust
+    assert_eq!(
+        m.epoch_history(),
+        vec![EpochStart {
+            epoch: 1,
+            start_seq: 1
+        }]
+    );
+```
+
+with:
+
+```rust
+    assert_eq!(
+        m.epoch_history()
+            .iter()
+            .map(|e| (e.epoch, e.start_seq))
+            .collect::<Vec<_>>(),
+        vec![(1, 1)]
+    );
+```
+
+In `tests/repoint.rs`, replace:
+
+```rust
+    b.put("c", b"k2", b"v2").unwrap();
+    assert_converged(&b, &[("c", &cn)]).await;
+```
+
+with:
+
+```rust
+    b.put("c", b"k2", b"v2").unwrap();
+    // The reopened old master starts an epoch of its own, numbered 2 like B's (another nonce:
+    // that would be DIVERGED). B moves on to epoch 3, so the old master is behind: STALE_EPOCH.
+    b.bump_epoch().unwrap();
+    assert_converged(&b, &[("c", &cn)]).await;
+```
+
+In `tests/failpoints.rs`, replace:
+
+```rust
+/// A failed epoch bump fences the master's writer until reopen (the durability of the bump
+/// is unknown); the reopened master is at the old epoch and accepts writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+```
+
+with:
+
+```rust
+/// A failed epoch bump fences the master's writer until reopen (the durability of the bump
+/// is unknown); the reopened master starts the next epoch and accepts writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+```
+
+In `tests/failpoints.rs`, replace:
+
+```rust
+    m.shutdown().await.unwrap();
+    let m = Master::open(c.master_config("a")).await.unwrap();
+    assert_eq!(m.identity().epoch, 1);
+    assert_eq!(m.put("c", b"k", b"v").unwrap(), 2);
+```
+
+with:
+
+```rust
+    m.shutdown().await.unwrap();
+    // The failed bump persisted nothing: the reopen starts epoch 2 (every open starts one).
+    let m = Master::open(c.master_config("a")).await.unwrap();
+    assert_eq!(m.identity().epoch, 2);
+    assert_eq!(m.epoch_history().len(), 2);
+    assert_eq!(m.put("c", b"k", b"v").unwrap(), 2);
+```
+
+- [ ] **Step 2: Run them to confirm they fail**
+
+Run: `cargo test --test promotion --test rebootstrap --test failure_resume --test master_write --test repoint`
+Expected: FAIL to compile: `no field nonce on type EpochStart` (`tests/master_write.rs`). With that test file set aside, the new tests fail: `a_trimmed_compatible_peer_does_not_block_a_checked_promotion` (the repoint halts `IdentityChanged`: continuity cannot be proven without the trimmed entry), `a_peer_on_another_history_blocks_a_checked_promotion_without_its_entries` (`PromotionUnverifiable`, and the restored master is still at epoch 1), `a_restore_without_a_bump_is_diverged_by_the_history_alone` (the slave resumes) and `a_master_restart_moves_followers_to_the_new_epoch_without_a_bootstrap` (epoch 1 after the restart).
+
+- [ ] **Step 3: The record and the wire**
+
+In `proto/replication.proto` **and** in the PROTOCOL.md §14 block (byte-identical), replace:
+
+In `proto/replication.proto`, replace:
+
+```proto
+message EpochStart { uint64 epoch = 1; uint64 start_seq = 2; }
+```
+
+with:
+
+```proto
+message EpochStart { uint64 epoch = 1; uint64 start_seq = 2; uint64 nonce = 3; }
+```
+
+In PROTOCOL.md, the same line appears in §5.5 and in §14; replace it in both places (all 2 occurrences)
+
+```proto
+message EpochStart { uint64 epoch = 1; uint64 start_seq = 2; }
+```
+
+with:
+
+```proto
+message EpochStart { uint64 epoch = 1; uint64 start_seq = 2; uint64 nonce = 3; }
+```
+
+In `proto/replication.proto`, in `HandshakeRequest`, replace:
+
+```proto
+  optional uint64 known_epoch_start = 7;  // start_seq of known_identity.epoch in the client's history
+}
+```
+
+with:
+
+```proto
+  reserved 7;                              // was known_epoch_start
+  repeated EpochStart known_epochs = 8;   // the client's newest epoch records (up to 5), oldest first
+}
+```
+
+and the same in the PROTOCOL.md §14 block:
+
+```proto
+  optional uint64 known_epoch_start = 7;  // start_seq of known_identity.epoch in the client's history
+}
+```
+
+with:
+
+```proto
+  reserved 7;                              // was known_epoch_start
+  repeated EpochStart known_epochs = 8;   // the client's newest epoch records (up to 5), oldest first
+}
+```
+
+In `src/types.rs`, replace:
+
+```rust
+/// Start of one epoch in the epoch history (PROTOCOL.md §5.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+```
+
+with:
+
+```rust
+/// Start of one epoch in the epoch history (PROTOCOL.md §5.5).
+///
+/// Which of two nodes is later is decided by `epoch` and `last_seq` only. `nonce` only says
+/// whether two records with the same `epoch` are the same epoch: it is random, created when
+/// the epoch starts (a fresh master, every master open, `bump_epoch`, a promotion), and two
+/// histories that hold the same `epoch` with different nonces forked at the lower of the two
+/// `start_seq`s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+```
+
+In `src/types.rs`, replace:
+
+```rust
+    pub start_seq: Seq,
+}
+```
+
+with:
+
+```rust
+    pub start_seq: Seq,
+    /// Random identity of this epoch.
+    pub nonce: u64,
+}
+
+impl EpochStart {
+    /// A new epoch with a fresh random nonce.
+    pub(crate) fn fresh(epoch: u64, start_seq: Seq) -> EpochStart {
+        EpochStart {
+            epoch,
+            start_seq,
+            nonce: uuid::Uuid::new_v4().as_u64_pair().0,
+        }
+    }
+}
+```
+
+In `src/types.rs`, replace:
+
+```rust
+        .map(|e| e.start_seq)
+}
+```
+
+with:
+
+```rust
+        .map(|e| e.start_seq)
+}
+
+/// How many of its newest epoch records a node presents to prove its history (PROTOCOL.md
+/// §6.1, `known_epochs`); all of them when it has fewer.
+pub(crate) const KNOWN_EPOCHS: usize = 5;
+
+/// The newest [`KNOWN_EPOCHS`] records of `history` up to and including `epoch`, oldest first.
+pub(crate) fn newest_records(history: &[EpochStart], epoch: u64) -> &[EpochStart] {
+    let end = history.iter().take_while(|e| e.epoch <= epoch).count();
+    &history[end.saturating_sub(KNOWN_EPOCHS)..end]
+}
+
+/// Where a history whose newest records are `newest` (oldest first; the last one is that node's
+/// epoch) leaves `history` (PROTOCOL.md §6.3): the start of the first later epoch in `history`,
+/// lowered to the lower of the two start seqs for every record of `newest` that `history` does
+/// not hold identically (another start or nonce, or no record of that number). `None` when
+/// `history` holds all of `newest` and has no later epoch, or `newest` is empty.
+pub(crate) fn fork_from(history: &[EpochStart], newest: &[EpochStart]) -> Option<Seq> {
+    let mut fork = fork_after(history, newest.last()?.epoch);
+    for k in newest.iter().filter(|k| !history.contains(k)) {
+        let own = history.iter().find(|e| e.epoch == k.epoch);
+        let start = own.map_or(k.start_seq, |o| o.start_seq.min(k.start_seq));
+        fork = Some(fork.map_or(start, |f| f.min(start)));
+    }
+    fork
+}
+```
+
+In `src/types.rs`, replace:
+
+```rust
+    use super::*;
+    use std::time::Duration;
+```
+
+with:
+
+```rust
+    use super::*;
+
+    fn rec(epoch: u64, start_seq: Seq, nonce: u64) -> EpochStart {
+        EpochStart {
+            epoch,
+            start_seq,
+            nonce,
+        }
+    }
+
+    #[test]
+    fn up_to_five_newest_records_up_to_an_epoch() {
+        let h: Vec<EpochStart> = (1..=7).map(|e| rec(e, e * 10, e)).collect();
+        assert_eq!(newest_records(&h, 7), &h[2..7]);
+        assert_eq!(
+            newest_records(&h, 3),
+            &h[0..3],
+            "all of them when there are fewer"
+        );
+        assert_eq!(newest_records(&h, 6), &h[1..6]);
+        assert!(newest_records(&h, 0).is_empty());
+    }
+
+    #[test]
+    fn the_fork_from_a_set_of_records_is_the_lowest_difference() {
+        let server = vec![rec(1, 1, 1), rec(2, 10, 2), rec(3, 20, 3), rec(4, 30, 4)];
+        // A prefix: the fork is the next epoch's start.
+        assert_eq!(fork_from(&server, &server[..2]), Some(20));
+        assert_eq!(fork_from(&server, &server), None);
+        // Epoch 3 with another nonce: the histories differ from its start.
+        assert_eq!(
+            fork_from(&server, &[rec(2, 10, 2), rec(3, 20, 9)]),
+            Some(20)
+        );
+        // An older record differs: the fork moves down to it.
+        assert_eq!(
+            fork_from(&server, &[rec(2, 12, 7), rec(3, 20, 3)]),
+            Some(10)
+        );
+        // A number the server never had forks at the client's start.
+        assert_eq!(
+            fork_from(&server[..2], &[rec(1, 1, 1), rec(3, 15, 3)]),
+            Some(15)
+        );
+        assert_eq!(fork_from(&server, &[]), None);
+    }
+    use std::time::Duration;
+```
+
+In `src/types.rs`, replace:
+
+```rust
+                start_seq: 1,
+            },
+```
+
+with:
+
+```rust
+                start_seq: 1,
+                nonce: 0,
+            },
+```
+
+In `src/types.rs`, replace:
+
+```rust
+                start_seq: 701,
+            },
+```
+
+with:
+
+```rust
+                start_seq: 701,
+                nonce: 0,
+            },
+```
+
+In `src/types.rs`, replace:
+
+```rust
+                start_seq: 900,
+            },
+```
+
+with:
+
+```rust
+                start_seq: 900,
+                nonce: 0,
+            },
+```
+
+In `src/net/convert.rs`, replace:
+
+```rust
+
+pub(crate) fn epochs_to_pb(h: &[EpochStart]) -> Vec<pb::EpochStart> {
+    h.iter()
+        .map(|e| pb::EpochStart {
+            epoch: e.epoch,
+            start_seq: e.start_seq,
+        })
+        .collect()
+}
+
+pub(crate) fn epochs_from_pb(h: &[pb::EpochStart]) -> Vec<EpochStart> {
+    h.iter()
+        .map(|e| EpochStart {
+            epoch: e.epoch,
+            start_seq: e.start_seq,
+        })
+        .collect()
+}
+```
+
+with:
+
+```rust
+
+pub(crate) fn epoch_to_pb(e: &EpochStart) -> pb::EpochStart {
+    pb::EpochStart {
+        epoch: e.epoch,
+        start_seq: e.start_seq,
+        nonce: e.nonce,
+    }
+}
+
+pub(crate) fn epoch_from_pb(e: &pb::EpochStart) -> EpochStart {
+    EpochStart {
+        epoch: e.epoch,
+        start_seq: e.start_seq,
+        nonce: e.nonce,
+    }
+}
+
+pub(crate) fn epochs_to_pb(h: &[EpochStart]) -> Vec<pb::EpochStart> {
+    h.iter().map(epoch_to_pb).collect()
+}
+
+pub(crate) fn epochs_from_pb(h: &[pb::EpochStart]) -> Vec<EpochStart> {
+    h.iter().map(epoch_from_pb).collect()
+}
+```
+
+In `src/net/convert.rs`, replace:
+
+```rust
+                start_seq: 1,
+            },
+```
+
+with:
+
+```rust
+                start_seq: 1,
+                nonce: 0,
+            },
+```
+
+In `src/net/convert.rs`, replace:
+
+```rust
+                start_seq: 70,
+            },
+```
+
+with:
+
+```rust
+                start_seq: 70,
+                nonce: 0,
+            },
+```
+
+In `src/net/convert.rs`, replace:
+
+```rust
+            v.iter()
+                .map(|&(epoch, start_seq)| pb::EpochStart { epoch, start_seq })
+                .collect::<Vec<_>>()
+```
+
+with:
+
+```rust
+            v.iter()
+                .map(|&(epoch, start_seq)| pb::EpochStart {
+                    epoch,
+                    start_seq,
+                    nonce: 0,
+                })
+                .collect::<Vec<_>>()
+```
+
+In `src/net/convert.rs`, replace:
+
+```rust
+                epoch: 1,
+                start_seq: 1
+            }]
+```
+
+with:
+
+```rust
+                epoch: 1,
+                start_seq: 1,
+                nonce: 0,
+            }]
+```
+
+In `src/store/meta.rs`, replace:
+
+```rust
+            epoch: e.epoch,
+            start_seq: e.start_seq,
+        })
+        .collect();
+```
+
+with:
+
+```rust
+            epoch: e.epoch,
+            start_seq: e.start_seq,
+            nonce: e.nonce,
+        })
+        .collect();
+```
+
+In `src/store/meta.rs`, replace:
+
+```rust
+            start_seq: e.start_seq,
+        })
+```
+
+with:
+
+```rust
+            start_seq: e.start_seq,
+            nonce: e.nonce,
+        })
+```
+
+- [ ] **Step 4: Every master open starts an epoch**
+
+In `src/master/mod.rs`, replace:
+
+```rust
+    /// Opens or creates a master database. Must be called within a tokio runtime.
+    pub async fn open(cfg: MasterConfig) -> Result<Self> {
+        cfg.validate()?;
+```
+
+with:
+
+```rust
+    /// Opens or creates a master database. Must be called within a tokio runtime.
+    ///
+    /// Every open of an existing database starts a new epoch (a fresh nonce, starting at
+    /// `last_seq + 1`) before the replication port opens: within one epoch there is exactly
+    /// one writer process, so two histories can only differ from an epoch's start on, and a
+    /// database restored from a backup is told apart from the history its replicas followed
+    /// (DESIGN.md §13). Replicas continue across the restart with `EPOCH_ADVANCED`.
+    pub async fn open(cfg: MasterConfig) -> Result<Self> {
+        Self::open_with(cfg, true).await
+    }
+
+    /// Opens a database that a promotion just turned into a master: the promotion already
+    /// started its epoch.
+    pub(crate) async fn open_promoted(cfg: MasterConfig) -> Result<Self> {
+        Self::open_with(cfg, false).await
+    }
+
+    async fn open_with(cfg: MasterConfig, new_epoch: bool) -> Result<Self> {
+        cfg.validate()?;
+```
+
+In `src/master/mod.rs`, replace:
+
+```rust
+                };
+                let history = vec![EpochStart {
+                    epoch: 1,
+                    start_seq: 1,
+                }];
+                store.write_meta(
+```
+
+with:
+
+```rust
+                };
+                let history = vec![EpochStart::fresh(1, 1)];
+                store.write_meta(
+```
+
+In `src/master/mod.rs`, replace:
+
+```rust
+        };
+        let bump = cfg.bump_epoch_on_open;
+        let inner = Arc::new(Inner::new(store, cfg, meta.last_ts, identity, history));
+        if bump && !fresh {
+            inner.bump_epoch()?;
+        }
+        // The epoch bump above happens before the replication port opens (DESIGN.md §13).
+        let server =
+```
+
+with:
+
+```rust
+        };
+        let inner = Arc::new(Inner::new(store, cfg, meta.last_ts, identity, history));
+        if new_epoch && !fresh {
+            inner.bump_epoch()?;
+        }
+        // The new epoch above starts before the replication port opens (DESIGN.md §13).
+        let server =
+```
+
+In `src/master/writer.rs`, replace:
+
+```rust
+        let start = self.store.position().last_seq + 1;
+        history.push(EpochStart {
+            epoch: id.epoch,
+            start_seq: start,
+        });
+        let written = crate::failpoint::io_error("master-bump-epoch-write").and_then(|()| {
+```
+
+with:
+
+```rust
+        let start = self.store.position().last_seq + 1;
+        history.push(EpochStart::fresh(id.epoch, start));
+        let written = crate::failpoint::io_error("master-bump-epoch-write").and_then(|()| {
+```
+
+In `src/config.rs`, replace:
+
+```rust
+    pub heartbeat: Duration,
+    /// Set when opening a database restored from a backup (DESIGN.md §13).
+    pub bump_epoch_on_open: bool,
+```
+
+with:
+
+```rust
+    pub heartbeat: Duration,
+    /// Redundant, kept for compatibility: every open of an existing master database starts a
+    /// new epoch anyway (DESIGN.md §13), so a database restored from a backup never reuses the
+    /// epoch its replicas may have followed past the restore point.
+    pub bump_epoch_on_open: bool,
+```
+
+In `src/store/promote.rs`, replace:
+
+```rust
+        let epoch = own.max(m.max_burned_epoch).max(floor) + 1;
+        history.push(EpochStart {
+            epoch,
+            start_seq: m.last_seq + 1,
+        });
+        let identity = DbIdentity {
+```
+
+with:
+
+```rust
+        let epoch = own.max(m.max_burned_epoch).max(floor) + 1;
+        history.push(EpochStart::fresh(epoch, m.last_seq + 1));
+        let identity = DbIdentity {
+```
+
+In `src/store/promote.rs`, replace:
+
+```rust
+                    epoch: 1,
+                    start_seq: 1,
+                },
+                EpochStart {
+```
+
+with:
+
+```rust
+                    epoch: 1,
+                    start_seq: 1,
+                    nonce: 0,
+                },
+                EpochStart {
+```
+
+In `src/store/promote.rs`, replace:
+
+```rust
+                    start_seq: 1,
+                },
+```
+
+with:
+
+```rust
+                    start_seq: 1,
+                    nonce: 0,
+                },
+```
+
+In `src/store/promote.rs`, replace:
+
+```rust
+        assert_eq!(
+            m.epoch_history.last(),
+            Some(&EpochStart {
+                epoch: 3,
+                start_seq: 3
+            })
+        );
+```
+
+with:
+
+```rust
+        assert_eq!(
+            m.epoch_history.last().map(|e| (e.epoch, e.start_seq)),
+            Some((3, 3))
+        );
+```
+
+In `src/store/promote.rs`, replace:
+
+```rust
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path(), Role::Slave, Default::default())
+                .unwrap()
+                .0;
+            let id = DbIdentity {
+                db_uuid: uuid::Uuid::from_u128(5),
+                epoch: 1,
+            };
+            store
+                .finish_bootstrap(&BootstrapFinish {
+                    identity: id,
+                    epoch_history: vec![EpochStart {
+                        epoch: 1,
+                        start_seq: 1,
+                    }],
+                    cf_specs: vec![],
+                    snapshot_seq: 0,
+                    snapshot_crc: None,
+                    max_entry_bytes: 1 << 20,
+                })
+                .unwrap();
+            apply(
+                &store,
+                vec![Op::CreateCf {
+                    spec: CfSpec::new("c"),
+                }],
+            )
+            .unwrap();
+            store.promote_to_master(0).unwrap();
+```
+
+with:
+
+```rust
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open(dir.path(), Role::Slave, Default::default())
+                .unwrap()
+                .0;
+            let id = DbIdentity {
+                db_uuid: uuid::Uuid::from_u128(5),
+                epoch: 1,
+            };
+            store
+                .finish_bootstrap(&BootstrapFinish {
+                    identity: id,
+                    epoch_history: vec![EpochStart {
+                        epoch: 1,
+                        start_seq: 1,
+                        nonce: 0,
+                    }],
+                    cf_specs: vec![],
+                    snapshot_seq: 0,
+                    snapshot_crc: None,
+                    max_entry_bytes: 1 << 20,
+                })
+                .unwrap();
+            apply(
+                &store,
+                vec![Op::CreateCf {
+                    spec: CfSpec::new("c"),
+                }],
+            )
+            .unwrap();
+            store.promote_to_master(0).unwrap();
+```
+
+In `src/store/promote.rs`, replace:
+
+```rust
+                epoch: 1,
+                start_seq: 1
+            }]
+```
+
+with:
+
+```rust
+                epoch: 1,
+                start_seq: 1,
+                nonce: 0,
+            }]
+```
+
+In `src/store/promote.rs`, replace:
+
+```rust
+                        start_seq: 1,
+                    }],
+```
+
+with:
+
+```rust
+                        start_seq: 1,
+                        nonce: 0,
+                    }],
+```
+
+- [ ] **Step 5: The handshake, the client's record, and the divergence report**
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
+use crate::pb;
+use crate::types::{DbIdentity, EpochStart, Seq, fork_after};
+```
+
+with:
+
+```rust
+use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
+use crate::net::convert::epoch_from_pb;
+use crate::pb;
+use crate::types::{DbIdentity, EpochStart, Seq, fork_after, fork_from};
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+
+/// Evaluates PROTOCOL.md §6.3 rules 1–14 (with 10a/10b) in order; the first match wins.
+pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
+```
+
+with:
+
+```rust
+
+/// Evaluates PROTOCOL.md §6.3 rules 1–14 (with 10a/10b) in order, 10a before 9; the first
+/// match wins.
+pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+    }
+    if let Some(cfork) = changed_epoch_fork(v, known.epoch, ident.epoch, r.known_epoch_start) {
+        // 8: the client holds entries at or past the point where its history leaves the server's.
+```
+
+with:
+
+```rust
+    }
+    // The client's newest records count only if they end with its own epoch.
+    let known_records: Vec<EpochStart> = r.known_epochs.iter().map(epoch_from_pb).collect();
+    let known_records = match known_records.last() {
+        Some(k) if k.epoch == known.epoch => known_records,
+        _ => Vec::new(),
+    };
+    if let Some(cfork) = changed_epoch_fork(v, known.epoch, ident.epoch, &known_records) {
+        // 8: the client holds entries at or past the point where its history leaves the server's.
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+        }
+        // 9: continuity proven by the CRC of the client's last entry.
+        if client_crc_matches {
+            return verdict(
+```
+
+with:
+
+```rust
+        }
+        // 10a: a mismatch the server can prove below the fork outweighs any other evidence.
+        if r.last_crc32c.is_some() && v.crc_at_client_last.is_some() && !client_crc_matches {
+            return verdict(Reject, R::Diverged, format!("entry {} differs", r.last_seq));
+        }
+        // 9: continuity is proven by the history (the client's newest records, nonces included,
+        // are all in the server's history, and the client holds nothing at or past the fork) or
+        // by the CRC of the client's last entry.
+        let history_proves =
+            !known_records.is_empty() && known_records.iter().all(|k| v.epoch_history.contains(k));
+        if history_proves || client_crc_matches {
+            return verdict(
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+            );
+        }
+        // 10a: a proven mismatch below the fork.
+        if r.last_crc32c.is_some() && v.crc_at_client_last.is_some() {
+            return verdict(Reject, R::Diverged, format!("entry {} differs", r.last_seq));
+        }
+```
+
+with:
+
+```rust
+            );
+        }
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+/// `Some(cfork)` when the client's epoch is *changed* (PROTOCOL.md §6.3): an older epoch number,
+/// or the same number with another start seq (`known_epoch_start`) than the server's record of
+/// it. `cfork` is where the client's history leaves the server's (`None`: inconsistent).
+/// `None` when the client follows the server's epoch.
+fn changed_epoch_fork(
+```
+
+with:
+
+```rust
+/// `Some(cfork)` when the client's epoch is *changed* (PROTOCOL.md §6.3): an older epoch number,
+/// or one of the client's newest records (`known_epochs`, its own epoch last) is not in the
+/// server's history (another start seq or another nonce, or a number the server never had).
+/// `cfork` is where the client's history leaves the server's (`None`: inconsistent). `None`
+/// when the client follows the server's epoch.
+fn changed_epoch_fork(
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+    server_epoch: u64,
+    known_start: Option<Seq>,
+) -> Option<Option<Seq>> {
+    let server_start = v
+        .epoch_history
+        .iter()
+        .find(|e| e.epoch == known_epoch)
+        .map(|e| e.start_seq);
+    // The client's epoch began at another seq than the server's epoch of the same number (or
+    // the server never had that epoch): the histories differ from the lower start on.
+    let start_fork = known_start
+        .filter(|&k| server_start != Some(k))
+        .map(|k| server_start.map_or(k, |s| s.min(k)));
+    if known_epoch == server_epoch && start_fork.is_none() {
+        return None;
+    }
+    let fork = match (fork_after(&v.epoch_history, known_epoch), start_fork) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    Some(fork)
+}
+```
+
+with:
+
+```rust
+    server_epoch: u64,
+    known: &[EpochStart],
+) -> Option<Option<Seq>> {
+    let differs = known.iter().any(|k| !v.epoch_history.contains(k));
+    if known_epoch == server_epoch && !differs {
+        return None;
+    }
+    if known.is_empty() {
+        return Some(fork_after(&v.epoch_history, known_epoch));
+    }
+    Some(fork_from(&v.epoch_history, known))
+}
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+
+    /// A master at epoch 2 (fork after epoch 1 at seq 101), last_seq 200, log from 50.
+    fn master() -> ServerView {
+```
+
+with:
+
+```rust
+
+    fn record(epoch: u64, start_seq: Seq, nonce: u64) -> EpochStart {
+        EpochStart {
+            epoch,
+            start_seq,
+            nonce,
+        }
+    }
+
+    /// The client's newest records, oldest first.
+    fn known(records: &[(u64, Seq, u64)]) -> Vec<pb::EpochStart> {
+        records
+            .iter()
+            .map(|&(epoch, start_seq, nonce)| pb::EpochStart {
+                epoch,
+                start_seq,
+                nonce,
+            })
+            .collect()
+    }
+
+    /// A master at epoch 2 (fork after epoch 1 at seq 101; nonces 11 and 22), last_seq 200, log
+    /// from 50.
+    fn master() -> ServerView {
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+            }),
+            epoch_history: vec![
+                EpochStart {
+                    epoch: 1,
+                    start_seq: 1,
+                },
+                EpochStart {
+                    epoch: 2,
+                    start_seq: 101,
+                },
+            ],
+            upstream_chain: vec![],
+```
+
+with:
+
+```rust
+            }),
+            epoch_history: vec![record(1, 1, 11), record(2, 101, 22)],
+            upstream_chain: vec![],
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+            last_crc32c: Some(0xAAAA),
+            known_epoch_start: Some(101),
+        }
+```
+
+with:
+
+```rust
+            last_crc32c: Some(0xAAAA),
+            known_epochs: known(&[(1, 1, 11), (2, 101, 22)]),
+        }
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+        r.known_identity.as_mut().unwrap().epoch = 1;
+        r.known_epoch_start = Some(1);
+        r.last_seq = last_seq;
+```
+
+with:
+
+```rust
+        r.known_identity.as_mut().unwrap().epoch = 1;
+        r.known_epochs = known(&[(1, 1, 11)]);
+        r.last_seq = last_seq;
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+        check(&master(), &r, Reject, R::Diverged);
+        // Without known_epoch_start (the field is optional) the fork is the same.
+        let mut r = epoch_1(101);
+        r.known_epoch_start = None;
+        check(&master(), &r, Reject, R::Diverged);
+```
+
+with:
+
+```rust
+        check(&master(), &r, Reject, R::Diverged);
+        // Without known_epochs (the field is optional) the fork is the same.
+        let mut r = epoch_1(101);
+        r.known_epochs = Vec::new();
+        check(&master(), &r, Reject, R::Diverged);
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+
+    #[test]
+    fn rule_10b_epoch_change_without_proof() {
+        let mut r = epoch_1(30);
+        r.last_crc32c = Some(0xAAAA);
+        let mut v = master();
+```
+
+with:
+
+```rust
+
+    /// The history proves continuity without any entry: the client's record of epoch 1, nonce
+    /// included, is in the server's history, so a trimmed entry or a missing CRC is no obstacle.
+    #[test]
+    fn rule_09_the_history_proves_continuity_without_the_entry() {
+        let mut r = epoch_1(30);
+        let mut v = master();
+        v.crc_at_client_last = None; // entry 30 was trimmed
+        check(&v, &r, Resume, R::EpochAdvanced);
+        r.last_crc32c = None;
+        check(&master(), &r, Resume, R::EpochAdvanced);
+        // Still: a proven CRC mismatch wins over the history.
+        let mut r = epoch_1(30);
+        r.last_crc32c = Some(0xBBBB);
+        check(&master(), &r, Reject, R::Diverged);
+    }
+
+    #[test]
+    fn rule_10b_epoch_change_without_proof() {
+        // No record sent: only the CRC can prove continuity.
+        let mut r = epoch_1(30);
+        r.known_epochs = Vec::new();
+        let mut v = master();
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+
+    #[test]
+    fn rule_08_inconsistent_history_fails_closed() {
+        let mut v = master();
+        v.epoch_history = vec![EpochStart {
+            epoch: 1,
+            start_seq: 1,
+        }];
+        let r = epoch_1(100);
+```
+
+with:
+
+```rust
+
+    /// Restoring a master from a backup without a bump: the restored node opens a new epoch 2
+    /// at 101 with another nonce. A client of the lost epoch 2 holding entries from 101 on is
+    /// DIVERGED by the history alone, even with matching CRCs.
+    #[test]
+    fn the_same_epoch_with_another_nonce_is_another_epoch() {
+        let mut r = req();
+        r.known_epochs = known(&[(1, 1, 11), (2, 101, 23)]);
+        check(&master(), &r, Reject, R::Diverged);
+        check(&replica(), &r, Reject, R::Diverged);
+        // Below the start nothing differs, but only the CRC proves it.
+        r.last_seq = 100;
+        check(&master(), &r, Resume, R::EpochAdvanced);
+        let mut v = master();
+        v.crc_at_client_last = None;
+        check(&v, &r, Bootstrap, R::IdentityChanged);
+    }
+
+    /// Up to five newest records are compared, not only the client's own epoch: an older
+    /// record with another nonce (a history that forked earlier and reached the same numbers)
+    /// moves the fork down to it.
+    #[test]
+    fn every_record_the_client_sends_is_checked() {
+        let mut r = req();
+        r.known_epochs = known(&[(1, 1, 99), (2, 101, 22)]);
+        check(&master(), &r, Reject, R::Diverged);
+        // Records that do not end with the client's own epoch are ignored: identities decide.
+        let mut r = req();
+        r.known_epochs = known(&[(1, 1, 11)]);
+        check(&master(), &r, Resume, R::Unspecified);
+    }
+
+    #[test]
+    fn rule_08_inconsistent_history_fails_closed() {
+        let mut v = master();
+        v.epoch_history = vec![record(1, 1, 11)];
+        let r = epoch_1(100);
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+        let mut r = req();
+        r.known_epoch_start = Some(81);
+        r.last_seq = 80;
+```
+
+with:
+
+```rust
+        let mut r = req();
+        r.known_epochs = known(&[(1, 1, 11), (2, 81, 33)]);
+        r.last_seq = 80;
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+        let mut r = req();
+        r.known_epoch_start = Some(121);
+        r.last_seq = 101;
+```
+
+with:
+
+```rust
+        let mut r = req();
+        r.known_epochs = known(&[(1, 1, 11), (2, 121, 33)]);
+        r.last_seq = 101;
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+        let mut r = req();
+        r.known_epoch_start = None;
+        check(&master(), &r, Resume, R::Unspecified);
+```
+
+with:
+
+```rust
+        let mut r = req();
+        r.known_epochs = Vec::new();
+        check(&master(), &r, Resume, R::Unspecified);
+```
+
+In `src/server/handshake.rs`, replace:
+
+```rust
+        });
+        v.epoch_history = vec![
+            EpochStart {
+                epoch: 1,
+                start_seq: 1,
+            },
+            EpochStart {
+                epoch: 3,
+                start_seq: 101,
+            },
+        ];
+        let mut r = req(); // epoch 2 from 81
+        r.known_epoch_start = Some(81);
+        r.last_seq = 90;
+```
+
+with:
+
+```rust
+        });
+        v.epoch_history = vec![record(1, 1, 11), record(3, 101, 33)];
+        let mut r = req(); // epoch 2 from 81
+        r.known_epochs = known(&[(1, 1, 11), (2, 81, 22)]);
+        r.last_seq = 90;
+```
+
+In `src/server/test_client.rs`, replace:
+
+```rust
+        last_crc32c: None,
+        known_epoch_start: None,
+    }
+```
+
+with:
+
+```rust
+        last_crc32c: None,
+        known_epochs: Vec::new(),
+    }
+```
+
+In `src/slave/inner.rs`, replace:
+
+```rust
+use crate::store::meta::{MetaSnapshot, key};
+use crate::types::{DbIdentity, EpochStart, Seq};
+```
+
+with:
+
+```rust
+use crate::store::meta::{MetaSnapshot, key};
+use crate::types::{DbIdentity, EpochStart, Seq, newest_records};
+```
+
+In `src/slave/inner.rs`, replace:
+
+```rust
+        *self.ident.write().unwrap_or_else(PoisonError::into_inner) = v;
+    }
+```
+
+with:
+
+```rust
+        *self.ident.write().unwrap_or_else(PoisonError::into_inner) = v;
+    }
+
+    /// This slave's newest epoch records, up to the epoch it follows (at most
+    /// `KNOWN_EPOCHS`, oldest first; empty without data).
+    pub(crate) fn known_epochs(&self) -> Vec<EpochStart> {
+        self.ident()
+            .map(|(id, history)| newest_records(&history, id.epoch).to_vec())
+            .unwrap_or_default()
+    }
+```
+
+In `src/slave/driver.rs`, replace:
+
+```rust
+use crate::net::DECODE_SLACK;
+use crate::net::convert::{checked_history, entry_from_pb, identity_from_pb, identity_to_pb};
+use crate::pb;
+```
+
+with:
+
+```rust
+use crate::net::DECODE_SLACK;
+use crate::net::convert::{
+    checked_history, entry_from_pb, epoch_to_pb, identity_from_pb, identity_to_pb,
+};
+use crate::pb;
+```
+
+In `src/slave/driver.rs`, replace:
+
+```rust
+        },
+        // Tells the server which promotion's epoch this is, not only its number (PROTOCOL §6.3).
+        known_epoch_start: ident
+            .as_ref()
+            .and_then(|(id, h)| h.iter().find(|e| e.epoch == id.epoch).map(|e| e.start_seq)),
+    }
+```
+
+with:
+
+```rust
+        },
+        // Tells the server which epochs these are, not only the number: start seqs and nonces
+        // of the newest records (PROTOCOL §6.3).
+        known_epochs: inner.known_epochs().iter().map(epoch_to_pb).collect(),
+    }
+```
+
+In `src/slave/driver.rs`, replace:
+
+```rust
+                RepointDivergence::Refuse | RepointDivergence::Repair { .. } => {
+                    let local_epoch = inner.ident().map_or(0, |(id, _)| id.epoch);
+                    let err = repoint::mode_error(mode, || {
+                        repoint::divergence(local_epoch, inner.store.position().last_seq, &hs)
+                    });
+```
+
+with:
+
+```rust
+                RepointDivergence::Refuse | RepointDivergence::Repair { .. } => {
+                    let err = repoint::mode_error(mode, || {
+                        repoint::divergence(
+                            &inner.known_epochs(),
+                            inner.store.position().last_seq,
+                            &hs,
+                        )
+                    });
+```
+
+In `src/slave/repoint.rs`, replace:
+
+```rust
+use crate::error::{Error, Result};
+use crate::pb;
+use crate::types::{EpochStart, Seq, fork_after};
+```
+
+with:
+
+```rust
+use crate::error::{Error, Result};
+use crate::net::convert::epochs_from_pb;
+use crate::pb;
+use crate::types::{EpochStart, Seq, fork_after, fork_from};
+```
+
+In `src/slave/repoint.rs`, replace:
+
+```rust
+
+/// `Error::Diverged` for a `DIVERGED` answer: where the local log leaves the upstream's.
+pub(crate) fn divergence(local_epoch: u64, local_last: Seq, hs: &pb::HandshakeResponse) -> Error {
+    let history: Vec<EpochStart> = hs
+        .epoch_history
+        .iter()
+        .map(|e| EpochStart {
+            epoch: e.epoch,
+            start_seq: e.start_seq,
+        })
+        .collect();
+    let fork_seq = match fork_after(&history, local_epoch) {
+        // Rule 8: everything from the next epoch's start is not on the upstream's history.
+        Some(fork) if fork <= local_last => fork,
+```
+
+with:
+
+```rust
+
+/// `Error::Diverged` for a `DIVERGED` answer: where the local log, whose newest epoch records
+/// are `local` (oldest first), leaves the upstream's.
+pub(crate) fn divergence(
+    local: &[EpochStart],
+    local_last: Seq,
+    hs: &pb::HandshakeResponse,
+) -> Error {
+    let history = epochs_from_pb(&hs.epoch_history);
+    let fork = match local {
+        [] => fork_after(&history, 0),
+        records => fork_from(&history, records),
+    };
+    let fork_seq = match fork {
+        // Rule 8: everything from the next epoch's start (or from the start of a same-numbered
+        // epoch with another nonce) is not on the upstream's history.
+        Some(fork) if fork <= local_last => fork,
+```
+
+- [ ] **Step 6: Comparing nodes and checking a promotion by history**
+
+In `src/admin.rs`, replace:
+
+```rust
+//! 2. Gather the status of every replica with [`gather`], which also probes the entry CRCs
+//!    that [`compare`] needs ([`node_status`] reads one node).
+//! 3. Promote the most advanced compatible one: [`choose_promotion_candidate`], then
+```
+
+with:
+
+```rust
+//! 2. Gather the status of every replica with [`gather`], which also probes the entry CRCs
+//!    that [`compare`] checks as a second line of defence ([`node_status`] reads one node).
+//! 3. Promote the most advanced compatible one: [`choose_promotion_candidate`], then
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+    Equal,
+    /// Both hold different entries from `fork` on: a CRC mismatch was proven (or the epoch
+    /// histories fork below both positions).
+    Diverged {
+        fork: Seq,
+    },
+    /// Compatibility cannot be proven: the node that would have to hold the other's last
+    /// entry no longer does (trimmed, or bootstrapped past it), or no probe was taken.
+    /// `later` is the side that is later by position (newest epoch, then `last_seq`); `None`
+    /// when both positions are equal.
+    Unverifiable {
+        later: Option<Side>,
+    },
+```
+
+with:
+
+```rust
+    Equal,
+    /// Both hold different entries from `fork` on: the epoch histories (nonces included) fork
+    /// below both positions, or a CRC mismatch was proven.
+    Diverged {
+        fork: Seq,
+    },
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+
+/// The first seq whose epoch differs between two histories, if any.
+fn fork_between(a: &[EpochStart], b: &[EpochStart]) -> Option<Seq> {
+```
+
+with:
+
+```rust
+
+/// The first seq whose epoch differs between two histories, if any. Records are compared with
+/// their nonces: the same epoch number with another nonce is another epoch.
+fn fork_between(a: &[EpochStart], b: &[EpochStart]) -> Option<Seq> {
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+///
+/// Otherwise the nodes are compatible when no seq both hold lies at or past a point where
+/// their epoch histories differ, **and** the shorter node's last entry is present in the
+/// longer node with the same CRC: equal `last_entry_crc` at equal `last_seq`, or the longer
+/// node's probe at the shorter node's `last_seq` ([`NodeInfo::probes`]). The later of two
+/// compatible nodes has the newer epoch, then the higher `last_seq`: a node whose newest
+/// epoch is still empty (a promotion that took no writes) is later than a node of the older
+/// epoch that holds *fewer* entries than its epoch's start, and **diverged** from one that
+/// holds entries at or past that start (`fork` is that epoch's `start_seq`; demoting the
+/// empty-epoch node and promoting the other would lose nothing). Anything that cannot be
+/// shown compatible because of a CRC mismatch is `Diverged`; when the
+/// histories agree, `fork` is then the shorter node's `last_seq` (the first seq known not to
+/// match may be earlier). A comparison that needs a CRC nobody can supply is `Unverifiable`,
+/// never `Compatible` or `Diverged`.
+pub fn compare(a: &NodeInfo, b: &NodeInfo) -> Comparison {
+```
+
+with:
+
+```rust
+///
+/// Otherwise the epoch histories decide (addendum §7): every epoch has a random nonce and
+/// exactly one writer process, so two nodes whose histories (nonces included) agree below
+/// both positions hold the same entries up to the shorter node's `last_seq`, and two whose
+/// histories differ below both positions are `Diverged` at the first differing record. Entry
+/// CRCs are a second line of defence only: equal `last_seq`s with different
+/// `last_entry_crc`s, or the longer node's probe at the shorter node's `last_seq`
+/// ([`NodeInfo::probes`]) differing from it, is `Diverged` at that seq; a missing CRC or
+/// probe never makes nodes incomparable. The later of two compatible nodes has the newer
+/// epoch, then the higher `last_seq`: a node whose newest epoch is still empty (a promotion
+/// that took no writes) is later than a node of the older epoch that holds *fewer* entries
+/// than its epoch's start, and **diverged** from one that holds entries at or past that start
+/// (`fork` is that epoch's `start_seq`; demoting the empty-epoch node and promoting the other
+/// would lose nothing).
+pub fn compare(a: &NodeInfo, b: &NodeInfo) -> Comparison {
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+            return match (a.last_entry_crc, b.last_entry_crc) {
+                _ if a.last_seq == 0 => by_position.map_or(Comparison::Equal, Comparison::Later),
+                (Some(x), Some(y)) if x == y => {
+                    by_position.map_or(Comparison::Equal, Comparison::Later)
+                }
+                (Some(_), Some(_)) => Comparison::Diverged { fork: a.last_seq },
+                _ => Comparison::Unverifiable { later: by_position },
+            };
+```
+
+with:
+
+```rust
+            return match (a.last_entry_crc, b.last_entry_crc) {
+                (Some(x), Some(y)) if a.last_seq > 0 && x != y => {
+                    Comparison::Diverged { fork: a.last_seq }
+                }
+                _ => by_position.map_or(Comparison::Equal, Comparison::Later),
+            };
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+    }
+    if short.last_seq > 0 {
+        let held = long.probes.get(&short.last_seq).copied().flatten();
+        match (short.last_entry_crc, held) {
+            (Some(x), Some(y)) if x == y => {}
+            (Some(_), Some(_)) => {
+                return Comparison::Diverged {
+                    fork: short.last_seq,
+                };
+            }
+            _ => return Comparison::Unverifiable { later: by_position },
+        }
+```
+
+with:
+
+```rust
+    }
+    // Second line of defence: a CRC mismatch at the shorter node's last entry.
+    let held = long.probes.get(&short.last_seq).copied().flatten();
+    if let (Some(x), Some(y)) = (short.last_entry_crc, held) {
+        if short.last_seq > 0 && x != y {
+            return Comparison::Diverged {
+                fork: short.last_seq,
+            };
+        }
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+    pub foreign: Vec<String>,
+    /// Nodes whose compatibility with the candidate cannot be proven (see
+    /// [`Comparison::Unverifiable`]). They are not known to be safe to follow it.
+    pub unverifiable: Vec<String>,
+}
+
+/// Compatibility is judged by entries. A node whose newest epoch is empty and differs from the
+/// candidate's (for example a wrongly promoted master with no writes) is not safe to follow the
+/// candidate as it is: `demote` it (or rebootstrap it) first.
+```
+
+with:
+
+```rust
+    pub foreign: Vec<String>,
+    /// Nodes that compare as later than the candidate although the candidate is the latest by
+    /// position. This cannot happen with consistent inputs; such a node is not known to be safe
+    /// to follow the candidate.
+    pub unverifiable: Vec<String>,
+}
+
+/// Compatibility is judged by epoch histories (see [`compare`]). A node whose newest epoch is
+/// empty and differs from the candidate's (for example a wrongly promoted master with no writes) is not safe to follow the
+/// candidate as it is: `demote` it (or rebootstrap it) first.
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+            Comparison::DifferentDatabase => choice.foreign.push(n.node_id.clone()),
+            Comparison::Unverifiable { .. } => choice.unverifiable.push(n.node_id.clone()),
+        }
+```
+
+with:
+
+```rust
+            Comparison::DifferentDatabase => choice.foreign.push(n.node_id.clone()),
+        }
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+            .iter()
+            .map(|&(epoch, start_seq)| EpochStart { epoch, start_seq })
+            .collect();
+```
+
+with:
+
+```rust
+            .iter()
+            // The same (epoch, start) is the same epoch in these tests: nonce = start.
+            .map(|&(epoch, start_seq)| EpochStart {
+                epoch,
+                start_seq,
+                nonce: start_seq,
+            })
+            .collect();
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+        assert_eq!(compare(&other_8, &b), Comparison::Diverged { fork: 8 });
+        // a no longer holds entry 8 (or was not probed): unverifiable, a still later by position.
+        assert_eq!(
+            compare(&node("a", 1, &[(1, 1)], 10, Some(1)), &b),
+            Comparison::Unverifiable {
+                later: Some(Side::A)
+            }
+        );
+        assert_eq!(
+            compare(&b, &probed(node("a", 1, &[(1, 1)], 10, Some(1)), 8, None)),
+            Comparison::Unverifiable {
+                later: Some(Side::B)
+            }
+        );
+```
+
+with:
+
+```rust
+        assert_eq!(compare(&other_8, &b), Comparison::Diverged { fork: 8 });
+        // a no longer holds entry 8 (or was not probed): the shared history (epoch 1, same
+        // nonce) proves b's entries are a's; a is later.
+        assert_eq!(
+            compare(&node("a", 1, &[(1, 1)], 10, Some(1)), &b),
+            Comparison::Later(Side::A)
+        );
+        assert_eq!(
+            compare(&b, &probed(node("a", 1, &[(1, 1)], 10, Some(1)), 8, None)),
+            Comparison::Later(Side::B)
+        );
+        // The same epoch number and start with another nonce is another epoch: a master
+        // restored from a backup and reopened. Diverged at that epoch's start.
+        let mut restored = node("r", 1, &[(1, 1), (2, 5)], 9, None);
+        restored.epoch_history[1].nonce = 77;
+        assert_eq!(
+            compare(&node("a", 1, &[(1, 1), (2, 5)], 10, None), &restored),
+            Comparison::Diverged { fork: 5 }
+        );
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+        );
+        // c no longer holds entry 10: b is listed as unverifiable, neither compatible nor diverged.
+        let trimmed = vec![
+```
+
+with:
+
+```rust
+        );
+        // c no longer holds entry 10: the shared history still proves b compatible.
+        let trimmed = vec![
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+            (choice.unverifiable, choice.compatible, choice.diverged),
+            (vec!["b".to_string()], vec![], vec![])
+        );
+```
+
+with:
+
+```rust
+            (choice.unverifiable, choice.compatible, choice.diverged),
+            (vec![], vec!["b".to_string()], vec![])
+        );
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+        assert_eq!(compare(&past, &w), Comparison::Diverged { fork: 11 });
+        // Equal position with an unverifiable CRC keeps the order by epoch.
+        let no_crc = node("b", 1, &[(1, 1)], 10, None);
+        assert_eq!(
+            compare(&w, &no_crc),
+            Comparison::Unverifiable {
+                later: Some(Side::A)
+            }
+        );
+    }
+```
+
+with:
+
+```rust
+        assert_eq!(compare(&past, &w), Comparison::Diverged { fork: 11 });
+        // Equal position without a CRC: the history decides, ordered by epoch.
+        let no_crc = node("b", 1, &[(1, 1)], 10, None);
+        assert_eq!(compare(&w, &no_crc), Comparison::Later(Side::A));
+    }
+```
+
+In `src/slave/promote.rs`, replace:
+
+```rust
+    /// may hold the same epoch number this promotion picks. The handshake still tells the two
+    /// epochs apart by their start seq (PROTOCOL.md §6.3, `known_epoch_start`), so no history
+    /// is mixed, but [`promote_checked`](Self::promote_checked), which chooses an epoch above
+```
+
+with:
+
+```rust
+    /// may hold the same epoch number this promotion picks. The handshake still tells the two
+    /// epochs apart by their nonce (PROTOCOL.md §6.3, `known_epochs`), so no history
+    /// is mixed, but [`promote_checked`](Self::promote_checked), which chooses an epoch above
+```
+
+In `src/slave/promote.rs`, replace:
+
+```rust
+        .await?;
+        Master::open(cfg).await
+    }
+```
+
+with:
+
+```rust
+        .await?;
+        Master::open_promoted(cfg).await
+    }
+```
+
+In `src/slave/promote.rs`, replace:
+
+```rust
+    pub foreign: Vec<String>,
+    /// Peers behind this slave whose history cannot be verified against it (`node_id`,
+    /// `last_seq`): following it may discard entries they hold.
+    pub unverifiable: Vec<(String, Seq)>,
+    /// The highest epoch number any reachable peer of this database reported (its identity,
+```
+
+with:
+
+```rust
+    pub foreign: Vec<String>,
+    /// The highest epoch number any reachable peer of this database reported (its identity,
+```
+
+In `src/slave/promote.rs`, replace:
+
+```rust
+
+    /// Asks every reachable peer for its `Status` and **refuses by default** (addendum §4):
+    /// `Error::NotMostAdvanced` if a peer is proven to hold more of the log, and
+    /// `Error::PromotionUnverifiable` if a peer is at least as far by position but its history
+    /// cannot be verified (the entry that would prove it is trimmed or before its bootstrap),
+    /// `Error::MasterReachable` if a peer reports `role == Master`, and
+    /// `Error::PromotionWouldDiscard` (below).
+    /// Each peer is probed at this slave's `last_seq`, and this slave's entry at the peer's
+    /// `last_seq` is read locally, so [`admin::compare`] can check the shorter node's last
+    /// entry. A peer whose history forks from this slave's at `fork` and that holds entries at
+    /// or past it blocks with `Error::PromotionWouldDiscard` (promoting this slave would
+    /// discard them; promote that node instead, or use plain `promote` to accept the loss).
+    /// A diverged peer with nothing at or past the fork is only reported (in the result, and
+    /// in a refusal's error); unreachable peers (no answer within `admin::STATUS_TIMEOUT`), foreign
+    /// peers and unverifiable peers that are behind are reported too: the operator decides.
+    /// A peer that is reachable but answered `Status` with an error (permission denied, another
+```
+
+with:
+
+```rust
+
+    /// Asks every reachable peer for its `Status` and **refuses by default** (addendum §4, §7):
+    /// `Error::NotMostAdvanced` if a peer holds more of a compatible history,
+    /// `Error::MasterReachable` if a peer reports `role == Master`, and
+    /// `Error::PromotionWouldDiscard` (below). Compatibility is decided by the epoch histories,
+    /// nonces included ([`admin::compare`]), so a peer whose entries were trimmed is never
+    /// incomparable; each peer is also probed at this slave's `last_seq`, and this slave's
+    /// entry at the peer's `last_seq` is read locally, so a CRC mismatch is caught as a second
+    /// line of defence. A peer whose history forks from this slave's at `fork` and that holds
+    /// entries at or past it blocks with `Error::PromotionWouldDiscard` (promoting this slave
+    /// would discard them; promote that node instead, or use plain `promote` to accept the
+    /// loss). A diverged peer with nothing at or past the fork is only reported (in the
+    /// result, and in a refusal's error); unreachable peers (no answer within
+    /// `admin::STATUS_TIMEOUT`) and foreign peers are reported too: the operator decides.
+    /// A peer that is reachable but answered `Status` with an error (permission denied, another
+```
+
+In `src/slave/promote.rs`, replace:
+
+```rust
+        let mut check = PromotionCheck::default();
+        let (mut later, mut unverified_ahead, mut would_discard) =
+            (Vec::new(), Vec::new(), Vec::new());
+        for peer in peers {
+```
+
+with:
+
+```rust
+        let mut check = PromotionCheck::default();
+        let (mut later, mut unanswered, mut would_discard) = (Vec::new(), Vec::new(), Vec::new());
+        for peer in peers {
+```
+
+In `src/slave/promote.rs`, replace:
+
+```rust
+                // The peer is alive but its state is unknown (refused the call, spoke another
+                // protocol, ...): it may be ahead, so it blocks like an unverifiable peer.
+                Err(admin::StatusFailure::Answered(e)) => {
+                    tracing::warn!(peer = %peer.uri(), error = %e, "promotion check: peer answered with an error");
+                    unverified_ahead.push((format!("{} ({e})", peer.uri()), 0));
+                    continue;
+```
+
+with:
+
+```rust
+                // The peer is alive but its state is unknown (refused the call, spoke another
+                // protocol, ...): it may be ahead, so it blocks as unverifiable.
+                Err(admin::StatusFailure::Answered(e)) => {
+                    tracing::warn!(peer = %peer.uri(), error = %e, "promotion check: peer answered with an error");
+                    unanswered.push((format!("{} ({e})", peer.uri()), 0));
+                    continue;
+```
+
+In `src/slave/promote.rs`, replace:
+
+```rust
+                Comparison::Later(Side::B) => later.push((info.node_id, info.last_seq)),
+                Comparison::Unverifiable {
+                    later: Some(Side::B) | None,
+                } => unverified_ahead.push((info.node_id, info.last_seq)),
+                Comparison::Unverifiable {
+                    later: Some(Side::A),
+                } => check.unverifiable.push((info.node_id, info.last_seq)),
+                // The peer holds entries this slave would discard: refused by default.
+```
+
+with:
+
+```rust
+                Comparison::Later(Side::B) => later.push((info.node_id, info.last_seq)),
+                // The peer holds entries this slave would discard: refused by default.
+```
+
+In `src/slave/promote.rs`, replace:
+
+```rust
+        }
+        if let Some((peer, seq)) = unverified_ahead.into_iter().next() {
+            return Err(Error::PromotionUnverifiable {
+```
+
+with:
+
+```rust
+        }
+        if let Some((peer, seq)) = unanswered.into_iter().next() {
+            return Err(Error::PromotionUnverifiable {
+```
+
+In `src/slave/promote.rs`, replace:
+
+```rust
+    /// halted `Corrupt`/`SpecMismatch`, wrong `cfg.path`, invalid `cfg`), a later reachable peer
+    /// (`Error::NotMostAdvanced`), a peer at least as far whose history cannot be verified
+    /// (`Error::PromotionUnverifiable`), a peer that reports itself a master
+```
+
+with:
+
+```rust
+    /// halted `Corrupt`/`SpecMismatch`, wrong `cfg.path`, invalid `cfg`), a later reachable peer
+    /// (`Error::NotMostAdvanced`), a peer that answered `Status` with an error
+    /// (`Error::PromotionUnverifiable`), a peer that reports itself a master
+```
+
+In `src/slave/promote.rs`, replace:
+
+```rust
+                    || !check.foreign.is_empty()
+                    || !check.unverifiable.is_empty()
+                {
+```
+
+with:
+
+```rust
+                    || !check.foreign.is_empty()
+                {
+```
+
+In `src/error.rs`, replace:
+
+```rust
+    },
+    /// `promote_checked` found a reachable peer that is at least as far by position (newest
+    /// epoch, then `last_seq`) but whose compatibility cannot be proven, because the entry that
+    /// would prove it is no longer held. Plain `promote` remains available as an explicit
+    /// operator decision. `diverged` as for `NotMostAdvanced`.
+    #[error(
+        "{peer} (last_seq {seq}) is at least as far and its history cannot be verified; promote explicitly if intended (diverged peers: {diverged:?})"
+    )]
+```
+
+with:
+
+```rust
+    },
+    /// `promote_checked` reached a peer that answered `Status` with an error (permission
+    /// denied, throttled, another protocol, ...): it is alive and its state is unknown, so it
+    /// may be ahead. `peer` holds its address and the error, `seq` is 0. Plain `promote`
+    /// remains available as an explicit operator decision. `diverged` as for
+    /// `NotMostAdvanced`.
+    #[error(
+        "{peer} answered Status with an error, so its state is unknown; promote explicitly if intended (diverged peers: {diverged:?})"
+    )]
+```
+
+- [ ] **Step 7: Unit-test fixtures**
+
+Record literals in unit tests get `nonce: 0`; assertions on a real node's history compare `(epoch, start_seq)`:
+
+In `src/server/tests.rs`, replace:
+
+```rust
+use crate::log::LogApi;
+use crate::net::convert::identity_to_pb;
+use crate::net::reason_of;
+```
+
+with:
+
+```rust
+use crate::log::LogApi;
+use crate::net::convert::{epochs_to_pb, identity_to_pb};
+use crate::net::reason_of;
+```
+
+In `src/server/tests.rs`, replace:
+
+```rust
+    assert_eq!(r.identity, Some(identity_to_pb(&m.identity())));
+    assert_eq!(
+        r.epoch_history,
+        vec![pb::EpochStart {
+            epoch: 1,
+            start_seq: 1
+        }]
+    );
+```
+
+with:
+
+```rust
+    assert_eq!(r.identity, Some(identity_to_pb(&m.identity())));
+    assert_eq!(r.epoch_history, epochs_to_pb(&m.epoch_history()));
+    assert_eq!(
+        (r.epoch_history[0].epoch, r.epoch_history[0].start_seq),
+        (1, 1)
+    );
+```
+
+In `src/slave/apply.rs`, replace:
+
+```rust
+                start_seq: 1,
+            },
+```
+
+with:
+
+```rust
+                start_seq: 1,
+                nonce: 0,
+            },
+```
+
+In `src/slave/apply.rs`, replace:
+
+```rust
+                start_seq: 11,
+            },
+```
+
+with:
+
+```rust
+                start_seq: 11,
+                nonce: 0,
+            },
+```
+
+In `src/store/bootstrap.rs`, replace:
+
+```rust
+                    start_seq: 1,
+                },
+```
+
+with:
+
+```rust
+                    start_seq: 1,
+                    nonce: 0,
+                },
+```
+
+In `src/store/bootstrap.rs`, replace:
+
+```rust
+                    start_seq: 3,
+                },
+```
+
+with:
+
+```rust
+                    start_seq: 3,
+                    nonce: 0,
+                },
+```
+
+In `src/store/bootstrap.rs`, replace:
+
+```rust
+                start_seq: 1,
+            },
+```
+
+with:
+
+```rust
+                start_seq: 1,
+                nonce: 0,
+            },
+```
+
+In `src/store/bootstrap.rs`, replace:
+
+```rust
+                start_seq: 40,
+            },
+```
+
+with:
+
+```rust
+                start_seq: 40,
+                nonce: 0,
+            },
+```
+
+In `src/store/mod.rs`, replace:
+
+```rust
+                start_seq: 1,
+            },
+```
+
+with:
+
+```rust
+                start_seq: 1,
+                nonce: 0,
+            },
+```
+
+In `src/store/mod.rs`, replace:
+
+```rust
+                start_seq: 50,
+            },
+```
+
+with:
+
+```rust
+                start_seq: 50,
+                nonce: 0,
+            },
+```
+
+- [ ] **Step 8: Run the tests**
+
+Run: `cargo test --lib`
+Expected: PASS (195), including every `server::handshake` rule test and the `admin` comparison tests.
+
+Run: `cargo test --test promotion --test rebootstrap --test failure_resume --test master_write --test repoint --test proto_sync`
+Expected: PASS, including the four new end-to-end tests.
+
+- [ ] **Step 9: Document it**
+
+In PROTOCOL.md §5.5, replace the first paragraph under **Epoch history**:
+
+```markdown
+The **epoch history** of a database is the list of `EpochStart { epoch, start_seq }` records, one per epoch, sorted by `epoch` ascending. The first record is always `{1, 1}`. A new epoch starts when the master bumps its epoch (for example after a restore) or when a replica is promoted to master (§6.4). The new record's `start_seq` is the seq of the first entry written in the new epoch, which is the node's `last_seq + 1` at that moment.
+```
+
+with:
+
+```markdown
+The **epoch history** of a database is the list of `EpochStart { epoch, start_seq, nonce }` records, one per epoch, sorted by `epoch` ascending. The first record is always `{1, 1, n}`. A new epoch starts **every time a master opens an existing database**, when the master bumps its epoch, and when a replica is promoted to master (§6.4). The new record's `start_seq` is the seq of the first entry written in the new epoch, which is the node's `last_seq + 1` at that moment; an epoch that took no writes shares its `start_seq` with the next one. Within one epoch there is exactly one writer process, so two histories can only differ from the start of an epoch on.
+
+`nonce` is a random 64-bit value chosen when the epoch starts. It never takes part in ordering: which of two nodes is later is decided by the epoch number, then `last_seq`. It only decides **identity**: two records with the same `epoch` are the same epoch if and only if their nonces are equal (their `start_seq`s are then equal too). Two histories that hold the same epoch number with different nonces forked at the lower of the two `start_seq`s. (A restored backup that opens and starts epoch `e` again, or two promotions that chose the same number, are told apart this way.)
+```
+
+In §6.1, replace the `known_epoch_start` row:
+
+```markdown
+| `known_epoch_start` | The `start_seq` of the record for `known_identity.epoch` in the client's epoch history. Absent if the client has no data. A client with data SHOULD send it: two histories can carry the same epoch *number* with different start seqs (two promotions that chose the same number), and only this field lets the server tell them apart (§6.3). |
+```
+
+with:
+
+```markdown
+| `known_epochs` | The client's newest epoch records (`epoch`, `start_seq`, `nonce`; §5.5), oldest first and ending with its record of `known_identity.epoch`: the last 5, or all of them when its history is shorter. Empty if the client has no data. A client with data SHOULD send them: they let the server tell apart two epochs with the same number (§6.3) and prove continuity across an epoch change from the history alone, without any entry. A list that does not end with `known_identity.epoch` is ignored. Field 7 (formerly `known_epoch_start`) is reserved. |
+```
+
+In §6.3, replace the two derived values:
+
+```markdown
+- The client's epoch is **changed** when `known_identity.epoch < identity.epoch`, or when `known_identity.epoch = identity.epoch`, `known_epoch_start` is present and differs from the `start_seq` of the server's record for that epoch. In the second case the two histories share the epoch number but not the epoch: the client follows another promotion that happened to choose the same number, and it is treated exactly like an older epoch.
+- The **client fork** `cfork` is `fork(known_identity.epoch)` in the server's history, lowered to `min(known_epoch_start, start_seq of the server's record for known_identity.epoch)` when `known_epoch_start` is present and the server has no record of that epoch with that `start_seq` (if the server has no record of the epoch at all, the server's side of the minimum is omitted). Entries before `cfork` are shared; entries at or after it may differ. `cfork` is "none" only when the epoch is changed and the server's history has no later epoch and no differing start, which is an inconsistent history.
+```
+
+with:
+
+```markdown
+- The client's epoch is **changed** when `known_identity.epoch < identity.epoch`, or when `known_identity.epoch = identity.epoch` and one of the records in `known_epochs` is not in the server's history (another `start_seq` or another `nonce`, or a number the server never had). In the second case the two histories share the epoch number but not the epoch (a restored backup that started the number again, or another promotion that chose it), and the client is treated exactly like one of an older epoch.
+- The **client fork** `cfork` is `fork(known_identity.epoch)` in the server's history, lowered, for every record of `known_epochs` that is not in the server's history, to `min(its start_seq, start_seq of the server's record of the same number)` (if the server has no record of that number, the server's side of the minimum is omitted). Entries before `cfork` are shared; entries at or after it may differ. `cfork` is "none" only when the epoch is changed and the server's history has no later epoch and no differing record, which is an inconsistent history.
+- **Continuity is proven by the history** when every record of `known_epochs` is in the server's history (same `epoch`, `start_seq` and `nonce`): every entry before `cfork` was written by the same processes on both sides.
+```
+
+and the sentence before the table:
+
+```markdown
+The server evaluates these rules **in order** and applies the first that matches:
+```
+
+with:
+
+```markdown
+The server evaluates these rules **in order** (rule 10a before rule 9) and applies the first that matches:
+```
+
+and rows 9–10b:
+
+```markdown
+| 11 | The client's epoch is changed, the server holds entry `last_seq`, and its `crc32c` equals `last_crc32c` | `RESUME` | `EPOCH_ADVANCED` |
+| 10a | The client's epoch is changed, `last_crc32c` is present, the server holds entry `last_seq`, and its `crc32c` differs | `REJECT` | `DIVERGED` |
+| 10b | The client's epoch is changed (continuity cannot be proven: the entry is not held, or `last_crc32c` is absent) | `BOOTSTRAP` | `IDENTITY_CHANGED` |
+```
+
+with:
+
+```markdown
+| 11 | The client's epoch is changed and continuity is proven: by the history (every record of `known_epochs` is in the server's history), or because the server holds entry `last_seq` and its `crc32c` equals `last_crc32c` | `RESUME` | `EPOCH_ADVANCED` |
+| 10a | The client's epoch is changed, `last_crc32c` is present, the server holds entry `last_seq`, and its `crc32c` differs (checked before rule 9) | `REJECT` | `DIVERGED` |
+| 10b | The client's epoch is changed (continuity cannot be proven: `known_epochs` is empty, and the entry is not held or `last_crc32c` is absent) | `BOOTSTRAP` | `IDENTITY_CHANGED` |
+```
+
+and the notes on rules 8–10 and on same-numbered epochs:
+
+```markdown
+- **Rules 8–10, epoch continuity.** After an epoch bump or a promotion, a replica of an older epoch can keep its data if its history is a prefix of the server's. That holds when its last entry comes before the fork point and the server holds the same entry, proven by `crc32c`. Such a client continues without a bootstrap (`EPOCH_ADVANCED`): it adopts the server's identity and history, which replaces its own record of a same-numbered epoch. A client that has entries at or past the fork point holds writes the new history does not have (`DIVERGED`), and so does a client whose last entry is held by the server with a different `crc32c` (rule 10a: the mismatch is proven). Only when the needed entry is not held (trimmed, or before the server's bootstrap) or the client sent no `last_crc32c` is continuity unprovable, and the client is treated as having a changed identity (rule 10b).
+- **Same epoch number, different start (`known_epoch_start`).** Epoch numbers are not globally coordinated: a promotion that was undone (`demote`) may have handed its number to replicas that followed it, and another node may later start the same number at another seq. Without `known_epoch_start` such a client would get a plain `RESUME` (equal identities) and then receive entries whose epoch contradicts its history. With it, the server sees that the epochs differ and applies rules 8–10 with the fork at the lower of the two start seqs. A server that receives no `known_epoch_start` compares identities only.
+```
+
+with:
+
+```markdown
+- **Rules 8–10, epoch continuity.** After a master restart, an epoch bump or a promotion, a replica of an older epoch can keep its data if its history is a prefix of the server's. That holds when its last entry comes before the fork point and its newest records (`known_epochs`), nonces included, are in the server's history: both sides then hold entries written by the same processes. Such a client continues without a bootstrap (`EPOCH_ADVANCED`), even when the server no longer holds the client's last entry: it adopts the server's identity and history, which replaces its own record of a same-numbered epoch. Entry CRCs are a second line of defence: a client whose last entry is held by the server with a different `crc32c` is `DIVERGED` (rule 10a, checked first), and a client that sent no `known_epochs` can still prove continuity by CRC (rule 9). A client that has entries at or past the fork point holds writes the new history does not have (`DIVERGED`). Only a client without `known_epochs` whose entry cannot be compared is treated as having a changed identity (rule 10b).
+- **Same epoch number, another epoch (`known_epochs`).** Epoch numbers are not globally coordinated: a master restored from a backup starts again a number its replicas may already have followed past the restore point, a promotion that was undone (`demote`) may have handed its number to replicas that followed it, and another node may later start the same number. Without `known_epochs` such a client would get a plain `RESUME` (equal identities) and then receive entries whose epoch contradicts its history. With them, the server sees that a record differs (start seq or nonce) and applies rules 8–10 with the fork at the lower of the two start seqs; comparing up to five records also catches histories that forked at an older epoch and later reached the same numbers. A server that receives no `known_epochs` compares identities only.
+```
+
+and the note on rule 11:
+
+```markdown
+- **Rule 11.** The master commits with fsync, so a replica can never be ahead of it legitimately. If one is, the master has lost history, typically because it was restored from a backup without an epoch bump. Accepting the replica would let the same seq carry different writes on different nodes.
+```
+
+with:
+
+```markdown
+- **Rule 11.** The master commits with fsync, so a replica can never be ahead of it legitimately. If one is, the master has lost history, typically because it was restored from a backup. Since every master open starts a new epoch, rule 8 normally catches this first; rule 11 remains as a backstop. Accepting the replica would let the same seq carry different writes on different nodes.
+```
+
+In §6.4, replace the old-master bullet and the closing paragraph:
+
+```markdown
+- The old master, if restarted and asked by a new-epoch replica, answers `STALE_EPOCH` (rule 7). It can rejoin only as a new replica with an empty directory.
+
+The protocol cannot stop an operator from running two masters at once. If two nodes both start the same epoch number at different seqs, `known_epoch_start` makes the handshake treat them as different epochs (§6.3); if they start it at the same seq, rule 12 detects the divergence wherever the conflicting entry is still retained.
+```
+
+with:
+
+```markdown
+- The old master, if restarted, starts an epoch of its own (§5.5). A new-epoch replica that asks it gets `STALE_EPOCH` (rule 7) when the old master's number is lower, and `DIVERGED` otherwise (its record of that number has another nonce, or the old master never had the replica's epoch). It can rejoin only as a new replica with an empty directory.
+
+The protocol cannot stop an operator from running two masters at once. If two nodes both start the same epoch number, their records differ by nonce (and possibly start seq), and `known_epochs` makes the handshake treat them as different epochs (§6.3), wherever the conflicting entries are, retained or not.
+```
+
+In the §15 examples, replace:
+
+````markdown
+**Master restored from backup without an epoch bump.**
+
+```
+B → A  Handshake{known_identity:(U,1), last_seq: 5000}     A.last_seq = 4800
+A → B  {decision: REJECT, reason: DIVERGED}               (rule 11)
+````
+
+with:
+
+````markdown
+**Master restored from backup without an epoch bump.** Its open started epoch 2 at 4801.
+
+```
+B → A  Handshake{known_identity:(U,1), last_seq: 5000, known_epochs:[{1,1,n1}]}     A.last_seq = 4800
+A → B  {decision: REJECT, reason: DIVERGED}               (rule 8: 5000 ≥ fork(1) = 4801)
+````
+
+and:
+
+```markdown
+A → …  restarted old master: any (U,2) replica asking A gets STALE_EPOCH (rule 7)
+```
+
+with:
+
+```markdown
+A → …  restarted old master: its open starts its own epoch 2 (another nonce); a replica of
+       B's epoch 2 asking A gets DIVERGED (rule 8), one of a later epoch STALE_EPOCH (rule 7)
+```
+
+In DESIGN.md §3.2, replace the `epoch_history` row:
+
+```markdown
+| `epoch_history` | all | `Vec<EpochStart { epoch, start_seq }>`, sorted by epoch; first is `{1, 1}` (PROTOCOL.md §5.5). Written atomically with `origin_identity`. |
+```
+
+with:
+
+```markdown
+| `epoch_history` | all | `Vec<EpochStart { epoch, start_seq, nonce }>`, sorted by epoch; first is `{1, 1, n}` (PROTOCOL.md §5.5). Written atomically with `origin_identity`. |
+```
+
+In DESIGN.md §13, replace the first four bullets:
+
+```markdown
+- `DbIdentity { db_uuid: Uuid, epoch: u64 }` is created when a master DB is first opened, with `epoch = 1` and epoch history `[{1, 1}]`.
+- **Epoch history** (PROTOCOL.md §5.5): one `{epoch, start_seq}` record per epoch. Every entry satisfies `entry.epoch == epoch_for(entry.seq)`. Every node persists the history with its identity and forwards it in the handshake and the bootstrap header.
+- **`Master::bump_epoch()`** (admin action): under the writer lock, `epoch += 1`, append `{epoch, last_seq + 1}` to the history, and persist both in one synced batch. **Seq numbering continues.** Then end every replication stream with `UPSTREAM_RESET`.
+- **Epoch continuity.** A slave of an older epoch whose last entry lies before the fork point, and whose last entry's CRC matches the upstream's, continues without a bootstrap (`EPOCH_ADVANCED`). It persists the new identity and history before tailing. A slave with entries at or past the fork point is `DIVERGED`. Rules: PROTOCOL.md §6.3 rules 6–10.
+```
+
+with:
+
+```markdown
+- `DbIdentity { db_uuid: Uuid, epoch: u64 }` is created when a master DB is first opened, with `epoch = 1` and epoch history `[{1, 1, nonce}]`.
+- **Epoch history** (PROTOCOL.md §5.5): one `{epoch, start_seq, nonce}` record per epoch; `nonce` is random, chosen when the epoch starts. Ordering uses the numbers only (epoch, then `last_seq`); the nonce only says whether two records of the same number are the same epoch. Every entry satisfies `entry.epoch == epoch_for(entry.seq)`. Every node persists the history with its identity and forwards it in the handshake, the bootstrap header and `Status`.
+- **Every master open starts a new epoch** (like a Raft term): `epoch + 1` with a fresh nonce at `last_seq + 1`, persisted before the replication port opens. Within one epoch there is exactly one writer process, so "same seq, same epoch, different content" cannot happen and divergence can only begin at an epoch's start. The history grows by one record per open. A promotion starts its epoch itself; the master it opens does not add another.
+- **`Master::bump_epoch()`** (admin action): under the writer lock, `epoch += 1`, append `{epoch, last_seq + 1, fresh nonce}` to the history, and persist both in one synced batch. **Seq numbering continues.** Then end every replication stream with `UPSTREAM_RESET`.
+- **Epoch continuity.** A slave of an older epoch with nothing at or past the fork point continues without a bootstrap (`EPOCH_ADVANCED`) when its newest epoch records (up to 5), nonces included, are all in the upstream's history, or (without records) when its last entry's CRC matches the upstream's. A proven CRC mismatch is `DIVERGED` regardless. It persists the new identity and history before tailing. A slave with entries at or past the fork point is `DIVERGED`. The handshake carries those records as `known_epochs`. Rules: PROTOCOL.md §6.3 rules 6–10.
+```
+
+and the restore bullet:
+
+```markdown
+- **Restoring a master from a backup** must change its epoch before any replica connects. Open it with `MasterConfig { bump_epoch_on_open: true, .. }`. That bumps the epoch before the replication port opens. Slaves at or behind the restored seq with matching entries continue; slaves past it get `DIVERGED`. If the bump is forgotten, the backstop still applies: a slave ahead of the master, or one whose last entry has a different CRC, gets `DIVERGED` instead of silently diverging.
+```
+
+with:
+
+```markdown
+- **Restoring a master from a backup** needs no special step: its open starts a new epoch at the restored `last_seq + 1` before the replication port opens. Slaves at or behind the restored seq continue (`EPOCH_ADVANCED`); slaves holding entries past it get `DIVERGED`, from the history alone (even when the restored node never held those entries, or already trimmed them). `MasterConfig::bump_epoch_on_open` is kept for compatibility and is redundant. Rules 11 and 12 (a slave ahead of the master, a last entry with a different CRC) remain as backstops.
+```
+
+In §13.1, replace the `admin::compare` bullet:
+
+```markdown
+- `admin::compare(a, b)` → `Later(A | B)`, `Equal`, `Diverged { fork }` or `DifferentDatabase`. Two nodes are compatible when no seq both hold lies at or past a point where their epoch histories differ **and** the longer node holds the shorter node's last entry with the same CRC (`NodeInfo::probes`, filled by asking the longer node's `Status` with `probe_seq`; equal positions compare `last_entry_crc`). Then the node with the newer epoch is later, then the one with the higher `last_seq`. A proven CRC mismatch is `Diverged`, so same-epoch divergence (a restore without an epoch bump, two masters in one epoch) is caught. When the longer node no longer holds the probed entry (trimmed, or bootstrapped past it), the result is `Unverifiable { later }`: the order by position is still reported, compatibility is not. A node without data is behind every node with data.
+```
+
+with:
+
+```markdown
+- `admin::compare(a, b)` → `Later(A | B)`, `Equal`, `Diverged { fork }` or `DifferentDatabase`. The epoch histories decide, nonces included: two nodes are compatible when no seq both hold lies at or past the first record where their histories differ, and `Diverged { fork }` at that record's (lower) start seq otherwise. Then the node with the newer epoch is later, then the one with the higher `last_seq`. Entry CRCs are a second line of defence: a CRC mismatch at the shorter node's last entry (`NodeInfo::probes`, filled by asking the longer node's `Status` with `probe_seq`; equal positions compare `last_entry_crc`) is `Diverged` too, but a missing CRC (trimmed, or bootstrapped past it) never makes nodes incomparable. A node without data is behind every node with data.
+```
+
+in the chooser bullet, replace:
+
+```markdown
+lists the others as compatible, diverged (`(node_id, fork)`), unverifiable or foreign. Compatibility is judged by entries:
+```
+
+with:
+
+```markdown
+lists the others as compatible, diverged (`(node_id, fork)`) or foreign (`unverifiable` stays empty with consistent inputs). Compatibility is judged by histories:
+```
+
+in the `promote_checked` bullet, replace:
+
+```markdown
+`Error::NotMostAdvanced { leader, seq, diverged }` if a reachable peer is proven later, `Error::PromotionUnverifiable { peer, seq, diverged }` if a reachable peer is at least as far by position but its history cannot be verified. Both name the proven-diverged peers.
+```
+
+with:
+
+```markdown
+`Error::NotMostAdvanced { leader, seq, diverged }` if a reachable peer is later on a compatible history, naming the diverged peers.
+```
+
+and:
+
+```markdown
+Unreachable, foreign, behind-but-unverifiable and diverged peers with nothing at or past the fork are reported and do not block;
+```
+
+with:
+
+```markdown
+Unreachable and foreign peers and diverged peers with nothing at or past the fork are reported and do not block;
+```
+
+in the epoch-numbers bullet, replace:
+
+```markdown
+Plain `promote` checks no peer: it can still pick a number an unreachable replica holds. The handshake's `known_epoch_start` (PROTOCOL.md §6.3) then tells the two epochs apart by their start seq and applies the epoch-change rules (continuity proven by CRC, or `DIVERGED`), so histories never mix;
+```
+
+with:
+
+```markdown
+Plain `promote` checks no peer: it can still pick a number an unreachable replica holds. The handshake's `known_epochs` (PROTOCOL.md §6.3) then tells the two epochs apart by their nonce and applies the epoch-change rules (`DIVERGED` from the lower start seq on), so histories never mix;
+```
+
+and the old-master bullet after promotion:
+
+```markdown
+- The old master can never rejoin as master. Replicas of the new epoch refuse to follow it (`STALE_EPOCH`, retried and reported). To reuse the machine, wipe its directory and start it as a new slave, which bootstraps.
+```
+
+with:
+
+```markdown
+- The old master can never rejoin as master. A restart starts an epoch of its own; replicas of the new history refuse to follow it (`STALE_EPOCH` while its number is lower, retried and reported; `DIVERGED` otherwise). To reuse the machine, wipe its directory and start it as a new slave, which bootstraps.
+```
+
+In §16, `MasterConfig`:
+
+```markdown
+    pub bump_epoch_on_open: bool,       // set when opening a restored backup (§13)
+```
+
+with:
+
+```markdown
+    pub bump_epoch_on_open: bool,       // redundant: every open starts a new epoch (§13)
+```
+
+and `PromotionCheck`:
+
+```markdown
+    pub unverifiable: Vec<(String, Seq)>, pub max_peer_epoch: u64,
+```
+
+with:
+
+```markdown
+    pub max_peer_epoch: u64,
+```
+
+In §21, replace:
+
+```markdown
+- **Divergence:** master restored from an older backup without an epoch bump → slaves halt `Diverged`; with `bump_epoch_on_open` → slaves at or behind the restore point continue (`EPOCH_ADVANCED`), slaves past it are `DIVERGED` and follow `on_divergence`.
+- **Promotion:** A→B, A→C, A→D. Stop A. Promote B. C (behind B) continues from B without a bootstrap; D (ahead of B) is `DIVERGED` and, with `Rebootstrap`, converges. A restarted A is refused with `STALE_EPOCH`.
+```
+
+with:
+
+```markdown
+- **Divergence:** master restored from an older backup (no flag needed) → slaves past the restore point are `DIVERGED` by the epoch history alone, also when the restored master writes past them and trims their last entry, and follow `on_divergence`; slaves at or behind it continue (`EPOCH_ADVANCED`).
+- **Epoch nonces:** every master open starts an epoch; followers move to it with `EPOCH_ADVANCED` and no bootstrap even when their last entry is trimmed; the same epoch number with another nonce is `DIVERGED`; `promote_checked` passes a trimmed compatible peer and blocks a peer on another history (`PromotionWouldDiscard`) without needing its entries.
+- **Promotion:** A→B, A→C, A→D. Stop A. Promote B. C (behind B) continues from B without a bootstrap; D (ahead of B) is `DIVERGED` and, with `Rebootstrap`, converges. A restarted A is refused (`STALE_EPOCH` once B's epoch number is above A's).
+```
+
+In §22, replace:
+
+```markdown
+- Epoch history with fork points lets replicas keep their data across epoch bumps and promotions when their history is a proven prefix.
+```
+
+with:
+
+```markdown
+- Epoch history with fork points lets replicas keep their data across epoch bumps and promotions when their history is a proven prefix. Every record carries a random nonce and every master open starts an epoch, so compatibility is decided exactly from the histories; entry CRCs are only a second line of defence.
+```
+
+In DESIGN.md §16, `Comparison` loses `Unverifiable`:
+
+```markdown
+    Diverged { fork: Seq },                     // proven: histories or a CRC differ
+    Unverifiable { later: Option<Side> },       // compatibility cannot be proven (entry not held)
+    DifferentDatabase,
+```
+
+with:
+
+```markdown
+    Diverged { fork: Seq },                     // proven: histories (with nonces) or a CRC differ
+    DifferentDatabase,
+```
+
+In PROTOCOL.md §6.4, replace:
+
+```markdown
+appends `{e', last_seq + 1}` to its history, and begins accepting writes at `last_seq + 1`.
+```
+
+with:
+
+```markdown
+appends `{e', last_seq + 1, fresh nonce}` to its history, and begins accepting writes at `last_seq + 1`.
+```
+
+and:
+
+```markdown
+A promotion that checks no peers can still choose a number that some unreachable replica already holds; `known_epoch_start` (§6.3) then detects the clash.
+```
+
+with:
+
+```markdown
+A promotion that checks no peers can still choose a number that some unreachable replica already holds; `known_epochs` (§6.3) then detects the clash by its nonce.
+```
+
+- [ ] **Step 10: Run everything and commit**
+
+Run: `cargo fmt --check && cargo test && cargo test --features failpoints && cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features failpoints -- -D warnings`
+Expected: PASS, no warnings.
+
+```bash
+git add proto src tests DESIGN.md PROTOCOL.md
+git commit -m "feat: epoch nonces and a new epoch on every master open
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 2: API ergonomics
+
+**Files:**
+- Create: `tests/ergonomics.rs`
+- Modify: `src/master/mod.rs`, `src/master/write_concern.rs` (an import), `src/slave/mod.rs`, `src/slave/promote.rs`, `src/config.rs`, `src/admin.rs`, `src/error.rs`, `tests/write_concern.rs`, `tests/master_ttl.rs`, `tests/repoint.rs` (unused imports), `examples/{failover,master_and_replica,write_concern,secure_replication}.rs`, `examples/README.md`, `DESIGN.md` (§5.2, §13.1, §16, §16.2)
+
+Spec addendum §8 (agreed 2026-10-10), from writing the user-facing examples:
+
+- **CF operations are exempt from the configured write concern**: `create_cf` / `drop_cf` always commit with the asynchronous default. A fresh master with `min_insync_replicas = 1` can create its CFs before any replica exists.
+- `Master::wait_in_sync(n, timeout)` and `Slave::wait_streaming(timeout)` (`Err(Halted(r))` / `Err(Timeout)`) replace hand-rolled polling loops.
+- `PromoteRefused::into_parts()` / `DemoteRefused::into_parts()` → `(Error, Option<node>)`: keep the node and still use `?`.
+- `MasterConfig::from_slave_config(&SlaveConfig, Option<ServeConfig>)`: the configuration to promote with.
+- Inherent `last_seq()` on `Master` and `Slave` (no `LogApi` import), which leaves a few `LogApi` imports unused.
+- `admin` reports an unreachable peer with a **one-line** reason (the root cause); `Error::PeerUnreachable` gains `source` with the whole chain, and `Gathered::unreachable` holds the reason only.
+
+**Interfaces:**
+- Consumes: Plan 2 `Master::{create_cf, drop_cf, replicas, server}`, `master::writer::Inner::commit_with`, `WriteConcern::default`, `Slave.inner.state_tx`, `PromoteRefused { error, slave }`, `DemoteRefused { error, master }`, `admin::{status_classified, node_status_probed, gather, StatusFailure, is_transport_failure}`, `Slave::check_promotion`; Task 1 `Master::open`.
+- Produces:
+  - `Master::{last_seq(&self) -> Seq, wait_in_sync(&self, n: usize, timeout: Duration) -> Result<()> (async)}`; `Slave::{last_seq(&self) -> Seq, wait_streaming(&self, timeout: Duration) -> Result<()> (async)}`.
+  - `PromoteRefused::into_parts(self) -> (Error, Option<Slave>)`, `DemoteRefused::into_parts(self) -> (Error, Option<Master>)`.
+  - `MasterConfig::from_slave_config(slave: &SlaveConfig, serve: Option<ServeConfig>) -> MasterConfig`.
+  - `Error::PeerUnreachable { peer, reason, source: Option<Box<dyn std::error::Error + Send + Sync>> }`; `admin::StatusFailure::Unreachable { reason, source }`; `admin::short_reason` (private).
+  - Tests: `ergonomics::{wait_streaming_resolves_or_reports_the_halt, promotion_config_and_refusal_parts}`, `admin::tests::unreachable_reasons_are_the_root_cause_on_one_line`; `write_concern::the_configured_write_concern_applies_to_every_write` now checks the CF exemption and `wait_in_sync`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/ergonomics.rs`:
+
+```rust
+//! The small helpers of addendum §8, end to end.
+
+mod support;
+
+use std::time::Duration;
+
+use replicated_rocksdb::{
+    CfSpec, Error, HaltReason, IdentityPolicy, MasterConfig, ReadApi, Slave, SlaveState,
+};
+use support::{Cluster, WAIT, assert_converged};
+
+/// `Slave::wait_streaming` resolves once the slave tails, and fails at once with the halt
+/// reason when it halts instead; `last_seq` is inherent on both node types.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_streaming_resolves_or_reports_the_halt() {
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
+    b.wait_streaming(WAIT).await.unwrap();
+    assert_eq!(b.status().state, SlaveState::Streaming);
+    m.put("c", b"k", b"v").unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    assert_eq!(b.last_seq(), m.last_seq());
+
+    // Another database at the same address, refused by policy: the wait reports the halt.
+    let port = m.serve_addr().unwrap().port();
+    m.shutdown().await.unwrap();
+    let mut other = c.master_config("other");
+    other.serve.as_mut().unwrap().port = port;
+    let other = replicated_rocksdb::Master::open(other).await.unwrap();
+    b.shutdown().await.unwrap();
+    let (mut cfg, _) = c.slave_config("b", other.serve_addr().unwrap());
+    cfg.on_identity_change = IdentityPolicy::Refuse;
+    let b = Slave::open(cfg).await.unwrap();
+    assert!(matches!(
+        b.wait_streaming(WAIT).await,
+        Err(Error::Halted(HaltReason::IdentityChanged))
+    ));
+    drop(other);
+    // A short wait on a slave that cannot get there times out.
+    let (lonely, _) = c.slave("lonely", "127.0.0.1:9".parse().unwrap()).await;
+    assert!(matches!(
+        lonely.wait_streaming(Duration::from_millis(100)).await,
+        Err(Error::Timeout)
+    ));
+}
+
+/// `MasterConfig::from_slave_config` keeps what a promotion must keep, and a refused
+/// promotion's `into_parts` hands back the error and the still-running slave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promotion_config_and_refusal_parts() {
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", b"k", b"v").unwrap();
+    let (cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    let b = Slave::open(cfg.clone()).await.unwrap();
+    b.wait_streaming(WAIT).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+
+    let mcfg = MasterConfig::from_slave_config(&cfg, Some(c.serve()));
+    assert_eq!(
+        (mcfg.identifier.as_str(), &mcfg.path, mcfg.heartbeat),
+        ("b", &cfg.path, cfg.heartbeat)
+    );
+    assert!(mcfg.serve.is_some());
+
+    // The old master is still reachable: refused, and the slave comes back running.
+    let master_up = replicated_rocksdb::UpstreamConfig::from_addr(m.serve_addr().unwrap());
+    let refused = b
+        .promote_checked(mcfg.clone(), std::slice::from_ref(&master_up))
+        .await
+        .err()
+        .expect("the old master is reachable");
+    let (error, b) = refused.into_parts();
+    assert!(matches!(error, Error::MasterReachable { .. }), "{error}");
+    let b = b.expect("a refusal returns the slave");
+    assert_eq!(b.get("c", b"k").unwrap(), Some(b"v".to_vec()));
+
+    m.shutdown().await.unwrap();
+    let promoted = b.promote(mcfg).await.unwrap();
+    assert_eq!(promoted.get("c", b"k").unwrap(), Some(b"v".to_vec()));
+    promoted.put("c", b"after", b"w").unwrap();
+}
+```
+
+In `tests/write_concern.rs`, replace:
+
+```rust
+
+use replicated_rocksdb::{CfSpec, Error, LogApi, Master, SlaveState, UpstreamConfig, WriteConcern};
+use support::{Cluster, assert_converged, wait_state, wait_until};
+```
+
+with:
+
+```rust
+
+use replicated_rocksdb::{CfSpec, Error, Master, SlaveState, UpstreamConfig, WriteConcern};
+use support::{Cluster, assert_converged, wait_state, wait_until};
+```
+
+In `tests/write_concern.rs`, replace:
+
+```rust
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_configured_write_concern_applies_to_every_write() {
+```
+
+with:
+
+```rust
+}
+
+/// The configured write concern applies to every data write; CF operations are exempt
+/// (addendum §8): a fresh master with `min_insync_replicas = 1` creates its CF with no replica.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_configured_write_concern_applies_to_every_write() {
+```
+
+In `tests/write_concern.rs`, replace:
+
+```rust
+    let m = Master::open(cfg).await.unwrap();
+    let r = m.create_cf(CfSpec::new("c"));
+    assert!(
+```
+
+with:
+
+```rust
+    let m = Master::open(cfg).await.unwrap();
+    assert_eq!(
+        m.create_cf(CfSpec::new("c")).unwrap(),
+        1,
+        "no replica needed"
+    );
+    let r = m.put("c", b"k", b"v");
+    assert!(
+```
+
+In `tests/write_concern.rs`, replace:
+
+```rust
+    );
+    assert_eq!(m.last_seq(), 0);
+    // An explicit asynchronous write needs no replica.
+```
+
+with:
+
+```rust
+    );
+    assert_eq!(m.last_seq(), 1, "the refused write consumed no seq");
+    // An explicit asynchronous write needs no replica.
+```
+
+In `tests/write_concern.rs`, replace:
+
+```rust
+    let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
+    // The slave bootstraps the empty database (S = 0) and tails; then it is in sync.
+    wait_until("b in sync", || m.replicas().iter().any(|r| r.in_sync)).await;
+    let m = Arc::new(m);
+    let m2 = m.clone();
+    tokio::task::spawn_blocking(move || m2.create_cf(CfSpec::new("c")))
+        .await
+```
+
+with:
+
+```rust
+    let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
+    m.wait_in_sync(1, support::WAIT).await.unwrap();
+    let m = Arc::new(m);
+    let m2 = m.clone();
+    tokio::task::spawn_blocking(move || m2.put("c", b"k", b"v"))
+        .await
+```
+
+In `tests/write_concern.rs`, replace:
+
+```rust
+        .unwrap();
+    assert_converged(&*m, &[("b", &b)]).await;
+}
+```
+
+with:
+
+```rust
+        .unwrap();
+    assert_converged(&*m, &[("b", &b)]).await;
+    m.drop_cf("c").unwrap();
+    assert!(matches!(
+        m.wait_in_sync(2, Duration::from_millis(100)).await,
+        Err(Error::Timeout)
+    ));
+}
+```
+
+- [ ] **Step 2: Run them to confirm they fail**
+
+Run: `cargo test --test ergonomics --test write_concern`
+Expected: FAIL to compile: `no method named wait_streaming`, `no function or associated item named from_slave_config`, `no method named into_parts`, `no method named wait_in_sync`.
+
+- [ ] **Step 3: CF operations, `last_seq`, `wait_in_sync`, `into_parts`**
+
+In `src/master/mod.rs`, replace:
+
+```rust
+            server,
+        })
+    }
+```
+
+with:
+
+```rust
+            server,
+        })
+    }
+
+    /// The seq of the last committed entry (the same as `LogApi::last_seq`, without the
+    /// import).
+    pub fn last_seq(&self) -> Seq {
+        self.inner.store.position().last_seq
+    }
+
+    /// Waits until at least `n` direct replicas are in sync (see [`replicas`](Self::replicas)),
+    /// for example before writes with `min_insync_replicas = n`. `Err(Timeout)` after
+    /// `timeout`; `Err(Config)` if `n > 0` and this master does not serve replication.
+    pub async fn wait_in_sync(&self, n: usize, timeout: Duration) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        if self.server.is_none() {
+            return Err(crate::Error::Config(
+                "this master does not serve replication".into(),
+            ));
+        }
+        let wait = async {
+            loop {
+                if self.replicas().iter().filter(|r| r.in_sync).count() >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(timeout, wait)
+            .await
+            .map_err(|_| crate::Error::Timeout)
+    }
+```
+
+In `src/master/mod.rs`, replace:
+
+```rust
+    ///
+    /// With a configured `MasterConfig::write_concern` it also waits for in-sync
+    /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
+    /// not undo the write; see [`write_with`](Self::write_with)).
+    pub fn create_cf(&self, spec: CfSpec) -> Result<Seq> {
+        validate_cf_name(&spec.name)?;
+        self.inner.commit_with(&self.inner.cfg.write_concern, |_| {
+            Ok(vec![Op::CreateCf { spec }])
+```
+
+with:
+
+```rust
+    ///
+    /// **Exempt from `MasterConfig::write_concern`** (DESIGN.md §5.2): a CF operation carries
+    /// no user data and converges once replicated, so it always commits asynchronously
+    /// (fsynced on the master, no acks awaited). A fresh master configured with
+    /// `min_insync_replicas = 1` can therefore create its CFs before any replica exists.
+    pub fn create_cf(&self, spec: CfSpec) -> Result<Seq> {
+        validate_cf_name(&spec.name)?;
+        self.inner.commit_with(&WriteConcern::default(), |_| {
+            Ok(vec![Op::CreateCf { spec }])
+```
+
+In `src/master/mod.rs`, replace:
+
+```rust
+    ///
+    /// With a configured `MasterConfig::write_concern` it also waits for in-sync
+    /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
+    /// not undo the write; see [`write_with`](Self::write_with)).
+    pub fn drop_cf(&self, name: &str) -> Result<Seq> {
+```
+
+with:
+
+```rust
+    ///
+    /// **Exempt from `MasterConfig::write_concern`**, like [`create_cf`](Self::create_cf).
+    pub fn drop_cf(&self, name: &str) -> Result<Seq> {
+```
+
+In `src/master/mod.rs`, replace:
+
+```rust
+        let op = Op::DropCf { name: name.into() };
+        self.inner
+            .commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
+    }
+```
+
+with:
+
+```rust
+        let op = Op::DropCf { name: name.into() };
+        self.inner
+            .commit_with(&WriteConcern::default(), |_| Ok(vec![op]))
+    }
+```
+
+In `src/master/mod.rs`, replace:
+
+```rust
+        self.master.map(|m| *m)
+    }
+}
+```
+
+with:
+
+````rust
+        self.master.map(|m| *m)
+    }
+
+    /// The error and the master (if it was handed back), to keep the master while still
+    /// propagating the error with `?`:
+    ///
+    /// ```ignore
+    /// let slave = match master.demote(cfg).await {
+    ///     Ok(slave) => slave,
+    ///     Err(refused) => {
+    ///         let (error, master) = refused.into_parts();
+    ///         keep_serving(master);
+    ///         return Err(error.into());
+    ///     }
+    /// };
+    /// ```
+    pub fn into_parts(self) -> (crate::Error, Option<Master>) {
+        (self.error, self.master.map(|m| *m))
+    }
+}
+````
+
+In `src/master/write_concern.rs`, replace:
+
+```rust
+    use crate::error::Error;
+    use crate::log::LogApi;
+    use crate::server::test_client::{
+```
+
+with:
+
+```rust
+    use crate::error::Error;
+    use crate::server::test_client::{
+```
+
+In `src/slave/mod.rs`, replace:
+
+```rust
+    pub fn applied_seq(&self) -> Seq {
+        self.inner.store.position().last_seq
+    }
+```
+
+with:
+
+```rust
+    pub fn applied_seq(&self) -> Seq {
+        self.inner.store.position().last_seq
+    }
+
+    /// Last applied seq (the same as `LogApi::last_seq` and [`applied_seq`](Self::applied_seq),
+    /// without the import).
+    pub fn last_seq(&self) -> Seq {
+        self.inner.store.position().last_seq
+    }
+
+    /// Waits until the slave is `Streaming` (connected and tailing its upstream).
+    /// `Err(Halted(reason))` if it halts first, `Err(Timeout)` after `timeout`.
+    pub async fn wait_streaming(&self, timeout: Duration) -> Result<()> {
+        let mut states = self.inner.state_tx.subscribe();
+        let wait = async {
+            loop {
+                match &*states.borrow_and_update() {
+                    SlaveState::Streaming => return Ok(()),
+                    SlaveState::Halted(r) => return Err(Error::Halted(*r)),
+                    _ => {}
+                }
+                if states.changed().await.is_err() {
+                    return Err(Error::NotReady);
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait)
+            .await
+            .map_err(|_| Error::Timeout)?
+    }
+```
+
+In `src/slave/promote.rs`, replace:
+
+```rust
+                Ok(info) => info,
+                Err(admin::StatusFailure::Unreachable(e)) => {
+                    tracing::warn!(peer = %peer.uri(), error = %e, "promotion check: peer unreachable");
+                    check.unreachable.push((peer.uri(), e));
+                    continue;
+```
+
+with:
+
+```rust
+                Ok(info) => info,
+                Err(admin::StatusFailure::Unreachable { reason, source }) => {
+                    tracing::warn!(peer = %peer.uri(), reason = %reason, error = ?source, "promotion check: peer unreachable");
+                    check.unreachable.push((peer.uri(), reason));
+                    continue;
+```
+
+In `src/slave/promote.rs`, replace:
+
+```rust
+        self.slave.map(|s| *s)
+    }
+}
+```
+
+with:
+
+````rust
+        self.slave.map(|s| *s)
+    }
+
+    /// The error and the slave (if it was handed back), to keep the slave while still
+    /// propagating the error with `?`:
+    ///
+    /// ```ignore
+    /// let master = match slave.promote_checked(cfg, &peers).await {
+    ///     Ok(master) => master,
+    ///     Err(refused) => {
+    ///         let (error, slave) = refused.into_parts();
+    ///         keep_replicating(slave);
+    ///         return Err(error.into());
+    ///     }
+    /// };
+    /// ```
+    pub fn into_parts(self) -> (Error, Option<Slave>) {
+        (self.error, self.slave.map(|s| *s))
+    }
+}
+````
+
+In `src/config.rs`, replace:
+
+```rust
+impl MasterConfig {
+    pub fn new(identifier: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+```
+
+with:
+
+```rust
+impl MasterConfig {
+    /// The configuration to promote a slave with: the same identifier, path, retention,
+    /// heartbeat, RocksDB tuning and clock, and `serve` as given (usually the slave's own).
+    /// Everything else is the default.
+    pub fn from_slave_config(
+        slave: &crate::slave::SlaveConfig,
+        serve: Option<ServeConfig>,
+    ) -> Self {
+        MasterConfig {
+            retention: slave.retention.clone(),
+            heartbeat: slave.heartbeat,
+            rocksdb: slave.rocksdb.clone(),
+            clock: slave.clock.clone(),
+            serve,
+            ..MasterConfig::new(slave.identifier.clone(), slave.path.clone())
+        }
+    }
+
+    pub fn new(identifier: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+```
+
+- [ ] **Step 4: One-line reasons for unreachable peers**
+
+In `src/error.rs`, replace:
+
+```rust
+    /// `admin::node_status` (and `node_status_probed`) could not get an answer from `peer`:
+    /// connect error, timeout, or a transport failure. A peer that answered with an error
+    /// status is reported as `Config` with the status text instead.
+    #[error("{peer} is unreachable: {reason}")]
+    PeerUnreachable { peer: String, reason: String },
+    #[error(transparent)]
+```
+
+with:
+
+```rust
+    /// `admin::node_status` (and `node_status_probed`) could not get an answer from `peer`:
+    /// connect error, timeout, or a transport failure. `reason` is one short line (the root
+    /// cause); the whole chain is available through `source` (and `{:?}`). A peer that answered
+    /// with an error status is reported as `Config` with the status text instead.
+    #[error("{peer} is unreachable: {reason}")]
+    PeerUnreachable {
+        peer: String,
+        reason: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+    #[error(transparent)]
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+/// address, TLS and credentials. A peer that cannot be reached is
+/// `Err(Error::PeerUnreachable { peer, reason })`.
+pub async fn node_status(upstream: &UpstreamConfig, client_id: &str) -> Result<NodeInfo> {
+```
+
+with:
+
+```rust
+/// address, TLS and credentials. A peer that cannot be reached is
+/// `Err(Error::PeerUnreachable { peer, reason, source })`, with a one-line `reason`.
+pub async fn node_status(upstream: &UpstreamConfig, client_id: &str) -> Result<NodeInfo> {
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+///
+/// `Err(PeerUnreachable { peer, reason })` when no answer could be had (connect error, the
+/// [`STATUS_TIMEOUT`], a transport failure); `Err(Config)` with the status text when the peer
+```
+
+with:
+
+```rust
+///
+/// `Err(PeerUnreachable { peer, reason, source })` when no answer could be had (connect error, the
+/// [`STATUS_TIMEOUT`], a transport failure); `Err(Config)` with the status text when the peer
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+        .map_err(|f| match f {
+            StatusFailure::Unreachable(reason) => Error::PeerUnreachable {
+                peer: upstream.uri(),
+                reason,
+            },
+```
+
+with:
+
+```rust
+        .map_err(|f| match f {
+            StatusFailure::Unreachable { reason, source } => Error::PeerUnreachable {
+                peer: upstream.uri(),
+                reason,
+                source,
+            },
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+pub(crate) enum StatusFailure {
+    Unreachable(String),
+    Answered(String),
+}
+```
+
+with:
+
+```rust
+pub(crate) enum StatusFailure {
+    /// `reason` is one short line; `source` keeps the whole error.
+    Unreachable {
+        reason: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+    Answered(String),
+}
+
+impl StatusFailure {
+    fn unreachable(e: impl std::error::Error + Send + Sync + 'static) -> StatusFailure {
+        StatusFailure::Unreachable {
+            reason: short_reason(&e),
+            source: Some(Box::new(e)),
+        }
+    }
+}
+
+/// One short line for an operator: the innermost cause of `e` (transport errors wrap the
+/// useful message, such as "Connection refused", several levels deep), first line only.
+fn short_reason(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut root = e;
+    while let Some(next) = root.source() {
+        root = next;
+    }
+    let text = root.to_string();
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        e.to_string()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    } else {
+        line.to_string()
+    }
+}
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+    let mut c = crate::slave::connect_upstream(upstream, client_id, STATUS_TIMEOUT)
+        .map_err(|e| StatusFailure::Unreachable(format!("Status from {uri}: {e}")))?;
+    let call = c.status(pb::StatusRequest {
+```
+
+with:
+
+```rust
+    let mut c = crate::slave::connect_upstream(upstream, client_id, STATUS_TIMEOUT)
+        .map_err(StatusFailure::unreachable)?;
+    let call = c.status(pb::StatusRequest {
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+        .await
+        .map_err(|_| {
+            StatusFailure::Unreachable(format!(
+                "Status from {uri}: no answer within {STATUS_TIMEOUT:?}"
+            ))
+        })?
+        .map_err(|s| {
+            let m = format!("Status from {uri}: {}: {}", s.code(), s.message());
+            if is_transport_failure(&s) {
+                StatusFailure::Unreachable(m)
+            } else {
+                StatusFailure::Answered(m)
+            }
+```
+
+with:
+
+```rust
+        .await
+        .map_err(|_| StatusFailure::Unreachable {
+            reason: format!("no answer within {STATUS_TIMEOUT:?}"),
+            source: None,
+        })?
+        .map_err(|s| {
+            if is_transport_failure(&s) {
+                StatusFailure::unreachable(s)
+            } else {
+                StatusFailure::Answered(format!("Status from {uri}: {}: {}", s.code(), s.message()))
+            }
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+    pub nodes: Vec<NodeInfo>,
+    /// Nodes that did not answer, or answered with an error (address, error text);
+    /// `Slave::check_promotion` treats the latter as blocking instead.
+    pub unreachable: Vec<(String, String)>,
+```
+
+with:
+
+```rust
+    pub nodes: Vec<NodeInfo>,
+    /// Nodes that did not answer, or answered with an error (address, a one-line reason for
+    /// the former, the error text for the latter); `Slave::check_promotion` treats the latter
+    /// as blocking instead.
+    pub unreachable: Vec<(String, String)>,
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+            Ok(info) => reached.push((up, info)),
+            Err(e) => out.unreachable.push((up.uri(), e.to_string())),
+```
+
+with:
+
+```rust
+            Ok(info) => reached.push((up, info)),
+            // One short line: the address is already in the pair.
+            Err(Error::PeerUnreachable { reason, .. }) => out.unreachable.push((up.uri(), reason)),
+            Err(e) => out.unreachable.push((up.uri(), e.to_string())),
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+
+    /// M8: an unreachable peer is reported as such, not as a configuration error.
+```
+
+with:
+
+```rust
+
+    #[derive(Debug)]
+    struct Wrapped(&'static str, Option<Box<Wrapped>>);
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|e| e as _)
+        }
+    }
+
+    /// The reason for an unreachable peer is the root cause, one line.
+    #[test]
+    fn unreachable_reasons_are_the_root_cause_on_one_line() {
+        let chain = Wrapped(
+            "transport error",
+            Some(Box::new(Wrapped(
+                "tcp connect error",
+                Some(Box::new(Wrapped(
+                    "Connection refused (os error 111)\nat line 2",
+                    None,
+                ))),
+            ))),
+        );
+        assert_eq!(short_reason(&chain), "Connection refused (os error 111)");
+        assert_eq!(short_reason(&Wrapped("just this", None)), "just this");
+    }
+
+    /// M8: an unreachable peer is reported as such, not as a configuration error.
+```
+
+In `src/admin.rs`, replace:
+
+```rust
+        match node_status(&up, "operator").await {
+            Err(Error::PeerUnreachable { peer, reason }) => {
+                assert_eq!(peer, up.uri());
+                assert!(!reason.is_empty());
+            }
+```
+
+with:
+
+```rust
+        match node_status(&up, "operator").await {
+            Err(Error::PeerUnreachable {
+                peer,
+                reason,
+                source,
+            }) => {
+                assert_eq!(peer, up.uri());
+                assert!(!reason.is_empty() && !reason.contains('\n'), "{reason:?}");
+                assert!(source.is_some(), "the whole chain is kept");
+            }
+```
+
+- [ ] **Step 5: Unused imports**
+
+`last_seq()` is now inherent, so these `LogApi` imports are unused (clippy `-D warnings`):
+
+In `tests/master_ttl.rs`, replace:
+
+```rust
+use common::{clock, config, log};
+use replicated_rocksdb::{Batch, CfSpec, LogApi, Master, Op, ReadApi, ReapStats};
+```
+
+with:
+
+```rust
+use common::{clock, config, log};
+use replicated_rocksdb::{Batch, CfSpec, Master, Op, ReadApi, ReapStats};
+```
+
+In `tests/repoint.rs`, replace:
+
+```rust
+use replicated_rocksdb::{
+    AcceptDataLoss, CfSpec, Error, HaltAction, HaltReason, LogApi, Master, ReadApi,
+    RepointDivergence, RepointOptions, RepointOutcome, Slave, SlaveState, UpstreamConfig,
+};
+```
+
+with:
+
+```rust
+use replicated_rocksdb::{
+    AcceptDataLoss, CfSpec, Error, HaltAction, HaltReason, Master, ReadApi, RepointDivergence,
+    RepointOptions, RepointOutcome, Slave, SlaveState, UpstreamConfig,
+};
+```
+
+- [ ] **Step 6: Run the tests**
+
+Run: `cargo test --test ergonomics --test write_concern && cargo test --lib admin`
+Expected: PASS.
+
+- [ ] **Step 7: Use the helpers in the examples**
+
+Replace the hand-rolled polling loops (`while status().state != Streaming { sleep }`, the `replicas()` in-sync loops), the `PromoteRefused` `map_err`, the hand-written promotion config and the `LogApi` imports:
+
+In `examples/failover.rs`, replace:
+
+```rust
+use replicated_rocksdb::{
+    AcceptDataLoss, AllowAll, CfSpec, Error, LogApi, Master, MasterConfig, ReadApi,
+    RepointDivergence, RepointOptions, ServeConfig, Slave, SlaveConfig, SlaveState, UpstreamConfig,
+};
+```
+
+with:
+
+```rust
+use replicated_rocksdb::{
+    AcceptDataLoss, AllowAll, CfSpec, Error, Master, MasterConfig, ReadApi, RepointDivergence,
+    RepointOptions, ServeConfig, Slave, SlaveConfig, UpstreamConfig,
+};
+```
+
+In `examples/failover.rs`, replace:
+
+```rust
+
+/// The config to promote replica `id` with: same directory, now serving as a master.
+fn master_cfg(dir: &Path, id: &str) -> MasterConfig {
+    let mut cfg = MasterConfig::new(id, dir.join(id));
+    cfg.serve = Some(serve());
+    cfg
+}
+
+async fn streaming(s: &Slave) {
+    while s.status().state != SlaveState::Streaming {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+```
+
+with:
+
+```rust
+
+/// The config to promote replica `id` with: same identifier, directory, retention, tuning
+/// and clock as its `SlaveConfig`, now serving as a master.
+fn master_cfg(dir: &Path, id: &str) -> MasterConfig {
+    let slave_cfg = replica_cfg(dir, id, ([127, 0, 0, 1], 0).into());
+    MasterConfig::from_slave_config(&slave_cfg, Some(serve()))
+}
+```
+
+In `examples/failover.rs`, replace:
+
+```rust
+    let c = Slave::open(replica_cfg(dir, "C", a_addr)).await?;
+    streaming(&b).await;
+    streaming(&c).await;
+```
+
+with:
+
+```rust
+    let c = Slave::open(replica_cfg(dir, "C", a_addr)).await?;
+    b.wait_streaming(WAIT).await?;
+    c.wait_streaming(WAIT).await?;
+```
+
+In `examples/failover.rs`, replace:
+
+```rust
+    for (addr, why) in &gathered.unreachable {
+        println!(
+            "  unreachable: {addr} ({})",
+            why.lines().next().unwrap_or("")
+        );
+    }
+```
+
+with:
+
+```rust
+    for (addr, why) in &gathered.unreachable {
+        println!("  unreachable: {addr} ({why})");
+    }
+```
+
+In `examples/failover.rs`, replace:
+
+```rust
+    ];
+    let new_master = c
+        .promote_checked(master_cfg(dir, "C"), &peers)
+        .await
+        .map_err(|e| e.to_string())?;
+    let new_addr = new_master.serve_addr().unwrap();
+```
+
+with:
+
+```rust
+    ];
+    // `into_parts` keeps the slave of a refusal while `?` propagates the error.
+    let new_master = match c.promote_checked(master_cfg(dir, "C"), &peers).await {
+        Ok(master) => master,
+        Err(refused) => {
+            let (error, _slave) = refused.into_parts();
+            return Err(error.into());
+        }
+    };
+    let new_addr = new_master.serve_addr().unwrap();
+```
+
+In `examples/master_and_replica.rs`, replace:
+
+```rust
+use replicated_rocksdb::{
+    AllowAll, CfSpec, FetchConfig, LogApi, Master, MasterConfig, ReadApi, ServeConfig, Slave,
+    SlaveConfig, SlaveState, UpstreamConfig,
+};
+```
+
+with:
+
+```rust
+use replicated_rocksdb::{
+    AllowAll, CfSpec, FetchConfig, Master, MasterConfig, ReadApi, ServeConfig, Slave, SlaveConfig,
+    SlaveState, UpstreamConfig,
+};
+```
+
+In `examples/master_and_replica.rs`, replace:
+
+```rust
+    // This is the signal `WriteConcern` uses (see the `write_concern` example).
+    for _ in 0..200 {
+        if master.replicas().iter().any(|r| r.in_sync) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for r in master.replicas() {
+```
+
+with:
+
+```rust
+    // This is the signal `WriteConcern` uses (see the `write_concern` example).
+    master.wait_in_sync(1, Duration::from_secs(10)).await?;
+    for r in master.replicas() {
+```
+
+In `examples/master_and_replica.rs`, replace:
+
+```rust
+    // Let it finish its bootstrap and attach, so the next write travels through the log.
+    while master.replicas().len() < 2 || batched_slave.status().state != SlaveState::Streaming {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let seq = master.put("users", b"carol", b"Carol C.")?;
+```
+
+with:
+
+```rust
+    // Let it finish its bootstrap and attach, so the next write travels through the log.
+    batched_slave
+        .wait_streaming(Duration::from_secs(10))
+        .await?;
+    master.wait_in_sync(2, Duration::from_secs(10)).await?;
+    let seq = master.put("users", b"carol", b"Carol C.")?;
+```
+
+In `examples/write_concern.rs`, replace:
+
+```rust
+    AllowAll, CfSpec, Error, FetchConfig, Master, MasterConfig, ReadApi, Seq, ServeConfig, Slave,
+    SlaveConfig, SlaveState, UpstreamConfig, WriteConcern,
+};
+```
+
+with:
+
+```rust
+    AllowAll, CfSpec, Error, FetchConfig, Master, MasterConfig, ReadApi, Seq, ServeConfig, Slave,
+    SlaveConfig, UpstreamConfig, WriteConcern,
+};
+```
+
+In `examples/write_concern.rs`, replace:
+
+```rust
+    let slave = Slave::open(cfg).await?;
+    while slave.status().state != SlaveState::Streaming {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(slave)
+```
+
+with:
+
+```rust
+    let slave = Slave::open(cfg).await?;
+    slave.wait_streaming(Duration::from_secs(10)).await?;
+    Ok(slave)
+```
+
+In `examples/write_concern.rs`, replace:
+
+```rust
+
+    // ---- Concern in the config: applies to EVERY write on this master (put, write,
+    // create_cf, ...) unless a call overrides it with the `*_with` variants.
+    let mut cfg = MasterConfig::new("master", dir.path().join("master"));
+```
+
+with:
+
+```rust
+
+    // ---- Concern in the config: applies to EVERY data write on this master (put, write,
+    // delete, ...) unless a call overrides it with the `*_with` variants. CF operations are
+    // exempt: they carry no user data.
+    let mut cfg = MasterConfig::new("master", dir.path().join("master"));
+```
+
+In `examples/write_concern.rs`, replace:
+
+```rust
+
+    // 1. No replica yet => even create_cf is refused, and nothing is written (no seq used).
+    match master.create_cf(CfSpec::new("kv")) {
+        Err(Error::NotEnoughReplicas { required, in_sync }) => {
+            println!("create_cf refused: {in_sync} in sync, {required} required (nothing written)")
+        }
+```
+
+with:
+
+```rust
+
+    // 1. No replica yet. Creating a CF needs none (CF operations ignore the write concern),
+    // but a data write is refused, and nothing is written (no seq used).
+    master.create_cf(CfSpec::new("kv"))?;
+    let m = master.clone();
+    match tokio::task::spawn_blocking(move || m.put("kv", b"early", b"x")).await? {
+        Err(Error::NotEnoughReplicas { required, in_sync }) => {
+            println!("put refused: {in_sync} in sync, {required} required (nothing written)")
+        }
+```
+
+In `examples/write_concern.rs`, replace:
+
+```rust
+    let fast = open_slave(dir.path(), "fast", addr, FetchConfig::default()).await?;
+    wait_in_sync(&master, 1).await;
+    master.create_cf(CfSpec::new("kv"))?; // now allowed by the configured concern (1)
+```
+
+with:
+
+```rust
+    let fast = open_slave(dir.path(), "fast", addr, FetchConfig::default()).await?;
+    master.wait_in_sync(1, Duration::from_secs(10)).await?;
+```
+
+In `examples/write_concern.rs`, replace:
+
+```rust
+    let slow = open_slave(dir.path(), "slow", addr, slow_fetch).await?;
+    wait_in_sync(&master, 2).await;
+    let tight = WriteConcern {
+```
+
+with:
+
+```rust
+    let slow = open_slave(dir.path(), "slow", addr, slow_fetch).await?;
+    master.wait_in_sync(2, Duration::from_secs(10)).await?;
+    let tight = WriteConcern {
+```
+
+In `examples/write_concern.rs`, replace:
+
+```rust
+}
+
+async fn wait_in_sync(master: &Master, n: usize) {
+    while master.replicas().iter().filter(|r| r.in_sync).count() < n {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+```
+
+with:
+
+```rust
+}
+```
+
+In `examples/secure_replication.rs`, replace:
+
+```rust
+use replicated_rocksdb::{
+    CfSpec, HaltReason, Master, MasterConfig, ReadApi, ServeConfig, Slave, SlaveConfig, SlaveState,
+    TlsClientConfig, TlsIdentity, TlsServerConfig, TokenAuthenticator, TokenCredentials,
+```
+
+with:
+
+```rust
+use replicated_rocksdb::{
+    CfSpec, HaltReason, Master, MasterConfig, ReadApi, ServeConfig, Slave, SlaveConfig,
+    TlsClientConfig, TlsIdentity, TlsServerConfig, TokenAuthenticator, TokenCredentials,
+```
+
+In `examples/secure_replication.rs`, replace:
+
+```rust
+    .await?;
+    while bad.status().state != SlaveState::Halted(HaltReason::AuthRejected) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+```
+
+with:
+
+```rust
+    .await?;
+    // `wait_streaming` reports the halt instead of waiting forever.
+    match bad.wait_streaming(Duration::from_secs(10)).await {
+        Err(replicated_rocksdb::Error::Halted(HaltReason::AuthRejected)) => {}
+        other => panic!("expected an AuthRejected halt, got {other:?}"),
+    }
+```
+
+In `examples/README.md`, replace:
+
+```
+| `embedded_master` | A `Master` as a plain local store: CFs, put/get/delete/delete_range, `Batch`, TTL, snapshot, iteration, and the **application-lock read-modify-write pattern** (the crate has no `update`/CAS/merge). | A line per operation; the locked counter ends at exactly `200`. |
+| `master_and_replica` | Master serving replication, a `Slave` following it, `wait_for_seq` for read-your-writes, `Master::replicas()` / `Slave::status()`, real-time vs batched `FetchConfig`. | Replica reads, lag/in_sync numbers, and the batched replica lagging by about its `max_wait` (~500 ms). |
+| `write_concern` | `WriteConcern` in config and per call; `NotEnoughReplicas` (nothing written) vs `AckTimeout` (committed, do not blindly retry); `spawn_blocking`. | A refused write, an acked write, and a timeout whose entry still reaches the slow replica. |
+| `failover` | The operator runbook: stop A, `admin::gather` / `choose_promotion_candidate`, `promote_checked` (incl. `PromoteRefused`), `repoint`, then the `Diverged` / `AcceptDataLoss` path. | Two scenarios: a clean failover, then a deliberately wrong promotion showing `Diverged` and the explicit data-loss opt-in. |
+| `secure_replication` | TLS (runtime `rcgen` CA and server cert) plus bearer-token auth; mTLS allow-list explained in comments. | A good-token replica replicates; a bad-token replica halts with `AuthRejected`. |
+```
+
+with:
+
+```
+| `embedded_master` | A `Master` as a plain local store: CFs, put/get/delete/delete_range, `Batch`, TTL, snapshot, iteration, and the **application-lock read-modify-write pattern** (the crate has no `update`/CAS/merge). | A line per operation; the locked counter ends at exactly `200`. |
+| `master_and_replica` | Master serving replication, a `Slave` following it, `wait_streaming` / `wait_in_sync` instead of polling, `wait_for_seq` for read-your-writes, `Master::replicas()` / `Slave::status()`, real-time vs batched `FetchConfig`. | Replica reads, lag/in_sync numbers, and the batched replica lagging by about its `max_wait` (~500 ms). |
+| `write_concern` | `WriteConcern` in config and per call (CF operations are exempt); `NotEnoughReplicas` (nothing written) vs `AckTimeout` (committed, do not blindly retry); `Master::wait_in_sync`; `spawn_blocking`. | A refused write, an acked write, and a timeout whose entry still reaches the slow replica. |
+| `failover` | The operator runbook: stop A, `admin::gather` / `choose_promotion_candidate`, `promote_checked` (incl. `PromoteRefused::into_parts`), `MasterConfig::from_slave_config`, `repoint`, then the `Diverged` / `AcceptDataLoss` path. | Two scenarios: a clean failover, then a deliberately wrong promotion showing `Diverged` and the explicit data-loss opt-in. |
+| `secure_replication` | TLS (runtime `rcgen` CA and server cert) plus bearer-token auth; mTLS allow-list explained in comments. | A good-token replica replicates; a bad-token replica halts with `AuthRejected`. |
+```
+
+Run each: `for e in embedded_master master_and_replica write_concern failover secure_replication; do cargo run -q --example $e || break; done`
+Expected: all exit 0; `write_concern` prints `put refused: 0 in sync, 1 required (nothing written)`; `failover` prints `unreachable: http://127.0.0.1:<port> (Connection refused (os error 111))` on one line.
+
+- [ ] **Step 8: Document it**
+
+In DESIGN.md §5.2, replace the first sentence:
+
+```markdown
+`MasterConfig::write_concern: WriteConcern { min_insync_replicas, ack_timeout }` (default `0` = asynchronous, `5 s`) applies to every write method; `Master::write_with(batch, concern)` and `Master::put_with(cf, key, value, concern)` override it per call.
+```
+
+with:
+
+```markdown
+`MasterConfig::write_concern: WriteConcern { min_insync_replicas, ack_timeout }` (default `0` = asynchronous, `5 s`) applies to every data write method; `Master::write_with(batch, concern)` and `Master::put_with(cf, key, value, concern)` override it per call. **CF operations are exempt:** `create_cf` and `drop_cf` carry no user data and converge once replicated, so they always commit asynchronously (fsynced on the master, no acks awaited), whatever the configured concern; a fresh master with `min_insync_replicas = 1` can create its CFs before any replica exists. `Master::wait_in_sync(n, timeout)` waits until at least `n` direct replicas are in sync (`Err(Timeout)` otherwise).
+```
+
+In DESIGN.md §16, add before `impl Master` and extend its first lines:
+
+```markdown
+impl Master {
+    pub async fn open(cfg: MasterConfig) -> Result<Self>;
+    pub fn identity(&self) -> DbIdentity;
+```
+
+with:
+
+```markdown
+impl MasterConfig {
+    pub fn new(identifier: impl Into<String>, path: impl Into<PathBuf>) -> Self;
+    pub fn from_slave_config(slave: &SlaveConfig, serve: Option<ServeConfig>) -> Self;
+                                        // to promote: same identifier, path, retention, heartbeat,
+                                        // tuning and clock
+}
+
+impl Master {
+    pub async fn open(cfg: MasterConfig) -> Result<Self>;   // starts a new epoch (§13)
+    pub fn identity(&self) -> DbIdentity;
+    pub fn last_seq(&self) -> Seq;                          // also via LogApi
+```
+
+and:
+
+```markdown
+    pub fn create_cf(&self, spec: CfSpec) -> Result<Seq>;
+    pub fn drop_cf(&self, name: &str) -> Result<Seq>;
+
+    pub fn snapshot(&self) -> Result<ReadSnapshot>;
+    pub fn replicas(&self) -> Vec<ReplicaStatus>;      // direct downstream only
+```
+
+with:
+
+```markdown
+    pub fn create_cf(&self, spec: CfSpec) -> Result<Seq>;   // CF ops ignore the write concern (§5.2)
+    pub fn drop_cf(&self, name: &str) -> Result<Seq>;
+
+    pub fn snapshot(&self) -> Result<ReadSnapshot>;
+    pub fn replicas(&self) -> Vec<ReplicaStatus>;      // direct downstream only
+    pub async fn wait_in_sync(&self, n: usize, timeout: Duration) -> Result<()>;   // Err(Timeout)
+```
+
+In the `Slave` methods:
+
+```markdown
+    pub fn applied_seq(&self) -> Seq;
+    pub fn serve_addr(&self) -> Option<SocketAddr>;     // when serve is configured
+    pub async fn wait_for_seq(&self, seq: Seq, timeout: Duration) -> Result<()>;
+```
+
+with:
+
+```markdown
+    pub fn applied_seq(&self) -> Seq;
+    pub fn last_seq(&self) -> Seq;                       // = applied_seq; also via LogApi
+    pub fn serve_addr(&self) -> Option<SocketAddr>;     // when serve is configured
+    pub async fn wait_for_seq(&self, seq: Seq, timeout: Duration) -> Result<()>;
+    pub async fn wait_streaming(&self, timeout: Duration) -> Result<()>;   // Err(Halted(r)) | Err(Timeout)
+```
+
+In §13.1, extend the refusal bullet:
+
+```markdown
+with `into_slave()` / `into_master()`.
+```
+
+with:
+
+```markdown
+with `into_slave()` / `into_master()`, or `into_parts()` → `(Error, Option<node>)` to keep the node while propagating the error with `?`.
+```
+
+In the `admin` block:
+
+```markdown
+                                                // unreachable → Error::PeerUnreachable { peer, reason }
+```
+
+with:
+
+```markdown
+                                                // unreachable → Error::PeerUnreachable { peer, reason, source }:
+                                                // `reason` is one line (the root cause), `source` the whole chain
+```
+
+In §16.2:
+
+```markdown
+`PeerUnreachable { peer, reason }` (`admin::node_status*` got no answer)
+```
+
+with:
+
+```markdown
+`PeerUnreachable { peer, reason, source }` (`admin::node_status*` got no answer; `reason` is one line)
+```
+
+- [ ] **Step 9: Run everything and commit**
+
+Run: `cargo fmt --check && cargo test && cargo test --features failpoints && cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features failpoints -- -D warnings && cargo doc --no-deps`
+Expected: PASS, no warnings (`--all-targets` includes the examples).
+
+```bash
+git add src tests examples DESIGN.md
+git commit -m "feat: API ergonomics (CF ops ignore write concern, wait helpers, into_parts, from_slave_config)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 3: Verify core — types, range arithmetic, snapshot scans and the comparison algorithm
 
 **Files:**
 - Create: `src/verify/mod.rs`, `src/verify/range.rs`, `src/verify/scan.rs`, `src/verify/compare.rs`
@@ -721,30 +5179,30 @@ pub use verify::{
 Create `src/verify/range.rs`, `src/verify/scan.rs` and `src/verify/compare.rs`, each with only a doc line for now, so the module compiles:
 
 ```rust
-//! See Task 1.
+//! See Task 3.
 ```
 
 (`src/verify/scan.rs`)
 
 ```rust
-//! See Task 1.
+//! See Task 3.
 ```
 
 (`src/verify/compare.rs`)
 
 ```rust
-//! See Task 1.
+//! See Task 3.
 ```
 
 Run: `cargo build`
-Expected: builds (dead-code warnings for the new items are expected until Tasks 2–3 use them).
+Expected: builds (dead-code warnings for the new items are expected until Tasks 4–5 use them).
 
 - [ ] **Step 2: Write the failing tests for range arithmetic and snapshot scans**
 
 Replace the content of `src/verify/range.rs` with its test module:
 
 ```rust
-//! See Task 1.
+//! See Task 3.
 ```
 
 with:
@@ -1005,7 +5463,7 @@ mod tests {
 Replace the content of `src/verify/scan.rs` with its test module:
 
 ```rust
-//! See Task 1.
+//! See Task 3.
 ```
 
 with:
@@ -1756,7 +6214,7 @@ Expected: PASS, 13 tests: 9 in `verify::range` (including `range_hashes_match_th
 Replace the content of `src/verify/compare.rs` with its test module:
 
 ```rust
-//! See Task 1.
+//! See Task 3.
 ```
 
 with:
@@ -2473,14 +6931,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 2: Server Verify RPCs — sessions, `HashRange`, `ListRange`, limits
+### Task 4: Server Verify RPCs — sessions, `HashRange`, `ListRange`, limits
 
 **Files:**
 - Create: `src/server/verify.rs`
 - Modify: `src/server/mod.rs`, `src/server/tests.rs` (remove `verify_is_not_implemented_yet`), `PROTOCOL.md` (§9.2, §9.4, §12)
 
 **Interfaces:**
-- Consumes: Task 1 `verify::{VerifyMode::from_pb, LIST_SOFT_BYTES, MAX_LIST_LIMIT}`, `verify::range::{Bounds::from_pb, KeyOrder::new}`, `verify::scan::{hash_range, list_range}`; Plan 2 `ServerState { source: Weak<dyn LogSource>, cfg: ServeConfig, shutdown: watch::Receiver<bool>, replicas, … }`, `ServerState::authorize(&self, &CallInfo, Method) -> Result<Arc<dyn LogSource>, Status>`, `call_info(&Request<T>, Method) -> Result<CallInfo, Status>`, `CallInfo::check_client_id`, `store_status(Error) -> Status`, `stopped`, `end_stream(&mpsc::Sender<Result<T, Status>>, Status, &mut watch::Receiver<bool>, &mut watch::Receiver<u64>)`, `VerifyRangeStream`, `ServerHandle::{shutdown, abort}`, `sweep_leases`, `LogSource::{is_ready, resets, store, node_id, upstream_chain}`, `ReadSnapshot::{meta, phys}`, `net::{reason_status, reason_of, invalid_argument, internal_status, convert::{cf_to_pb, identity_to_pb}}`, `ServeLimits::{max_verify_sessions, verify_session_timeout}`, test helpers `server::test_client::{client, serving_master, Client}`.
+- Consumes: Task 3 `verify::{VerifyMode::from_pb, LIST_SOFT_BYTES, MAX_LIST_LIMIT}`, `verify::range::{Bounds::from_pb, KeyOrder::new}`, `verify::scan::{hash_range, list_range}`; Plan 2 `ServerState { source: Weak<dyn LogSource>, cfg: ServeConfig, shutdown: watch::Receiver<bool>, replicas, … }`, `ServerState::authorize(&self, &CallInfo, Method) -> Result<Arc<dyn LogSource>, Status>`, `call_info(&Request<T>, Method) -> Result<CallInfo, Status>`, `CallInfo::check_client_id`, `store_status(Error) -> Status`, `stopped`, `end_stream(&mpsc::Sender<Result<T, Status>>, Status, &mut watch::Receiver<bool>, &mut watch::Receiver<u64>)`, `VerifyRangeStream`, `ServerHandle::{shutdown, abort}`, `sweep_leases`, `LogSource::{is_ready, resets, store, node_id, upstream_chain}`, `ReadSnapshot::{meta, phys}`, `net::{reason_status, reason_of, invalid_argument, internal_status, convert::{cf_to_pb, identity_to_pb}}`, `ServeLimits::{max_verify_sessions, verify_session_timeout}`, test helpers `server::test_client::{client, serving_master, Client}`.
 - Produces:
   - `server::verify::{Sessions (new(max: usize, timeout: Duration), expire(&self, Instant, reset_gen: Option<u64>), clear(&self)), Session, begin, range, end}`; `ServerState.verify_sessions: verify::Sessions`.
   - Wire behaviour: `VerifyBegin` → `VerifyBeginResponse { session_id (16 random bytes), identity, snapshot_seq, cf_specs, session_timeout_ms }`, `RESOURCE_EXHAUSTED/BUSY` at `max_verify_sessions`, `UNAVAILABLE/NOT_READY` while bootstrapping, `INVALID_ARGUMENT` for an unspecified mode or a `client_id` that is not the node-id metadata; `VerifyRange` answers in order (`request_id` echoed), ends with `NOT_FOUND/SESSION_NOT_FOUND` (unknown/expired), `UNAVAILABLE/UPSTREAM_RESET` (reset since the session began), `UNAVAILABLE/SHUTTING_DOWN`, `INVALID_ARGUMENT`; `ListResult` cut at ~1 MiB but with at least two keys; `VerifyEnd` removes the session (`NOT_FOUND` if unknown).
@@ -2876,7 +7334,7 @@ async fn verify_is_not_implemented_yet() {
 - [ ] **Step 2: Run them to confirm they fail**
 
 Run: `cargo test --lib server::verify`
-Expected: the tests compile (they use only Task 1 and Plan 2 items) and FAIL at runtime, because the Verify RPCs still answer `UNIMPLEMENTED`: e.g. ``called `Result::unwrap()` on an `Err` value: Status { code: Unimplemented, message: "Verify is not implemented by this version", … }``, and `malformed_requests_are_invalid_arguments` fails with `left: Unimplemented, right: InvalidArgument`.
+Expected: the tests compile (they use only Task 3 and Plan 2 items) and FAIL at runtime, because the Verify RPCs still answer `UNIMPLEMENTED`: e.g. ``called `Result::unwrap()` on an `Err` value: Status { code: Unimplemented, message: "Verify is not implemented by this version", … }``, and `malformed_requests_are_invalid_arguments` fails with `left: Unimplemented, right: InvalidArgument`.
 
 - [ ] **Step 3: Implement the sessions and handlers**
 
@@ -3479,19 +7937,19 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 3: Slave verifier — capture at `S`, `verify_now`, reports, policy and scheduling
+### Task 5: Slave verifier — capture at `S`, `verify_now`, reports, policy and scheduling
 
 **Files:**
 - Create: `src/slave/verifier.rs`, `tests/verify.rs`
-- Modify: `src/slave/inner.rs`, `src/slave/apply.rs`, `src/slave/bootstrap.rs`, `src/slave/driver.rs`, `src/slave/config.rs`, `src/slave/state.rs`, `src/slave/mod.rs`, `src/listener.rs`, `tests/support/mod.rs`, `DESIGN.md` (§12, §16, §16.2, §18)
+- Modify: `src/slave/inner.rs`, `src/slave/apply.rs`, `src/slave/bootstrap.rs`, `src/slave/driver.rs`, `src/slave/client.rs`, `src/slave/config.rs`, `src/slave/state.rs`, `src/slave/mod.rs`, `src/listener.rs`, `tests/support/mod.rs`, `DESIGN.md` (§12, §16, §16.2, §18)
 
 **Interfaces:**
-- Consumes: Task 1 `verify::{VerifyMode, VerifyConfig, VerifyReport, VerifyAbort, MismatchPolicy, VERIFY_WINDOW, LIST_SOFT_BYTES}`, `verify::compare::{compare_cf, compare_specs, Budget, CfRun, Oracle, LocalSide}`, `verify::range::{Bounds, KeyOrder, LocalRange, LocalRecord, Throttle}`, `verify::scan::{chunk_cf, load_range}`; Task 2's server; Plan 2 `slave::inner::Inner { store, cfg, state_tx, shutdown_tx, max_entry_bytes, force_bootstrap: ForcedBootstrap, repoint_tx, … }` and `Inner::{new, ident, state, notify, status, upstream_uri}`, `ForcedBootstrap::{request, is_requested_for}`, `slave::client::{connect(&Inner) -> Result<Client>, Client}` (connects to the current upstream, so verify follows `repoint`), `background::blocking`, `net::{reason_of, reason_status, DECODE_SLACK, convert::{cf_from_pb, identity_from_pb}}`, the apply closure in `slave::apply::apply`, `slave::bootstrap::install`, the receive loop of `slave::driver::tail` and `unless_repointed`, `Slave { inner, driver, maintenance, server }`, `Slave::{open, shutdown, kill}`, harness `Cluster::{new, master, master_config, slave, slave_config}`, `assert_converged`, `wait_state`, `wait_until`, `RecordingListener`.
+- Consumes: Task 3 `verify::{VerifyMode, VerifyConfig, VerifyReport, VerifyAbort, MismatchPolicy, VERIFY_WINDOW, LIST_SOFT_BYTES}`, `verify::compare::{compare_cf, compare_specs, Budget, CfRun, Oracle, LocalSide}`, `verify::range::{Bounds, KeyOrder, LocalRange, LocalRecord, Throttle}`, `verify::scan::{chunk_cf, load_range}`; Task 4's server; Plan 2 `slave::inner::Inner { store, cfg, state_tx, shutdown_tx, max_entry_bytes, force_bootstrap: ForcedBootstrap, repoint_tx, … }` and `Inner::{new, ident, state, notify, status, upstream_uri}`, `ForcedBootstrap::{request, is_requested_for}`, `slave::client::{connect_upstream, CallMeta, Client}`, `background::blocking`, `net::{reason_of, reason_status, DECODE_SLACK, convert::{cf_from_pb, identity_from_pb}}`, the apply closure in `slave::apply::apply`, `slave::bootstrap::install`, the receive loop of `slave::driver::tail` and `unless_repointed`, `Slave { inner, driver, maintenance, server }`, `Slave::{open, shutdown, kill}`, harness `Cluster::{new, master, master_config, slave, slave_config}`, `assert_converged`, `wait_state`, `wait_until`, `RecordingListener`.
 - Produces:
   - `SlaveConfig.verify: VerifyConfig` (validated in `SlaveConfig::validate`); `SlaveStatus.last_verify: Option<VerifyReport>`; `ReplicationListener::on_verify_complete(&self, &VerifyReport)` (default no-op).
   - `Slave::verify_now(&self, mode: VerifyMode) -> Result<VerifyReport>` (async).
-  - `slave::inner::{Capture { Idle, Hold, At { seq, tx } }, CaptureHold (target(&self, Seq) -> oneshot::Receiver<CaptureReply>; dropping it releases the applier), CaptureMiss { Passed(Seq), Cancelled }, CaptureReply}`, `Inner::{hold_applier(self: &Arc<Self>) -> CaptureHold, wait_while_held(&self) (async), cancel_capture(&self), capture_after_commit(&self, Seq), set_last_verify(&self, VerifyReport), last_verify(&self) -> Option<VerifyReport>}`, fields `Inner.{verify_lock: tokio::sync::Mutex<()>, last_applied_ts: AtomicU64, rebootstrap: Notify}`.
-  - `slave::verifier::{verify(&Arc<Inner>, VerifyMode) -> Result<VerifyReport>, spawn(&Arc<Inner>) -> Option<JoinHandle<()>>}`; `Slave.verifier: Option<JoinHandle<()>>`.
+  - `slave::inner::{Capture { Idle, Hold, At { seq, tx }, Cancelled }, CaptureHold (target(&self, Seq) -> oneshot::Receiver<CaptureReply>; dropping it releases the applier), CaptureMiss { Passed(Seq), Cancelled }, CaptureReply}`, `Inner::{hold_applier(self: &Arc<Self>) -> CaptureHold, wait_while_held(&self) (async), cancel_capture(&self), capture_after_commit(&self, Seq), set_last_verify(&self, VerifyReport), last_verify(&self) -> Option<VerifyReport>}`, fields `Inner.{verify_lock: tokio::sync::Mutex<()>, last_applied_ts: AtomicU64, rebootstrap: Notify}`.
+  - `slave::verifier::{verify(&Arc<Inner>, VerifyMode) -> Result<VerifyReport>, spawn(&Arc<Inner>) -> Option<JoinHandle<()>>}`; `Slave.verifier: Option<JoinHandle<()>>`; `slave::client::connect_now(&Inner) -> Result<Client>` (async, eager).
   - Harness: `RecordingListener::verifies(&self) -> Vec<VerifyReport>` (field `pub verifies: Mutex<Vec<VerifyReport>>`).
 
 - [ ] **Step 1: Write the failing end-to-end tests**
@@ -3579,7 +8037,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use replicated_rocksdb::{
-    CfSpec, Error, HaltReason, LogApi, Master, ReadApi, Slave, SlaveState, VerifyAbort, VerifyMode,
+    CfSpec, Error, HaltReason, Master, ReadApi, Slave, SlaveState, VerifyAbort, VerifyMode,
 };
 use support::{Cluster, assert_converged, wait_state, wait_until};
 
@@ -3916,13 +8374,13 @@ use crate::store::Store;
 and:
 
 ```rust
-use crate::types::{DbIdentity, EpochStart, Seq};
+use crate::types::{DbIdentity, EpochStart, Seq, newest_records};
 ```
 
 with:
 
 ```rust
-use crate::types::{DbIdentity, EpochStart, Seq};
+use crate::types::{DbIdentity, EpochStart, Seq, newest_records};
 use crate::verify::VerifyReport;
 ```
 
@@ -4042,6 +8500,9 @@ pub(crate) enum Capture {
         seq: Seq,
         tx: oneshot::Sender<CaptureReply>,
     },
+    /// The state a held verify was waiting for is gone (a bootstrap began): its target is
+    /// answered `Cancelled`, and the applier is not held.
+    Cancelled,
 }
 
 /// A verify's hold on the applier. While it exists the applier commits nothing past the
@@ -4052,9 +8513,32 @@ pub(crate) struct CaptureHold {
 
 impl CaptureHold {
     /// Lets the applier run up to `seq`, snapshot right after committing it, and continue.
+    ///
+    /// Answered at once when the slave is already at or past `seq`: a commit that was under
+    /// way when the hold was taken may have landed since. The applier is held, so a snapshot
+    /// taken now is exactly the state at `seq`.
     pub(crate) fn target(&self, seq: Seq) -> oneshot::Receiver<CaptureReply> {
         let (tx, rx) = oneshot::channel();
-        *self.inner.capture() = Capture::At { seq, tx };
+        let mut slot = self.inner.capture();
+        if matches!(*slot, Capture::Cancelled) {
+            let _ = tx.send(Err(CaptureMiss::Cancelled));
+            return rx;
+        }
+        let applied = self.inner.store.position().last_seq;
+        if applied >= seq {
+            let reply = if applied == seq {
+                self.inner.store.read_snapshot(0).map_err(|e| {
+                    tracing::warn!(node = %self.inner.cfg.identifier, seq, error = %e, "verify snapshot failed");
+                    CaptureMiss::Cancelled
+                })
+            } else {
+                Err(CaptureMiss::Passed(applied))
+            };
+            let _ = tx.send(reply);
+            return rx;
+        }
+        *slot = Capture::At { seq, tx };
+        drop(slot);
         self.inner.capture_changed.notify_waiters();
         rx
     }
@@ -4095,11 +8579,19 @@ impl Inner {
         }
     }
 
-    /// Ends any capture (a bootstrap replaces the state it was waiting for).
+    /// Ends any capture (a bootstrap replaces the state it was waiting for): a target already
+    /// set is answered `Cancelled`, and so is one a held verify sets later.
     pub(crate) fn cancel_capture(&self) {
-        if let Capture::At { tx, .. } = std::mem::take(&mut *self.capture()) {
-            let _ = tx.send(Err(CaptureMiss::Cancelled));
+        let mut slot = self.capture();
+        match std::mem::take(&mut *slot) {
+            Capture::At { tx, .. } => {
+                let _ = tx.send(Err(CaptureMiss::Cancelled));
+                *slot = Capture::Cancelled;
+            }
+            Capture::Hold | Capture::Cancelled => *slot = Capture::Cancelled,
+            Capture::Idle => {}
         }
+        drop(slot);
         self.capture_changed.notify_waiters();
     }
 
@@ -4237,6 +8729,82 @@ with:
         };
 ```
 
+In `src/slave/client.rs`, add an eager connect (the verifier connects before it holds the applier) and split the endpoint setup out of `connect_upstream`:
+
+```rust
+/// A client for `up`, identifying itself as `identifier`.
+pub(crate) fn connect_upstream(
+    up: &UpstreamConfig,
+    identifier: &str,
+    connect_timeout: Duration,
+) -> Result<Client> {
+    let mut endpoint = Endpoint::from_shared(up.uri())
+```
+
+with:
+
+```rust
+/// A client for the current upstream whose connection is already established (bounded by
+/// `connect_timeout`). A verify connects this way before it holds the applier.
+pub(crate) async fn connect_now(inner: &Inner) -> Result<Client> {
+    let (endpoint, meta) = endpoint_for(
+        &inner.upstream(),
+        &inner.cfg.identifier,
+        inner.cfg.connect_timeout,
+    )?;
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+    Ok(ReplicationClient::with_interceptor(channel, meta))
+}
+
+/// A client for `up`, identifying itself as `identifier`.
+pub(crate) fn connect_upstream(
+    up: &UpstreamConfig,
+    identifier: &str,
+    connect_timeout: Duration,
+) -> Result<Client> {
+    let (endpoint, meta) = endpoint_for(up, identifier, connect_timeout)?;
+    Ok(ReplicationClient::with_interceptor(
+        endpoint.connect_lazy(),
+        meta,
+    ))
+}
+
+fn endpoint_for(
+    up: &UpstreamConfig,
+    identifier: &str,
+    connect_timeout: Duration,
+) -> Result<(Endpoint, CallMeta)> {
+    let mut endpoint = Endpoint::from_shared(up.uri())
+```
+
+and at the end of the old body (now `endpoint_for`):
+
+```rust
+    let meta = CallMeta {
+        node_id,
+        credentials: up.credentials.clone(),
+    };
+    Ok(ReplicationClient::with_interceptor(
+        endpoint.connect_lazy(),
+        meta,
+    ))
+}
+```
+
+with:
+
+```rust
+    let meta = CallMeta {
+        node_id,
+        credentials: up.credentials.clone(),
+    };
+    Ok((endpoint, meta))
+}
+```
+
 - [ ] **Step 6: Implement the verifier**
 
 Create `src/slave/verifier.rs`:
@@ -4246,10 +8814,9 @@ Create `src/slave/verifier.rs`:
 //! capture a local snapshot at exactly the upstream's seq `S` (taken by the applier right
 //! after it commits `S`), compare the CF lists, then compare each common CF range by range.
 
-use std::cmp::Ordering as SeqOrder;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -4277,6 +8844,12 @@ use crate::verify::scan::{chunk_cf, load_range};
 use crate::verify::{
     LIST_SOFT_BYTES, MismatchPolicy, VERIFY_WINDOW, VerifyAbort, VerifyMode, VerifyReport,
 };
+
+/// The longest the applier stays held waiting for `VerifyBegin` (bounded by `capture_timeout`
+/// too). While held the slave applies and acknowledges nothing (DESIGN.md §12).
+const BEGIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// The longest one answer on the verify stream may take.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn abort(a: VerifyAbort) -> Error {
     Error::VerifyAborted(a)
@@ -4328,6 +8901,9 @@ pub(crate) async fn verify(inner: &Arc<Inner>, mode: VerifyMode) -> Result<Verif
 }
 
 fn finish(inner: &Inner, report: &VerifyReport) {
+    // A halted slave may be on another history than its upstream (a divergence the handshake
+    // refused): a mismatch policy must not act on that. The report is still kept.
+    let halted = matches!(inner.state(), SlaveState::Halted(_));
     if report.is_clean() {
         tracing::info!(
             seq = report.seq,
@@ -4341,7 +8917,7 @@ fn finish(inner: &Inner, report: &VerifyReport) {
             mismatches = report.mismatches.len(),
             "verify found mismatches"
         );
-        if inner.cfg.verify.on_mismatch == MismatchPolicy::Rebootstrap {
+        if !halted && inner.cfg.verify.on_mismatch == MismatchPolicy::Rebootstrap {
             // For the upstream the slave follows now; a later repoint makes it inert.
             inner.force_bootstrap.request(*inner.repoint_tx.borrow());
             inner.rebootstrap.notify_one();
@@ -4359,17 +8935,26 @@ async fn session(
 ) -> Result<VerifyReport> {
     let started = Instant::now();
     let limit = decode_limit(inner.max_entry_bytes.load(Ordering::SeqCst));
-    let mut client = client::connect(inner)?.max_decoding_message_size(limit);
+    // Connected before the applier is held, so the pause never includes TCP or TLS setup.
+    let mut client = client::connect_now(inner)
+        .await
+        .map_err(|e| abort(VerifyAbort::Upstream(format!("connect: {e}"))))?
+        .max_decoding_message_size(limit);
     let req = pb::VerifyBeginRequest {
         client_id: inner.cfg.identifier.clone(),
         mode: mode.to_pb() as i32,
     };
     // The applier commits nothing while the upstream pins its snapshot, so this slave cannot
-    // pass the snapshot's seq before the capture is set up.
+    // pass the snapshot's seq before the capture is set up. The pause is bounded.
     let hold = inner.hold_applier();
-    let begin = client
-        .verify_begin(req)
+    let bound = BEGIN_TIMEOUT.min(inner.cfg.verify.capture_timeout);
+    let begin = tokio::time::timeout(bound, client.verify_begin(req))
         .await
+        .map_err(|_| {
+            abort(VerifyAbort::Upstream(format!(
+                "VerifyBegin got no answer within {bound:?}"
+            )))
+        })?
         .map_err(|s| status_abort(&s))?
         .into_inner();
     span.record("seq", begin.snapshot_seq);
@@ -4477,31 +9062,9 @@ async fn compare(
 }
 
 /// A local snapshot at exactly `s`, taken while `hold` keeps the applier from passing it:
-/// now if the slave is at `s`, otherwise by the applier right after it commits `s`.
+/// at once if the slave is at `s`, otherwise by the applier right after it commits `s`. A
+/// slave already past `s` is only possible with an upstream that is behind it (DESIGN.md §6).
 async fn capture(inner: &Arc<Inner>, hold: CaptureHold, s: Seq) -> Result<ReadSnapshot> {
-    let applied = inner.store.position().last_seq;
-    match applied.cmp(&s) {
-        // Only possible with an upstream that is behind this slave (DESIGN.md §6).
-        SeqOrder::Greater => {
-            return Err(abort(VerifyAbort::PassedSnapshot {
-                snapshot_seq: s,
-                applied_seq: applied,
-            }));
-        }
-        SeqOrder::Equal => {
-            let i = inner.clone();
-            let snap = blocking(move || i.store.read_snapshot(0)).await?;
-            // A commit that was already under way when the hold was taken may have landed.
-            if snap.seq() != s {
-                return Err(abort(VerifyAbort::PassedSnapshot {
-                    snapshot_seq: s,
-                    applied_seq: snap.seq(),
-                }));
-            }
-            return Ok(snap);
-        }
-        SeqOrder::Less => {}
-    }
     let reply = hold.target(s);
     let mut states = inner.state_tx.subscribe();
     let timeout = inner.cfg.verify.capture_timeout;
@@ -4546,7 +9109,14 @@ impl Upstream {
     }
 
     async fn answer(&mut self, id: u64) -> Result<RespKind> {
-        match self.answers.message().await {
+        let next = tokio::time::timeout(ANSWER_TIMEOUT, self.answers.message())
+            .await
+            .map_err(|_| {
+                abort(VerifyAbort::Upstream(format!(
+                    "no answer within {ANSWER_TIMEOUT:?}"
+                )))
+            })?;
+        match next {
             Ok(Some(r)) if r.request_id == id => r
                 .kind
                 .ok_or_else(|| abort(VerifyAbort::Upstream("empty answer".into()))),
@@ -4692,7 +9262,9 @@ Notes for the implementer:
 - The verifier **holds the applier before `VerifyBegin`**: the upstream's snapshot `S` is then never behind this slave (unless the upstream is a slave that is itself behind, DESIGN.md §6). With the target set, the applier runs up to `S`, snapshots right after committing it and continues; the run gets a snapshot whose `seq()` is exactly `S`, or learns that the slave is past `S` (`PassedSnapshot`). It gives up at once if the slave is halted (it can never reach `S`) and otherwise after `capture_timeout`. Without the hold, a slave that follows a busy master passes `S` while the `VerifyBegin` answer travels back, and verifies under writes would always abandon.
 - The local side runs on blocking threads: the chunker streams ranges through a channel (capacity `VERIFY_WINDOW`), and `compare_cf` hashes them upstream sixteen at a time. Both share one `Throttle`, so `max_bytes_per_sec` bounds every local read of the run.
 - `VerifyEnd` is sent on every path after `VerifyBegin` succeeded; errors from it are ignored (the upstream expires idle sessions anyway).
-- `client::connect(inner)` connects to the **current** upstream, so a verify after `Slave::repoint` compares with the new upstream.
+- `client::connect_now(inner)` connects to the **current** upstream (so a verify after `Slave::repoint` compares with the new upstream) and establishes the connection **before** the applier is held; `VerifyBegin` is then bounded by `min(10 s, capture_timeout)`. While held, the slave applies and acknowledges nothing, so the pause must stay short (a write concern on the master could otherwise time out). Every later answer on the stream is bounded by 60 s.
+- `CaptureHold::target` answers at once when the slave is already at or past `S` (a commit under way when the hold was taken may have landed meanwhile); `cancel_capture` also marks a held verify `Cancelled` so its later target is refused (a bootstrap replaced the state).
+- `finish` stores and reports every report, but applies `on_mismatch` only when the slave is not halted: a halted slave may be on another history than its upstream (a refused divergence), and a policy must not discard data on that basis.
 
 - [ ] **Step 7: Wire it into `Slave`**
 
@@ -4821,6 +9393,18 @@ Expected: PASS.
 
 - [ ] **Step 9: Update DESIGN.md**
 
+In DESIGN.md §12 **Comparing at the same seq**, replace step 2:
+
+```markdown
+2. The slave's applier captures a snapshot **exactly at `S`**: it applies up to `S` and snapshots before `S + 1`. Normally the slave is at or behind `S`, since it can only have received what the upstream had. The exception is the case in §6, where it can be ahead. If it is already past `S`, the session is abandoned and retried later.
+```
+
+with:
+
+```markdown
+2. The slave's applier captures a snapshot **exactly at `S`**. The slave connects first, then **holds its applier before sending `VerifyBegin`**, so it cannot run past `S` while the answer travels back (a slave following a busy master otherwise always would). Once `S` is known the applier runs up to `S`, snapshots right after committing it, and continues; a slave already at `S` snapshots at once. The pause is bounded: `VerifyBegin` must answer within `min(10 s, capture_timeout)`, because a held slave applies and acknowledges nothing (a write concern on the master would time out). Normally the slave is at or behind `S`, since it can only have received what the upstream had; the exception is the case in §6, where it can be ahead: then the run is abandoned (`PassedSnapshot`) and retried later. A slave that cannot reach `S` gives up after `capture_timeout`, and at once when it is halted.
+```
+
 In DESIGN.md §12 **Ranges**, replace:
 
 ```markdown
@@ -4866,13 +9450,13 @@ with:
 In DESIGN.md §16.2, replace:
 
 ```markdown
-`PeerUnreachable { peer, reason }` (`admin::node_status*` got no answer), `Io`, `RocksDb`.
+`PeerUnreachable { peer, reason, source }` (`admin::node_status*` got no answer; `reason` is one line), `Io`, `RocksDb`.
 ```
 
 with:
 
 ```markdown
-`PeerUnreachable { peer, reason }` (`admin::node_status*` got no answer), `VerifyAborted(VerifyAbort)` (`verify_now` could not produce a report), `Io`, `RocksDb`.
+`PeerUnreachable { peer, reason, source }` (`admin::node_status*` got no answer; `reason` is one line), `VerifyAborted(VerifyAbort)` (`verify_now` could not produce a report), `Io`, `RocksDb`.
 ```
 
 In the DESIGN.md §18 table, replace:
@@ -4898,5489 +9482,4 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
-
-### Task 4: Integrity scans with real on-disk damage, chains, policies and limits
-
-**Files:**
-- Create: `tests/integrity.rs`
-- Modify: `tests/support/mod.rs` (add `RawDb`, `KeyCmp`)
-
-**Interfaces:**
-- Consumes: Task 3 `Slave::verify_now`, `SlaveConfig.verify`, `SlaveStatus.last_verify`, `RecordingListener::verifies`; Task 1 public `Mismatch`, `MismatchPolicy`, `VerifyAbort`, `VerifyMode`; Plan 1 `replicated_rocksdb::codec::envelope::encode` (public, doc-hidden), `ComparatorRegistry::register`; Plan 2 harness `Cluster::{new, master, master_config, slave_config, path}`, `assert_converged`, `wait_state`, `wait_until`, `write_edge_cases`, `edge_cases`, `copy_dir`, `restore_dir`, `RecordingListener::{bootstraps, assert_no_violations}`, `Slave::{shutdown, serve_addr, last_seq}`, `ServeLimits::{verify_session_timeout, max_verify_sessions}`; the `rocksdb` crate (a normal dependency, so integration tests can use it).
-- Produces: harness `RawDb { open(&Path), open_with(&Path, &[(&str /* logical CF */, &str /* comparator name */, KeyCmp)]), get(cf, key) -> Option<Vec<u8>>, put(cf, key, envelope), delete(cf, key), corrupt_value(cf, key) }`, `type KeyCmp = fn(&[u8], &[u8]) -> std::cmp::Ordering`.
-
-This task adds no production code: it proves Tasks 1–3 against real damage. If a test fails, fix the code it points at (`src/verify/compare.rs` for wrong or missing mismatches, `src/slave/verifier.rs` for aborts and policy, `src/server/verify.rs` for limits).
-
-- [ ] **Step 1: Add the raw-access helper to the harness**
-
-Append to `tests/support/mod.rs`:
-
-```rust
-/// A **stopped** node's directory opened with plain RocksDB, bypassing the crate, to inject
-/// damage replication itself never causes. `comparators` lists `(logical CF, comparator
-/// name, ordering)` for each CF created with a custom comparator (RocksDB refuses to open a
-/// CF with another comparator name).
-pub struct RawDb {
-    db: rocksdb::DB,
-    names: Vec<String>,
-}
-
-/// A key ordering for [`RawDb::open_with`].
-pub type KeyCmp = fn(&[u8], &[u8]) -> std::cmp::Ordering;
-
-impl RawDb {
-    pub fn open(path: &Path) -> RawDb {
-        Self::open_with(path, &[])
-    }
-
-    pub fn open_with(path: &Path, comparators: &[(&str, &str, KeyCmp)]) -> RawDb {
-        let names = rocksdb::DB::list_cf(&rocksdb::Options::default(), path).unwrap();
-        let descriptors: Vec<rocksdb::ColumnFamilyDescriptor> = names
-            .iter()
-            .map(|n| {
-                let mut opts = rocksdb::Options::default();
-                for &(cf, name, f) in comparators {
-                    if n.starts_with(&format!("u:{cf}:")) {
-                        opts.set_comparator(name, Box::new(f));
-                    }
-                }
-                rocksdb::ColumnFamilyDescriptor::new(n, opts)
-            })
-            .collect();
-        let db = rocksdb::DB::open_cf_descriptors(&rocksdb::Options::default(), path, descriptors)
-            .unwrap();
-        RawDb { db, names }
-    }
-
-    /// The physical CF of logical CF `name` (`u:{name}:{create_seq}`); there must be one.
-    fn cf(&self, name: &str) -> Arc<rocksdb::BoundColumnFamily<'_>> {
-        let prefix = format!("u:{name}:");
-        let mut found = self.names.iter().filter(|n| n.starts_with(&prefix));
-        let physical = found
-            .next()
-            .unwrap_or_else(|| panic!("no physical CF for {name}"));
-        assert!(found.next().is_none(), "{name} has several physical CFs");
-        self.db.cf_handle(physical).unwrap()
-    }
-
-    /// The stored envelope.
-    pub fn get(&self, cf: &str, key: &[u8]) -> Option<Vec<u8>> {
-        self.db.get_cf(&self.cf(cf), key).unwrap()
-    }
-
-    pub fn put(&self, cf: &str, key: &[u8], envelope: &[u8]) {
-        self.db.put_cf(&self.cf(cf), key, envelope).unwrap();
-    }
-
-    pub fn delete(&self, cf: &str, key: &[u8]) {
-        self.db.delete_cf(&self.cf(cf), key).unwrap();
-    }
-
-    /// Flips the last byte of a stored value, keeping its envelope header (and `write_seq`):
-    /// the damage only a `Full` verify can see.
-    pub fn corrupt_value(&self, cf: &str, key: &[u8]) {
-        let mut env = self.get(cf, key).expect("the key to corrupt exists");
-        let header = replicated_rocksdb::codec::envelope::decode(&env)
-            .unwrap()
-            .header_len;
-        assert!(env.len() > header, "the value must be non-empty");
-        let last = env.len() - 1;
-        env[last] ^= 0xFF;
-        self.put(cf, key, &env);
-    }
-}
-```
-
-(`RawDb` must only open a **stopped** node's directory: RocksDB holds a lock on an open one. `Slave::shutdown` returns once the database is closed.)
-
-- [ ] **Step 2: Write the integrity tests**
-
-Create `tests/integrity.rs`:
-
-```rust
-//! Integrity scans, end to end: damage is injected into a stopped slave's files with plain
-//! RocksDB, then the slave verifies against its upstream over real gRPC.
-
-mod support;
-
-use std::cmp::Ordering;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use replicated_rocksdb::codec::envelope;
-use replicated_rocksdb::{
-    CfSpec, Error, HaltReason, LogApi, Master, Mismatch, MismatchPolicy, ReadApi, Slave,
-    SlaveConfig, SlaveState, VerifyAbort, VerifyMode,
-};
-use support::{
-    Cluster, RawDb, RecordingListener, assert_converged, copy_dir, edge_cases, restore_dir,
-    wait_state, wait_until, write_edge_cases,
-};
-
-const KEYS: u32 = 200;
-
-fn key(i: u32) -> Vec<u8> {
-    format!("k{i:03}").into_bytes()
-}
-
-fn fill(m: &Master) {
-    m.create_cf(CfSpec::new("data")).unwrap();
-    for i in 0..KEYS {
-        m.put("data", &key(i), format!("value-{i}").as_bytes())
-            .unwrap();
-    }
-}
-
-async fn primary(c: &Cluster) -> Master {
-    let m = c.master("a").await;
-    fill(&m);
-    m
-}
-
-/// A replica with small ranges (16 keys, listed at 2), so a mismatch is narrowed through
-/// several bisection levels.
-async fn replica(
-    c: &Cluster,
-    name: &str,
-    upstream: SocketAddr,
-    tweak: impl FnOnce(&mut SlaveConfig),
-) -> (Slave, SlaveConfig, Arc<RecordingListener>) {
-    let (mut cfg, listener) = c.slave_config(name, upstream);
-    cfg.verify.chunk_keys = 16;
-    cfg.verify.min_chunk_keys = 2;
-    tweak(&mut cfg);
-    (Slave::open(cfg.clone()).await.unwrap(), cfg, listener)
-}
-
-/// Stops `s`, changes its files with plain RocksDB, and opens it again.
-async fn tamper(s: Slave, cfg: &SlaveConfig, f: impl FnOnce(&RawDb)) -> Slave {
-    tamper_with(s, cfg, &[], f).await
-}
-
-async fn tamper_with(
-    s: Slave,
-    cfg: &SlaveConfig,
-    comparators: &[(&str, &str, support::KeyCmp)],
-    f: impl FnOnce(&RawDb),
-) -> Slave {
-    s.shutdown().await.unwrap();
-    f(&RawDb::open_with(&cfg.path, comparators));
-    Slave::open(cfg.clone()).await.unwrap()
-}
-
-fn ws(m: &Master, cf: &str, k: &[u8]) -> u64 {
-    m.get_with_meta(cf, k).unwrap().unwrap().1.write_seq
-}
-
-fn mismatch(cf: &str, k: &[u8], local: Option<u64>, upstream: Option<u64>) -> Mismatch {
-    Mismatch::Key {
-        cf: cf.into(),
-        key: k.to_vec(),
-        local,
-        upstream,
-    }
-}
-
-fn reverse(a: &[u8], b: &[u8]) -> Ordering {
-    b.cmp(a)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_corrupted_value_is_found_by_full_verify_only() {
-    let c = Cluster::new();
-    let m = primary(&c).await;
-    let (b, cfg, _) = replica(&c, "b", m.serve_addr().unwrap(), |_| {}).await;
-    assert_converged(&m, &[("b", &b)]).await;
-    let b = tamper(b, &cfg, |raw| raw.corrupt_value("data", &key(100))).await;
-
-    let quick = b.verify_now(VerifyMode::Quick).await.unwrap();
-    assert!(
-        quick.is_clean(),
-        "Quick hashes envelope headers only: {:?}",
-        quick.mismatches
-    );
-    let full = b.verify_now(VerifyMode::Full).await.unwrap();
-    let w = ws(&m, "data", &key(100));
-    assert_eq!(
-        full.mismatches,
-        vec![mismatch("data", &key(100), Some(w), Some(w))]
-    );
-    assert_eq!(full.keys_checked, u64::from(KEYS));
-    assert_eq!(b.status().last_verify, Some(full));
-}
-
-/// The first and the last key sit in the two ranges without a lower / upper bound.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn keys_deleted_on_disk_are_reported_in_both_modes() {
-    let c = Cluster::new();
-    let m = primary(&c).await;
-    let (b, cfg, _) = replica(&c, "b", m.serve_addr().unwrap(), |_| {}).await;
-    assert_converged(&m, &[("b", &b)]).await;
-    let b = tamper(b, &cfg, |raw| {
-        raw.delete("data", &key(0));
-        raw.delete("data", &key(KEYS - 1));
-    })
-    .await;
-    let expected = vec![
-        mismatch("data", &key(0), None, Some(ws(&m, "data", &key(0)))),
-        mismatch(
-            "data",
-            &key(KEYS - 1),
-            None,
-            Some(ws(&m, "data", &key(KEYS - 1))),
-        ),
-    ];
-    for mode in [VerifyMode::Quick, VerifyMode::Full] {
-        assert_eq!(
-            b.verify_now(mode).await.unwrap().mismatches,
-            expected,
-            "{mode:?}"
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn extra_keys_on_disk_are_reported_with_no_upstream_value() {
-    let c = Cluster::new();
-    let m = primary(&c).await;
-    let (b, cfg, _) = replica(&c, "b", m.serve_addr().unwrap(), |_| {}).await;
-    assert_converged(&m, &[("b", &b)]).await;
-    let b = tamper(b, &cfg, |raw| {
-        raw.put("data", b"k050x", &envelope::encode(7, None, b"stray"));
-        raw.put("data", b"zzz", &envelope::encode(8, Some(1), b"stray"));
-    })
-    .await;
-    let expected = vec![
-        mismatch("data", b"k050x", Some(7), None),
-        mismatch("data", b"zzz", Some(8), None),
-    ];
-    for mode in [VerifyMode::Quick, VerifyMode::Full] {
-        assert_eq!(
-            b.verify_now(mode).await.unwrap().mismatches,
-            expected,
-            "{mode:?}"
-        );
-    }
-}
-
-/// The slave cuts ranges at its own keys (every 16th: k016, k032, k048, …). A key that exists
-/// only upstream, strictly between two boundaries, is still inside a range, and bisection
-/// plus listing finds it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_key_only_upstream_between_two_chunk_boundaries_is_found() {
-    let c = Cluster::new();
-    let m = primary(&c).await;
-    m.put("data", b"k040a", b"only upstream").unwrap();
-    let (b, cfg, _) = replica(&c, "b", m.serve_addr().unwrap(), |_| {}).await;
-    assert_converged(&m, &[("b", &b)]).await;
-    let b = tamper(b, &cfg, |raw| raw.delete("data", b"k040a")).await;
-    let w = ws(&m, "data", b"k040a");
-    for mode in [VerifyMode::Quick, VerifyMode::Full] {
-        let r = b.verify_now(mode).await.unwrap();
-        assert_eq!(
-            r.mismatches,
-            vec![mismatch("data", b"k040a", None, Some(w))],
-            "{mode:?}"
-        );
-        assert_eq!(r.keys_checked, u64::from(KEYS), "k040a is not a local key");
-    }
-}
-
-/// Empty and NUL keys, an all-NUL key, a 1 MiB key (as a range boundary: chunks of one key)
-/// and a ~16 MiB value verify clean in both modes; then damage to the 1 MiB key and to the
-/// big value is found.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn edge_case_data_verifies_and_its_corruption_is_found() {
-    let c = Cluster::new();
-    let m = c.master("a").await;
-    write_edge_cases(&m, "edge");
-    let (b, cfg, _) = replica(&c, "b", m.serve_addr().unwrap(), |cfg| {
-        cfg.verify.chunk_keys = 1;
-        cfg.verify.min_chunk_keys = 1;
-    })
-    .await;
-    assert_converged(&m, &[("b", &b)]).await;
-    for mode in [VerifyMode::Quick, VerifyMode::Full] {
-        let r = b.verify_now(mode).await.unwrap();
-        assert!(r.is_clean(), "{mode:?}: {} mismatches", r.mismatches.len());
-        assert_eq!(r.keys_checked, edge_cases().len() as u64);
-    }
-
-    let long_key = vec![0x5A; 1 << 20];
-    let b = tamper(b, &cfg, |raw| {
-        raw.delete("edge", &long_key);
-        raw.corrupt_value("edge", b"big");
-    })
-    .await;
-    let missing = mismatch("edge", &long_key, None, Some(ws(&m, "edge", &long_key)));
-    let w = ws(&m, "edge", b"big");
-    let quick = b.verify_now(VerifyMode::Quick).await.unwrap();
-    assert!(
-        quick.mismatches == vec![missing.clone()],
-        "Quick: {} mismatches",
-        quick.mismatches.len()
-    );
-    let full = b.verify_now(VerifyMode::Full).await.unwrap();
-    assert!(
-        full.mismatches == vec![missing, mismatch("edge", b"big", Some(w), Some(w))],
-        "Full: {} mismatches",
-        full.mismatches.len()
-    );
-}
-
-/// Ranges, bisection and listings follow the CF's comparator: under reverse order k050
-/// comes before k020, and that is the order mismatches are reported in.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_custom_comparator_cf_verifies_and_localises_damage() {
-    let c = Cluster::new();
-    let mut mcfg = c.master_config("a");
-    mcfg.rocksdb.comparators.register("reverse", reverse);
-    let m = Master::open(mcfg).await.unwrap();
-    m.create_cf(CfSpec::new("rev").with_comparator("reverse"))
-        .unwrap();
-    for i in 0..100 {
-        m.put("rev", &key(i), format!("value-{i}").as_bytes())
-            .unwrap();
-    }
-    let (b, cfg, _) = replica(&c, "b", m.serve_addr().unwrap(), |cfg| {
-        cfg.rocksdb.comparators.register("reverse", reverse);
-        cfg.verify.chunk_keys = 7;
-    })
-    .await;
-    assert_converged(&m, &[("b", &b)]).await;
-    for mode in [VerifyMode::Quick, VerifyMode::Full] {
-        assert!(b.verify_now(mode).await.unwrap().is_clean(), "{mode:?}");
-    }
-    let b = tamper_with(b, &cfg, &[("rev", "reverse", reverse)], |raw| {
-        raw.delete("rev", &key(20));
-        raw.corrupt_value("rev", &key(50));
-    })
-    .await;
-    let (w20, w50) = (ws(&m, "rev", &key(20)), ws(&m, "rev", &key(50)));
-    let quick = b.verify_now(VerifyMode::Quick).await.unwrap();
-    assert_eq!(
-        quick.mismatches,
-        vec![mismatch("rev", &key(20), None, Some(w20))]
-    );
-    let full = b.verify_now(VerifyMode::Full).await.unwrap();
-    assert_eq!(
-        full.mismatches,
-        vec![
-            mismatch("rev", &key(50), Some(w50), Some(w50)),
-            mismatch("rev", &key(20), None, Some(w20))
-        ]
-    );
-}
-
-/// A→B→C: each slave verifies against its own upstream; damage on C shows on C's link only.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_link_of_a_chain_verifies_against_its_own_upstream() {
-    let c = Cluster::new();
-    let m = primary(&c).await;
-    let (b, _, _) = replica(&c, "b", m.serve_addr().unwrap(), |_| {}).await;
-    let (cn, c_cfg, _) = replica(&c, "c", b.serve_addr().unwrap(), |_| {}).await;
-    assert_converged(&m, &[("b", &b), ("c", &cn)]).await;
-    for (name, s) in [("b", &b), ("c", &cn)] {
-        let r = s.verify_now(VerifyMode::Full).await.unwrap();
-        assert!(r.is_clean(), "{name}: {:?}", r.mismatches);
-        assert_eq!(r.seq, m.last_seq(), "{name}");
-    }
-    let cn = tamper(cn, &c_cfg, |raw| raw.corrupt_value("data", &key(7))).await;
-    let w = ws(&m, "data", &key(7));
-    assert_eq!(
-        cn.verify_now(VerifyMode::Full).await.unwrap().mismatches,
-        vec![mismatch("data", &key(7), Some(w), Some(w))]
-    );
-    assert!(
-        b.verify_now(VerifyMode::Full).await.unwrap().is_clean(),
-        "B's link is unaffected"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mismatch_policy_rebootstrap_repairs_and_a_reverify_is_clean() {
-    let c = Cluster::new();
-    let m = primary(&c).await;
-    let (b, cfg, listener) = replica(&c, "b", m.serve_addr().unwrap(), |cfg| {
-        cfg.verify.on_mismatch = MismatchPolicy::Rebootstrap
-    })
-    .await;
-    assert_converged(&m, &[("b", &b)]).await;
-    wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
-    assert_eq!(listener.bootstraps(), 1);
-    let b = tamper(b, &cfg, |raw| {
-        raw.delete("data", &key(3));
-        raw.corrupt_value("data", &key(150));
-    })
-    .await;
-    let report = b.verify_now(VerifyMode::Full).await.unwrap();
-    assert_eq!(report.mismatches.len(), 2, "{:?}", report.mismatches);
-    wait_until("the policy re-bootstraps the slave", || {
-        listener.bootstraps() == 2
-    })
-    .await;
-    assert_converged(&m, &[("b", &b)]).await;
-    assert_eq!(b.get("data", &key(3)).unwrap(), Some(b"value-3".to_vec()));
-    assert!(b.verify_now(VerifyMode::Full).await.unwrap().is_clean());
-    assert_eq!(listener.verifies().len(), 2);
-    listener.assert_no_violations();
-}
-
-/// A session idle for longer than the upstream's `verify_session_timeout` is gone: the run is
-/// abandoned with `SessionExpired`. (The slave reads its single range at 2 000 bytes/s, so its
-/// first request comes ~2 s after `VerifyBegin`.)
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_idle_session_expires_and_the_run_is_abandoned() {
-    let c = Cluster::new();
-    let mut mcfg = c.master_config("a");
-    mcfg.serve.as_mut().unwrap().limits.verify_session_timeout = Duration::from_millis(300);
-    let m = Master::open(mcfg).await.unwrap();
-    fill(&m);
-    let (b, _, _) = replica(&c, "b", m.serve_addr().unwrap(), |cfg| {
-        cfg.verify.chunk_keys = usize::MAX;
-        cfg.verify.chunk_bytes = usize::MAX;
-        cfg.verify.max_bytes_per_sec = Some(2_000);
-    })
-    .await;
-    assert_converged(&m, &[("b", &b)]).await;
-    let e = b.verify_now(VerifyMode::Quick).await.unwrap_err();
-    assert!(
-        matches!(e, Error::VerifyAborted(VerifyAbort::SessionExpired)),
-        "{e:?}"
-    );
-}
-
-/// With `max_verify_sessions = 1`, two slaves verifying at once cannot both get a session:
-/// one run is refused with `Busy`, and once the slot is free both verify clean.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_upstream_limits_concurrent_verify_sessions() {
-    let c = Cluster::new();
-    let mut mcfg = c.master_config("a");
-    mcfg.serve.as_mut().unwrap().limits.max_verify_sessions = 1;
-    let m = Master::open(mcfg).await.unwrap();
-    fill(&m);
-    let (b, _, _) = replica(&c, "b", m.serve_addr().unwrap(), |cfg| {
-        // A slow run (~2 s) that holds the only session.
-        cfg.verify.chunk_keys = usize::MAX;
-        cfg.verify.chunk_bytes = usize::MAX;
-        cfg.verify.max_bytes_per_sec = Some(2_000);
-    })
-    .await;
-    let (cn, _, _) = replica(&c, "c", m.serve_addr().unwrap(), |_| {}).await;
-    assert_converged(&m, &[("b", &b), ("c", &cn)]).await;
-
-    let b = Arc::new(b);
-    let slow = {
-        let b = b.clone();
-        tokio::spawn(async move { b.verify_now(VerifyMode::Quick).await })
-    };
-    let mut refused = 0;
-    while !slow.is_finished() {
-        match cn.verify_now(VerifyMode::Quick).await {
-            Err(Error::VerifyAborted(VerifyAbort::Busy)) => refused += 1,
-            Ok(r) => assert!(r.is_clean()),
-            Err(e) => panic!("{e:?}"),
-        }
-        tokio::task::yield_now().await;
-    }
-    let slow = slow.await.unwrap();
-    let slow_refused = matches!(slow, Err(Error::VerifyAborted(VerifyAbort::Busy)));
-    assert!(
-        refused > 0 || slow_refused,
-        "one of two overlapping sessions must have been refused"
-    );
-    if !slow_refused {
-        assert!(slow.unwrap().is_clean());
-    }
-    assert!(
-        cn.verify_now(VerifyMode::Quick).await.unwrap().is_clean(),
-        "the slot is free again"
-    );
-}
-
-/// C is ahead of B (B lost entries it had not flushed, DESIGN.md §6). C cannot capture B's
-/// snapshot seq and abandons the run instead of reporting phantom differences; once B has
-/// caught up, C verifies clean.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_slave_ahead_of_the_upstream_snapshot_abandons_the_run() {
-    let c = Cluster::new();
-    let a = c.master("a").await;
-    a.create_cf(CfSpec::new("c")).unwrap();
-    let (b_cfg, _) = c.slave_config("b", a.serve_addr().unwrap());
-    let b = Slave::open(b_cfg.clone()).await.unwrap();
-    assert_converged(&a, &[("b", &b)]).await;
-    let b_port = b.serve_addr().unwrap().port();
-    let at_port = |mut cfg: SlaveConfig| {
-        cfg.serve.as_mut().unwrap().port = b_port;
-        cfg
-    };
-    b.shutdown().await.unwrap();
-    copy_dir(&c.path("b"), &c.path("b-old"));
-    let b = Slave::open(at_port(b_cfg.clone())).await.unwrap();
-    let (c_cfg, _) = c.slave_config("c", b.serve_addr().unwrap());
-    let cn = Slave::open(c_cfg).await.unwrap();
-    for i in 0..10u8 {
-        a.put("c", &[i], b"v").unwrap();
-    }
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-    let c_seq = cn.last_seq();
-
-    // B loses its newer entries; A is stopped, so B cannot catch up yet.
-    let a_port = a.serve_addr().unwrap().port();
-    a.shutdown().await.unwrap();
-    b.shutdown().await.unwrap();
-    restore_dir(&c.path("b-old"), &c.path("b"));
-    let b = Slave::open(at_port(b_cfg.clone())).await.unwrap();
-    let b_seq = b.last_seq();
-    assert!(b_seq < c_seq);
-    let e = cn.verify_now(VerifyMode::Quick).await.unwrap_err();
-    assert!(
-        matches!(e, Error::VerifyAborted(VerifyAbort::PassedSnapshot { snapshot_seq, applied_seq })
-            if snapshot_seq == b_seq && applied_seq == c_seq),
-        "{e:?}"
-    );
-
-    let mut a_cfg = c.master_config("a");
-    a_cfg.serve.as_mut().unwrap().port = a_port;
-    let a = Master::open(a_cfg).await.unwrap();
-    a.put("c", b"after", b"v").unwrap();
-    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
-    assert!(cn.verify_now(VerifyMode::Quick).await.unwrap().is_clean());
-}
-
-/// A slave halted behind the upstream's snapshot can never reach it: the run gives up at once
-/// instead of waiting `capture_timeout` (60 s).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_halted_slave_behind_the_snapshot_gives_up_at_once() {
-    let c = Cluster::new();
-    let mut mcfg = c.master_config("a");
-    mcfg.rocksdb.comparators.register("reverse", reverse);
-    let m = Master::open(mcfg).await.unwrap();
-    fill(&m);
-    let (b, _, _) = replica(&c, "b", m.serve_addr().unwrap(), |_| {}).await; // no "reverse" here
-    assert_converged(&m, &[("b", &b)]).await;
-    m.create_cf(CfSpec::new("rev").with_comparator("reverse"))
-        .unwrap();
-    wait_state(&b, "SpecMismatch halt", |s| {
-        *s == SlaveState::Halted(HaltReason::SpecMismatch)
-    })
-    .await;
-    let started = Instant::now();
-    let e = b.verify_now(VerifyMode::Quick).await.unwrap_err();
-    assert!(
-        matches!(e, Error::VerifyAborted(VerifyAbort::CaptureTimeout { snapshot_seq }) if snapshot_seq == m.last_seq()),
-        "{e:?}"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "gave up without waiting for capture_timeout"
-    );
-}
-```
-
-- [ ] **Step 3: Run them**
-
-Run: `cargo test --test integrity`
-Expected: PASS, 12 tests: `a_corrupted_value_is_found_by_full_verify_only`, `keys_deleted_on_disk_are_reported_in_both_modes`, `extra_keys_on_disk_are_reported_with_no_upstream_value`, `a_key_only_upstream_between_two_chunk_boundaries_is_found`, `edge_case_data_verifies_and_its_corruption_is_found` (moves a ~16 MiB value through Full hashing on both sides; allow it a few seconds in debug builds), `a_custom_comparator_cf_verifies_and_localises_damage`, `every_link_of_a_chain_verifies_against_its_own_upstream`, `mismatch_policy_rebootstrap_repairs_and_a_reverify_is_clean`, `an_idle_session_expires_and_the_run_is_abandoned`, `the_upstream_limits_concurrent_verify_sessions`, `a_slave_ahead_of_the_upstream_snapshot_abandons_the_run`, `a_halted_slave_behind_the_snapshot_gives_up_at_once`.
-
-Run: `cargo test`
-Expected: PASS.
-
-- [ ] **Step 4: Commit**
-
-```bash
-cargo fmt
-git add tests
-git commit -m "test: integrity scans against on-disk corruption, chains, policies and limits
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-```
-
----
-
-### Task 5: Replication lag (`SlaveStatus.lag_ms`)
-
-**Files:**
-- Create: `tests/observability.rs`
-- Modify: `src/slave/state.rs`, `src/slave/inner.rs`, `src/slave/apply.rs`, `src/slave/bootstrap.rs`, `DESIGN.md` (§16)
-
-`Master::replicas()` / `Slave::replicas()` (`ReplicaStatus` with acks, `lag_entries`, `lag_ms`, `in_sync`) already exist from Plan 2's acks work; this task adds the slave's own lag behind the origin.
-
-**Interfaces:**
-- Consumes: Task 3 `Inner.last_applied_ts`, `Inner::last_verify`; Plan 2 `Inner::{status, now_ms}`, `slave::apply::apply`, `slave::bootstrap::install`, harness `Cluster`, `assert_converged`, `wait_state`, `Slave::clear_halt`.
-- Produces: `SlaveStatus.lag_ms: Option<u64>`; `slave::state::lag_ms(applied: Seq, origin_last: Seq, last_applied_ts: u64, now_ms: u64) -> Option<u64>`.
-
-- [ ] **Step 1: Write the failing tests**
-
-Append to `src/slave/state.rs`:
-
-```rust
-#[cfg(test)]
-mod lag_tests {
-    use super::lag_ms;
-
-    #[test]
-    fn lag_is_zero_when_caught_up_and_unknown_without_a_timestamp() {
-        assert_eq!(
-            lag_ms(10, 10, 0, 5),
-            Some(0),
-            "caught up, even without a timestamp"
-        );
-        assert_eq!(lag_ms(10, 12, 1_000, 4_000), Some(3_000));
-        assert_eq!(
-            lag_ms(10, 12, 0, 4_000),
-            None,
-            "behind, timestamp unknown (after a bootstrap)"
-        );
-        assert_eq!(
-            lag_ms(10, 12, 5_000, 4_000),
-            Some(0),
-            "clock skew never makes it negative"
-        );
-    }
-}
-```
-
-Create `tests/observability.rs`:
-
-```rust
-//! Observability, end to end: replication lag.
-
-mod support;
-
-use std::time::Duration;
-
-use replicated_rocksdb::{CfSpec, HaltAction, HaltReason, LogApi, Master, Slave, SlaveState};
-use support::{Cluster, assert_converged, wait_state};
-
-fn reverse(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
-    b.cmp(a)
-}
-
-/// `lag_ms` is 0 when caught up and, while behind, the age of the last applied entry. B is
-/// stopped behind by an entry whose comparator it lacks (it halts `SpecMismatch` there).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn lag_ms_is_the_age_of_the_last_applied_entry_while_behind() {
-    let c = Cluster::new();
-    let mut mcfg = c.master_config("a");
-    mcfg.rocksdb.comparators.register("reverse", reverse);
-    let m = Master::open(mcfg).await.unwrap();
-    m.create_cf(CfSpec::new("c")).unwrap();
-    let (cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
-    let b = Slave::open(cfg.clone()).await.unwrap();
-    assert_converged(&m, &[("b", &b)]).await;
-    // Tailed, not bootstrapped: B keeps these entries in its log, with their ts_ms.
-    for i in 0..5u8 {
-        m.put("c", &[i], b"v").unwrap(); // ts_ms = T0: the clock has not moved
-    }
-    assert_converged(&m, &[("b", &b)]).await;
-    assert_eq!(b.status().lag_ms, Some(0), "caught up");
-    b.shutdown().await.unwrap();
-
-    let behind = m.last_seq();
-    c.clock.advance(Duration::from_secs(1));
-    m.create_cf(CfSpec::new("rev").with_comparator("reverse"))
-        .unwrap();
-    m.put("c", b"later", b"v").unwrap();
-    let b = Slave::open(cfg.clone()).await.unwrap();
-    wait_state(&b, "SpecMismatch halt", |s| {
-        *s == SlaveState::Halted(HaltReason::SpecMismatch)
-    })
-    .await;
-    c.clock.advance(Duration::from_secs(7));
-    let st = b.status();
-    assert_eq!((st.applied_seq, st.origin_last_seq), (behind, m.last_seq()));
-    assert_eq!(
-        st.lag_ms,
-        Some(8_000),
-        "now − ts_ms of entry {behind}, which was written at T0"
-    );
-
-    b.shutdown().await.unwrap();
-    let mut fixed = cfg;
-    fixed.rocksdb.comparators.register("reverse", reverse);
-    let b = Slave::open(fixed).await.unwrap();
-    b.clear_halt(HaltAction::Retry).await.unwrap();
-    assert_converged(&m, &[("b", &b)]).await;
-    assert_eq!(b.status().lag_ms, Some(0));
-}
-```
-
-- [ ] **Step 2: Run them to confirm they fail**
-
-Run: `cargo test --lib slave::state`
-Expected: FAIL to compile: `unresolved import super::lag_ms`.
-
-Run: `cargo test --test observability`
-Expected: FAIL to compile: `no field lag_ms on type SlaveStatus`.
-
-- [ ] **Step 3: Implement `lag_ms`**
-
-In `src/slave/state.rs`, add the field to `SlaveStatus`:
-
-```rust
-    pub upstream_last_seq: Seq,
-    pub origin_last_seq: Seq,
-```
-
-with:
-
-```rust
-    pub upstream_last_seq: Seq,
-    pub origin_last_seq: Seq,
-    /// 0 when `applied_seq >= origin_last_seq`; while behind, `now − ts_ms` of the last
-    /// applied entry; `None` while that timestamp is unknown (after a bootstrap, until the
-    /// next entry).
-    pub lag_ms: Option<u64>,
-```
-
-and the function, above the first test module:
-
-```rust
-#[cfg(test)]
-mod tests {
-```
-
-insert:
-
-```rust
-/// Replication lag in ms; see [`SlaveStatus::lag_ms`]. `last_applied_ts = 0` means unknown.
-pub(crate) fn lag_ms(
-    applied: Seq,
-    origin_last: Seq,
-    last_applied_ts: u64,
-    now_ms: u64,
-) -> Option<u64> {
-    if applied >= origin_last {
-        return Some(0);
-    }
-    (last_applied_ts > 0).then(|| now_ms.saturating_sub(last_applied_ts))
-}
-```
-
-In `src/slave/inner.rs`, import it:
-
-```rust
-use super::state::{HaltReason, NodeState, SlaveState, SlaveStatus};
-```
-
-with:
-
-```rust
-use super::state::{HaltReason, NodeState, SlaveState, SlaveStatus, lag_ms};
-```
-
-and compute it in `Inner::status`:
-
-```rust
-    pub(crate) fn status(&self) -> SlaveStatus {
-        let pos = self.store.position();
-        SlaveStatus {
-            state: self.state(),
-            origin_identity: self.ident().map(|(id, _)| id),
-            applied_seq: pos.last_seq,
-            first_retained_seq: self.store.first_retained_seq(),
-            upstream_last_seq: self.upstream_last_seq.load(Ordering::SeqCst),
-            origin_last_seq: self
-                .origin_last_seq
-                .load(Ordering::SeqCst)
-                .max(pos.last_seq),
-```
-
-with:
-
-```rust
-    pub(crate) fn status(&self) -> SlaveStatus {
-        let pos = self.store.position();
-        let origin_last_seq = self
-            .origin_last_seq
-            .load(Ordering::SeqCst)
-            .max(pos.last_seq);
-        SlaveStatus {
-            state: self.state(),
-            origin_identity: self.ident().map(|(id, _)| id),
-            applied_seq: pos.last_seq,
-            first_retained_seq: self.store.first_retained_seq(),
-            upstream_last_seq: self.upstream_last_seq.load(Ordering::SeqCst),
-            origin_last_seq,
-            lag_ms: lag_ms(
-                pos.last_seq,
-                origin_last_seq,
-                self.last_applied_ts.load(Ordering::SeqCst),
-                self.now_ms(),
-            ),
-```
-
-In `src/slave/apply.rs`, after the commit, record the entry's timestamp:
-
-```rust
-    inner.origin_last_seq.fetch_max(seq, Ordering::SeqCst);
-```
-
-with:
-
-```rust
-    inner.origin_last_seq.fetch_max(seq, Ordering::SeqCst);
-    inner.last_applied_ts.store(entry.ts_ms, Ordering::SeqCst);
-```
-
-In `src/slave/bootstrap.rs`, in `install`, forget it:
-
-```rust
-    inner.cancel_capture();
-    inner.set_ident(None);
-```
-
-with:
-
-```rust
-    inner.cancel_capture();
-    // The snapshot's last entry is not transferred: its ts_ms is unknown until the next entry.
-    inner.last_applied_ts.store(0, Ordering::SeqCst);
-    inner.set_ident(None);
-```
-
-- [ ] **Step 4: Run the tests**
-
-Run: `cargo test --lib slave::state && cargo test --test observability`
-Expected: PASS: `lag_is_zero_when_caught_up_and_unknown_without_a_timestamp` and `lag_ms_is_the_age_of_the_last_applied_entry_while_behind`.
-
-Run: `cargo test`
-Expected: PASS.
-
-- [ ] **Step 5: Update DESIGN.md §16**
-
-In DESIGN.md §16, in `SlaveStatus`, replace:
-
-```
-    pub lag_ms: Option<u64>,                 // now − ts_ms of the last applied entry, while behind
-```
-
-with:
-
-```
-    pub lag_ms: Option<u64>,                 // 0 when caught up; while behind, now − ts_ms of the last
-                                             // applied entry; None while that ts is unknown (after a bootstrap)
-```
-
-and replace:
-
-```
-    // `SlaveStatus` is #[non_exhaustive]; `lag_ms` and `last_verify` above arrive in Plan 3.
-```
-
-with:
-
-```
-    // `SlaveStatus` is #[non_exhaustive].
-```
-
-- [ ] **Step 6: Commit**
-
-```bash
-cargo fmt
-git add src tests DESIGN.md
-git commit -m "feat: SlaveStatus.lag_ms from the last applied entry's timestamp
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-```
-
----
-
-### Task 6: Tracing spans, and RocksDB reads off the async workers
-
-**Files:**
-- Create: `tests/spans.rs`
-- Modify: `src/server/mod.rs` (Handshake, Status), `src/server/tail.rs`, `src/server/bootstrap.rs`, `src/server/replicas.rs`, `src/slave/driver.rs`, `src/master/reaper.rs`, `DESIGN.md` (§19)
-
-Two parts. **Spans** (DESIGN.md §19): `handshake`, `bootstrap`, `verify` and `reaper`, with `node_id`, `upstream` (absent on the master), `seq` and `epoch`; server-side spans add `client`, `verify` adds `mode`. The two `verify` spans exist since Tasks 2–3. **Deferred items from Plan 2's review:** RocksDB reads that ran on async workers move to blocking threads (the handshake's server view, Tail validation and the junction check, the `Status` RPC), and `ReplicaRegistry::status` no longer reads the log while holding the registry's locks.
-
-**Interfaces:**
-- Consumes: Plan 2 `Svc::{handshake, status}`, `server_view`, `status::node_info`, `tail::{tail, validate, check_junction, produce}`, `server::bootstrap::bootstrap` (its `"serving bootstrap"` event and the `spawn_blocking` that runs the job), `ReplicaRegistry::status`, `slave::driver::{session, handshake_request}`, `master::writer::Inner::{reap_round, identity}`, `net::internal_status`; harness `Cluster`, `assert_converged`; `tracing::{Subscriber, span::{Attributes, Id, Record}, field::{Field, Visit}, Instrument}`.
-- Produces: spans named `handshake`, `bootstrap`, `verify`, `reaper` with fields `node_id`, `upstream` (the client's current upstream URI, or the server's first `upstream_chain` entry; absent on the master), `seq`, `epoch` (when known); server spans add `client`; `verify` adds `mode`. No API change.
-
-- [ ] **Step 1: Write the failing test**
-
-Create `tests/spans.rs`:
-
-```rust
-//! Tracing spans, end to end (DESIGN.md §19). A test binary of its own: it installs a global
-//! subscriber that records every span.
-
-mod support;
-
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use tracing::field::{Field, Visit};
-use tracing::span::{Attributes, Id, Record};
-use tracing::{Event, Metadata, Subscriber};
-
-use replicated_rocksdb::{CfSpec, VerifyMode};
-use support::{Cluster, assert_converged};
-
-/// Every span opened in this test binary: its name and recorded fields (values as text).
-#[derive(Default)]
-struct Capture {
-    spans: Mutex<Vec<(String, BTreeMap<String, String>)>>,
-}
-
-impl Capture {
-    /// Field maps of the spans named `name` opened by node `node_id`.
-    fn find(&self, name: &str, node_id: &str) -> Vec<BTreeMap<String, String>> {
-        let spans = self.spans.lock().unwrap();
-        spans
-            .iter()
-            .filter(|(n, f)| n == name && f.get("node_id").map(String::as_str) == Some(node_id))
-            .map(|(_, f)| f.clone())
-            .collect()
-    }
-}
-
-struct Fields<'a>(&'a mut BTreeMap<String, String>);
-
-impl Visit for Fields<'_> {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.0
-            .insert(field.name().to_string(), format!("{value:?}"));
-    }
-
-    fn record_str(&mut self, field: &Field, value: &str) {
-        self.0.insert(field.name().to_string(), value.to_string());
-    }
-}
-
-/// A minimal subscriber that records spans and ignores events.
-struct Recorder(Arc<Capture>);
-
-impl Subscriber for Recorder {
-    fn enabled(&self, _: &Metadata<'_>) -> bool {
-        true
-    }
-
-    fn new_span(&self, attrs: &Attributes<'_>) -> Id {
-        let mut fields = BTreeMap::new();
-        attrs.record(&mut Fields(&mut fields));
-        let mut spans = self.0.spans.lock().unwrap();
-        spans.push((attrs.metadata().name().to_string(), fields));
-        Id::from_u64(spans.len() as u64)
-    }
-
-    fn record(&self, id: &Id, values: &Record<'_>) {
-        let mut spans = self.0.spans.lock().unwrap();
-        if let Some((_, fields)) = spans.get_mut(id.into_u64() as usize - 1) {
-            values.record(&mut Fields(fields));
-        }
-    }
-
-    fn record_follows_from(&self, _: &Id, _: &Id) {}
-
-    fn event(&self, _: &Event<'_>) {}
-
-    fn enter(&self, _: &Id) {}
-
-    fn exit(&self, _: &Id) {}
-}
-
-/// Both ends of a handshake, a bootstrap and a verify session, and a reaper round, open a span
-/// with `node_id`, `upstream` (absent on the master), `seq` and `epoch`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn spans_carry_node_upstream_seq_and_epoch() {
-    let capture = Arc::new(Capture::default());
-    tracing::subscriber::set_global_default(Recorder(capture.clone())).unwrap();
-
-    let c = Cluster::new();
-    let a = c.master("a").await;
-    a.create_cf(CfSpec::new("c")).unwrap();
-    a.put_with_ttl("c", b"t", b"v", Duration::from_secs(1))
-        .unwrap();
-    let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
-    assert_converged(&a, &[("b", &b)]).await;
-    assert!(b.verify_now(VerifyMode::Quick).await.unwrap().is_clean());
-    c.clock.advance(Duration::from_secs(2));
-    assert_eq!(a.reap_expired().unwrap().deleted, 1);
-
-    let upstream = format!("http://{}", a.serve_addr().unwrap());
-    let epoch = a.identity().epoch.to_string();
-    for (name, node) in [
-        ("handshake", "a"),
-        ("bootstrap", "a"),
-        ("verify", "a"),
-        ("reaper", "a"),
-        ("handshake", "b"),
-        ("bootstrap", "b"),
-        ("verify", "b"),
-    ] {
-        let spans = capture.find(name, node);
-        assert!(!spans.is_empty(), "no {name} span on {node}");
-        for f in &spans {
-            assert!(f.contains_key("seq"), "{name} on {node}: {f:?}");
-            if node == "b" {
-                assert_eq!(f.get("upstream"), Some(&upstream), "{name} on {node}");
-            } else {
-                assert!(
-                    !f.contains_key("upstream"),
-                    "the master has no upstream: {f:?}"
-                );
-            }
-        }
-    }
-    for (name, node) in [
-        ("bootstrap", "a"),
-        ("verify", "a"),
-        ("reaper", "a"),
-        ("verify", "b"),
-        ("handshake", "a"),
-    ] {
-        assert!(
-            capture
-                .find(name, node)
-                .iter()
-                .any(|f| f.get("epoch") == Some(&epoch)),
-            "{name} on {node} has no epoch"
-        );
-    }
-    let clients = |name: &str| {
-        capture
-            .find(name, "a")
-            .into_iter()
-            .filter_map(|f| f.get("client").cloned())
-            .collect::<Vec<_>>()
-    };
-    assert!(clients("handshake").contains(&"b".to_string()));
-    assert!(clients("bootstrap").contains(&"b".to_string()));
-    assert!(
-        capture
-            .find("verify", "b")
-            .iter()
-            .any(|f| f.get("mode").map(String::as_str) == Some("Quick"))
-    );
-}
-```
-
-- [ ] **Step 2: Run it to confirm it fails**
-
-Run: `cargo test --test spans`
-Expected: FAIL: `no handshake span on a` (only the `verify` spans exist so far).
-
-- [ ] **Step 3: Server-side spans, and the handshake and `Status` reads off the async workers**
-
-In `src/server/mod.rs`, in `Svc::handshake`, replace:
-
-```rust
-        let view = server_view(&*src, r.last_seq)?;
-        let v = handshake::decide(&view, &r);
-        tracing::info!(
-            server = %view.server_id, client = %r.client_id, last_seq = r.last_seq,
-            decision = v.decision.as_str_name(), reason = v.reason.as_str_name(), detail = %v.detail,
-            "handshake"
-        );
-```
-
-with:
-
-```rust
-        // `server_view` reads the log (the CRC at the client's last seq): a blocking thread.
-        let (s, client_last) = (src.clone(), r.last_seq);
-        let view = tokio::task::spawn_blocking(move || server_view(&*s, client_last))
-            .await
-            .map_err(|e| net::internal_status(format!("handshake task failed: {e}")))??;
-        let v = handshake::decide(&view, &r);
-        let span = tracing::info_span!(
-            "handshake",
-            node_id = %view.server_id,
-            upstream = view.upstream_chain.first().map(String::as_str),
-            client = %r.client_id,
-            seq = view.last_seq,
-            epoch = view.identity.map(|id| id.epoch),
-        );
-        span.in_scope(|| {
-            tracing::info!(
-                client_last_seq = r.last_seq,
-                decision = v.decision.as_str_name(),
-                reason = v.reason.as_str_name(),
-                detail = %v.detail,
-                "handshake"
-            )
-        });
-```
-
-and in `Svc::status`, replace:
-
-```rust
-        let probes: Vec<Seq> = r.probe_seq.into_iter().collect();
-        let info = status::node_info(
-            &*src,
-            &self.0.replicas,
-            self.0.cfg.limits.replica_lag_time_max,
-            &probes,
-        );
-```
-
-with:
-
-```rust
-        let probes: Vec<Seq> = r.probe_seq.into_iter().collect();
-        // `node_info` reads the log and `__meta`: a blocking thread.
-        let replicas = self.0.replicas.clone();
-        let lag_max = self.0.cfg.limits.replica_lag_time_max;
-        let info = tokio::task::spawn_blocking(move || {
-            status::node_info(&*src, &replicas, lag_max, &probes)
-        })
-        .await
-        .map_err(|e| net::internal_status(format!("status task failed: {e}")))?;
-```
-
-In `src/server/bootstrap.rs`, in `bootstrap`, replace:
-
-```rust
-    tracing::info!(client = %client_id, snapshot_seq = meta.last_seq, cfs = meta.cf_specs.len(), "serving bootstrap");
-```
-
-with:
-
-```rust
-    let chain = src.upstream_chain();
-    let span = tracing::info_span!(
-        "bootstrap",
-        node_id = %src.node_id(),
-        upstream = chain.first().map(String::as_str),
-        client = %client_id,
-        seq = meta.last_seq,
-        epoch = identity.epoch,
-    );
-    span.in_scope(|| tracing::info!(cfs = meta.cf_specs.len(), "serving bootstrap"));
-```
-
-and run the job inside the span:
-
-```rust
-    tokio::task::spawn_blocking(move || {
-        let (tx, end) = job.run();
-```
-
-with:
-
-```rust
-    tokio::task::spawn_blocking(move || {
-        let _entered = span.enter();
-        let (tx, end) = job.run();
-```
-
-- [ ] **Step 4: Tail validation and the junction check on blocking threads**
-
-In `src/server/tail.rs`, in `tail`, replace:
-
-```rust
-    let junction = validate(&*src, &r)?;
-```
-
-with:
-
-```rust
-    // `validate` reads the log (the CRC at `from_seq - 1`): a blocking thread.
-    let (s, req) = (src.clone(), r.clone());
-    let junction = tokio::task::spawn_blocking(move || validate(&*s, &req))
-        .await
-        .map_err(|e| internal_status(format!("tail validation failed: {e}")))??;
-```
-
-and in `produce`, replace:
-
-```rust
-            if let Err(status) = check_junction(&*src, j) {
-                return out.end(status).await;
-            }
-```
-
-with:
-
-```rust
-            let s = src.clone();
-            match tokio::task::spawn_blocking(move || check_junction(&*s, j)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(status)) => return out.end(status).await,
-                Err(e) => {
-                    let status = internal_status(format!("junction check failed: {e}"));
-                    return out.end(status).await;
-                }
-            }
-```
-
-- [ ] **Step 5: `ReplicaRegistry::status` reads the log after releasing its locks**
-
-In `src/server/replicas.rs`, in `ReplicaRegistry::status`, replace:
-
-```rust
-        let epoch = src.identity().map_or(0, |(id, _)| id.epoch);
-        let last = src.store().position().last_seq;
-        let mut out: Vec<ReplicaStatus> = self
-            .streams()
-            .values()
-            .map(|c| {
-                let p = c.progress();
-                let lag_entries = last.saturating_sub(p.applied_seq);
-                let lag_ms = if lag_entries == 0 {
-                    Some(0)
-                } else {
-                    src.store()
-                        .read_entries(p.applied_seq + 1, 1, usize::MAX)
-                        .ok()
-                        .and_then(|v| v.first().map(|e| now_ms.saturating_sub(e.ts_ms)))
-                };
-                ReplicaStatus {
-                    node_id: c.node_id.clone(),
-                    remote_addr: c.remote_addr,
-                    peer_verified: c.peer_verified,
-                    epoch: c.epoch,
-                    connected_since: c.connected_since,
-                    sent_seq: p.sent_seq,
-                    applied_seq: p.applied_seq,
-                    lag_entries,
-                    lag_ms,
-                    in_sync: p.in_sync(c.epoch, epoch, lag_max),
-                    fetch: c.fetch,
-                }
-            })
-            .collect();
-```
-
-with:
-
-```rust
-        let epoch = src.identity().map_or(0, |(id, _)| id.epoch);
-        let last = src.store().position().last_seq;
-        // Copy what is needed under the registry's locks, then read the log without them.
-        let streams: Vec<(Arc<ReplicaCell>, Seq, Seq, bool)> = self
-            .streams()
-            .values()
-            .map(|c| {
-                let p = c.progress();
-                let in_sync = p.in_sync(c.epoch, epoch, lag_max);
-                (c.clone(), p.sent_seq, p.applied_seq, in_sync)
-            })
-            .collect();
-        let mut out: Vec<ReplicaStatus> = streams
-            .into_iter()
-            .map(|(c, sent_seq, applied_seq, in_sync)| {
-                let lag_entries = last.saturating_sub(applied_seq);
-                let lag_ms = if lag_entries == 0 {
-                    Some(0)
-                } else {
-                    src.store()
-                        .read_entries(applied_seq + 1, 1, usize::MAX)
-                        .ok()
-                        .and_then(|v| v.first().map(|e| now_ms.saturating_sub(e.ts_ms)))
-                };
-                ReplicaStatus {
-                    node_id: c.node_id.clone(),
-                    remote_addr: c.remote_addr,
-                    peer_verified: c.peer_verified,
-                    epoch: c.epoch,
-                    connected_since: c.connected_since,
-                    sent_seq,
-                    applied_seq,
-                    lag_entries,
-                    lag_ms,
-                    in_sync,
-                    fetch: c.fetch,
-                }
-            })
-            .collect();
-```
-
-- [ ] **Step 6: Slave-side spans**
-
-In `src/slave/driver.rs`, import `Instrument`:
-
-```rust
-use tokio_stream::wrappers::WatchStream;
-```
-
-with:
-
-```rust
-use tokio_stream::wrappers::WatchStream;
-use tracing::Instrument;
-```
-
-in `session`, replace:
-
-```rust
-    let hs = match unless_repointed(
-        inner,
-        generation,
-        c.clone().handshake(handshake_request(inner)),
-    )
-    .await
-    {
-```
-
-with:
-
-```rust
-    let req = handshake_request(inner);
-    let span = tracing::info_span!(
-        "handshake",
-        node_id = %inner.cfg.identifier,
-        upstream = %inner.upstream_uri(),
-        seq = req.last_seq,
-        epoch = req.known_identity.as_ref().map(|id| id.epoch),
-    );
-    let hs = match unless_repointed(
-        inner,
-        generation,
-        c.clone().handshake(req).instrument(span.clone()),
-    )
-    .await
-    {
-```
-
-log the decision in the handshake's span:
-
-```rust
-    // The retry arm of the driver loop logs the warning and sets `last_error`.
-    if let Some(end) = contradicting_resume(after_stream_diverged, &action) {
-```
-
-with:
-
-```rust
-    span.in_scope(|| {
-        tracing::info!(
-            decision = hs.decision().as_str_name(),
-            reason = hs.reason().as_str_name(),
-            ?action,
-            "handshake answered"
-        )
-    });
-    // The retry arm of the driver loop logs the warning and sets `last_error`.
-    if let Some(end) = contradicting_resume(after_stream_diverged, &action) {
-```
-
-and run the bootstrap in its own span:
-
-```rust
-        Action::Bootstrap => match bootstrap::install(inner, generation, &c, &hs).await {
-            Ok(lease) => {
-                // The bootstrap commit wrote `ready` itself.
-                inner.halt_clear_pending.store(false, Ordering::SeqCst);
-                inner.settle_repoint(generation, Ok(RepointOutcome::Bootstrapped));
-                tail(inner, generation, &c, &hs, Some(lease), backoff).await
-            }
-            Err(end) => end,
-        },
-```
-
-with:
-
-```rust
-        Action::Bootstrap => {
-            // `seq` is the upstream's last_seq at the handshake; the snapshot seq is logged
-            // inside, when the header arrives.
-            let span = tracing::info_span!(
-                "bootstrap",
-                node_id = %inner.cfg.identifier,
-                upstream = %inner.upstream_uri(),
-                seq = hs.last_seq,
-                epoch = hs.identity.as_ref().map(|id| id.epoch),
-            );
-            match bootstrap::install(inner, generation, &c, &hs)
-                .instrument(span)
-                .await
-            {
-                Ok(lease) => {
-                    // The bootstrap commit wrote `ready` itself.
-                    inner.halt_clear_pending.store(false, Ordering::SeqCst);
-                    inner.settle_repoint(generation, Ok(RepointOutcome::Bootstrapped));
-                    tail(inner, generation, &c, &hs, Some(lease), backoff).await
-                }
-                Err(end) => end,
-            }
-        }
-```
-
-- [ ] **Step 7: The reaper span**
-
-In `src/master/reaper.rs`, at the start of `reap_round`:
-
-```rust
-    pub(crate) fn reap_round(&self) -> Result<ReapStats> {
-        let cfg = &self.cfg.reaper;
-```
-
-with:
-
-```rust
-    pub(crate) fn reap_round(&self) -> Result<ReapStats> {
-        let _span = tracing::info_span!(
-            "reaper",
-            node_id = %self.cfg.identifier,
-            seq = self.store.position().last_seq,
-            epoch = self.identity().epoch,
-        )
-        .entered();
-        let cfg = &self.cfg.reaper;
-```
-
-- [ ] **Step 8: Run the tests**
-
-Run: `cargo test --test spans`
-Expected: PASS, 1 test.
-
-Run: `cargo test && cargo test --features failpoints`
-Expected: PASS (behaviour is unchanged by the blocking-thread moves; the server, replica-status and Status tests cover them).
-
-- [ ] **Step 9: Update DESIGN.md §19**
-
-In `DESIGN.md`, replace:
-
-```markdown
-- **`tracing` spans** for each handshake, bootstrap, verify session and reaper round, with `node_id`, `upstream`, `seq` and `epoch` fields. Each applied entry is logged at `trace` level only.
-```
-
-with:
-
-```markdown
-- **`tracing` spans** named `handshake`, `bootstrap`, `verify` and `reaper`, with fields `node_id` (this node), `upstream` (this node's upstream; absent on the master), `seq` and `epoch` (when known). Both ends of a handshake, bootstrap and verify session open one; the server's also carry `client`, and `verify` carries `mode`. Each applied entry is logged at `trace` level only.
-- `SlaveStatus` carries `lag_ms` and `last_verify` (§16).
-```
-
-- [ ] **Step 10: Commit**
-
-```bash
-cargo fmt
-git add src tests DESIGN.md
-git commit -m "feat: tracing spans; move RocksDB reads off async workers and out of registry locks
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-```
-
----
-
-### Task 7: Repair fetches on the verify session — `FetchKeys`, `FetchRange`, `EntryCrcs`
-
-**Files:**
-- Modify: `proto/replication.proto`, `PROTOCOL.md` (§9.2, §13, §14), `src/server/verify.rs`, `src/verify/scan.rs`, `src/slave/verifier.rs`
-
-This task adds the wire half of divergence repair (spec addendum `docs/superpowers/specs/2026-10-09-failover-acks-repair.md` §5): three request kinds on the `VerifyRange` stream of a session pinned to the upstream's snapshot at `S`. `FetchKeys` returns the envelopes (or absence) of given keys, `FetchRange` every key of a range with its envelope (paged like `ListRange`), and `EntryCrcs` the `crc32c` of retained log entries up to `S` (to locate a fork point). The client side becomes a reusable `UpstreamSession`, used by verify and, in Task 8, by repair.
-
-**Interfaces:**
-- Consumes: Task 2 `server::verify::{Session, begin, answer, compute, target}`, Task 3 `slave::verifier::{verify, session, compare, capture, Upstream}`, Task 1 `verify::scan::scan`, `verify::{LIST_SOFT_BYTES, MAX_LIST_LIMIT, MAX_RESUME_KEY_BYTES}`; Plan 2 `LogSource::store`, `Store::entry_crc`, `ReadCtx::get_raw`, `ServerState.source`, `slave::client::connect`.
-- Produces:
-  - Generated `pb::{FetchKeys { cf, keys }, FetchRange { range, limit }, EntryCrcs { from_seq, to_seq }, FetchResult { records, truncated }, FetchedRecord { key, envelope: Option<Vec<u8>> }, EntryCrcResult { entries }, SeqCrc { seq, crc32c }}`, `pb::verify_range_request::Kind::{FetchKeys, FetchRange, EntryCrcs}`, `pb::verify_range_response::Kind::{Fetch, EntryCrcs}`.
-  - `verify::scan::fetch_range(&ReadSnapshot, Arc<PhysCf>, &KeyOrder, &Bounds, limit: usize, soft_bytes: usize) -> Result<(Vec<pb::FetchedRecord>, bool)>`.
-  - `slave::verifier::{UpstreamSession { pub begin: pb::VerifyBeginResponse, pub upstream: Upstream } (open(&Inner, &Client, VerifyMode) -> Result<Self>, close(self)), Upstream::{fetch_keys(&mut self, cf: &str, keys: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>>, fetch_range(&mut self, cf: &str, &Bounds) -> Result<Vec<(Vec<u8>, Vec<u8>)>>, entry_crc(&mut self, Seq) -> Result<Option<u32>>}}`.
-
-- [ ] **Step 1: Extend the protocol**
-
-In `proto/replication.proto` **and** in the PROTOCOL.md §14 protobuf block (they must stay byte-identical; `tests/proto_sync.rs` checks), make the same replacement:
-
-In `proto/replication.proto`, replace:
-
-```proto
-message VerifyRangeRequest {
-  bytes  session_id = 1;
-  uint64 request_id = 2;
-  oneof kind { HashRange hash = 3; ListRange list = 4; }
-}
-
-message VerifyRangeResponse {
-  uint64 request_id = 1;
-  oneof kind { HashResult hash = 2; ListResult list = 3; }
-}
-
-message HashResult { bool matched = 1; uint64 count = 2; bytes hash = 3; }
-message ListResult { repeated KeyDigest keys = 1; bool truncated = 2; }
-message KeyDigest  { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3; }
-```
-
-with:
-
-```proto
-message FetchKeys  { string cf = 1; repeated bytes keys = 2; }
-message FetchRange { KeyRange range = 1; uint32 limit = 2; }
-message EntryCrcs  { uint64 from_seq = 1; uint64 to_seq = 2; }
-
-message VerifyRangeRequest {
-  bytes  session_id = 1;
-  uint64 request_id = 2;
-  oneof kind {
-    HashRange  hash        = 3;
-    ListRange  list        = 4;
-    FetchKeys  fetch_keys  = 5;
-    FetchRange fetch_range = 6;
-    EntryCrcs  entry_crcs  = 7;
-  }
-}
-
-message VerifyRangeResponse {
-  uint64 request_id = 1;
-  oneof kind {
-    HashResult     hash       = 2;
-    ListResult     list       = 3;
-    FetchResult    fetch      = 4;
-    EntryCrcResult entry_crcs = 5;
-  }
-}
-
-message HashResult     { bool matched = 1; uint64 count = 2; bytes hash = 3; }
-message ListResult     { repeated KeyDigest keys = 1; bool truncated = 2; }
-message KeyDigest      { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3; }
-message FetchResult    { repeated FetchedRecord records = 1; bool truncated = 2; }
-message FetchedRecord  { bytes key = 1; optional bytes envelope = 2; }   // no envelope: no such key
-message EntryCrcResult { repeated SeqCrc entries = 1; }
-message SeqCrc         { uint64 seq = 1; fixed32 crc32c = 2; }
-```
-
-In PROTOCOL.md §14, replace the same text:
-
-```proto
-message VerifyRangeRequest {
-  bytes  session_id = 1;
-  uint64 request_id = 2;
-  oneof kind { HashRange hash = 3; ListRange list = 4; }
-}
-
-message VerifyRangeResponse {
-  uint64 request_id = 1;
-  oneof kind { HashResult hash = 2; ListResult list = 3; }
-}
-
-message HashResult { bool matched = 1; uint64 count = 2; bytes hash = 3; }
-message ListResult { repeated KeyDigest keys = 1; bool truncated = 2; }
-message KeyDigest  { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3; }
-```
-
-with:
-
-```proto
-message FetchKeys  { string cf = 1; repeated bytes keys = 2; }
-message FetchRange { KeyRange range = 1; uint32 limit = 2; }
-message EntryCrcs  { uint64 from_seq = 1; uint64 to_seq = 2; }
-
-message VerifyRangeRequest {
-  bytes  session_id = 1;
-  uint64 request_id = 2;
-  oneof kind {
-    HashRange  hash        = 3;
-    ListRange  list        = 4;
-    FetchKeys  fetch_keys  = 5;
-    FetchRange fetch_range = 6;
-    EntryCrcs  entry_crcs  = 7;
-  }
-}
-
-message VerifyRangeResponse {
-  uint64 request_id = 1;
-  oneof kind {
-    HashResult     hash       = 2;
-    ListResult     list       = 3;
-    FetchResult    fetch      = 4;
-    EntryCrcResult entry_crcs = 5;
-  }
-}
-
-message HashResult     { bool matched = 1; uint64 count = 2; bytes hash = 3; }
-message ListResult     { repeated KeyDigest keys = 1; bool truncated = 2; }
-message KeyDigest      { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3; }
-message FetchResult    { repeated FetchedRecord records = 1; bool truncated = 2; }
-message FetchedRecord  { bytes key = 1; optional bytes envelope = 2; }   // no envelope: no such key
-message EntryCrcResult { repeated SeqCrc entries = 1; }
-message SeqCrc         { uint64 seq = 1; fixed32 crc32c = 2; }
-```
-
-In the PROTOCOL.md §9.2 snippet, replace:
-
-```proto
-message VerifyRangeRequest  { bytes session_id = 1; uint64 request_id = 2;
-                              oneof kind { HashRange hash = 3; ListRange list = 4; } }
-message VerifyRangeResponse { uint64 request_id = 1;
-                              oneof kind { HashResult hash = 2; ListResult list = 3; } }
-message HashResult { bool matched = 1; uint64 count = 2; bytes hash = 3; }
-message ListResult { repeated KeyDigest keys = 1; bool truncated = 2; }
-message KeyDigest  { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3; }
-```
-
-with:
-
-```proto
-message FetchKeys  { string cf = 1; repeated bytes keys = 2; }
-message FetchRange { KeyRange range = 1; uint32 limit = 2; }
-message EntryCrcs  { uint64 from_seq = 1; uint64 to_seq = 2; }
-
-message VerifyRangeRequest  { bytes session_id = 1; uint64 request_id = 2;
-                              oneof kind { HashRange hash = 3; ListRange list = 4; FetchKeys fetch_keys = 5;
-                                           FetchRange fetch_range = 6; EntryCrcs entry_crcs = 7; } }
-message VerifyRangeResponse { uint64 request_id = 1;
-                              oneof kind { HashResult hash = 2; ListResult list = 3; FetchResult fetch = 4;
-                                           EntryCrcResult entry_crcs = 5; } }
-message HashResult     { bool matched = 1; uint64 count = 2; bytes hash = 3; }
-message ListResult     { repeated KeyDigest keys = 1; bool truncated = 2; }
-message KeyDigest      { bytes key = 1; uint64 write_seq = 2; bytes payload_hash = 3; }
-message FetchResult    { repeated FetchedRecord records = 1; bool truncated = 2; }
-message FetchedRecord  { bytes key = 1; optional bytes envelope = 2; }   // no envelope: no such key
-message EntryCrcResult { repeated SeqCrc entries = 1; }
-message SeqCrc         { uint64 seq = 1; fixed32 crc32c = 2; }
-```
-
-In PROTOCOL.md §9.2, after the bullet about `UPSTREAM_RESET` (added in Task 2), add the new kinds:
-
-```markdown
-- The server ends every `VerifyRange` stream, and drops every session, with `UNAVAILABLE` / `UPSTREAM_RESET` when its state is replaced (it starts bootstrapping itself, or its identity changes), as it does for `Tail` (§7.3).
-```
-
-with:
-
-```markdown
-- The server ends every `VerifyRange` stream, and drops every session, with `UNAVAILABLE` / `UPSTREAM_RESET` when its state is replaced (it starts bootstrapping itself, or its identity changes), as it does for `Tail` (§7.3).
-- `FetchKeys` (repair): the server returns, in the order asked, a `FetchedRecord` per key with its whole envelope as of the session's snapshot, or without `envelope` when the key does not exist. `keys` MUST NOT hold more than 1024 keys. The server MAY answer only a prefix of the keys (setting `truncated`) to bound the answer (RECOMMENDED: stop once ~1 MiB of envelopes is reached), but answers at least one; the client asks again for the rest.
-- `FetchRange` (repair): like `ListRange`, but each record carries the whole envelope. The same limits, paging rule and two-record minimum apply.
-- `EntryCrcs` (repair): the server returns `(seq, crc32c)` for every entry with `from_seq ≤ seq ≤ min(to_seq, snapshot_seq, from_seq + 1023)` that it still holds (entry `snapshot_seq` is always known). Entries up to the snapshot seq never change, so this locates the first seq where a client's log differs from the server's.
-- Envelopes expired but not yet reaped are returned like any other: repair copies what is stored.
-```
-
-In PROTOCOL.md §13, replace:
-
-```markdown
-- **Authorisation scope.** A credential that can call `Bootstrap` can read the whole database.
-```
-
-with:
-
-```markdown
-- **Authorisation scope.** A credential that can call `Bootstrap`, or `VerifyRange` with `FetchKeys` or `FetchRange`, can read the whole database.
-```
-
-Run: `cargo test --test proto_sync`
-Expected: PASS.
-
-Run: `cargo build`
-Expected: FAIL to compile: `non-exhaustive patterns: ReqKind::FetchKeys(_), ReqKind::FetchRange(_) and ReqKind::EntryCrcs(_) not covered` in `src/server/verify.rs`, and `non-exhaustive patterns` in `src/slave/verifier.rs` (`RespKind::Fetch(_)`, `RespKind::EntryCrcs(_)`).
-
-- [ ] **Step 2: Write the failing tests**
-
-In the test module of `src/server/verify.rs`, import `LogApi`:
-
-```rust
-    use crate::codec::envelope;
-    use crate::net::convert::identity_to_pb;
-```
-
-with:
-
-```rust
-    use crate::codec::envelope;
-    use crate::log::LogApi;
-    use crate::net::convert::identity_to_pb;
-```
-
-and add, before `sessions_are_limited_and_ending_one_frees_a_slot`:
-
-```rust
-    #[tokio::test]
-    async fn sessions_are_limited_and_ending_one_frees_a_slot() {
-```
-
-insert:
-
-```rust
-    fn request(session: &[u8], id: u64, kind: Req) -> pb::VerifyRangeRequest {
-        pb::VerifyRangeRequest {
-            session_id: session.to_vec(),
-            request_id: id,
-            kind: Some(kind),
-        }
-    }
-
-    /// Fetches answer from the session's snapshot; entry CRCs from the log, up to `S`.
-    #[tokio::test]
-    async fn fetches_and_entry_crcs_answer_at_the_snapshot_seq() {
-        let dir = tempfile::tempdir().unwrap();
-        let (m, _) = serving_master(dir.path(), |_| {}).await;
-        m.create_cf(CfSpec::new("c")).unwrap();
-        for k in [&b"a"[..], b"b", b"c"] {
-            m.put("c", k, b"v").unwrap(); // seqs 2..=4
-        }
-        let mut c = client(m.serve_addr().unwrap(), "b");
-        let sid = begin(&mut c, pb::VerifyMode::Quick)
-            .await
-            .unwrap()
-            .session_id;
-        m.put("c", b"a", b"later").unwrap(); // seq 5: after the snapshot
-        let keys = vec![b"a".to_vec(), b"zz".to_vec()];
-        let (answers, err) = exchange(
-            &mut c,
-            vec![
-                request(
-                    &sid,
-                    1,
-                    Req::FetchKeys(pb::FetchKeys {
-                        cf: "c".into(),
-                        keys,
-                    }),
-                ),
-                request(
-                    &sid,
-                    2,
-                    Req::FetchRange(pb::FetchRange {
-                        range: Some(range(Some(b"b"), None)),
-                        limit: 1024,
-                    }),
-                ),
-                request(
-                    &sid,
-                    3,
-                    Req::EntryCrcs(pb::EntryCrcs {
-                        from_seq: 3,
-                        to_seq: 9,
-                    }),
-                ),
-            ],
-        )
-        .await;
-        assert!(err.is_none(), "{err:?}");
-        match &answers[0].kind {
-            Some(Resp::Fetch(f)) => {
-                assert_eq!(f.records.len(), 2);
-                assert_eq!(
-                    f.records[0].envelope.as_deref(),
-                    Some(envelope::encode(2, None, b"v").as_slice()),
-                    "the snapshot's value"
-                );
-                assert_eq!(f.records[1].envelope, None, "no such key");
-                assert!(!f.truncated);
-            }
-            other => panic!("{other:?}"),
-        }
-        match &answers[1].kind {
-            Some(Resp::Fetch(f)) => {
-                assert_eq!(
-                    f.records.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
-                    vec![b"b".to_vec(), b"c".to_vec()]
-                );
-                assert!(f.records.iter().all(|r| r.envelope.is_some()));
-            }
-            other => panic!("{other:?}"),
-        }
-        let expected: Vec<pb::SeqCrc> = m
-            .entries_since(2)
-            .unwrap()
-            .map(Result::unwrap)
-            .filter(|e| e.seq <= 4)
-            .map(|e| pb::SeqCrc {
-                seq: e.seq,
-                crc32c: e.crc32c,
-            })
-            .collect();
-        match &answers[2].kind {
-            Some(Resp::EntryCrcs(r)) => {
-                assert_eq!(r.entries, expected, "3..=4: nothing past the snapshot")
-            }
-            other => panic!("{other:?}"),
-        }
-        let too_many = Req::FetchKeys(pb::FetchKeys {
-            cf: "c".into(),
-            keys: vec![vec![1]; 1025],
-        });
-        let (_, err) = exchange(&mut c, vec![request(&sid, 4, too_many)]).await;
-        assert_eq!(err.map(|e| e.code()), Some(Code::InvalidArgument));
-        let no_limit = Req::FetchRange(pb::FetchRange {
-            range: Some(range(None, None)),
-            limit: 0,
-        });
-        let (_, err) = exchange(&mut c, vec![request(&sid, 5, no_limit)]).await;
-        assert_eq!(err.map(|e| e.code()), Some(Code::InvalidArgument));
-    }
-```
-
-In the test module of `src/verify/scan.rs`, add, before `the_snapshot_pins_what_is_hashed`:
-
-```rust
-    #[test]
-    fn the_snapshot_pins_what_is_hashed() {
-```
-
-insert:
-
-```rust
-    #[test]
-    fn fetch_range_returns_whole_envelopes_in_pages() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = open_store(dir.path());
-        apply(
-            &store,
-            vec![Op::CreateCf {
-                spec: CfSpec::new("c"),
-            }],
-        )
-        .unwrap();
-        apply(
-            &store,
-            (b'a'..=b'e').map(|k| put("c", &[k], &[k; 3])).collect(),
-        )
-        .unwrap();
-        let snap = store.read_snapshot(0).unwrap();
-        let cf = snap.phys("c").unwrap();
-        let o = KeyOrder::bytewise();
-        let (all, more) = fetch_range(
-            &snap,
-            cf.clone(),
-            &o,
-            &b(Some(b"b"), Some(b"e")),
-            1024,
-            usize::MAX,
-        )
-        .unwrap();
-        assert!(!more);
-        assert_eq!(
-            all.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
-            vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
-        );
-        assert_eq!(
-            all[0].envelope.as_deref(),
-            Some(envelope::encode(2, None, b"bbb").as_slice())
-        );
-        let (page, more) = fetch_range(&snap, cf, &o, &all_bounds(), 1024, 1).unwrap();
-        assert_eq!(
-            (page.len(), more),
-            (2, true),
-            "two records even past the soft size"
-        );
-    }
-
-    fn all_bounds() -> Bounds {
-        Bounds::default()
-    }
-```
-
-- [ ] **Step 3: Serve the new kinds**
-
-In `src/verify/scan.rs`, above the test module, add:
-
-```rust
-#[cfg(test)]
-mod tests {
-```
-
-insert:
-
-```rust
-/// Up to `limit` keys of a range with their whole envelopes, for repair; `true` if there are
-/// more. Like a listing, the answer is cut at about `soft_bytes`, but never below two keys.
-pub(crate) fn fetch_range(
-    snap: &ReadSnapshot,
-    cf: Arc<PhysCf>,
-    order: &KeyOrder,
-    bounds: &Bounds,
-    limit: usize,
-    soft_bytes: usize,
-) -> Result<(Vec<pb::FetchedRecord>, bool)> {
-    let (mut records, mut bytes, mut truncated) = (Vec::new(), 0usize, false);
-    scan(snap, cf, order, bounds, |k, v| {
-        if records.len() >= limit || (records.len() >= 2 && bytes >= soft_bytes) {
-            truncated = true;
-            return Ok(false);
-        }
-        bytes += k.len() + v.len();
-        records.push(pb::FetchedRecord {
-            key: k.to_vec(),
-            envelope: Some(v.to_vec()),
-        });
-        Ok(true)
-    })?;
-    Ok((records, truncated))
-}
-```
-
-In `src/server/verify.rs`, add imports:
-
-```rust
-use crate::read::ReadSnapshot;
-use crate::store::cfs::PhysCf;
-```
-
-with:
-
-```rust
-use crate::read::ReadSnapshot;
-use crate::source::LogSource;
-use crate::store::cfs::PhysCf;
-use crate::types::Seq;
-```
-
-keep `S` and its CRC in the session:
-
-```rust
-    snap: ReadSnapshot,
-    mode: VerifyMode,
-    cfs: HashMap<String, (Arc<PhysCf>, KeyOrder)>,
-```
-
-with:
-
-```rust
-    snap: ReadSnapshot,
-    mode: VerifyMode,
-    /// `S` and the CRC of entry `S`, read through the snapshot.
-    seq: Seq,
-    last_crc: Option<u32>,
-    cfs: HashMap<String, (Arc<PhysCf>, KeyOrder)>,
-```
-
-(in `begin`):
-
-```rust
-    let session = Session {
-        snap,
-        mode,
-        cfs,
-```
-
-with:
-
-```rust
-    let session = Session {
-        snap,
-        mode,
-        seq: meta.last_seq,
-        last_crc: meta.last_entry_crc,
-        cfs,
-```
-
-pass the node to `compute` (in `answer`):
-
-```rust
-    let s = session.clone();
-    let kind = tokio::task::spawn_blocking(move || compute(&s, kind))
-```
-
-with:
-
-```rust
-    let s = session.clone();
-    // Entry CRCs come from the node's log; held only for this request.
-    let src = state.source.upgrade();
-    let kind = tokio::task::spawn_blocking(move || compute(&s, kind, src.as_deref()))
-```
-
-and in `compute`, replace the signature:
-
-```rust
-fn compute(s: &Session, kind: ReqKind) -> Result<RespKind, Status> {
-```
-
-with:
-
-```rust
-fn compute(s: &Session, kind: ReqKind, src: Option<&dyn LogSource>) -> Result<RespKind, Status> {
-```
-
-and add the arms after the `ReqKind::List` arm:
-
-```rust
-            Ok(RespKind::List(pb::ListResult { keys, truncated }))
-        }
-    }
-}
-```
-
-with:
-
-```rust
-            Ok(RespKind::List(pb::ListResult { keys, truncated }))
-        }
-        ReqKind::FetchKeys(f) => {
-            if f.keys.len() > MAX_LIST_LIMIT as usize {
-                return Err(net::invalid_argument(format!(
-                    "FetchKeys takes at most {MAX_LIST_LIMIT} keys"
-                )));
-            }
-            let range = pb::KeyRange {
-                cf: f.cf,
-                lower: None,
-                upper: None,
-            };
-            let (phys, _, _) = target(s, Some(&range))?;
-            let ctx = s.snap.raw_ctx();
-            let (mut records, mut bytes, mut truncated) = (Vec::new(), 0usize, false);
-            for key in f.keys {
-                if !records.is_empty() && bytes >= LIST_SOFT_BYTES {
-                    truncated = true;
-                    break;
-                }
-                let envelope = ctx.get_raw(phys, &key).map_err(store_status)?;
-                bytes += key.len() + envelope.as_ref().map_or(0, Vec::len);
-                records.push(pb::FetchedRecord { key, envelope });
-            }
-            Ok(RespKind::Fetch(pb::FetchResult { records, truncated }))
-        }
-        ReqKind::FetchRange(f) => {
-            if f.limit == 0 || f.limit > MAX_LIST_LIMIT {
-                return Err(net::invalid_argument(format!(
-                    "FetchRange.limit must be 1..={MAX_LIST_LIMIT}"
-                )));
-            }
-            let (phys, order, bounds) = target(s, f.range.as_ref())?;
-            let (records, truncated) = scan::fetch_range(
-                &s.snap,
-                phys.clone(),
-                order,
-                &bounds,
-                f.limit as usize,
-                LIST_SOFT_BYTES,
-            )
-            .map_err(store_status)?;
-            Ok(RespKind::Fetch(pb::FetchResult { records, truncated }))
-        }
-        ReqKind::EntryCrcs(e) => {
-            let src = src
-                .ok_or_else(|| reason_status(pb::Reason::ShuttingDown, "node is shutting down"))?;
-            // Entries up to S never change; later ones are not part of this session.
-            let last = e
-                .to_seq
-                .min(s.seq)
-                .min(e.from_seq.saturating_add(u64::from(MAX_LIST_LIMIT) - 1));
-            let mut entries = Vec::new();
-            for seq in e.from_seq.max(1)..=last {
-                let crc = match src.store().entry_crc(seq).map_err(store_status)? {
-                    None if seq == s.seq => s.last_crc,
-                    other => other,
-                };
-                if let Some(crc32c) = crc {
-                    entries.push(pb::SeqCrc { seq, crc32c });
-                }
-            }
-            Ok(RespKind::EntryCrcs(pb::EntryCrcResult { entries }))
-        }
-    }
-}
-```
-
-- [ ] **Step 4: The client side: a reusable session with fetches**
-
-Replace the whole of `src/slave/verifier.rs` with:
-
-```rust
-//! The slave side of Verify (DESIGN.md §12, PROTOCOL.md §9): open a session upstream,
-//! capture a local snapshot at exactly the upstream's seq `S` (taken by the applier right
-//! after it commits `S`), compare the CF lists, then compare each common CF range by range.
-
-use std::cmp::Ordering as SeqOrder;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval_at};
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Status, Streaming};
-use tracing::Instrument;
-
-use super::client::{self, Client};
-use super::inner::{CaptureHold, CaptureMiss, Inner};
-use super::state::SlaveState;
-use crate::background::blocking;
-use crate::error::{Error, Result};
-use crate::net::convert::{cf_from_pb, identity_from_pb};
-use crate::net::{DECODE_SLACK, reason_of};
-use crate::pb;
-use crate::pb::verify_range_request::Kind as ReqKind;
-use crate::pb::verify_range_response::Kind as RespKind;
-use crate::read::ReadSnapshot;
-use crate::store::cfs::PhysCf;
-use crate::types::{CfEntry, DbIdentity, Seq};
-use crate::verify::compare::{Budget, CfRun, LocalSide, Oracle, compare_cf, compare_specs};
-use crate::verify::range::{Bounds, KeyOrder, LocalRange, LocalRecord, Throttle};
-use crate::verify::scan::{chunk_cf, load_range};
-use crate::verify::{
-    LIST_SOFT_BYTES, MAX_LIST_LIMIT, MAX_RESUME_KEY_BYTES, MismatchPolicy, VERIFY_WINDOW,
-    VerifyAbort, VerifyMode, VerifyReport,
-};
-
-fn abort(a: VerifyAbort) -> Error {
-    Error::VerifyAborted(a)
-}
-
-fn status_abort(s: &Status) -> Error {
-    abort(match reason_of(s) {
-        Some(pb::Reason::Busy) => VerifyAbort::Busy,
-        Some(pb::Reason::SessionNotFound) => VerifyAbort::SessionExpired,
-        _ => VerifyAbort::Upstream(format!("{:?}: {}", s.code(), s.message())),
-    })
-}
-
-/// The largest answer: a listing cut at `LIST_SOFT_BYTES` plus up to two keys, each at most
-/// one entry long.
-fn decode_limit(max_entry_bytes: u64) -> usize {
-    let entry = usize::try_from(max_entry_bytes)
-        .unwrap_or(usize::MAX)
-        .max(16 << 20);
-    entry
-        .saturating_mul(2)
-        .saturating_add(LIST_SOFT_BYTES)
-        .saturating_add(DECODE_SLACK)
-}
-
-/// Runs one verify against the upstream now. One run at a time per slave; a second caller
-/// waits for the first. The report is stored in the status and passed to the listener.
-pub(crate) async fn verify(inner: &Arc<Inner>, mode: VerifyMode) -> Result<VerifyReport> {
-    let _turn = inner.verify_lock.lock().await;
-    let Some((identity, _)) = inner.ident() else {
-        return Err(Error::NotReady);
-    };
-    let span = tracing::info_span!(
-        "verify",
-        node_id = %inner.cfg.identifier,
-        upstream = %inner.upstream_uri(),
-        seq = tracing::field::Empty,
-        epoch = identity.epoch,
-        mode = ?mode,
-    );
-    let result = session(inner, identity, mode, &span)
-        .instrument(span.clone())
-        .await;
-    span.in_scope(|| match &result {
-        Ok(report) => finish(inner, report),
-        Err(e) => tracing::warn!(error = %e, "verify abandoned"),
-    });
-    result
-}
-
-fn finish(inner: &Inner, report: &VerifyReport) {
-    if report.is_clean() {
-        tracing::info!(
-            seq = report.seq,
-            keys = report.keys_checked,
-            ms = report.duration.as_millis() as u64,
-            "verify clean"
-        );
-    } else {
-        tracing::error!(
-            seq = report.seq,
-            mismatches = report.mismatches.len(),
-            "verify found mismatches"
-        );
-        if inner.cfg.verify.on_mismatch == MismatchPolicy::Rebootstrap {
-            // For the upstream the slave follows now; a later repoint makes it inert.
-            inner.force_bootstrap.request(*inner.repoint_tx.borrow());
-            inner.rebootstrap.notify_one();
-        }
-    }
-    inner.set_last_verify(report.clone());
-    inner.notify(|l| l.on_verify_complete(report));
-}
-
-/// An open session on the upstream (PROTOCOL.md §9): its `VerifyBegin` answer and the
-/// `VerifyRange` stream used for hashes, listings, fetches and entry CRCs.
-pub(crate) struct UpstreamSession {
-    client: Client,
-    pub begin: pb::VerifyBeginResponse,
-    pub upstream: Upstream,
-}
-
-impl UpstreamSession {
-    pub(crate) async fn open(
-        inner: &Inner,
-        client: &Client,
-        mode: VerifyMode,
-    ) -> Result<UpstreamSession> {
-        let limit = decode_limit(inner.max_entry_bytes.load(Ordering::SeqCst));
-        let mut client = client.clone().max_decoding_message_size(limit);
-        let req = pb::VerifyBeginRequest {
-            client_id: inner.cfg.identifier.clone(),
-            mode: mode.to_pb() as i32,
-        };
-        let begin = client
-            .verify_begin(req)
-            .await
-            .map_err(|s| status_abort(&s))?
-            .into_inner();
-        let (tx, rx) = mpsc::channel(2 * VERIFY_WINDOW);
-        let answers = match client.verify_range(ReceiverStream::new(rx)).await {
-            Ok(r) => r.into_inner(),
-            Err(s) => {
-                let end = pb::VerifyEndRequest {
-                    session_id: begin.session_id.clone(),
-                };
-                let _ = client.verify_end(end).await;
-                return Err(status_abort(&s));
-            }
-        };
-        let upstream = Upstream {
-            tx,
-            answers,
-            session_id: begin.session_id.clone(),
-            next_id: 0,
-        };
-        Ok(UpstreamSession {
-            client,
-            begin,
-            upstream,
-        })
-    }
-
-    /// Ends the session. Best effort: the upstream also expires idle sessions.
-    pub(crate) async fn close(self) {
-        let UpstreamSession {
-            mut client,
-            begin,
-            upstream,
-        } = self;
-        drop(upstream);
-        let end = pb::VerifyEndRequest {
-            session_id: begin.session_id,
-        };
-        let _ = client.verify_end(end).await;
-    }
-}
-
-async fn session(
-    inner: &Arc<Inner>,
-    identity: DbIdentity,
-    mode: VerifyMode,
-    span: &tracing::Span,
-) -> Result<VerifyReport> {
-    let started = Instant::now();
-    let client = client::connect(inner)?;
-    // The applier commits nothing while the upstream pins its snapshot, so this slave cannot
-    // pass the snapshot's seq before the capture is set up.
-    let hold = inner.hold_applier();
-    let mut session = UpstreamSession::open(inner, &client, mode).await?;
-    span.record("seq", session.begin.snapshot_seq);
-    let result = compare(inner, &mut session, hold, identity, mode, started).await;
-    session.close().await;
-    result
-}
-
-async fn compare(
-    inner: &Arc<Inner>,
-    session: &mut UpstreamSession,
-    hold: CaptureHold,
-    identity: DbIdentity,
-    mode: VerifyMode,
-    started: Instant,
-) -> Result<VerifyReport> {
-    let begin = &session.begin;
-    let upstream_identity = begin.identity.as_ref().map(identity_from_pb).transpose()?;
-    if upstream_identity != Some(identity) {
-        return Err(abort(VerifyAbort::IdentityChanged));
-    }
-    let s = begin.snapshot_seq;
-    let snap = Arc::new(capture(inner, hold, s).await?);
-    let meta_snap = snap.clone();
-    let local_cfs = blocking(move || meta_snap.meta()).await?.cf_specs;
-    let upstream_cfs: Vec<CfEntry> = begin.cf_specs.iter().map(cf_from_pb).collect();
-    let (mut mismatches, common) = compare_specs(&local_cfs, &upstream_cfs);
-
-    let upstream = &mut session.upstream;
-    let cfg = &inner.cfg.verify;
-    let throttle = Arc::new(Mutex::new(Throttle::new(cfg.max_bytes_per_sec)));
-    let mut budget = Budget::new(cfg.max_reported_keys);
-    let mut keys_checked = 0;
-    for cf in &common {
-        let name = cf.spec.name.clone();
-        let phys = snap.phys(&name).ok_or_else(|| {
-            Error::corrupt(format!("CF {name} is missing from the verify snapshot"))
-        })?;
-        let order = KeyOrder::new(
-            &inner.store.tuning().comparators,
-            cf.spec.comparator.as_deref(),
-        );
-        let (range_tx, mut ranges) = mpsc::channel(VERIFY_WINDOW);
-        let producer = {
-            let (snap, phys, throttle) = (snap.clone(), phys.clone(), throttle.clone());
-            let (chunk_keys, chunk_bytes) = (cfg.chunk_keys, cfg.chunk_bytes);
-            tokio::task::spawn_blocking(move || {
-                let emit = |r: LocalRange| range_tx.blocking_send(Ok(r)).is_ok();
-                match chunk_cf(&snap, phys, mode, chunk_keys, chunk_bytes, &throttle, emit) {
-                    Ok(keys) => keys,
-                    Err(e) => {
-                        let _ = range_tx.blocking_send(Err(e));
-                        0
-                    }
-                }
-            })
-        };
-        let local = Local {
-            snap: snap.clone(),
-            phys,
-            order: order.clone(),
-            mode,
-            throttle: throttle.clone(),
-        };
-        let mut run = CfRun {
-            cf: &name,
-            order,
-            min_chunk_keys: cfg.min_chunk_keys,
-            budget: &mut budget,
-            out: &mut mismatches,
-        };
-        let compared = compare_cf(upstream, &local, &mut run, &mut ranges).await;
-        // Unblocks the producer if the comparison stopped early.
-        drop(ranges);
-        let keys = producer
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-        compared?;
-        keys_checked += keys;
-    }
-    Ok(VerifyReport {
-        seq: s,
-        mode,
-        cfs_checked: common.len(),
-        keys_checked,
-        mismatches,
-        duration: started.elapsed(),
-    })
-}
-
-/// A local snapshot at exactly `s`, taken while `hold` keeps the applier from passing it:
-/// now if the slave is at `s`, otherwise by the applier right after it commits `s`.
-async fn capture(inner: &Arc<Inner>, hold: CaptureHold, s: Seq) -> Result<ReadSnapshot> {
-    let applied = inner.store.position().last_seq;
-    match applied.cmp(&s) {
-        // Only possible with an upstream that is behind this slave (DESIGN.md §6).
-        SeqOrder::Greater => {
-            return Err(abort(VerifyAbort::PassedSnapshot {
-                snapshot_seq: s,
-                applied_seq: applied,
-            }));
-        }
-        SeqOrder::Equal => {
-            let i = inner.clone();
-            let snap = blocking(move || i.store.read_snapshot(0)).await?;
-            // A commit that was already under way when the hold was taken may have landed.
-            if snap.seq() != s {
-                return Err(abort(VerifyAbort::PassedSnapshot {
-                    snapshot_seq: s,
-                    applied_seq: snap.seq(),
-                }));
-            }
-            return Ok(snap);
-        }
-        SeqOrder::Less => {}
-    }
-    let reply = hold.target(s);
-    let mut states = inner.state_tx.subscribe();
-    let timeout = inner.cfg.verify.capture_timeout;
-    let outcome = tokio::select! {
-        r = tokio::time::timeout(timeout, reply) => r.ok().and_then(|r| r.ok()),
-        _ = states.wait_for(|st| matches!(st, SlaveState::Halted(_))) => None,
-    };
-    drop(hold);
-    match outcome {
-        Some(Ok(snap)) => Ok(snap),
-        Some(Err(CaptureMiss::Passed(applied))) => Err(abort(VerifyAbort::PassedSnapshot {
-            snapshot_seq: s,
-            applied_seq: applied,
-        })),
-        Some(Err(CaptureMiss::Cancelled)) | None => {
-            Err(abort(VerifyAbort::CaptureTimeout { snapshot_seq: s }))
-        }
-    }
-}
-
-/// The upstream's half of a session, over one `VerifyRange` stream.
-pub(crate) struct Upstream {
-    tx: mpsc::Sender<pb::VerifyRangeRequest>,
-    answers: Streaming<pb::VerifyRangeResponse>,
-    session_id: Vec<u8>,
-    next_id: u64,
-}
-
-impl Upstream {
-    async fn send(&mut self, kind: ReqKind) -> Result<u64> {
-        self.next_id += 1;
-        let req = pb::VerifyRangeRequest {
-            session_id: self.session_id.clone(),
-            request_id: self.next_id,
-            kind: Some(kind),
-        };
-        self.tx
-            .send(req)
-            .await
-            .map_err(|_| abort(VerifyAbort::Upstream("the verify stream closed".into())))?;
-        Ok(self.next_id)
-    }
-
-    async fn answer(&mut self, id: u64) -> Result<RespKind> {
-        match self.answers.message().await {
-            Ok(Some(r)) if r.request_id == id => r
-                .kind
-                .ok_or_else(|| abort(VerifyAbort::Upstream("empty answer".into()))),
-            Ok(Some(r)) => Err(abort(VerifyAbort::Upstream(format!(
-                "answer {} arrived for request {id}",
-                r.request_id
-            )))),
-            Ok(None) => Err(abort(VerifyAbort::Upstream(
-                "the upstream ended the verify stream".into(),
-            ))),
-            Err(s) => Err(status_abort(&s)),
-        }
-    }
-
-    /// The upstream's envelopes of `keys` at the session's snapshot (`None`: no such key),
-    /// in the order asked.
-    pub(crate) async fn fetch_keys(
-        &mut self,
-        cf: &str,
-        keys: &[Vec<u8>],
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>> {
-        let mut out = Vec::with_capacity(keys.len());
-        let mut rest = keys;
-        while !rest.is_empty() {
-            let ask = &rest[..rest.len().min(MAX_LIST_LIMIT as usize)];
-            let req = pb::FetchKeys {
-                cf: cf.to_string(),
-                keys: ask.to_vec(),
-            };
-            let id = self.send(ReqKind::FetchKeys(req)).await?;
-            let RespKind::Fetch(f) = self.answer(id).await? else {
-                return Err(abort(VerifyAbort::Upstream(
-                    "unexpected answer to FetchKeys".into(),
-                )));
-            };
-            let answered_others = f.records.is_empty()
-                || f.records.len() > ask.len()
-                || f.records.iter().zip(ask).any(|(r, k)| r.key != *k);
-            if answered_others {
-                return Err(abort(VerifyAbort::Upstream(
-                    "FetchKeys answered other keys".into(),
-                )));
-            }
-            rest = &rest[f.records.len()..];
-            out.extend(f.records.into_iter().map(|r| (r.key, r.envelope)));
-        }
-        Ok(out)
-    }
-
-    /// Every key of `bounds` with its envelope at the session's snapshot, paging through
-    /// truncated answers like a listing.
-    pub(crate) async fn fetch_range(
-        &mut self,
-        cf: &str,
-        bounds: &Bounds,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut page = bounds.clone();
-        let mut resume: Option<Vec<u8>> = None;
-        loop {
-            let req = pb::FetchRange {
-                range: Some(page.to_pb(cf)),
-                limit: MAX_LIST_LIMIT,
-            };
-            let id = self.send(ReqKind::FetchRange(req)).await?;
-            let RespKind::Fetch(f) = self.answer(id).await? else {
-                return Err(abort(VerifyAbort::Upstream(
-                    "unexpected answer to FetchRange".into(),
-                )));
-            };
-            let before = out.len();
-            for r in f.records {
-                if resume.as_deref() == Some(r.key.as_slice()) {
-                    continue;
-                }
-                let env = r.envelope.ok_or_else(|| {
-                    abort(VerifyAbort::Upstream(
-                        "FetchRange record without envelope".into(),
-                    ))
-                })?;
-                out.push((r.key, env));
-            }
-            if !f.truncated {
-                return Ok(out);
-            }
-            match out.last() {
-                Some((k, _)) if out.len() > before && k.len() <= MAX_RESUME_KEY_BYTES => {
-                    page.lower = Some(k.clone());
-                    resume = Some(k.clone());
-                }
-                _ => {
-                    return Err(abort(VerifyAbort::Upstream(
-                        "FetchRange cannot be continued".into(),
-                    )));
-                }
-            }
-        }
-    }
-
-    /// The `crc32c` of the upstream's entry `seq`, if it still holds it and `seq <= S`.
-    pub(crate) async fn entry_crc(&mut self, seq: Seq) -> Result<Option<u32>> {
-        let req = pb::EntryCrcs {
-            from_seq: seq,
-            to_seq: seq,
-        };
-        let id = self.send(ReqKind::EntryCrcs(req)).await?;
-        let RespKind::EntryCrcs(r) = self.answer(id).await? else {
-            return Err(abort(VerifyAbort::Upstream(
-                "unexpected answer to EntryCrcs".into(),
-            )));
-        };
-        Ok(r.entries
-            .into_iter()
-            .find(|e| e.seq == seq)
-            .map(|e| e.crc32c))
-    }
-}
-
-impl Oracle for Upstream {
-    async fn hash(&mut self, cf: &str, ranges: &[LocalRange]) -> Result<Vec<bool>> {
-        let mut ids = Vec::with_capacity(ranges.len());
-        for r in ranges {
-            let req = pb::HashRange {
-                range: Some(r.bounds.to_pb(cf)),
-                count: r.count,
-                hash: r.hash.to_vec(),
-            };
-            ids.push(self.send(ReqKind::Hash(req)).await?);
-        }
-        let mut matched = Vec::with_capacity(ids.len());
-        for id in ids {
-            match self.answer(id).await? {
-                RespKind::Hash(h) => matched.push(h.matched),
-                _ => {
-                    return Err(abort(VerifyAbort::Upstream(
-                        "unexpected answer to HashRange".into(),
-                    )));
-                }
-            }
-        }
-        Ok(matched)
-    }
-
-    async fn list(
-        &mut self,
-        cf: &str,
-        bounds: &Bounds,
-        limit: u32,
-    ) -> Result<(Vec<pb::KeyDigest>, bool)> {
-        let id = self
-            .send(ReqKind::List(pb::ListRange {
-                range: Some(bounds.to_pb(cf)),
-                limit,
-            }))
-            .await?;
-        match self.answer(id).await? {
-            RespKind::List(l) => Ok((l.keys, l.truncated)),
-            _ => Err(abort(VerifyAbort::Upstream(
-                "unexpected answer to ListRange".into(),
-            ))),
-        }
-    }
-}
-
-/// This slave's half: records read from the captured snapshot.
-struct Local {
-    snap: Arc<ReadSnapshot>,
-    phys: Arc<PhysCf>,
-    order: KeyOrder,
-    mode: VerifyMode,
-    throttle: Arc<Mutex<Throttle>>,
-}
-
-impl LocalSide for Local {
-    async fn load(&self, bounds: &Bounds) -> Result<Vec<LocalRecord>> {
-        let (snap, phys, order, throttle) = (
-            self.snap.clone(),
-            self.phys.clone(),
-            self.order.clone(),
-            self.throttle.clone(),
-        );
-        let (mode, bounds) = (self.mode, bounds.clone());
-        blocking(move || load_range(&snap, phys, &order, &bounds, mode, &throttle)).await
-    }
-}
-
-/// Runs a verify every `VerifyConfig::interval` while the slave is streaming. Holds only a
-/// `Weak<Inner>` between runs; shutdown cancels a run in progress.
-pub(crate) fn spawn(inner: &Arc<Inner>) -> Option<JoinHandle<()>> {
-    let every = inner.cfg.verify.interval?;
-    let mode = inner.cfg.verify.mode;
-    let weak = Arc::downgrade(inner);
-    let mut shutdown = inner.shutdown_tx.subscribe();
-    Some(tokio::spawn(async move {
-        let mut tick = interval_at(tokio::time::Instant::now() + every, every);
-        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = tick.tick() => {}
-                _ = shutdown.changed() => return,
-            }
-            let Some(inner) = weak.upgrade() else { return };
-            if inner.state() != SlaveState::Streaming {
-                continue;
-            }
-            tokio::select! {
-                r = verify(&inner, mode) => if let Err(e) = r {
-                    tracing::warn!(node = %inner.cfg.identifier, error = %e, "scheduled verify did not complete");
-                },
-                _ = shutdown.changed() => return,
-            }
-        }
-    }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn answers_are_sized_for_two_maximal_keys() {
-        assert_eq!(decode_limit(0), (32 << 20) + LIST_SOFT_BYTES + DECODE_SLACK);
-        assert_eq!(
-            decode_limit(64 << 20),
-            (128 << 20) + LIST_SOFT_BYTES + DECODE_SLACK
-        );
-        let busy = crate::net::reason_status(pb::Reason::Busy, "x");
-        assert!(matches!(
-            status_abort(&busy),
-            Error::VerifyAborted(VerifyAbort::Busy)
-        ));
-        let gone = crate::net::reason_status(pb::Reason::SessionNotFound, "x");
-        assert!(matches!(
-            status_abort(&gone),
-            Error::VerifyAborted(VerifyAbort::SessionExpired)
-        ));
-        assert!(matches!(
-            status_abort(&Status::internal("x")),
-            Error::VerifyAborted(VerifyAbort::Upstream(_))
-        ));
-    }
-}
-```
-
-(Changes from Task 3: `UpstreamSession` opens and closes a session for any user; `Upstream` is `pub(crate)` and gains `fetch_keys`, `fetch_range` and `entry_crc`; answers of an unexpected kind are errors.)
-
-- [ ] **Step 5: Run the tests**
-
-Run: `cargo test --lib server::verify && cargo test --lib verify::scan && cargo test --lib slave::verifier`
-Expected: PASS, including `fetches_and_entry_crcs_answer_at_the_snapshot_seq` and `fetch_range_returns_whole_envelopes_in_pages`.
-
-Run: `cargo test --test verify --test integrity`
-Expected: PASS (verify itself is unchanged).
-
-- [ ] **Step 6: Commit**
-
-```bash
-cargo fmt
-git add proto src PROTOCOL.md
-git commit -m "feat: FetchKeys, FetchRange and EntryCrcs on verify sessions for repair
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-```
-
----
-
-### Task 8: Divergence repair and `MismatchPolicy::Repair`
-
-**Files:**
-- Create: `src/store/repair.rs`, `src/slave/repair.rs`, `tests/repair.rs`
-- Modify: `src/store/mod.rs`, `src/store/meta.rs`, `src/store/bootstrap.rs`, `src/slave/{mod,inner,state,config,policy,driver,repoint,apply,bootstrap,source,verifier}.rs`, `src/verify/mod.rs`, `src/listener.rs`, `proto/replication.proto`, `tests/support/mod.rs`, `tests/repoint.rs`, `tests/failpoints.rs`, `DESIGN.md` (§3.2, §12, §12.1 new, §13, §13.1, §15, §16, §16.3, §18, §21, §22), `PROTOCOL.md` (§6.5, §11.2, §14)
-
-Spec addendum §5. A slave whose log holds entries `F..=L` its upstream's history does not have (`DIVERGED`) can, instead of a full bootstrap, take **only the keys those entries touched** from the upstream's snapshot at `S`, drop `F..=L`, set `last_seq = F − 1` in the same synced batch, and tail from `F`. Replaying `F..=S` (absolute ops only) over the repaired keys gives the upstream's exact state at `S`, so the node answers `NotReady` (reads, downstream handshakes, `node_state = repairing:<S>`, persisted) until replay reaches `S`. The fork `F` is located by a binary search over `EntryCrcs` (Task 7). The same machinery repairs the keys a verify reports (`MismatchPolicy::Repair`). Anything it cannot prove falls back to a full bootstrap: a CF operation in the suffix, a suffix or fork entry no longer held by both sides, a CF that differs, or more than `repair_max_bytes` to fetch.
-
-It runs in the driver between sessions, so no entry is applied concurrently; it cancels a pending verify capture and resets downstream streams before the rewind. `repoint(.., RepointDivergence::Repair { accept_loss })` now works (it returned `Error::Unsupported` in Plan 2) and settles `Repaired { discarded }`; `DivergencePolicy::Repair` does the same on reconnects. A slave halted `Diverged` records its fork point (best effort, 30 s), and `Slave::diverged_entries()` returns the local suffix for salvage.
-
-**Interfaces:**
-- Consumes: Task 7 `UpstreamSession::{open, close}`, `Upstream::{fetch_keys, fetch_range, entry_crc}`; Task 3 `Inner::{cancel_capture, capture_after_commit, rebootstrap}`, `verifier::finish`; Task 1 `verify::range::{Bounds, KeyOrder}`, `Mismatch`; Plan 2 `Store::{entry_crc, read_entries(from, max, max_bytes), live_ctx, iter_raw_from, handle, cf, write_meta, set_position, set_first_retained_seq, first_changelog_seq, tuning}`, `meta::{encode_identity, encode_epoch_history, be64}`, `net::convert::{cf_from_pb, checked_history, identity_from_pb}`, `driver::{session, end_for, status_end, unless_repointed, commit_halt_clear}`, `Inner::{settle_repoint, fail_repoint_on_halt, force_bootstrap, halt_clear_pending, reset_downstream, set_ident, seq_tx, notify}`, `repoint::divergence`, `background::blocking`, `failpoint::fire`; harness `Cluster::{master, master_config, slave_config, restart_master_after_backup, path}`, `restore_dir`, `RawDb`, `RecordingListener`, `wait_state`, `wait_until`, `assert_converged`.
-- Produces:
-  - `store::repair::Rewind { keep_through, keep_crc, drop_through, identity, epoch_history, node_state, clear: Vec<(Arc<PhysCf>, Bounds)>, writes: Vec<(Arc<PhysCf>, Vec<u8>, Option<Vec<u8>>)> }`, `Store::{rewind(&Rewind) -> Result<()>, set_diverged_at(Option<Seq>) -> Result<()>, diverged_at() -> Result<Option<Seq>>}`, `meta::key::DIVERGED_AT`.
-  - `slave::repair::{AffectedSet { keys, ranges } (from_entries, from_mismatches, merge), RepairError::{Fallback, Retry}, Repaired { discarded, rewound_to, ready_at }, record_fork, repair_divergence, repair_pending}`; failpoint `slave-repair-after-rewind`.
-  - `NodeState::Repairing(Seq)` (`repairing:<seq>`); `Inner::{repairing, begin_repair, finish_repair_at, request_repair, take_pending_repair, has_pending_repair}`; `Inner::is_ready` is false while repairing.
-  - Public: `DivergencePolicy::Repair`, `MismatchPolicy::Repair`, `SlaveConfig::repair_max_bytes: u64` (default 64 MiB), `Slave::diverged_entries(&self) -> Result<Vec<LogEntry>>`, `ReplicationListener::on_rewind(&self, last_seq: Seq)`, `RepointOutcome::Repaired { discarded }` is now returned; `policy::Action::Repair`; `repoint::mode_error` is removed.
-  - Harness: `RecordingListener::rewinds() -> usize`.
-
-- [ ] **Step 1: The store side — an atomic rewind**
-
-In `src/store/meta.rs`, after:
-
-```rust
-    pub const MAX_BURNED_EPOCH: &[u8] = b"max_burned_epoch";
-```
-
-add:
-
-```rust
-    /// The first seq of the local divergent suffix, recorded when a slave halts `Diverged`
-    /// (`Slave::diverged_entries`). Cleared by a repair or a bootstrap.
-    pub const DIVERGED_AT: &[u8] = b"diverged_at";
-```
-
-In `src/store/bootstrap.rs`, `reset_for_bootstrap` forgets it too:
-
-```rust
-                key::MAX_ENTRY_BYTES,
-            ] {
-                batch.delete_cf(&meta_cf, k);
-```
-
-with:
-
-```rust
-                key::MAX_ENTRY_BYTES,
-                key::DIVERGED_AT,
-            ] {
-                batch.delete_cf(&meta_cf, k);
-```
-
-In `src/store/mod.rs`, register the module:
-
-```rust
-pub(crate) mod repl;
-```
-
-with:
-
-```rust
-pub(crate) mod repair;
-pub(crate) mod repl;
-```
-
-Create `src/store/repair.rs`:
-
-```rust
-//! Store side of repair (DESIGN.md §12.1): rewinding a slave to a common seq in one synced
-//! batch, with the affected keys set to the upstream's state, and the recorded fork point of
-//! a divergence.
-
-use std::sync::Arc;
-
-use rocksdb::{WriteBatch, WriteOptions};
-
-use super::cfs::PhysCf;
-use super::meta::{self, CF_CHANGELOG, CF_META, key};
-use super::{Position, Store};
-use crate::error::Result;
-use crate::types::{DbIdentity, EpochStart, Seq};
-use crate::verify::range::{Bounds, KeyOrder};
-
-/// A key to set to the upstream's envelope, or to delete (`None`).
-pub(crate) type KeyWrite = (Arc<PhysCf>, Vec<u8>, Option<Vec<u8>>);
-
-/// Everything one repair commits atomically.
-pub(crate) struct Rewind {
-    /// The new `last_seq`: the last entry both sides share.
-    pub keep_through: Seq,
-    /// `crc32c` of entry `keep_through` (`None` when it is 0).
-    pub keep_crc: Option<u32>,
-    /// The old `last_seq`: local log entries `keep_through + 1 ..= drop_through` are removed.
-    pub drop_through: Seq,
-    pub identity: DbIdentity,
-    pub epoch_history: Vec<EpochStart>,
-    /// The `node_state` to persist (`repairing:<seq>` or `ready`).
-    pub node_state: Vec<u8>,
-    /// Every local key in these ranges is deleted first.
-    pub clear: Vec<(Arc<PhysCf>, Bounds)>,
-    /// Then these keys are set to the upstream's envelope, or deleted (`None`).
-    pub writes: Vec<KeyWrite>,
-}
-
-impl Store {
-    /// Commits a repair in one synced batch. The caller must have stopped applying entries.
-    pub(crate) fn rewind(&self, r: &Rewind) -> Result<()> {
-        let mut batch = WriteBatch::default();
-        for (cf, bounds) in &r.clear {
-            let order = KeyOrder::new(
-                &self.tuning().comparators,
-                cf.entry.spec.comparator.as_deref(),
-            );
-            let handle = self.handle(cf)?;
-            for item in self
-                .live_ctx(0)
-                .iter_raw_from(cf.clone(), bounds.lower.as_deref())?
-            {
-                let (k, _) = item?;
-                if !bounds.below_upper(&order, &k) {
-                    break;
-                }
-                batch.delete_cf(&handle, &k);
-            }
-        }
-        for (cf, k, envelope) in &r.writes {
-            let handle = self.handle(cf)?;
-            match envelope {
-                Some(v) => batch.put_cf(&handle, k, v),
-                None => batch.delete_cf(&handle, k),
-            }
-        }
-        if r.drop_through > r.keep_through {
-            let from = (r.keep_through + 1).to_be_bytes();
-            let to = (r.drop_through + 1).to_be_bytes();
-            batch.delete_range_cf(&self.cf(CF_CHANGELOG), &from[..], &to[..]);
-        }
-        let meta_cf = self.cf(CF_META);
-        batch.put_cf(&meta_cf, key::LAST_SEQ, r.keep_through.to_be_bytes());
-        match r.keep_crc {
-            Some(crc) => batch.put_cf(&meta_cf, key::LAST_ENTRY_CRC, crc.to_be_bytes()),
-            None => batch.delete_cf(&meta_cf, key::LAST_ENTRY_CRC),
-        }
-        batch.put_cf(
-            &meta_cf,
-            key::ORIGIN_IDENTITY,
-            meta::encode_identity(&r.identity),
-        );
-        batch.put_cf(
-            &meta_cf,
-            key::EPOCH_HISTORY,
-            meta::encode_epoch_history(&r.epoch_history),
-        );
-        batch.put_cf(&meta_cf, key::NODE_STATE, &r.node_state);
-        batch.delete_cf(&meta_cf, key::DIVERGED_AT);
-        let mut wo = WriteOptions::default();
-        wo.set_sync(true);
-        self.db().write_opt(batch, &wo)?;
-        self.set_position(Position {
-            last_seq: r.keep_through,
-            last_entry_crc: r.keep_crc,
-        });
-        let first = self.first_changelog_seq()?.unwrap_or(r.keep_through + 1);
-        self.set_first_retained_seq(first);
-        Ok(())
-    }
-
-    /// Records (or, with `None`, forgets) where the local divergent suffix starts. Synced.
-    pub(crate) fn set_diverged_at(&self, fork: Option<Seq>) -> Result<()> {
-        match fork {
-            Some(seq) => self.write_meta(&[(key::DIVERGED_AT, &seq.to_be_bytes())], true),
-            None => {
-                let mut batch = WriteBatch::default();
-                batch.delete_cf(&self.cf(CF_META), key::DIVERGED_AT);
-                let mut wo = WriteOptions::default();
-                wo.set_sync(true);
-                Ok(self.db().write_opt(batch, &wo)?)
-            }
-        }
-    }
-
-    pub(crate) fn diverged_at(&self) -> Result<Option<Seq>> {
-        let raw = self.db().get_cf(&self.cf(CF_META), key::DIVERGED_AT)?;
-        raw.map(|v| meta::be64(&v)).transpose()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::codec::envelope;
-    use crate::read::ReadApi;
-    use crate::store::test_support::{apply, open_store};
-    use crate::types::{CfSpec, Op};
-
-    fn put(k: &[u8], v: &[u8]) -> Op {
-        Op::Put {
-            cf: "c".into(),
-            key: k.to_vec(),
-            value: v.to_vec(),
-            expire_at_ms: None,
-        }
-    }
-
-    #[test]
-    fn rewind_sets_keys_drops_the_suffix_and_moves_the_position() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = open_store(dir.path());
-        apply(
-            &store,
-            vec![Op::CreateCf {
-                spec: CfSpec::new("c"),
-            }],
-        )
-        .unwrap(); // 1
-        apply(
-            &store,
-            vec![
-                put(b"a", b"1"),
-                put(b"b", b"1"),
-                put(b"r1", b"1"),
-                put(b"r2", b"1"),
-            ],
-        )
-        .unwrap(); // 2
-        let crc2 = store.entry_crc(2).unwrap();
-        apply(&store, vec![put(b"a", b"diverged")]).unwrap(); // 3
-        apply(
-            &store,
-            vec![Op::Delete {
-                cf: "c".into(),
-                key: b"b".to_vec(),
-            }],
-        )
-        .unwrap(); // 4
-        let cf = store.live_cf("c").unwrap();
-        let identity = DbIdentity {
-            db_uuid: uuid::Uuid::new_v4(),
-            epoch: 2,
-        };
-        let history = vec![
-            EpochStart {
-                epoch: 1,
-                start_seq: 1,
-            },
-            EpochStart {
-                epoch: 2,
-                start_seq: 3,
-            },
-        ];
-        let bounds = Bounds {
-            lower: Some(b"r".to_vec()),
-            upper: Some(b"s".to_vec()),
-        };
-        store
-            .rewind(&Rewind {
-                keep_through: 2,
-                keep_crc: crc2,
-                drop_through: 4,
-                identity,
-                epoch_history: history.clone(),
-                node_state: b"repairing:9".to_vec(),
-                clear: vec![(cf.clone(), bounds)],
-                writes: vec![
-                    (
-                        cf.clone(),
-                        b"a".to_vec(),
-                        Some(envelope::encode(5, None, b"upstream")),
-                    ),
-                    (
-                        cf.clone(),
-                        b"b".to_vec(),
-                        Some(envelope::encode(2, None, b"1")),
-                    ),
-                    (
-                        cf.clone(),
-                        b"r2".to_vec(),
-                        Some(envelope::encode(6, None, b"kept")),
-                    ),
-                ],
-            })
-            .unwrap();
-        assert_eq!(
-            store.position(),
-            Position {
-                last_seq: 2,
-                last_entry_crc: crc2
-            }
-        );
-        assert_eq!(store.first_retained_seq(), 1);
-        assert!(
-            store.read_entries(3, 10, usize::MAX).unwrap().is_empty(),
-            "the suffix is gone"
-        );
-        let snap = store.read_snapshot(0).unwrap();
-        assert_eq!(snap.get("c", b"a").unwrap(), Some(b"upstream".to_vec()));
-        assert_eq!(snap.get("c", b"b").unwrap(), Some(b"1".to_vec()));
-        assert_eq!(snap.get("c", b"r1").unwrap(), None, "cleared range");
-        assert_eq!(
-            snap.get_with_meta("c", b"r2").unwrap().unwrap().1.write_seq,
-            6
-        );
-        let m = store.load_meta().unwrap().unwrap();
-        assert_eq!((m.identity, m.epoch_history), (Some(identity), history));
-        assert_eq!(m.node_state.as_deref(), Some(&b"repairing:9"[..]));
-    }
-
-    #[test]
-    fn the_fork_point_is_recorded_and_forgotten() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = open_store(dir.path());
-        assert_eq!(store.diverged_at().unwrap(), None);
-        store.set_diverged_at(Some(42)).unwrap();
-        assert_eq!(store.diverged_at().unwrap(), Some(42));
-        store.set_diverged_at(None).unwrap();
-        assert_eq!(store.diverged_at().unwrap(), None);
-    }
-}
-```
-
-Run: `cargo test --lib store::repair`
-Expected: PASS (2 tests).
-
-- [ ] **Step 2: `repairing:<seq>`, the new policies and settings**
-
-In `src/slave/state.rs`, replace:
-
-```rust
-/// `__meta.node_state`: `ready`, `bootstrapping` or `halted:<Reason>`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NodeState {
-    Ready,
-    Bootstrapping,
-    Halted(HaltReason),
-}
-```
-
-with:
-
-```rust
-/// `__meta.node_state`: `ready`, `bootstrapping`, `halted:<Reason>` or `repairing:<seq>`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NodeState {
-    Ready,
-    Bootstrapping,
-    Halted(HaltReason),
-    /// A repair committed; reads answer `NotReady` until `last_seq` reaches this seq again
-    /// (DESIGN.md §12.1).
-    Repairing(Seq),
-}
-```
-
-in `encode`:
-
-```rust
-                format!("halted:{}", r.name()).into_bytes()
-            }
-        }
-    }
-```
-
-with:
-
-```rust
-                format!("halted:{}", r.name()).into_bytes()
-            }
-            NodeState::Repairing(seq) => format!("repairing:{seq}").into_bytes(),
-        }
-    }
-```
-
-in `decode`:
-
-```rust
-        if raw == NODE_BOOTSTRAPPING {
-            return Ok(NodeState::Bootstrapping);
-        }
-        std::str::from_utf8(raw)
-```
-
-with:
-
-```rust
-        if raw == NODE_BOOTSTRAPPING {
-            return Ok(NodeState::Bootstrapping);
-        }
-        if let Some(seq) = std::str::from_utf8(raw)
-            .ok()
-            .and_then(|s| s.strip_prefix("repairing:"))
-            .and_then(|s| s.parse().ok())
-        {
-            return Ok(NodeState::Repairing(seq));
-        }
-        std::str::from_utf8(raw)
-```
-
-and in the test `node_state_round_trips_and_only_data_halts_persist`:
-
-```rust
-        for s in [NodeState::Ready, NodeState::Bootstrapping] {
-```
-
-with:
-
-```rust
-        for s in [
-            NodeState::Ready,
-            NodeState::Bootstrapping,
-            NodeState::Repairing(42),
-        ] {
-```
-
-In `src/slave/state.rs`, replace:
-
-```rust
-        assert!(NodeState::decode(Some(b"halted:Nope")).is_err());
-```
-
-with:
-
-```rust
-        assert!(NodeState::decode(Some(b"halted:Nope")).is_err());
-        assert_eq!(NodeState::Repairing(7).encode(), b"repairing:7");
-        assert!(NodeState::decode(Some(b"repairing:x")).is_err());
-```
-
-In `src/slave/config.rs`, replace:
-
-```rust
-/// What to do when the upstream reports `DIVERGED`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DivergencePolicy {
-    /// Halt with `Diverged` (persisted).
-    #[default]
-    Halt,
-    Rebootstrap,
-}
-```
-
-with:
-
-```rust
-/// What to do when the upstream reports `DIVERGED` on a reconnect (an explicit
-/// `Slave::repoint` uses `RepointOptions::on_divergence` instead).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DivergencePolicy {
-    /// Halt with `Diverged` (persisted). The data stays readable; `Slave::diverged_entries`
-    /// returns the divergent suffix for salvage.
-    #[default]
-    Halt,
-    /// Discard only the divergent suffix (DESIGN.md §12.1): the keys it touched are taken
-    /// from the upstream, the suffix is dropped, and the slave replays the upstream's history.
-    /// Falls back to a bootstrap when that cannot be proven safe.
-    Repair,
-    /// Discard all local data and bootstrap.
-    Rebootstrap,
-}
-```
-
-add the setting to `SlaveConfig`, before `sync_writes`:
-
-```rust
-    /// Fsync every applied entry before acknowledging it.
-```
-
-with:
-
-```rust
-    /// A repair (DESIGN.md §12.1) that would fetch more than this many bytes of keys and
-    /// envelopes falls back to a bootstrap. Default 64 MiB.
-    pub repair_max_bytes: u64,
-    /// Fsync every applied entry before acknowledging it.
-```
-
-and to `SlaveConfig::new`:
-
-```rust
-            fetch: FetchConfig::default(),
-            sync_writes: false,
-```
-
-with:
-
-```rust
-            fetch: FetchConfig::default(),
-            repair_max_bytes: 64 << 20,
-            sync_writes: false,
-```
-
-In `src/verify/mod.rs`, replace:
-
-```rust
-    /// Report it, then discard local data and bootstrap from the upstream.
-    Rebootstrap,
-}
-```
-
-with:
-
-```rust
-    /// Report it, then discard local data and bootstrap from the upstream.
-    Rebootstrap,
-    /// Report it, then take the reported keys and ranges from the upstream (DESIGN.md
-    /// §12.1), without a bootstrap. A `CfSpec` mismatch, or a repair that cannot be done,
-    /// bootstraps instead.
-    Repair,
-}
-```
-
-In `src/listener.rs`, replace:
-
-```rust
-    fn on_verify_complete(&self, _report: &VerifyReport) {}
-}
-```
-
-with:
-
-```rust
-    fn on_verify_complete(&self, _report: &VerifyReport) {}
-    /// A repair (DESIGN.md §12.1) rewrote some keys and moved the applied position back to
-    /// `last_seq`. Entries after it are delivered again (`on_entry` continues at
-    /// `last_seq + 1`); derived state of the keys involved should be rebuilt from reads once
-    /// the slave is ready.
-    fn on_rewind(&self, _last_seq: Seq) {}
-}
-```
-
-and in the trait docs:
-
-```rust
-/// Delivery is at-most-once across crashes. Within a process, `on_entry` seqs are strictly
-/// increasing between bootstraps; after `on_bootstrap_complete(S)` delivery continues at
-/// `S + 1` (state was replaced wholesale, so rebuild derived state).
-```
-
-with:
-
-```rust
-/// Delivery is at-most-once across crashes. Within a process, `on_entry` seqs are strictly
-/// increasing between bootstraps and rewinds; after `on_bootstrap_complete(S)` or
-/// `on_rewind(S)` delivery continues at `S + 1` (state was replaced wholesale, or in part, so
-/// rebuild derived state).
-```
-
-Run: `cargo build`
-Expected: two `E0004` errors for the new variants: `NodeState::Repairing` not covered in `src/slave/inner.rs` (Step 3) and `DivergencePolicy::Repair` not covered in `src/slave/policy.rs` (Step 5).
-
-- [ ] **Step 3: The slave's repair state**
-
-In `src/slave/inner.rs`, replace:
-
-```rust
-use super::repoint::PendingRepoint;
-```
-
-with:
-
-```rust
-use super::repair::AffectedSet;
-use super::repoint::PendingRepoint;
-```
-
-add the fields:
-
-```rust
-    /// Wakes the tail loop when a verify asks for a re-bootstrap.
-    pub rebootstrap: Notify,
-}
-```
-
-with:
-
-```rust
-    /// Wakes the tail loop when a verify asks for a re-bootstrap or a repair.
-    pub rebootstrap: Notify,
-    /// Non-zero while a repair waits for replay to reach this seq: reads answer `NotReady`.
-    repair_until: AtomicU64,
-    /// Keys a verify asked to repair (`MismatchPolicy::Repair`), done at the next session.
-    pending_repair: Mutex<Option<AffectedSet>>,
-}
-```
-
-in `Inner::new`, replace:
-
-```rust
-        let state = match node_state {
-            NodeState::Halted(r) => SlaveState::Halted(r),
-            NodeState::Ready | NodeState::Bootstrapping => SlaveState::Connecting,
-        };
-        let last_seq = store.position().last_seq;
-```
-
-with:
-
-```rust
-        let state = match node_state {
-            NodeState::Halted(r) => SlaveState::Halted(r),
-            NodeState::Ready | NodeState::Bootstrapping | NodeState::Repairing(_) => {
-                SlaveState::Connecting
-            }
-        };
-        let last_seq = store.position().last_seq;
-        // A repair interrupted before replay reached its target stays not ready.
-        let repair_until = match node_state {
-            NodeState::Repairing(until) if until > last_seq => until,
-            _ => 0,
-        };
-```
-
-and initialise them:
-
-```rust
-            rebootstrap: Notify::new(),
-        })
-```
-
-with:
-
-```rust
-            rebootstrap: Notify::new(),
-            repair_until: AtomicU64::new(repair_until),
-            pending_repair: Mutex::new(None),
-        })
-```
-
-Replace `is_ready`:
-
-```rust
-    /// Readable and servable: the slave holds a consistent state at some seq.
-    pub(crate) fn is_ready(&self) -> bool {
-        self.ident
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some()
-    }
-```
-
-with:
-
-```rust
-    /// Readable and servable: the slave holds a consistent state at some seq (not during a
-    /// bootstrap, nor while a repair replays up to its target).
-    pub(crate) fn is_ready(&self) -> bool {
-        self.ident
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some()
-            && self.repair_until.load(Ordering::SeqCst) == 0
-    }
-```
-
-In `src/slave/inner.rs`, insert before the test module:
-
-```rust
-#[cfg(test)]
-mod tests {
-```
-
-insert:
-
-```rust
-impl Inner {
-    /// `Some(seq)` while a repair waits for replay to reach `seq` (reads answer `NotReady`).
-    pub(crate) fn repairing(&self) -> Option<Seq> {
-        match self.repair_until.load(Ordering::SeqCst) {
-            0 => None,
-            seq => Some(seq),
-        }
-    }
-
-    /// Refuses reads (and serving) until `ready_at` is applied again; 0 = ready now.
-    pub(crate) fn begin_repair(&self, ready_at: Seq) {
-        self.repair_until.store(ready_at, Ordering::SeqCst);
-    }
-
-    /// Called by the applier after committing `seq`: a repair is complete once replay has
-    /// reached its target (DESIGN.md §12.1).
-    pub(crate) fn finish_repair_at(&self, seq: Seq) {
-        let until = self.repair_until.load(Ordering::SeqCst);
-        if until == 0 || seq < until {
-            return;
-        }
-        if let Err(e) = self
-            .store
-            .write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true)
-        {
-            // On restart, `repairing:<until>` with last_seq >= until is treated as ready.
-            tracing::warn!(node = %self.cfg.identifier, error = %e, "could not persist the end of a repair");
-        }
-        self.repair_until.store(0, Ordering::SeqCst);
-        tracing::info!(node = %self.cfg.identifier, seq, "repair complete: replay reached the upstream's snapshot");
-    }
-
-    /// Asks the driver to repair `set` at its next session (`MismatchPolicy::Repair`).
-    pub(crate) fn request_repair(&self, set: AffectedSet) {
-        let mut pending = self
-            .pending_repair
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        match pending.as_mut() {
-            Some(p) => p.merge(set),
-            None => *pending = Some(set),
-        }
-    }
-
-    pub(crate) fn take_pending_repair(&self) -> Option<AffectedSet> {
-        self.pending_repair
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-    }
-
-    pub(crate) fn has_pending_repair(&self) -> bool {
-        self.pending_repair
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some()
-    }
-}
-```
-
-In `src/slave/source.rs`, `node_state` reports it:
-
-```rust
-            SlaveState::Connecting | SlaveState::Streaming => {
-                if Inner::is_ready(self) {
-                    "ready".into()
-                } else {
-                    "bootstrapping".into()
-                }
-            }
-```
-
-with:
-
-```rust
-            SlaveState::Connecting | SlaveState::Streaming => {
-                if Inner::is_ready(self) {
-                    "ready".into()
-                } else if let Some(seq) = self.repairing() {
-                    format!("repairing:{seq}")
-                } else {
-                    "bootstrapping".into()
-                }
-            }
-```
-
-In `src/slave/apply.rs`, replace:
-
-```rust
-        i.capture_after_commit(e.seq);
-        Ok::<(), Failure>(())
-```
-
-with:
-
-```rust
-        i.capture_after_commit(e.seq);
-        // A repair is complete once replay reaches its target (DESIGN.md §12.1).
-        i.finish_repair_at(e.seq);
-        Ok::<(), Failure>(())
-```
-
-In `src/slave/bootstrap.rs`, in `install`, replace:
-
-```rust
-    // A verify waiting for a seq of the old state can never be served now.
-    inner.cancel_capture();
-```
-
-with:
-
-```rust
-    // A verify waiting for a seq of the old state can never be served now.
-    inner.cancel_capture();
-    // A bootstrap replaces everything a repair would have fixed.
-    inner.take_pending_repair();
-    inner.begin_repair(0);
-```
-
-- [ ] **Step 4: The repair itself**
-
-In `src/slave/mod.rs`, register the module:
-
-```rust
-mod repoint;
-mod source;
-```
-
-with:
-
-```rust
-mod repair;
-mod repoint;
-mod source;
-```
-
-Create `src/slave/repair.rs`:
-
-```rust
-//! Repair (DESIGN.md §12.1): bring a slave back in line with its upstream by rewriting only
-//! the keys that differ, instead of a full bootstrap.
-//!
-//! Both kinds run in the driver, while no entry is being applied:
-//! - **Divergence repair**: the local log has entries `F..=L` the upstream's history does not
-//!   have. The keys those entries touched are set to the upstream's state at its snapshot
-//!   `S`, the suffix is dropped, `last_seq` becomes `F - 1`, and the slave tails from `F`.
-//!   Replaying `F..=S` (absolute ops) over the repaired keys gives exactly the upstream's
-//!   state at `S`; until then reads answer `NotReady`.
-//! - **Verify repair** (`MismatchPolicy::Repair`): the keys a verify reported are set to the
-//!   upstream's state at a fresh snapshot `S`; local entries after `S` are dropped and
-//!   fetched again, so the same replay argument holds.
-//!
-//! Anything this cannot handle falls back to a full bootstrap: a CF operation in the
-//! suffix, a suffix or fork entry that is no longer retained on either side, a CF that
-//! differs between the sides, or more than `repair_max_bytes` to fetch.
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::ops::RangeInclusive;
-use std::sync::Arc;
-
-use super::client::Client;
-use super::inner::Inner;
-use super::state::NodeState;
-use super::verifier::{Upstream, UpstreamSession};
-use crate::background::blocking;
-use crate::codec::envelope;
-use crate::error::{Error, Result};
-use crate::failpoint;
-use crate::net::convert::{cf_from_pb, checked_history, identity_from_pb};
-use crate::pb;
-use crate::store::repair::Rewind;
-use crate::types::{CfEntry, LogEntry, Op, Seq};
-use crate::verify::range::Bounds;
-use crate::verify::{Mismatch, VerifyMode};
-
-/// Why a repair did not happen.
-#[derive(Debug)]
-pub(crate) enum RepairError {
-    /// Repair cannot handle this case: bootstrap instead.
-    Fallback(String),
-    /// A transient failure (upstream unreachable, session lost): try again later.
-    Retry(String),
-}
-
-impl From<Error> for RepairError {
-    fn from(e: Error) -> Self {
-        RepairError::Retry(e.to_string())
-    }
-}
-
-/// What a repair did.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Repaired {
-    /// Local entries that were dropped (empty when none were).
-    pub discarded: RangeInclusive<Seq>,
-    /// The new `last_seq`.
-    pub rewound_to: Seq,
-    /// Reads answer `NotReady` until this seq is applied again.
-    pub ready_at: Seq,
-}
-
-/// The keys and ranges to take from the upstream, per CF.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct AffectedSet {
-    pub keys: BTreeMap<String, BTreeSet<Vec<u8>>>,
-    pub ranges: BTreeMap<String, Vec<Bounds>>,
-}
-
-impl AffectedSet {
-    /// What the entries of a divergent suffix touched. `None` if one of them creates or
-    /// drops a CF (repair cannot undo that).
-    pub(crate) fn from_entries(entries: &[LogEntry]) -> Result<Option<AffectedSet>> {
-        let mut set = AffectedSet::default();
-        for e in entries {
-            for op in e.decode_ops()? {
-                match op {
-                    Op::Put { cf, key, .. } | Op::Delete { cf, key } => {
-                        set.keys.entry(cf).or_default().insert(key);
-                    }
-                    Op::DeleteRange { cf, start, end } => {
-                        set.ranges.entry(cf).or_default().push(Bounds {
-                            lower: Some(start),
-                            upper: Some(end),
-                        });
-                    }
-                    Op::CreateCf { .. } | Op::DropCf { .. } => return Ok(None),
-                }
-            }
-        }
-        Ok(Some(set))
-    }
-
-    /// What a verify reported. `None` if the CF lists differ (repair cannot fix that).
-    pub(crate) fn from_mismatches(mismatches: &[Mismatch]) -> Option<AffectedSet> {
-        let mut set = AffectedSet::default();
-        for m in mismatches {
-            match m {
-                Mismatch::Key { cf, key, .. } => {
-                    set.keys.entry(cf.clone()).or_default().insert(key.clone());
-                }
-                Mismatch::Range { cf, lower, upper } => {
-                    set.ranges.entry(cf.clone()).or_default().push(Bounds {
-                        lower: lower.clone(),
-                        upper: upper.clone(),
-                    });
-                }
-                Mismatch::CfSpec { .. } => return None,
-            }
-        }
-        Some(set)
-    }
-
-    pub(crate) fn merge(&mut self, other: AffectedSet) {
-        for (cf, keys) in other.keys {
-            self.keys.entry(cf).or_default().extend(keys);
-        }
-        for (cf, ranges) in other.ranges {
-            self.ranges.entry(cf).or_default().extend(ranges);
-        }
-    }
-
-    fn cfs(&self) -> BTreeSet<&String> {
-        self.keys.keys().chain(self.ranges.keys()).collect()
-    }
-}
-
-fn fallback(why: impl Into<String>) -> RepairError {
-    RepairError::Fallback(why.into())
-}
-
-/// The first seq where the local log and the upstream's (up to its snapshot `s`) differ,
-/// found by binary search over entry CRCs. `last + 1` if they agree up to
-/// `min(local last, s)`. Fails over to bootstrap when the answer cannot be proven from
-/// entries both sides still hold.
-async fn locate_fork(
-    inner: &Inner,
-    up: &mut Upstream,
-    s: Seq,
-) -> std::result::Result<Seq, RepairError> {
-    let upper = inner.store.position().last_seq.min(s);
-    if upper == 0 {
-        return Ok(1);
-    }
-    let lo = inner.store.first_retained_seq().clamp(1, upper);
-    // Some(true): entry `seq` is the same on both sides; None: one side no longer has it.
-    let mut same = async |seq: Seq| -> std::result::Result<Option<bool>, RepairError> {
-        let local = inner.store.entry_crc(seq)?;
-        let upstream = up.entry_crc(seq).await?;
-        Ok(local.zip(upstream).map(|(a, b)| a == b))
-    };
-    match same(upper).await? {
-        Some(true) => return Ok(upper + 1),
-        Some(false) => {}
-        None => return Err(fallback(format!("entry {upper} is not held by both sides"))),
-    }
-    // Invariant: entry `hi` differs; the first difference is in `low..=hi`.
-    let (mut low, mut hi) = (lo, upper);
-    while low < hi {
-        let mid = low + (hi - low) / 2;
-        match same(mid).await? {
-            Some(true) => low = mid + 1,
-            Some(false) => hi = mid,
-            None => return Err(fallback(format!("entry {mid} is not held by both sides"))),
-        }
-    }
-    if hi > 1 && same(hi - 1).await? != Some(true) {
-        return Err(fallback(format!(
-            "the last common entry {} is no longer held by both sides",
-            hi - 1
-        )));
-    }
-    Ok(hi)
-}
-
-/// Opens a session and checks it follows the identity the handshake announced.
-async fn open(
-    inner: &Inner,
-    client: &Client,
-    hs: &pb::HandshakeResponse,
-) -> std::result::Result<UpstreamSession, RepairError> {
-    let session = UpstreamSession::open(inner, client, VerifyMode::Quick).await?;
-    if session.begin.identity != hs.identity {
-        session.close().await;
-        return Err(RepairError::Retry(
-            "the upstream's identity changed since the handshake".into(),
-        ));
-    }
-    Ok(session)
-}
-
-/// How long a halting slave asks its upstream for the fork point.
-const FORK_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Finds the fork point of a divergence and records it for `Slave::diverged_entries`.
-/// Best effort: on failure the fork point is recorded as unknown.
-pub(crate) async fn record_fork(
-    inner: &Arc<Inner>,
-    client: &Client,
-    hs: &pb::HandshakeResponse,
-) -> Option<Seq> {
-    let lookup = async {
-        let mut session = open(inner, client, hs).await?;
-        let s = session.begin.snapshot_seq;
-        let fork = locate_fork(inner, &mut session.upstream, s).await;
-        session.close().await;
-        fork
-    };
-    let fork = match tokio::time::timeout(FORK_LOOKUP_TIMEOUT, lookup).await {
-        Ok(Ok(fork)) => Some(fork),
-        Ok(Err(e)) => {
-            tracing::warn!(node = %inner.cfg.identifier, error = ?e, "fork point unknown");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(node = %inner.cfg.identifier, "fork point unknown: the upstream did not answer in time");
-            None
-        }
-    };
-    let i = inner.clone();
-    if let Err(e) = blocking(move || i.store.set_diverged_at(fork)).await {
-        tracing::warn!(node = %inner.cfg.identifier, error = %e, "could not record the fork point");
-    }
-    fork
-}
-
-/// Repairs a divergence from the upstream that answered `hs` (`REJECT / DIVERGED`).
-pub(crate) async fn repair_divergence(
-    inner: &Arc<Inner>,
-    client: &Client,
-    hs: &pb::HandshakeResponse,
-) -> std::result::Result<Repaired, RepairError> {
-    let mut session = open(inner, client, hs).await?;
-    let result = async {
-        let s = session.begin.snapshot_seq;
-        let fork = locate_fork(inner, &mut session.upstream, s).await?;
-        if fork < hs.first_retained_seq {
-            return Err(fallback(format!(
-                "the upstream no longer holds entry {fork}"
-            )));
-        }
-        let last = inner.store.position().last_seq;
-        let i = inner.clone();
-        let suffix = blocking(move || i.store.read_entries(fork, usize::MAX, usize::MAX))
-            .await
-            .map_err(|e| match e {
-                Error::Gap { .. } => fallback(format!(
-                    "the local suffix from {fork} is no longer retained"
-                )),
-                other => RepairError::Retry(other.to_string()),
-            })?;
-        let Some(set) = AffectedSet::from_entries(&suffix)? else {
-            return Err(fallback(
-                "the divergent suffix creates or drops a column family",
-            ));
-        };
-        let plan = Plan {
-            keep_through: fork - 1,
-            ready_at: s,
-            set,
-        };
-        apply(inner, hs, &mut session, plan, last).await
-    }
-    .await;
-    session.close().await;
-    result
-}
-
-/// Repairs the keys a verify reported (`MismatchPolicy::Repair`), taking them from the
-/// upstream that answered `hs` (`RESUME`).
-pub(crate) async fn repair_pending(
-    inner: &Arc<Inner>,
-    client: &Client,
-    hs: &pb::HandshakeResponse,
-) -> std::result::Result<Repaired, RepairError> {
-    let Some(set) = inner.take_pending_repair() else {
-        let last = inner.store.position().last_seq;
-        return Ok(Repaired {
-            discarded: last + 1..=last,
-            rewound_to: last,
-            ready_at: last,
-        });
-    };
-    let mut session = match open(inner, client, hs).await {
-        Ok(s) => s,
-        Err(e) => {
-            inner.request_repair(set);
-            return Err(e);
-        }
-    };
-    let result = async {
-        let s = session.begin.snapshot_seq;
-        let last = inner.store.position().last_seq;
-        if last > s && inner.store.entry_crc(s)? != session.upstream.entry_crc(s).await? {
-            return Err(fallback(format!("entry {s} differs from the upstream's")));
-        }
-        let plan = Plan {
-            keep_through: last.min(s),
-            ready_at: last.max(s),
-            set: set.clone(),
-        };
-        apply(inner, hs, &mut session, plan, last).await
-    }
-    .await;
-    session.close().await;
-    if let Err(RepairError::Retry(_)) = &result {
-        inner.request_repair(set);
-    }
-    result
-}
-
-/// A repair to carry out: rewind to `keep_through`, take `set` from the upstream's snapshot,
-/// and refuse reads until `ready_at` is applied again.
-struct Plan {
-    keep_through: Seq,
-    ready_at: Seq,
-    set: AffectedSet,
-}
-
-async fn apply(
-    inner: &Arc<Inner>,
-    hs: &pb::HandshakeResponse,
-    session: &mut UpstreamSession,
-    plan: Plan,
-    last: Seq,
-) -> std::result::Result<Repaired, RepairError> {
-    let identity = hs
-        .identity
-        .as_ref()
-        .ok_or_else(|| RepairError::Retry("handshake without identity".into()))?;
-    let identity = identity_from_pb(identity)?;
-    let history = checked_history(&identity, &hs.epoch_history)?;
-    let upstream_cfs: Vec<CfEntry> = session.begin.cf_specs.iter().map(cf_from_pb).collect();
-    let max_bytes = inner.cfg.repair_max_bytes;
-    let mut fetched_bytes = 0u64;
-    let mut clear = Vec::new();
-    let mut writes = Vec::new();
-    for cf in plan.set.cfs() {
-        let local = inner
-            .store
-            .live_cf(cf)
-            .map_err(|_| fallback(format!("CF {cf} does not exist locally")))?;
-        if !upstream_cfs.contains(&local.entry) {
-            return Err(fallback(format!(
-                "CF {cf} differs between this slave and its upstream"
-            )));
-        }
-        let mut take =
-            |key: Vec<u8>, env: Option<Vec<u8>>| -> std::result::Result<(), RepairError> {
-                if let Some(v) = &env {
-                    envelope::decode(v).map_err(|e| {
-                        RepairError::Retry(format!("upstream sent a bad envelope: {e}"))
-                    })?;
-                    fetched_bytes += (key.len() + v.len()) as u64;
-                    if fetched_bytes > max_bytes {
-                        return Err(fallback(format!(
-                            "more than repair_max_bytes ({max_bytes}) to fetch"
-                        )));
-                    }
-                }
-                writes.push((local.clone(), key, env));
-                Ok(())
-            };
-        if let Some(keys) = plan.set.keys.get(cf) {
-            let keys: Vec<Vec<u8>> = keys.iter().cloned().collect();
-            for (key, env) in session.upstream.fetch_keys(cf, &keys).await? {
-                take(key, env)?;
-            }
-        }
-        for bounds in plan.set.ranges.get(cf).into_iter().flatten() {
-            for (key, env) in session.upstream.fetch_range(cf, bounds).await? {
-                take(key, Some(env))?;
-            }
-            clear.push((local.clone(), bounds.clone()));
-        }
-    }
-    let keep_crc = match plan.keep_through {
-        0 => None,
-        k => Some(
-            inner
-                .store
-                .entry_crc(k)?
-                .ok_or_else(|| fallback(format!("local entry {k} is no longer retained")))?,
-        ),
-    };
-    let repairing = plan.ready_at > plan.keep_through;
-    let node_state = if repairing {
-        NodeState::Repairing(plan.ready_at)
-    } else {
-        NodeState::Ready
-    };
-    let rewind = Rewind {
-        keep_through: plan.keep_through,
-        keep_crc,
-        drop_through: last,
-        identity,
-        epoch_history: history.clone(),
-        node_state: node_state.encode(),
-        clear,
-        writes,
-    };
-    // Readers and downstream replicas must not see the mixed state, and a verify waiting for
-    // a seq of the old state can never be served now.
-    inner.begin_repair(if repairing { plan.ready_at } else { 0 });
-    inner.reset_downstream();
-    inner.cancel_capture();
-    let i = inner.clone();
-    if let Err(e) = blocking(move || i.store.rewind(&rewind)).await {
-        // The batch is atomic: nothing was written, the old state stands.
-        inner.begin_repair(0);
-        return Err(e.into());
-    }
-    inner.set_ident(Some((identity, history)));
-    inner.seq_tx.send_replace(plan.keep_through);
-    tracing::info!(
-        node = %inner.cfg.identifier,
-        rewound_to = plan.keep_through,
-        discarded = last.saturating_sub(plan.keep_through),
-        ready_at = plan.ready_at,
-        "repaired from the upstream"
-    );
-    inner.notify(|l| l.on_rewind(plan.keep_through));
-    if failpoint::fire("slave-repair-after-rewind") {
-        // Emulated crash right after the rewind: freeze until the test kills the node.
-        std::future::pending::<()>().await;
-    }
-    Ok(Repaired {
-        discarded: plan.keep_through + 1..=last,
-        rewound_to: plan.keep_through,
-        ready_at: plan.ready_at,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::codec::encode_ops;
-    use crate::types::CfSpec;
-
-    fn entry(seq: Seq, ops: Vec<Op>) -> LogEntry {
-        LogEntry::new(seq, 1, 1_000, encode_ops(&ops))
-    }
-
-    #[test]
-    fn the_affected_set_of_a_suffix_covers_every_key_and_range() {
-        let put = |cf: &str, k: &[u8]| Op::Put {
-            cf: cf.into(),
-            key: k.to_vec(),
-            value: b"v".to_vec(),
-            expire_at_ms: None,
-        };
-        let suffix = vec![
-            entry(7, vec![put("a", b"k1"), put("b", b"k2")]),
-            entry(
-                8,
-                vec![
-                    Op::Delete {
-                        cf: "a".into(),
-                        key: b"k3".to_vec(),
-                    },
-                    put("a", b"k1"),
-                ],
-            ),
-            entry(
-                9,
-                vec![Op::DeleteRange {
-                    cf: "b".into(),
-                    start: b"m".to_vec(),
-                    end: b"p".to_vec(),
-                }],
-            ),
-        ];
-        let set = AffectedSet::from_entries(&suffix).unwrap().unwrap();
-        assert_eq!(
-            set.keys["a"],
-            [b"k1".to_vec(), b"k3".to_vec()].into_iter().collect()
-        );
-        assert_eq!(set.keys["b"], [b"k2".to_vec()].into_iter().collect());
-        assert_eq!(
-            set.ranges["b"],
-            vec![Bounds {
-                lower: Some(b"m".to_vec()),
-                upper: Some(b"p".to_vec())
-            }]
-        );
-        let with_cf_op = vec![
-            entry(7, vec![put("a", b"k")]),
-            entry(
-                8,
-                vec![Op::CreateCf {
-                    spec: CfSpec::new("n"),
-                }],
-            ),
-        ];
-        assert_eq!(AffectedSet::from_entries(&with_cf_op).unwrap(), None);
-    }
-
-    #[test]
-    fn verify_mismatches_become_keys_and_ranges_but_cf_differences_do_not() {
-        let ms = vec![
-            Mismatch::Key {
-                cf: "a".into(),
-                key: b"k".to_vec(),
-                local: Some(3),
-                upstream: None,
-            },
-            Mismatch::Range {
-                cf: "a".into(),
-                lower: None,
-                upper: Some(b"z".to_vec()),
-            },
-        ];
-        let mut set = AffectedSet::from_mismatches(&ms).unwrap();
-        assert_eq!(set.keys["a"].len(), 1);
-        assert_eq!(
-            set.ranges["a"],
-            vec![Bounds {
-                lower: None,
-                upper: Some(b"z".to_vec())
-            }]
-        );
-        set.merge(
-            AffectedSet::from_mismatches(&[Mismatch::Key {
-                cf: "b".into(),
-                key: b"x".to_vec(),
-                local: None,
-                upstream: Some(1),
-            }])
-            .unwrap(),
-        );
-        assert_eq!(set.cfs().len(), 2);
-        let cf = Mismatch::CfSpec {
-            name: "a".into(),
-            local: None,
-            upstream: None,
-        };
-        assert_eq!(AffectedSet::from_mismatches(&[cf]), None);
-    }
-}
-```
-
-Run: `cargo build`
-Expected: only the `DivergencePolicy::Repair` error in `src/slave/policy.rs` remains; Step 5 wires the module in.
-
-- [ ] **Step 5: Wire it into the policies, the driver and the verifier**
-
-In `src/slave/policy.rs`, add the action:
-
-```rust
-    Bootstrap,
-    Halt(HaltReason),
-```
-
-with:
-
-```rust
-    Bootstrap,
-    /// Repair the divergence from the upstream (DESIGN.md §12.1); bootstrap if that fails.
-    Repair,
-    Halt(HaltReason),
-```
-
-and map the policy:
-
-```rust
-        DivergencePolicy::Halt => Action::Halt(HaltReason::Diverged),
-        DivergencePolicy::Rebootstrap => Action::Bootstrap,
-```
-
-with:
-
-```rust
-        DivergencePolicy::Halt => Action::Halt(HaltReason::Diverged),
-        DivergencePolicy::Repair => Action::Repair,
-        DivergencePolicy::Rebootstrap => Action::Bootstrap,
-```
-
-In the test `reject_rows`, replace:
-
-```rust
-        assert_eq!(
-            act(Decision::Reject, Reason::Diverged, &OPPOSITE),
-            Action::Bootstrap
-        );
-```
-
-with:
-
-```rust
-        assert_eq!(
-            act(Decision::Reject, Reason::Diverged, &OPPOSITE),
-            Action::Bootstrap
-        );
-        let repair = Policies {
-            divergence: DivergencePolicy::Repair,
-            ..DEFAULTS
-        };
-        assert_eq!(
-            act(Decision::Reject, Reason::Diverged, &repair),
-            Action::Repair
-        );
-```
-
-and in `status_rows`:
-
-```rust
-        assert_eq!(
-            after_status(&s(Reason::Diverged), &OPPOSITE),
-            Action::Bootstrap
-        );
-```
-
-with:
-
-```rust
-        assert_eq!(
-            after_status(&s(Reason::Diverged), &OPPOSITE),
-            Action::Bootstrap
-        );
-        let repair = Policies {
-            divergence: DivergencePolicy::Repair,
-            ..DEFAULTS
-        };
-        assert_eq!(after_status(&s(Reason::Diverged), &repair), Action::Repair);
-```
-
-In `src/slave/driver.rs`, replace the imports:
-
-```rust
-use super::policy::{self, Action};
-use super::repoint::{self, RepointDivergence, RepointOutcome};
-```
-
-with:
-
-```rust
-use super::policy::{self, Action};
-use super::repair::{self, RepairError};
-use super::repoint::{self, RepointDivergence, RepointOutcome};
-```
-
-In `end_for`, replace the last arm, and add a helper after the function:
-
-```rust
-        Action::Again | Action::Tail | Action::AdoptEpochThenTail => SessionEnd::Again,
-    }
-}
-```
-
-with:
-
-```rust
-        // A failed call carries no handshake to repair from: the next handshake answers
-        // `DIVERGED` and repairs.
-        Action::Again | Action::Tail | Action::AdoptEpochThenTail | Action::Repair => {
-            SessionEnd::Again
-        }
-    }
-}
-
-/// How a repair that did not happen ends the session: a fallback bootstraps (for this repoint
-/// generation only), a transient failure is retried with backoff.
-fn repair_failed(inner: &Inner, generation: u64, e: RepairError) -> SessionEnd {
-    match e {
-        RepairError::Fallback(why) => {
-            tracing::warn!(node = %inner.cfg.identifier, reason = %why, "repair not possible; bootstrapping instead");
-            inner.force_bootstrap.request(generation);
-            SessionEnd::Again
-        }
-        RepairError::Retry(why) => SessionEnd::Retry(format!("repair failed: {why}")),
-    }
-}
-```
-
-In `session`, a repoint's `Repair` mode now repairs:
-
-```rust
-            action = match mode {
-                RepointDivergence::Rebootstrap { .. } => Action::Bootstrap,
-                RepointDivergence::Refuse | RepointDivergence::Repair { .. } => {
-                    let local_epoch = inner.ident().map_or(0, |(id, _)| id.epoch);
-                    let err = repoint::mode_error(mode, || {
-                        repoint::divergence(local_epoch, inner.store.position().last_seq, &hs)
-                    });
-                    tracing::warn!(node = %inner.cfg.identifier, error = %err, "repoint refused: diverged");
-```
-
-with:
-
-```rust
-            action = match mode {
-                RepointDivergence::Rebootstrap { .. } => Action::Bootstrap,
-                RepointDivergence::Repair { .. } => Action::Repair,
-                RepointDivergence::Refuse => {
-                    let local_epoch = inner.ident().map_or(0, |(id, _)| id.epoch);
-                    let err =
-                        repoint::divergence(local_epoch, inner.store.position().last_seq, &hs);
-                    tracing::warn!(node = %inner.cfg.identifier, error = %err, "repoint refused: diverged");
-```
-
-and in the `match action`, replace the `Tail` arm:
-
-```rust
-        Action::Tail => {
-            commit_halt_clear(inner).await;
-            inner.settle_repoint(generation, Ok(RepointOutcome::Resumed));
-            tail(inner, generation, &c, &hs, None, backoff).await
-        }
-```
-
-with:
-
-```rust
-        Action::Tail => {
-            commit_halt_clear(inner).await;
-            if inner.has_pending_repair() {
-                // A verify reported keys to repair (`MismatchPolicy::Repair`): fix them, then
-                // handshake again from the new position.
-                let span = repair_span(inner);
-                return match repair::repair_pending(inner, &c, &hs)
-                    .instrument(span)
-                    .await
-                {
-                    Ok(_) => SessionEnd::Again,
-                    Err(e) => repair_failed(inner, generation, e),
-                };
-            }
-            inner.settle_repoint(generation, Ok(RepointOutcome::Resumed));
-            tail(inner, generation, &c, &hs, None, backoff).await
-        }
-```
-
-add the `Repair` arm and record the fork point on a `Diverged` halt:
-
-```rust
-        Action::Halt(r) => SessionEnd::Halt(r),
-        Action::Retry(m) => SessionEnd::Retry(m),
-        Action::Again => SessionEnd::Again,
-    }
-}
-```
-
-with:
-
-```rust
-        Action::Repair => {
-            let span = repair_span(inner);
-            match repair::repair_divergence(inner, &c, &hs)
-                .instrument(span)
-                .await
-            {
-                Ok(r) => {
-                    // The rewind batch wrote `node_state` itself.
-                    inner.halt_clear_pending.store(false, Ordering::SeqCst);
-                    inner.settle_repoint(
-                        generation,
-                        Ok(RepointOutcome::Repaired {
-                            discarded: r.discarded,
-                        }),
-                    );
-                    // Handshake again from the rewound position, then tail.
-                    SessionEnd::Again
-                }
-                Err(e) => repair_failed(inner, generation, e),
-            }
-        }
-        Action::Halt(HaltReason::Diverged) => {
-            // Where the local suffix starts, for `Slave::diverged_entries` (best effort).
-            repair::record_fork(inner, &c, &hs).await;
-            SessionEnd::Halt(HaltReason::Diverged)
-        }
-        Action::Halt(r) => SessionEnd::Halt(r),
-        Action::Retry(m) => SessionEnd::Retry(m),
-        Action::Again => SessionEnd::Again,
-    }
-}
-
-fn repair_span(inner: &Inner) -> tracing::Span {
-    tracing::info_span!(
-        "repair",
-        node_id = %inner.cfg.identifier,
-        upstream = %inner.upstream_uri(),
-        seq = inner.store.position().last_seq,
-        epoch = inner.ident().map(|(id, _)| id.epoch),
-    )
-}
-```
-
-In `tail`, a verify's repair request also ends the stream:
-
-```rust
-            // A verify asked for a re-bootstrap (`MismatchPolicy::Rebootstrap`): handshake again,
-            // which bootstraps because the request is set. A stale wake-up is ignored.
-            _ = inner.rebootstrap.notified() => {
-                if inner.force_bootstrap.is_requested_for(generation) {
-                    return SessionEnd::Again;
-                }
-                continue;
-            }
-```
-
-with:
-
-```rust
-            // A verify asked for a re-bootstrap (`MismatchPolicy::Rebootstrap`) or a repair
-            // (`MismatchPolicy::Repair`): handshake again, which bootstraps or repairs because
-            // the request is set. A stale wake-up is ignored.
-            _ = inner.rebootstrap.notified() => {
-                if inner.force_bootstrap.is_requested_for(generation) || inner.has_pending_repair() {
-                    return SessionEnd::Again;
-                }
-                continue;
-            }
-```
-
-In `src/slave/verifier.rs`, in `finish`, replace:
-
-```rust
-        if inner.cfg.verify.on_mismatch == MismatchPolicy::Rebootstrap {
-            // For the upstream the slave follows now; a later repoint makes it inert.
-            inner.force_bootstrap.request(*inner.repoint_tx.borrow());
-            inner.rebootstrap.notify_one();
-        }
-```
-
-with:
-
-```rust
-        let set = match inner.cfg.verify.on_mismatch {
-            MismatchPolicy::Report => None,
-            MismatchPolicy::Rebootstrap => Some(None),
-            // A CF that differs cannot be repaired key by key: bootstrap.
-            MismatchPolicy::Repair => Some(AffectedSet::from_mismatches(&report.mismatches)),
-        };
-        match set {
-            None => {}
-            Some(Some(set)) => {
-                inner.request_repair(set);
-                inner.rebootstrap.notify_one();
-            }
-            Some(None) => {
-                // For the upstream the slave follows now; a later repoint makes it inert.
-                inner.force_bootstrap.request(*inner.repoint_tx.borrow());
-                inner.rebootstrap.notify_one();
-            }
-        }
-```
-
-with the import:
-
-```rust
-use super::inner::{CaptureHold, CaptureMiss, Inner};
-```
-
-with:
-
-```rust
-use super::inner::{CaptureHold, CaptureMiss, Inner};
-use super::repair::AffectedSet;
-```
-
-In `src/slave/repoint.rs`, delete `mode_error` (no longer used):
-
-```rust
-/// The error a repoint reports when `mode` halts on divergence: `diverged` for `Refuse`,
-/// `Unsupported` for `Repair`.
-pub(crate) fn mode_error(mode: RepointDivergence, diverged: impl FnOnce() -> Error) -> Error {
-    match mode {
-        RepointDivergence::Repair { .. } => {
-            Error::Unsupported("divergence repair needs verify sessions (Plan 3)".into())
-        }
-        _ => diverged(),
-    }
-}
-```
-
-with:
-
-```rust
-
-```
-
-and update the docs of `Repair`:
-
-```rust
-    /// Discard only the divergent suffix and resume (DESIGN.md §22, Plan 3). **Not available in
-    /// this version:** `repoint` returns `Error::Unsupported` and the slave halts
-    /// `Diverged` with its data intact. It needs verify sessions (Plan 3).
-    Repair { accept_loss: AcceptDataLoss },
-```
-
-with:
-
-```rust
-    /// Discard only the divergent suffix (DESIGN.md §12.1): the keys it touched are taken from
-    /// the new upstream, the suffix is dropped, and the slave replays the upstream's history
-    /// (`Repaired { discarded }`; reads answer `NotReady` until replay reaches the upstream's
-    /// snapshot seq). When repair cannot be proven safe (a CF operation in the suffix, entries
-    /// no longer retained, too much to fetch), the slave bootstraps instead (`Bootstrapped`).
-    Repair { accept_loss: AcceptDataLoss },
-```
-
-In `src/slave/repoint.rs`, replace:
-
-```rust
-    /// The divergent suffix `discarded` was rolled back (Plan 3; never returned by this
-    /// version).
-    Repaired { discarded: RangeInclusive<Seq> },
-```
-
-with:
-
-```rust
-    /// The divergent suffix `discarded` was rolled back and the keys it touched were taken
-    /// from the new upstream (`RepointDivergence::Repair`). Reads answer `NotReady` until the
-    /// slave has replayed up to the upstream's snapshot seq.
-    Repaired { discarded: RangeInclusive<Seq> },
-```
-
-and in the docs of `Slave::repoint`:
-
-```rust
-    ///   `RepointDivergence::Repair` returns `Err(Unsupported)` in this version (it needs
-    ///   Plan 3's verify sessions) and also leaves the slave halted with its data intact.
-```
-
-with:
-
-```rust
-    ///   `RepointDivergence::Repair { accept_loss: AcceptDataLoss }` discards only the
-    ///   divergent suffix and returns `Ok(Repaired { discarded })` (or `Ok(Bootstrapped)` when
-    ///   repair is not possible).
-```
-
-In `src/slave/mod.rs`, add before `watch_state`:
-
-```rust
-    pub fn watch_state(&self) -> watch::Receiver<SlaveState> {
-```
-
-with:
-
-```rust
-    /// On a slave halted `Diverged`: its local entries past the fork point, for salvage (DESIGN.md
-    /// §12.1). The fork point is located when the slave halts, by comparing entry CRCs with the
-    /// upstream. `Err(Config)` if the slave is not halted `Diverged`, or the fork point is not
-    /// known (the upstream could not be asked); `Err(Gap)` if local retention already removed
-    /// part of the suffix.
-    pub fn diverged_entries(&self) -> Result<Vec<LogEntry>> {
-        if self.inner.state() != SlaveState::Halted(HaltReason::Diverged) {
-            return Err(Error::Config("the slave is not halted Diverged".into()));
-        }
-        let fork = self.inner.store.diverged_at()?.ok_or_else(|| {
-            Error::Config(
-                "the fork point is not known: the upstream could not be asked when the slave halted"
-                    .into(),
-            )
-        })?;
-        self.inner.store.read_entries(fork, usize::MAX, usize::MAX)
-    }
-
-    pub fn watch_state(&self) -> watch::Receiver<SlaveState> {
-```
-
-with the import:
-
-```rust
-use crate::types::{CfSpec, Direction, IterMode, Role, Seq, ValueMeta};
-```
-
-with:
-
-```rust
-use crate::types::{CfSpec, Direction, IterMode, LogEntry, Role, Seq, ValueMeta};
-```
-
-and in the docs of `verify_now`:
-
-```rust
-    /// listener's `on_verify_complete`; under `MismatchPolicy::Rebootstrap` a report with
-    /// mismatches makes the slave bootstrap.
-```
-
-with:
-
-```rust
-    /// listener's `on_verify_complete`; under `MismatchPolicy::Rebootstrap` a report with
-    /// mismatches makes the slave bootstrap, under `MismatchPolicy::Repair` it takes the
-    /// reported keys from the upstream.
-```
-
-In `proto/replication.proto` **and** the PROTOCOL.md §14 block (byte-identical), replace:
-
-```proto
-  string   node_state               = 8;   // "ready", "bootstrapping" or "halted:<Reason>"
-```
-
-with:
-
-```proto
-  string   node_state               = 8;   // "ready", "bootstrapping", "halted:<Reason>" or "repairing:<seq>"
-```
-
-In PROTOCOL.md §14:
-
-```proto
-  string   node_state               = 8;   // "ready", "bootstrapping" or "halted:<Reason>"
-```
-
-with:
-
-```proto
-  string   node_state               = 8;   // "ready", "bootstrapping", "halted:<Reason>" or "repairing:<seq>"
-```
-
-In PROTOCOL.md §6.5, the `Status` field table:
-
-```markdown
-| `node_state` | `"ready"`, `"bootstrapping"` or `"halted:<Reason>"`. |
-```
-
-with:
-
-```markdown
-| `node_state` | `"ready"`, `"bootstrapping"`, `"halted:<Reason>"` or `"repairing:<seq>"` (a repair is replaying up to `seq`; the node answers `NOT_READY` until then). |
-```
-
-In PROTOCOL.md §11.2:
-
-```markdown
-| `REJECT` / `DIVERGED` | Divergence policy *Halt* (default) → halt `Diverged`. *Rebootstrap* → bootstrap. |
-```
-
-with:
-
-```markdown
-| `REJECT` / `DIVERGED` | Divergence policy *Halt* (default) → halt `Diverged`. *Repair* → repair from a verify session (`EntryCrcs` to find the fork, `FetchKeys`/`FetchRange` for the keys the suffix touched; §9.2), falling back to a bootstrap. *Rebootstrap* → bootstrap. |
-```
-
-Run: `cargo build && cargo test --lib`
-Expected: builds without warnings; all unit tests PASS (224), including `store::repair`, `slave::repair` (2 each), `reject_rows`, `status_rows` and `node_state_round_trips_and_only_data_halts_persist`.
-
-- [ ] **Step 6: Write the end-to-end tests**
-
-The recording listener counts rewinds and restarts its seq-order check there.
-
-In `tests/support/mod.rs`, replace:
-
-```rust
-    pub verifies: Mutex<Vec<VerifyReport>>,
-    pub violations: Mutex<Vec<String>>,
-```
-
-with:
-
-```rust
-    pub verifies: Mutex<Vec<VerifyReport>>,
-    pub rewinds: AtomicUsize,
-    pub violations: Mutex<Vec<String>>,
-```
-
-add:
-
-```rust
-    pub fn entries(&self) -> Vec<Seq> {
-```
-
-with:
-
-```rust
-    pub fn rewinds(&self) -> usize {
-        self.rewinds.load(Ordering::SeqCst)
-    }
-
-    pub fn entries(&self) -> Vec<Seq> {
-```
-
-and in `impl ReplicationListener for RecordingListener`:
-
-```rust
-    fn on_verify_complete(&self, report: &VerifyReport) {
-        self.verifies
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(report.clone());
-    }
-```
-
-with:
-
-```rust
-    fn on_verify_complete(&self, report: &VerifyReport) {
-        self.verifies
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(report.clone());
-    }
-
-    fn on_rewind(&self, last_seq: Seq) {
-        self.last.store(last_seq, Ordering::SeqCst);
-        self.rewinds.fetch_add(1, Ordering::SeqCst);
-    }
-```
-
-Create `tests/repair.rs`:
-
-```rust
-//! Repair, end to end (DESIGN.md §12.1): a diverged slave, or one a verify found damaged,
-//! takes only the affected keys from its upstream instead of bootstrapping.
-
-mod support;
-
-use std::time::Duration;
-
-use replicated_rocksdb::codec::envelope;
-use replicated_rocksdb::{
-    CfSpec, DivergencePolicy, Error, HaltReason, LogApi, Master, MismatchPolicy, ReadApi, Slave,
-    SlaveConfig, SlaveState, VerifyMode,
-};
-use support::{
-    Cluster, RawDb, RecordingListener, assert_converged, restore_dir, wait_state, wait_until,
-};
-
-fn key(i: u32) -> Vec<u8> {
-    format!("k{i:03}").into_bytes()
-}
-
-/// A master with 50 keys and a converged slave `d` that received them through Tail, so its
-/// own log holds the entries before any later fork point (repair needs entry `F - 1` on both
-/// sides).
-async fn setup(
-    c: &Cluster,
-    tweak: impl FnOnce(&mut SlaveConfig),
-) -> (
-    Master,
-    Slave,
-    SlaveConfig,
-    std::sync::Arc<RecordingListener>,
-) {
-    let a = c.master("a").await;
-    a.create_cf(CfSpec::new("c")).unwrap();
-    let (mut cfg, listener) = c.slave_config("d", a.serve_addr().unwrap());
-    tweak(&mut cfg);
-    let d = Slave::open(cfg.clone()).await.unwrap();
-    assert_converged(&a, &[("d", &d)]).await;
-    for i in 0..50u32 {
-        a.put("c", &key(i), b"base").unwrap();
-    }
-    assert_converged(&a, &[("d", &d)]).await;
-    wait_state(&d, "streaming", |s| *s == SlaveState::Streaming).await;
-    (a, d, cfg, listener)
-}
-
-/// Backs the master up, lets `write_lost` write entries the slave receives, then restores the
-/// backup with an epoch bump (DESIGN.md §13): those entries are the slave's divergent suffix.
-/// `write_new` writes the restored master's own history.
-async fn diverge(
-    c: &Cluster,
-    a: Master,
-    d: &Slave,
-    write_lost: impl FnOnce(&Master),
-    write_new: impl FnOnce(&Master),
-) -> Master {
-    let a = c.restart_master_after_backup(a, "a", "a-backup").await;
-    write_lost(&a);
-    assert_converged(&a, &[("d", d)]).await;
-    let port = a.serve_addr().unwrap().port();
-    a.shutdown().await.unwrap();
-    restore_dir(&c.path("a-backup"), &c.path("a"));
-    let mut cfg = c.master_config("a");
-    cfg.serve.as_mut().unwrap().port = port;
-    cfg.bump_epoch_on_open = true;
-    let a = Master::open(cfg).await.unwrap();
-    write_new(&a);
-    a
-}
-
-fn lost(a: &Master) {
-    a.put("c", &key(1), b"lost").unwrap();
-    a.put("c", b"only-in-the-lost-history", b"x").unwrap();
-    a.delete("c", &key(2)).unwrap();
-    a.delete_range("c", &key(10), &key(20)).unwrap();
-}
-
-fn new_history(a: &Master) {
-    a.put("c", &key(3), b"new").unwrap();
-    a.delete("c", &key(15)).unwrap();
-    a.put("c", b"only-in-the-new-history", b"y").unwrap();
-}
-
-/// Puts, a delete and a range delete in the divergent suffix; the slave rewrites only those
-/// keys, drops the suffix, replays the new history and matches the master exactly, with no
-/// second bootstrap.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_diverged_slave_repairs_without_a_bootstrap() {
-    let c = Cluster::new();
-    let (a, d, _, ld) = setup(&c, |cfg| cfg.on_divergence = DivergencePolicy::Repair).await;
-    let a = diverge(&c, a, &d, lost, new_history).await;
-    wait_until("the divergence is repaired", || ld.rewinds() == 1).await;
-    assert_converged(&a, &[("d", &d)]).await;
-    assert_eq!(ld.bootstraps(), 1, "only the initial bootstrap");
-    assert_eq!(d.get("c", b"only-in-the-lost-history").unwrap(), None);
-    assert_eq!(
-        d.get("c", &key(12)).unwrap(),
-        Some(b"base".to_vec()),
-        "the lost range delete is undone"
-    );
-    assert_eq!(d.get("c", &key(1)).unwrap(), Some(b"base".to_vec()));
-    assert_eq!(d.status().origin_identity, Some(a.identity()));
-    assert!(d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
-    ld.assert_no_violations();
-}
-
-/// Under the default `Halt` policy the data stays as it was, readable, and the divergent
-/// suffix can be read back for salvage.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_halted_diverged_slave_lists_its_divergent_entries() {
-    let c = Cluster::new();
-    let (a, d, _, _) = setup(&c, |_| {}).await;
-    assert!(
-        matches!(d.diverged_entries(), Err(Error::Config(_))),
-        "not halted"
-    );
-    let fork = a.last_seq() + 1;
-    let a = diverge(&c, a, &d, lost, new_history).await;
-    wait_state(&d, "Diverged halt", |s| {
-        *s == SlaveState::Halted(HaltReason::Diverged)
-    })
-    .await;
-    let suffix = d.diverged_entries().unwrap();
-    assert_eq!(
-        suffix.iter().map(|e| e.seq).collect::<Vec<_>>(),
-        (fork..fork + 4).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        d.get("c", b"only-in-the-lost-history").unwrap(),
-        Some(b"x".to_vec()),
-        "data intact and readable"
-    );
-    drop(a);
-}
-
-/// A CF created in the divergent suffix cannot be undone key by key: the slave bootstraps.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_cf_operation_in_the_suffix_falls_back_to_a_bootstrap() {
-    let c = Cluster::new();
-    let (a, d, _, ld) = setup(&c, |cfg| cfg.on_divergence = DivergencePolicy::Repair).await;
-    let a = diverge(
-        &c,
-        a,
-        &d,
-        |a| {
-            a.create_cf(CfSpec::new("extra")).unwrap();
-            a.put("extra", b"k", b"v").unwrap();
-        },
-        new_history,
-    )
-    .await;
-    wait_until("the fallback bootstrap", || ld.bootstraps() == 2).await;
-    assert_converged(&a, &[("d", &d)]).await;
-    assert_eq!(ld.rewinds(), 0);
-}
-
-/// The slave's own retention removed its divergent suffix: it cannot know what to repair.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_trimmed_local_suffix_falls_back_to_a_bootstrap() {
-    let c = Cluster::new();
-    let (a, d, _, ld) = setup(&c, |cfg| {
-        cfg.on_divergence = DivergencePolicy::Repair;
-        cfg.retention.max_entries = Some(1);
-        cfg.retention.check_interval = Duration::from_millis(20);
-    })
-    .await;
-    let a = diverge(&c, a, &d, lost, new_history).await;
-    wait_until("the fallback bootstrap", || ld.bootstraps() == 2).await;
-    assert_converged(&a, &[("d", &d)]).await;
-    assert_eq!(ld.rewinds(), 0);
-}
-
-/// The upstream no longer holds the fork point: it cannot be proven where the histories
-/// split.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_upstream_without_the_fork_point_falls_back_to_a_bootstrap() {
-    let c = Cluster::new();
-    let (a, d, d_cfg, ld) = setup(&c, |cfg| cfg.on_divergence = DivergencePolicy::Repair).await;
-    let a = c.restart_master_after_backup(a, "a", "a-backup").await;
-    lost(&a);
-    assert_converged(&a, &[("d", &d)]).await;
-    d.shutdown().await.unwrap();
-    let port = a.serve_addr().unwrap().port();
-    a.shutdown().await.unwrap();
-    restore_dir(&c.path("a-backup"), &c.path("a"));
-    let mut cfg = c.master_config("a");
-    cfg.serve.as_mut().unwrap().port = port;
-    cfg.bump_epoch_on_open = true;
-    cfg.retention.max_entries = Some(1);
-    cfg.retention.check_interval = Duration::from_millis(20);
-    let a = Master::open(cfg).await.unwrap();
-    new_history(&a);
-    let before = a.last_seq();
-    wait_until("the restored master trims its log", || {
-        a.first_retained_seq() == before
-    })
-    .await;
-    let d = Slave::open(d_cfg).await.unwrap();
-    wait_until("the fallback bootstrap", || ld.bootstraps() == 2).await;
-    assert_converged(&a, &[("d", &d)]).await;
-    assert_eq!(ld.rewinds(), 0);
-}
-
-/// `MismatchPolicy::Repair`: the keys a verify reports — corrupted, missing, extra — are
-/// taken from the upstream; no bootstrap, and the next verify is clean.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn verify_mismatches_are_repaired_from_the_upstream() {
-    let c = Cluster::new();
-    let (a, d, cfg, ld) = setup(&c, |cfg| {
-        cfg.verify.on_mismatch = MismatchPolicy::Repair;
-        cfg.verify.chunk_keys = 8;
-        cfg.verify.min_chunk_keys = 2;
-    })
-    .await;
-    d.shutdown().await.unwrap();
-    {
-        let raw = RawDb::open(&cfg.path);
-        raw.corrupt_value("c", &key(40));
-        raw.delete("c", &key(3));
-        raw.put("c", b"k020x", &envelope::encode(7, None, b"stray"));
-    }
-    let d = Slave::open(cfg).await.unwrap();
-    let report = d.verify_now(VerifyMode::Full).await.unwrap();
-    assert_eq!(report.mismatches.len(), 3, "{:?}", report.mismatches);
-    wait_until("the reported keys are repaired", || ld.rewinds() == 1).await;
-    assert_converged(&a, &[("d", &d)]).await;
-    assert!(d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
-    assert_eq!(ld.bootstraps(), 1, "only the initial bootstrap");
-    assert_eq!(d.get("c", &key(3)).unwrap(), Some(b"base".to_vec()));
-    assert_eq!(d.get("c", b"k020x").unwrap(), None);
-}
-```
-
-In `tests/repoint.rs`, in `divergence_is_refused_unless_data_loss_is_accepted`, replace:
-
-```rust
-    let (d, ld) = c.slave("d", a.serve_addr().unwrap()).await;
-    wait_state(&b, "b streaming", |s| *s == SlaveState::Streaming).await;
-    a.put("c", b"k", b"1").unwrap();
-    assert_converged(&a, &[("b", &b), ("d", &d)]).await;
-    let b_cfg = c.slave_config("b", a.serve_addr().unwrap()).0;
-```
-
-with:
-
-```rust
-    let (d, ld) = c.slave("d", a.serve_addr().unwrap()).await;
-    wait_state(&b, "b streaming", |s| *s == SlaveState::Streaming).await;
-    // D tails entry 2 rather than bootstrapping past it: repair needs the entry before the
-    // fork point on both sides.
-    wait_state(&d, "d streaming", |s| *s == SlaveState::Streaming).await;
-    a.put("c", b"k", b"1").unwrap();
-    assert_converged(&a, &[("b", &b), ("d", &d)]).await;
-    let b_cfg = c.slave_config("b", a.serve_addr().unwrap()).0;
-```
-
-Further down in the same test, `RepointDivergence::Repair` now repairs (the Plan 2 test asserted `Unsupported`; the `Rebootstrap` path stays covered by `consent_to_lose_data_ends_when_its_repoint_settles`). Replace the end of the test:
-
-Replace:
-
-```rust
-    let repair = RepointOptions {
-        on_divergence: RepointDivergence::Repair {
-            accept_loss: AcceptDataLoss,
-        },
-    };
-    assert!(matches!(
-        repoint(&d, b_up.clone(), repair).await,
-        Err(Error::Unsupported(_))
-    ));
-    assert_eq!(d.status().state, SlaveState::Halted(HaltReason::Diverged));
-    assert_eq!(d.get("c", b"also only on d").unwrap(), Some(b"3".to_vec()));
-
-    let rebootstrap = RepointOptions {
-        on_divergence: RepointDivergence::Rebootstrap {
-            accept_loss: AcceptDataLoss,
-        },
-    };
-    assert_eq!(
-        repoint(&d, b_up, rebootstrap).await.unwrap(),
-        RepointOutcome::Bootstrapped
-    );
-    b.put("c", b"after", b"4").unwrap();
-    assert_converged(&b, &[("d", &d)]).await;
-    assert_eq!(
-        d.get("c", b"only on d").unwrap(),
-        None,
-        "the divergent entries were discarded"
-    );
-    assert_eq!(ld.bootstraps(), 2);
-}
-```
-
-with:
-
-```rust
-    let d_last = d.last_seq();
-    assert_eq!(
-        d.diverged_entries()
-            .unwrap()
-            .iter()
-            .map(|e| e.seq)
-            .collect::<Vec<_>>(),
-        (fork..=d_last).collect::<Vec<_>>(),
-        "the divergent suffix can be salvaged"
-    );
-
-    let repair = RepointOptions {
-        on_divergence: RepointDivergence::Repair {
-            accept_loss: AcceptDataLoss,
-        },
-    };
-    assert_eq!(
-        repoint(&d, b_up, repair).await.unwrap(),
-        RepointOutcome::Repaired {
-            discarded: fork..=d_last
-        }
-    );
-    b.put("c", b"after", b"4").unwrap();
-    assert_converged(&b, &[("d", &d)]).await;
-    assert_eq!(
-        d.get("c", b"only on d").unwrap(),
-        None,
-        "the divergent entries were discarded"
-    );
-    assert_eq!(d.get("c", b"k").unwrap(), Some(b"1".to_vec()));
-    assert_eq!(ld.bootstraps(), 1, "repaired without a bootstrap");
-    assert_eq!(ld.rewinds(), 1);
-}
-```
-
-Append to `tests/failpoints.rs` (a crash right after the rewind):
-
-```rust
-/// A slave killed right after its repair committed: it stays `NotReady` until replay passes
-/// the upstream's snapshot seq (also across the restart), then converges, without a bootstrap.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn crash_mid_repair_then_converge() {
-    let (_serial, scenario) = serial().await;
-    let c = Cluster::new();
-    let a = c.master("a").await;
-    a.create_cf(CfSpec::new("c")).unwrap();
-    let (mut cfg, first) = c.slave_config("d", a.serve_addr().unwrap());
-    cfg.on_divergence = replicated_rocksdb::DivergencePolicy::Repair;
-    let d = Slave::open(cfg.clone()).await.unwrap();
-    // Tailed, not bootstrapped: D's log holds the entries before the fork point.
-    assert_converged(&a, &[("d", &d)]).await;
-    for i in 0..20u8 {
-        a.put("c", &[i], b"base").unwrap();
-    }
-    assert_converged(&a, &[("d", &d)]).await;
-    wait_until("streaming", || d.status().state == SlaveState::Streaming).await;
-
-    // D receives entries the restored master will not have.
-    let a = c.restart_master_after_backup(a, "a", "a-backup").await;
-    a.put("c", &[1], b"lost").unwrap();
-    a.delete("c", &[2]).unwrap();
-    assert_converged(&a, &[("d", &d)]).await;
-    d.shutdown().await.unwrap();
-    let port = a.serve_addr().unwrap().port();
-    a.shutdown().await.unwrap();
-    support::restore_dir(&c.path("a-backup"), &c.path("a"));
-    let mut mcfg = c.master_config("a");
-    mcfg.serve.as_mut().unwrap().port = port;
-    mcfg.bump_epoch_on_open = true;
-    let a = Master::open(mcfg).await.unwrap();
-    for i in 0..5u8 {
-        a.put("c", &[100 + i], b"new").unwrap(); // so replay must run past the rewind point
-    }
-
-    fail::cfg("slave-repair-after-rewind", "1*return").unwrap();
-    let listener = std::sync::Arc::new(support::RecordingListener::default());
-    let mut frozen_cfg = cfg.clone();
-    frozen_cfg.listener = Some(listener.clone());
-    let d = Slave::open(frozen_cfg).await.unwrap();
-    wait_until("frozen right after the rewind", || listener.rewinds() == 1).await;
-    assert!(
-        matches!(d.get("c", &[0]), Err(replicated_rocksdb::Error::NotReady)),
-        "mixed state is never served"
-    );
-    d.kill().await.unwrap();
-    fail::remove("slave-repair-after-rewind");
-
-    // The persisted `repairing:<S>` keeps it NotReady after the restart until replay reaches S.
-    let d = Slave::open(cfg).await.unwrap();
-    assert_converged(&a, &[("d", &d)]).await;
-    assert_eq!(d.get("c", &[1]).unwrap(), Some(b"base".to_vec()));
-    assert_eq!(first.bootstraps(), 1, "no bootstrap at any point");
-    assert!(
-        d.verify_now(replicated_rocksdb::VerifyMode::Full)
-            .await
-            .unwrap()
-            .is_clean()
-    );
-    scenario.teardown();
-}
-```
-
-- [ ] **Step 7: Run the tests**
-
-Run: `cargo test --test repair --test repoint`
-Expected: PASS (6 tests in `repair`, 9 in `repoint`).
-
-Run: `cargo test --features failpoints --test failpoints crash_mid_repair_then_converge`
-Expected: PASS.
-
-- [ ] **Step 8: Document it**
-
-In DESIGN.md §3.2, replace the `node_state` row:
-
-```markdown
-| `node_state` | slave | text: `ready`, `bootstrapping` or `halted:<Reason>` (data-related reasons only); absent means `ready`. Persisted, see §16.3 |
-```
-
-with:
-
-```markdown
-| `node_state` | slave | text: `ready`, `bootstrapping`, `halted:<Reason>` (data-related reasons only) or `repairing:<seq>` (§12.1); absent means `ready`. Persisted, see §16.3 |
-| `diverged_at` | slave | first seq of the local divergent suffix, recorded when the slave halts `Diverged` (`Slave::diverged_entries`); cleared by a repair or a bootstrap |
-```
-
-In DESIGN.md §12, replace:
-
-```markdown
-- Every report is stored in `SlaveStatus.last_verify` and passed to `on_verify_complete`. Under `MismatchPolicy::Rebootstrap`, a report with mismatches ends the current Tail stream and the slave bootstraps at once (a halted slave stays halted).
-- `MismatchPolicy::Report` (default) or `MismatchPolicy::Rebootstrap`. There is no automatic range repair in v1.
-```
-
-with:
-
-```markdown
-- Every report is stored in `SlaveStatus.last_verify` and passed to `on_verify_complete`. Under `MismatchPolicy::Rebootstrap`, a report with mismatches ends the current Tail stream and the slave bootstraps at once (a halted slave stays halted). Under `MismatchPolicy::Repair`, it ends the stream and the reported keys and ranges are repaired from the upstream (§12.1); a `CfSpec` mismatch bootstraps instead.
-- `MismatchPolicy::Report` (default), `MismatchPolicy::Rebootstrap` or `MismatchPolicy::Repair`.
-```
-
-In DESIGN.md, insert before `## 13. Identity, epoch, versioning`:
-
-```
-## 13. Identity, epoch, versioning
-```
-
-insert:
-
-```
-### 12.1 Repair
-
-A slave can take **only the keys that differ** from its upstream instead of bootstrapping. Repair runs in the driver between sessions (no entry is applied meanwhile), over a verify session (PROTOCOL.md §9.2) pinned to the upstream's snapshot at `S`.
-
-- **Divergence** (`REJECT` / `DIVERGED` under `DivergencePolicy::Repair`, or a `repoint` with `RepointDivergence::Repair { accept_loss }`):
-  1. Find the fork `F`, the first seq whose entry differs, by binary search over `EntryCrcs` between the local `first_retained_seq` and `min(last_seq, S)`. Entry `F − 1` must be held by both sides with the same `crc32c`.
-  2. Read the local suffix `F..=L` and collect what it touched: keys of `Put` and `Delete`, ranges of `DeleteRange`.
-  3. Fetch those keys (`FetchKeys`) and every key of those ranges (`FetchRange`) as the upstream's whole envelopes at `S`.
-  4. One synced `WriteBatch`: clear the ranges, write or delete the keys with the fetched envelopes, delete changelog entries `F..=L`, set `last_seq = F − 1` and `last_entry_crc` = CRC of local entry `F − 1`, the upstream's identity and epoch history, and `node_state = repairing:<S>` (`ready` when `S < F`). Downstream streams are reset and a pending verify capture is cancelled.
-  5. Tail from `F`. Replaying `F..=S` (absolute ops only) over the repaired keys gives exactly the upstream's state at `S`; every other key was never touched by the suffix and already held its state at `F − 1`. Until `last_seq` reaches `S`, reads, snapshots and downstream handshakes answer `NotReady`, also after a restart (`repairing:<S>` is persisted). Then `node_state = ready`.
-- **Verify mismatches** (`MismatchPolicy::Repair`): the reported keys and ranges are fetched at a fresh snapshot `S`. When `last_seq > S`, entry `S` must match and the local entries after `S` are dropped (they came from this upstream and are fetched again); the slave is `NotReady` until it is back at `max(last_seq, S)`.
-- **Fallback to a full bootstrap:** a CF operation in the suffix, a suffix entry this slave no longer retains, a fork entry the upstream no longer holds, a CF that differs between the sides (or a `CfSpec` mismatch), or more than `SlaveConfig::repair_max_bytes` (default 64 MiB) of keys and envelopes to fetch. A transient failure (upstream unreachable, session lost) retries with backoff.
-- **Salvage.** A slave that halts `Diverged` locates and persists its fork point (`__meta.diverged_at`, best effort); `Slave::diverged_entries()` returns the local entries `F..=L`.
-- The listener's `on_rewind(F − 1)` is called after the batch; `on_entry` then continues at `F`. `RepointOutcome::Repaired { discarded: F..=L }` is what `repoint` returns.
-```
-
-In DESIGN.md §13, replace:
-
-```markdown
-  - `on_divergence: DivergencePolicy` — `Halt` (default) halts with `Diverged`; `Rebootstrap` bootstraps. Applies to `DIVERGED` on reconnects; an explicit `Slave::repoint` uses `RepointOptions::on_divergence` instead (§13.1).
-```
-
-with:
-
-```markdown
-  - `on_divergence: DivergencePolicy` — `Halt` (default) halts with `Diverged`; `Repair` repairs only the divergent suffix (§12.1); `Rebootstrap` bootstraps. Applies to `DIVERGED` on reconnects; an explicit `Slave::repoint` uses `RepointOptions::on_divergence` instead (§13.1).
-```
-
-In DESIGN.md §13.1, replace:
-
-```markdown
-- `Repair { accept_loss: AcceptDataLoss }`: roll back only the divergent entries (§22). Until verify sessions exist it returns `Error::Unsupported`, and the slave halts `Diverged` with its data intact.
-```
-
-with:
-
-```markdown
-- `Repair { accept_loss: AcceptDataLoss }`: roll back only the divergent entries and take the keys they touched from the new upstream (§12.1); returns `Repaired { discarded }`, or `Bootstrapped` when repair falls back.
-```
-
-In DESIGN.md §15, replace:
-
-````markdown
-    fn on_verify_complete(&self, report: &VerifyReport) {}
-}
-```
-````
-
-with:
-
-````markdown
-    fn on_verify_complete(&self, report: &VerifyReport) {}
-    fn on_rewind(&self, last_seq: Seq) {}  // a repair (§12.1) moved the position back; on_entry continues at last_seq + 1
-}
-```
-````
-
-and:
-
-```markdown
-- Strictly increasing `seq`, with no duplicates within a process, between bootstraps. After `on_bootstrap_complete(S)` delivery continues at `S + 1`;
-```
-
-with:
-
-```markdown
-- Strictly increasing `seq`, with no duplicates within a process, between bootstraps and rewinds. After `on_bootstrap_complete(S)` or `on_rewind(S)` delivery continues at `S + 1`;
-```
-
-In DESIGN.md §16, `SlaveConfig`:
-
-```markdown
-    pub on_divergence: DivergencePolicy,     // Halt (default) | Rebootstrap
-```
-
-with:
-
-```markdown
-    pub on_divergence: DivergencePolicy,     // Halt (default) | Repair | Rebootstrap
-    pub repair_max_bytes: u64,               // a larger repair bootstraps instead; default 64 MiB
-```
-
-and the `Slave` methods:
-
-```markdown
-    pub async fn verify_now(&self, mode: VerifyMode) -> Result<VerifyReport>;
-```
-
-with:
-
-```markdown
-    pub async fn verify_now(&self, mode: VerifyMode) -> Result<VerifyReport>;
-    pub fn diverged_entries(&self) -> Result<Vec<LogEntry>>;   // halted Diverged: the local suffix (§12.1)
-```
-
-In DESIGN.md §16.3, add a row:
-
-```markdown
-| `halted:<Reason>`, data-related reasons only | `Halted(reason)`. The slave does not contact its upstream until `clear_halt`. |
-```
-
-with:
-
-```markdown
-| `halted:<Reason>`, data-related reasons only | `Halted(reason)`. The slave does not contact its upstream until `clear_halt`. |
-| `repairing:<seq>` | `Connecting` or `Streaming`, reads `NotReady` until `applied_seq` reaches `seq` (§12.1), also after a restart. |
-```
-
-In DESIGN.md §18, add a row:
-
-```markdown
-| Verify session timeout | 5 min |
-```
-
-with:
-
-```markdown
-| Verify session timeout | 5 min |
-| Repair fetch bound (`repair_max_bytes`) | 64 MiB; a larger repair bootstraps |
-```
-
-In DESIGN.md §21, add after the corruption bullet:
-
-```markdown
-- Injected corruption on a slave is detected by `Full` verify and localised to the key. A key that exists only on the upstream, between the slave's chunk boundaries, is found.
-```
-
-with:
-
-```markdown
-- Injected corruption on a slave is detected by `Full` verify and localised to the key. A key that exists only on the upstream, between the slave's chunk boundaries, is found.
-- **Repair:** a diverged slave with puts, deletes and range deletes in its suffix repairs without a bootstrap and matches under `Full` verify; `repoint(.., Repair { AcceptDataLoss })` returns `Repaired`; a CF op in the suffix, a trimmed local suffix and an upstream without the fork point fall back to a bootstrap; a crash right after the rewind stays `NotReady` until replay passes `S`, then converges; `MismatchPolicy::Repair` fixes corrupted, missing and extra keys; `diverged_entries` returns the suffix of a halted slave.
-```
-
-In DESIGN.md §22, replace:
-
-```markdown
-- Divergence is detected by CRC comparison on connect and by rejecting slaves ahead of the master. It is not repaired automatically: an explicit `repoint` refuses by default and discards entries only with `AcceptDataLoss`.
-```
-
-with:
-
-```markdown
-- Divergence is detected by CRC comparison on connect and by rejecting slaves ahead of the master. It is resolved only by policy (`DivergencePolicy::Repair` or `Rebootstrap`) or with explicit consent: a `repoint` refuses by default and discards entries only with `AcceptDataLoss`. Repair rewrites only the keys the divergent suffix touched (§12.1) and falls back to a bootstrap whenever it cannot prove the result.
-```
-
-and delete the future-work item (it is `MismatchPolicy::Repair` now):
-
-```markdown
-- Automatic range repair after a verify mismatch.
-```
-
-with:
-
-```markdown
-
-```
-
-- [ ] **Step 9: Run everything and commit**
-
-Run: `cargo test && cargo test --features failpoints && cargo clippy --all-targets -- -D warnings`
-Expected: PASS, no warnings.
-
-```bash
-git add src tests proto DESIGN.md PROTOCOL.md
-git commit -m "feat: divergence repair, MismatchPolicy::Repair and diverged_entries
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-```
-
----
-
-### Task 9: DESIGN.md §21 sweep — every listed test exists, and the missing ones are added
-
-**Files:**
-- Modify: `tests/failure_resume.rs`, `tests/replication.rs`, `tests/failpoints.rs`, `tests/promotion.rs`, `tests/support/mod.rs`
-
-**Interfaces:**
-- Consumes: Task 3 `Slave::verify_now`, `VerifyMode`; Plan 2 harness (`Cluster::{new, master, master_config, slave, slave_config, restart_master, path, clock}`, `assert_converged`, `wait_state`, `wait_until`, `RecordingListener`, `RawDb`, `WAIT`), `Slave::{snapshot, wait_for_seq, kill (feature failpoints), shutdown}`, `serial()` in `tests/failpoints.rs`, the locals `b`, `cn`, `e`, `f` at the end of `promotion_end_to_end` in `tests/promotion.rs`; `LogApi::{last_seq, first_retained_seq, entries_since}`.
-- Produces: tests only, plus `RawDb::last_seq() -> u64` in the harness.
-
-The coverage map below is the sweep. Every DESIGN.md §21 item (including the repair bullet Task 8 adds) names the test(s) that cover it; the four marked **new** are added in this task.
-
-| DESIGN.md §21 item | Test(s) |
-|---|---|
-| A→B convergence under concurrent writes; verify `Full` matches | `tests/verify.rs::verify_pins_the_snapshot_while_concurrent_writes_continue` (Task 3) |
-| A→B→C chain, C bootstrapping from B while A writes and creates/drops CFs; A, B, C identical | `tests/chain.rs::a_chain_replicates_everything_and_bootstraps_from_the_middle` (Plan 2); `tests/integrity.rs::every_link_of_a_chain_verifies_against_its_own_upstream` (Task 4) |
-| Acks and write concern: `replicas()` follows acks and lag; bad acks end the stream; `NotEnoughReplicas`; `AckTimeout`; promote the in-sync replica after losing the master | `src/server/tests.rs::{acks_drive_replica_status_and_in_sync, ack_violations_end_the_stream_with_invalid_argument}`, `src/server/replicas.rs::acks_must_be_monotonic_and_not_above_what_was_sent`, `tests/write_concern.rs` (all four), `tests/failpoints.rs::a_replica_that_stops_acking_times_the_write_out` (Plan 2) |
-| Slave crash and restart at random points: no gaps, no duplicates, listener order preserved | `tests/failpoints.rs::crash_after_apply_resumes_without_gap_or_duplicate`, `crash_mid_bootstrap_restarts_the_bootstrap` (Plan 2); **new** `tests/failpoints.rs::random_kills_while_writing_never_lose_or_repeat_an_entry` |
-| C ahead of B after B crashes unsynced: C waits, then converges | `tests/failure_resume.rs::a_downstream_ahead_of_its_upstream_waits_and_converges` (Plan 2); `tests/integrity.rs::a_slave_ahead_of_the_upstream_snapshot_abandons_the_run` (Task 4) |
-| Retention trims past a stopped slave; it bootstraps again on restart | `tests/rebootstrap.rs::retention_gap_triggers_a_rebootstrap_that_converges` (Plan 2) |
-| Bootstrap lease under `max_entries = 1` | `tests/failpoints.rs::bootstrap_lease_survives_aggressive_retention`, `src/server/tests.rs::bootstrap_lease_holds_retention_until_tail_presents_it` (Plan 2) |
-| Quiet master with every changelog entry expired: `last_seq` kept, slaves resume | `src/store/retention.rs::quiet_store_can_trim_everything_but_keeps_position` (Plan 1); **new** `tests/failure_resume.rs::a_quiet_master_with_an_empty_log_keeps_last_seq_and_slaves_resume` |
-| TTL: visible expiry before reaping, reaper `Delete` replicates, overwrite clears TTL, stale index cleaned, several entries past `max_deletes_per_entry` | `tests/master_ttl.rs` (Plan 1: `expired_values_are_hidden_then_reaped_by_a_logged_delete`, `overwrite_clears_ttl_and_leaves_a_stale_index_entry`, `range_deleted_and_dropped_cf_entries_are_stale`, `large_rounds_split_into_bounded_entries`, `ttl_on_empty_and_nul_keys_is_reaped`); `tests/replication.rs::ttl_values_replicate_and_the_reapers_delete_replicates` (Plan 2) |
-| Divergence: restore without bump → `Diverged`; with `bump_epoch_on_open` → `EPOCH_ADVANCED` / `DIVERGED` per position | `tests/rebootstrap.rs::master_restored_without_epoch_bump_makes_ahead_slaves_diverge`, `restored_master_with_epoch_bump_keeps_behind_slaves_and_rejects_ahead_ones` (Plan 2) |
-| Promotion: siblings continue or diverge per policy, old master `STALE_EPOCH`, writes and TTLs on the new master, **`Full` verify on every link** | `tests/promotion.rs::promotion_end_to_end`, `the_old_master_is_refused_with_stale_epoch_and_the_client_retries`, `promote_checked_refuses_when_a_reachable_peer_is_later`, `demote_undoes_a_wrong_promotion_with_zero_loss`, `tests/repoint.rs::failover_runbook_end_to_end` (Plan 2); **new** verify block appended to `promotion_end_to_end` |
-| Failure and resume: master, mid-chain and leaf restarts; crash mid-bootstrap and mid-apply; dropped connections | `tests/failure_resume.rs::restarts_of_master_mid_chain_and_leaf_resume_without_bootstrap`, `tests/failpoints.rs::{crash_mid_bootstrap_restarts_the_bootstrap, crash_after_apply_resumes_without_gap_or_duplicate, connection_drop_mid_tail_resumes}` (Plan 2) |
-| Edge-case data on every path (write, reopen, tail, bootstrap, verify, promotion) | `tests/master_write.rs::edge_case_keys_and_values_through_the_master`, `src/store/apply.rs::nul_empty_and_large_keys_and_values_survive_reopen` (Plan 1); `tests/replication.rs::edge_case_data_through_tail_and_bootstrap`, `tests/chain.rs::a_chain_replicates_everything_and_bootstraps_from_the_middle`, `tests/promotion.rs::promotion_end_to_end` (Plan 2); `tests/integrity.rs::edge_case_data_verifies_and_its_corruption_is_found` (Task 4) |
-| Epoch bump: streams end `UPSTREAM_RESET`; seq continues; a `Rebootstrap` slave converges | `tests/rebootstrap.rs::live_epoch_bump_resets_streams_and_slaves_continue`, `src/server/tests.rs::bump_epoch_ends_streams_with_upstream_reset` (Plan 2); `src/server/verify.rs::an_epoch_bump_ends_verify_streams_and_sessions` (Task 2) |
-| Identity change → `Halted`; protocol mismatch → `REJECT`; loop → `LoopDetected` | `tests/rebootstrap.rs::identity_change_is_refused_persistently_until_clear_halt_rebootstraps`, `src/server/tests.rs::version_mismatch_is_answered_in_the_handshake_body`, `tests/chain.rs::{a_loop_is_detected_and_the_halt_is_not_persisted, a_slave_pointed_at_itself_halts_loop_detected}` (Plan 2) |
-| Halt persistence; `clear_halt(Rebootstrap)` recovers | `tests/failure_resume.rs::a_log_gap_halt_persists_across_restart_until_cleared`, `tests/rebootstrap.rs::identity_change_is_refused_persistently_until_clear_halt_rebootstraps` (Plan 2) |
-| CF drop while a `ReadSnapshot` is open: still readable; physical drop after release | `src/store/read.rs::snapshot_keeps_dropped_cf_readable_until_released`, `tests/master_retention.rs::maintenance_drops_released_cfs` (Plan 1); `tests/replication.rs::a_cf_held_by_a_snapshot_is_retried_not_halted` (Plan 2); **new** `tests/replication.rs::a_replicated_cf_drop_waits_for_a_slave_snapshot` |
-| Unregistered comparator: master rejects; slave halts `SpecMismatch`, recovers once registered | `tests/rebootstrap.rs::missing_comparator_halts_until_registered_and_cleared` (Plan 2) |
-| Token auth accept/reject; per-method authorisation; token without TLS refused | `tests/security.rs` (Plan 2: `tokens_over_tls_accept_any_valid_secret_and_reject_others`, `bootstrap_can_be_denied_per_method`, `token_authentication_on_plaintext_is_refused_unless_allowed`, `mutual_tls_allow_list_by_certificate_subject`) |
-| Entry over `max_entry_bytes` rejected; a large valid entry passes through the chain | `tests/master_write.rs::max_entry_bytes_is_enforced_at_the_boundary` (Plan 1); `tests/chain.rs::a_chain_replicates_everything_and_bootstraps_from_the_middle` (the ~16 MiB edge-case value through A→B→C, Plan 2) |
-| Injected corruption found by `Full` verify and localised to the key; an upstream-only key between chunk boundaries is found | `tests/integrity.rs::{a_corrupted_value_is_found_by_full_verify_only, a_key_only_upstream_between_two_chunk_boundaries_is_found, keys_deleted_on_disk_are_reported_in_both_modes, extra_keys_on_disk_are_reported_with_no_upstream_value, a_custom_comparator_cf_verifies_and_localises_damage}` (Task 4) |
-| Repair: divergence repaired without bootstrap; fallbacks; crash after the rewind; verify-mismatch repair; `diverged_entries` | `tests/repair.rs` (all six), `tests/failpoints.rs::crash_mid_repair_then_converge`, `tests/repoint.rs::divergence_is_refused_unless_data_loss_is_accepted` (Task 8) |
-| Wire codec matches PROTOCOL.md §15 vectors | `src/codec/entry.rs::vector_v1_ops_bytes_and_crc`, `src/codec/envelope.rs::vector_v2_envelopes`, `src/codec/digest.rs::vector_v3_digests` (Plan 1); `src/verify/range.rs::range_hashes_match_the_v3_vectors`, `src/verify/scan.rs::a_snapshot_range_hashes_to_the_v3_vectors` (Task 1) |
-
-- [ ] **Step 1: A quiet master with an empty log**
-
-Append to `tests/failure_resume.rs`:
-
-```rust
-/// DESIGN.md §21: a quiet master whose whole changelog expired keeps its `last_seq`, across
-/// a restart too, and a slave stopped at that seq resumes without a bootstrap.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_quiet_master_with_an_empty_log_keeps_last_seq_and_slaves_resume() {
-    let c = Cluster::new();
-    let mut mcfg = c.master_config("a");
-    mcfg.retention.max_age = Some(Duration::from_secs(60));
-    mcfg.retention.check_interval = Duration::from_millis(20);
-    let m = Master::open(mcfg.clone()).await.unwrap();
-    m.create_cf(CfSpec::new("c")).unwrap();
-    for i in 0..5u8 {
-        m.put("c", &[i], b"v").unwrap();
-    }
-    let (b_cfg, listener) = c.slave_config("b", m.serve_addr().unwrap());
-    let b = Slave::open(b_cfg.clone()).await.unwrap();
-    assert_converged(&m, &[("b", &b)]).await;
-    // The Tail presenting the bootstrap lease has started: the lease no longer holds retention.
-    wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
-    b.shutdown().await.unwrap();
-
-    let last = m.last_seq();
-    c.clock.advance(Duration::from_secs(120));
-    wait_until("the whole log expired", || {
-        m.first_retained_seq() == last + 1
-    })
-    .await;
-    let m = c.restart_master(m, mcfg).await;
-    assert_eq!(
-        (m.last_seq(), m.first_retained_seq()),
-        (last, last + 1),
-        "the position survives an empty log"
-    );
-    assert_eq!(m.entries_since(last).unwrap().count(), 0);
-
-    let b = Slave::open(b_cfg).await.unwrap();
-    wait_state(&b, "streaming without a bootstrap", |s| {
-        *s == SlaveState::Streaming
-    })
-    .await;
-    m.put("c", b"after", b"v").unwrap();
-    assert_converged(&m, &[("b", &b)]).await;
-    assert_eq!(listener.bootstraps(), 1, "only the initial bootstrap");
-}
-```
-
-Run: `cargo test --test failure_resume a_quiet_master`
-Expected: PASS (it exercises Plan 1 retention and Plan 2 handshake rule 13; if it fails, the bug is there).
-
-- [ ] **Step 2: A replicated CF drop waits for a slave snapshot**
-
-Append to `tests/replication.rs`:
-
-```rust
-/// DESIGN.md §21: a CF dropped while a `ReadSnapshot` of a slave is open stays readable
-/// through the snapshot; the slave drops it physically once the snapshot is released.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_replicated_cf_drop_waits_for_a_slave_snapshot() {
-    let c = Cluster::new();
-    let m = c.master("a").await;
-    m.create_cf(CfSpec::new("gone")).unwrap();
-    m.put("gone", b"k", b"v").unwrap();
-    let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
-    assert_converged(&m, &[("b", &b)]).await;
-    let snap = b.snapshot().unwrap();
-    m.drop_cf("gone").unwrap();
-    b.wait_for_seq(m.last_seq(), WAIT).await.unwrap();
-    assert!(b.list_cfs().is_empty(), "dropped for live reads");
-    assert_eq!(
-        snap.get("gone", b"k").unwrap(),
-        Some(b"v".to_vec()),
-        "the snapshot still reads it"
-    );
-    assert_eq!(snap.list_cfs(), vec![CfSpec::new("gone")]);
-    // Physical CFs of the running slave, from its MANIFEST.
-    let physical = |dir: &std::path::Path| {
-        rocksdb::DB::list_cf(&rocksdb::Options::default(), dir)
-            .map(|names| names.iter().filter(|n| n.starts_with("u:gone:")).count())
-    };
-    assert_eq!(
-        physical(&c.path("b")).unwrap(),
-        1,
-        "kept while the snapshot is alive"
-    );
-    drop(snap);
-    wait_until("the slave drops the physical CF", || {
-        physical(&c.path("b")).is_ok_and(|n| n == 0)
-    })
-    .await;
-}
-```
-
-Run: `cargo test --test replication a_replicated_cf_drop`
-Expected: PASS (within one slave CF-drop tick of releasing the snapshot).
-
-- [ ] **Step 3: Random kills while writing**
-
-The harness reads a stopped node's durable position, so the test knows exactly where each restart must resume.
-
-In `tests/support/mod.rs`, in `impl RawDb`, insert before `get`:
-
-```rust
-    /// The stored envelope.
-    pub fn get(&self, cf: &str, key: &[u8]) -> Option<Vec<u8>> {
-```
-
-insert:
-
-```rust
-    /// `__meta.last_seq` as stored: the node's durable position.
-    pub fn last_seq(&self) -> u64 {
-        let meta = self.db.cf_handle("__meta").unwrap();
-        let raw = self
-            .db
-            .get_cf(&meta, b"last_seq")
-            .unwrap()
-            .unwrap_or_default();
-        raw.try_into().map(u64::from_be_bytes).unwrap_or(0)
-    }
-```
-
-Append to `tests/failpoints.rs`:
-
-```rust
-/// DESIGN.md §21: the slave is killed at random points while the master keeps writing, five
-/// times. Each time it resumes from its durable seq without a bootstrap, each process's
-/// listener sees strictly increasing seqs starting right after that seq, and in the end
-/// the slave holds every entry exactly once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn random_kills_while_writing_never_lose_or_repeat_an_entry() {
-    let (_serial, scenario) = serial().await;
-    let c = Cluster::new();
-    let m = std::sync::Arc::new(c.master("a").await);
-    m.create_cf(CfSpec::new("c")).unwrap();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let writer = {
-        let (m, stop) = (m.clone(), stop.clone());
-        tokio::task::spawn_blocking(move || {
-            let mut n = 0u32;
-            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                m.put("c", &n.to_be_bytes(), &n.to_le_bytes()).unwrap();
-                n += 1;
-            }
-            n
-        })
-    };
-    let (cfg, first) = c.slave_config("b", m.serve_addr().unwrap());
-    let mut b = Slave::open(cfg.clone()).await.unwrap();
-    wait_until("the initial bootstrap", || first.bootstraps() == 1).await;
-    for round in 0..5 {
-        // A random point: 1–50 entries further on.
-        let target = b.last_seq() + 1 + (uuid::Uuid::new_v4().as_u128() % 50) as u64;
-        wait_until("progress before the kill", || b.last_seq() >= target).await;
-        b.kill().await.unwrap();
-        let durable = support::RawDb::open(&cfg.path).last_seq();
-        let listener = std::sync::Arc::new(support::RecordingListener::default());
-        let mut next = cfg.clone();
-        next.listener = Some(listener.clone());
-        b = Slave::open(next).await.unwrap();
-        wait_until("delivery resumed", || !listener.entries().is_empty()).await;
-        assert_eq!(
-            listener.entries()[0],
-            durable + 1,
-            "round {round}: no gap and no repeat at the restart"
-        );
-        assert_eq!(
-            listener.bootstraps(),
-            0,
-            "round {round}: resumed without a bootstrap"
-        );
-        listener.assert_no_violations();
-    }
-    stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    assert!(writer.await.unwrap() > 0);
-    assert_converged(&*m, &[("b", &b)]).await;
-    let first_retained = b.first_retained_seq();
-    let seqs: Vec<u64> = b
-        .entries_since(first_retained - 1)
-        .unwrap()
-        .map(|e| e.unwrap().seq)
-        .collect();
-    assert_eq!(
-        seqs,
-        (first_retained..=b.last_seq()).collect::<Vec<_>>(),
-        "the slave's log has no gap or duplicate"
-    );
-    scenario.teardown();
-}
-```
-
-Run: `cargo test --features failpoints --test failpoints random_kills`
-Expected: PASS.
-
-- [ ] **Step 4: `Full` verify on every link after promotion**
-
-In `tests/promotion.rs`, at the end of `promotion_end_to_end`, replace:
-
-```rust
-    assert_eq!(lf.bootstraps(), 1);
-    check_edge_cases(&f, "edge");
-}
-```
-
-with:
-
-```rust
-    assert_eq!(lf.bootstraps(), 1);
-    check_edge_cases(&f, "edge");
-
-    // DESIGN.md §21: `Full` verify matches on every link of the new topology.
-    for (name, s) in [("c", &cn), ("e", &e), ("f", &f)] {
-        let r = s
-            .verify_now(replicated_rocksdb::VerifyMode::Full)
-            .await
-            .unwrap();
-        assert!(r.is_clean(), "{name}: {} mismatches", r.mismatches.len());
-        assert_eq!(r.seq, b.last_seq(), "{name}");
-    }
-}
-```
-
-Run: `cargo test --test promotion promotion_end_to_end`
-Expected: PASS.
-
-- [ ] **Step 5: Run everything and lint**
-
-Run: `cargo fmt --check && cargo test && cargo test --features failpoints`
-Expected: PASS: every unit, integration and doc test, with and without the feature.
-
-Run: `cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features failpoints -- -D warnings && cargo doc --no-deps`
-Expected: no warnings; docs build.
-
-Run: `cargo test --test proto_sync`
-Expected: PASS (`proto/replication.proto` still matches PROTOCOL.md §14 after Tasks 7 and 8).
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add tests
-git commit -m "test: complete the DESIGN.md §21 sweep (quiet master, slave snapshot CF drop, random kills, verify after promotion)
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-```
 
