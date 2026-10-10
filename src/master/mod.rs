@@ -149,7 +149,7 @@ impl Master {
         self.inner.identity()
     }
 
-    /// One `{epoch, start_seq}` record per epoch, oldest first (PROTOCOL.md §5.5).
+    /// One `{epoch, start_seq, nonce}` record per epoch, oldest first (PROTOCOL.md §5.5).
     pub fn epoch_history(&self) -> Vec<EpochStart> {
         self.inner.epoch_history()
     }
@@ -359,16 +359,20 @@ impl Master {
     /// Whether [`demote`](Self::demote) would be allowed now: no entry was written since the
     /// promotion started (`last_seq <` the start of the first epoch the promotion added) and
     /// there is an earlier epoch to return to. Epochs that restarts of this master added after
-    /// the promotion do not count: they are undone too. `Err(Config)` says why not. The master
-    /// keeps running either way.
+    /// the promotion do not count: they are undone too. The record of the promotion stays after
+    /// the first write, so a later epoch that is still empty (a restart after writes) is not
+    /// demotable either: refused by default. `Err(Config)` says why not. The master keeps
+    /// running either way.
     pub fn can_demote(&self) -> Result<()> {
         self.inner.store.check_demote()
     }
 
-    /// Undoes a promotion of the wrong node (addendum §4): allowed only while no entry was written
-    /// since the promotion started (restarts in between are undone too), so nothing is lost. Persists role = slave, restores the identity and
-    /// epoch history from before the promotion, and opens the directory as a slave with `cfg`
-    /// (`cfg.path` must be this master's path).
+    /// Undoes a promotion of the wrong node (addendum §4): allowed only while no entry was
+    /// written since the promotion started (restarts in between are undone too), so nothing is
+    /// lost; once an entry was written, never again (see [`can_demote`](Self::can_demote)).
+    /// Persists role = slave, restores the identity and epoch history from before the
+    /// promotion, and opens the directory as a slave with `cfg` (`cfg.path` must be this
+    /// master's path).
     ///
     /// Replicas that already followed the wrongly promoted master are refused by it with
     /// `STALE_EPOCH` after the demotion (they know the newer epoch) until they are repointed
@@ -474,15 +478,19 @@ impl DemoteRefused {
     /// The error and the master (if it was handed back), to keep the master while still
     /// propagating the error with `?`:
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use replicated_rocksdb::{Master, Result, Slave, SlaveConfig};
+    /// # fn keep_serving(_: Option<Master>) {}
+    /// # async fn f(master: Master, cfg: SlaveConfig) -> Result<Slave> {
     /// let slave = match master.demote(cfg).await {
     ///     Ok(slave) => slave,
     ///     Err(refused) => {
     ///         let (error, master) = refused.into_parts();
     ///         keep_serving(master);
-    ///         return Err(error.into());
+    ///         return Err(error);
     ///     }
     /// };
+    /// # Ok(slave) }
     /// ```
     pub fn into_parts(self) -> (crate::Error, Option<Master>) {
         (self.error, self.master.map(|m| *m))

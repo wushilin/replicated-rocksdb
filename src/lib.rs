@@ -28,7 +28,6 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub(crate) mod net;
-#[allow(dead_code)] // generated types are unused until later tasks
 pub(crate) mod proto;
 
 pub(crate) use proto::replication::v1 as pb;

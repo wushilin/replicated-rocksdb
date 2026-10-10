@@ -215,7 +215,9 @@ pub enum VerifyAbort {
     /// the upstream's `verify_session_timeout`) or `UPSTREAM_RESET` (the upstream's state was
     /// replaced, which drops its sessions). Retry.
     SessionExpired,
-    /// The upstream follows another database identity than this slave.
+    /// The upstream follows another database identity than this slave, or its epoch changed
+    /// since the run started (for example its master restarted: every master open starts an
+    /// epoch). Retry.
     IdentityChanged,
     /// This slave had already applied entries past the upstream's snapshot (possible when the
     /// upstream is a slave that lost unflushed entries, DESIGN.md §6). Retry later.

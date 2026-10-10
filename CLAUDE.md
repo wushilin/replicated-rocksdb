@@ -10,12 +10,16 @@ Rust crate: single-master, async log-shipping replication for RocksDB. Master is
 - **Master always fsyncs.** Losing acknowledged entries would cause seqs to be reused and replicas to diverge.
 - **Slaves forward entries unchanged** (seq, epoch, ts, crc, and the `ops` bytes verbatim; never re-encode `ops`). Identity always refers to the origin master.
 - **Divergence is never silent.** The master rejects a replica ahead of it; mismatched `last_entry_crc` / `prev_crc32c` → `DIVERGED` halt.
+- **Consent is scoped.** Only `clear_halt(Rebootstrap)`, a repoint with `AcceptDataLoss`, or a configured `DivergencePolicy` discards divergent entries. Automatic and verify requests are bound to (repoint generation, `db_uuid`) and never override `DIVERGED` or `IDENTITY_CHANGED`; repair fallbacks are pinned to the consented database and fork.
 - **Epoch history is part of identity.** Every entry satisfies `entry.epoch == epoch_for(entry.seq)`; history and `origin_identity` are always written in the same batch. Promotion (`Slave::promote`) and `bump_epoch` append to it; seq numbering never restarts.
+- **Every master open starts an epoch** with a fresh nonce, persisted before the port opens; a repair's rewind rewrites identity and epoch history in the same batch.
 - **The client owns its replication position.** It resumes by sending its durable `last_seq` (Handshake) and `from_seq = last_seq + 1` (Tail). Servers keep no per-client cursor.
 - **All user values are wrapped in an envelope** `[ver][flags][write_seq][expire_at?][value]`. `ReadApi` strips it; bootstrap and verify use raw envelopes.
 - **TTL is master-driven.** `expire_at` is absolute and computed on the master. Only the master reaps, and it does so by logging `Delete`. Reads filter expired values on every node. RocksDB native TTL and compaction filters are not used. `__ttl_index` is master-local.
 - **CF ops** are standalone entries. Physical CF name is `u:{name}:{create_seq}`. Drop is logical, and the physical drop is deferred while snapshots reference the CF.
 - Bootstrap and verify read `S`, `cf_specs` and state **through the same RocksDB snapshot** as the data.
+- Repair fetches, `EntryCrcs` and the epoch history sent with them are read through that same snapshot too.
+- **Repair readiness.** `__meta.repair_until > last_seq` means not ready on every surface (reads, snapshots, serving, verify capture, promotion, rechecked on the stopped store). It is persisted apart from `node_state`, and the replay commit that reaches it clears it before `S` is acknowledged.
 - `PROTOCOL_VERSION` must match exactly between nodes (crate version is not compared).
 - User CF names must not start with `__`.
 - **No read-modify-write API** (no `update`, CAS or merge). Applications must hold their own lock around get → compute → put (DESIGN.md §5.1). This must stay clearly documented in the rustdoc for `Master::put`, `Master::write` and `Master::get`, and in the crate-level docs.

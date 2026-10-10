@@ -281,8 +281,11 @@ impl Slave {
     /// `ReadSnapshot` that still holds the database (`Error::Config`; drop it and reopen the
     /// directory as a slave, which is unchanged), or a failure while rewriting it. One final
     /// check runs on the stopped store: a repair that committed its rewind meanwhile (it is
-    /// replaying, DESIGN.md §12.1) refuses with `Error::Config`, the directory unchanged, and
-    /// the slave is reopened and handed back.
+    /// replaying, DESIGN.md §12.1) or a bootstrap that began meanwhile (no data to promote)
+    /// refuses with `Error::Config`, the directory unchanged, and the slave is reopened and
+    /// handed back. It is reopened with the configured `cfg.upstream`: an upstream set by
+    /// `repoint` is not kept (repoint it again). If that reopen fails, the handle is lost
+    /// (`slave` is `None`) and the application reopens the directory.
     pub async fn promote_checked(
         self,
         cfg: MasterConfig,
@@ -333,15 +336,19 @@ impl PromoteRefused {
     /// The error and the slave (if it was handed back), to keep the slave while still
     /// propagating the error with `?`:
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use replicated_rocksdb::{Master, MasterConfig, Result, Slave, UpstreamConfig};
+    /// # fn keep_replicating(_: Option<Slave>) {}
+    /// # async fn f(slave: Slave, cfg: MasterConfig, peers: Vec<UpstreamConfig>) -> Result<Master> {
     /// let master = match slave.promote_checked(cfg, &peers).await {
     ///     Ok(master) => master,
     ///     Err(refused) => {
     ///         let (error, slave) = refused.into_parts();
     ///         keep_replicating(slave);
-    ///         return Err(error.into());
+    ///         return Err(error);
     ///     }
     /// };
+    /// # Ok(master) }
     /// ```
     pub fn into_parts(self) -> (Error, Option<Slave>) {
         (self.error, self.slave.map(|s| *s))

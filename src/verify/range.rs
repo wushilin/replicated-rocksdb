@@ -274,7 +274,10 @@ pub(crate) struct Throttle {
 }
 
 impl Throttle {
+    /// `rate` bytes per second; `None` is unlimited. `Some(0)` would never let a byte through
+    /// (`consume` divides by it and panics): `VerifyConfig::validate` refuses it.
     pub(crate) fn new(rate: Option<u64>) -> Self {
+        debug_assert_ne!(rate, Some(0), "validated by VerifyConfig::validate");
         Throttle {
             rate,
             start: Instant::now(),
