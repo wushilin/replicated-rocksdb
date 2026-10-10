@@ -398,7 +398,7 @@ Every key ends at its value at `S`, so after replaying `S` the slave holds exact
 
 Nothing has to be recorded at write time, and the divergent entries only need to be readable, not reversible.
 
-**Why the state at `S` is consistent.** The upstream's verify session pins one RocksDB snapshot (PROTOCOL.md §9.2). `S` (`__meta.last_seq`), the identity, `cf_specs` and every fetched envelope are read through it.
+**Why the state at `S` is consistent.** The upstream's verify session pins one RocksDB snapshot (PROTOCOL.md §9.2). `S` (`__meta.last_seq`), the identity, the epoch history, `cf_specs` and every fetched envelope are read through it. The rewind stores that epoch history; if it differs from the handshake's (the upstream moved to another history with the same identity in between), the repair falls back.
 
 - Every entry is one `WriteBatch` together with `__meta.last_seq`, on the master and on slaves (§5, §6). A snapshot therefore holds exactly the effects of entries `1..=S`: never part of an entry, never a later one.
 - Writes the upstream commits while the slave fetches are invisible to the fetch. They are entries after `S`, which the slave replays after `S`.
@@ -415,8 +415,10 @@ Nothing has to be recorded at write time, and the divergent entries only need to
    - `node_state = ready`, and `diverged_at` removed;
    - `repair_until = S` when `S > T`.
 
+   It is serialized with retention (both hold the retention lock, and a trim reads its positions under it), so a trim never decides from a position the rewind replaced.
+
    It is **all or nothing**. Before it, the old state stands (the divergent suffix is still readable and is retried); after it, the rewound state stands with its target. The batch is refused if the position moved since the fetch. Readers are refused before the batch becomes visible. Downstream streams and sessions are reset before and after it (they end with `UPSTREAM_RESET`, so no downstream bootstrap or verify completes on a mixed snapshot). A verify capture waiting on the old state is cancelled. In memory, identity and position follow on the same blocking thread.
-3. **Replay** (the ordinary apply path, §6). Each entry is its own atomic commit, together with `__changelog[seq]` and `last_seq`. A crash resumes from the durable `last_seq + 1`, since the handshake sends it. The mixed state is **hidden behind `repair_until`**. Until `last_seq` reaches it, the slave answers `NotReady` to reads, snapshots, `verify_now`, verify captures, promotion and downstream handshakes, bootstraps and verify sessions. `Status` reports `repairing:<S>`. All of this holds in every state, also after a restart and after a halt during the replay, because a halt rewrites `node_state` and not `repair_until`. The commit that reaches `S` removes `repair_until` (synced) before the slave reports ready. A crash in between leaves a target at or below `last_seq`, which the next open ignores.
+3. **Replay** (the ordinary apply path, §6). Reads, iterators and `Slave::snapshot` re-check readiness after they took their view, so a view that could hold the rewind is never returned. Each entry is its own atomic commit, together with `__changelog[seq]` and `last_seq`. A crash resumes from the durable `last_seq + 1`, since the handshake sends it. The mixed state is **hidden behind `repair_until`**. Until `last_seq` reaches it, the slave answers `NotReady` to reads, snapshots, `verify_now`, verify captures, promotion and downstream handshakes, bootstraps and verify sessions. `Status` reports `repairing:<S>`. All of this holds in every state, also after a restart and after a halt during the replay, because a halt rewrites `node_state` and not `repair_until`. The commit that reaches `S` removes `repair_until` (synced) before the slave reports ready. A crash in between leaves a target at or below `last_seq`, which the next open removes (the node is ready at once).
 
 **Guards**
 
@@ -439,7 +441,7 @@ Nothing has to be recorded at write time, and the divergent entries only need to
 - a key over 1 MiB, or a range bound or page key over 2 MiB;
 - more than `SlaveConfig::repair_max_bytes` (default 64 MiB) to read, fetch or delete.
 
-The consent that started the repair (the policy, or the repoint's `AcceptDataLoss`) covers this bootstrap. The operator's `force_bootstrap` is not used, so a later `IDENTITY_CHANGED` still follows its own policy. A transient failure (upstream unreachable, session lost, timeout) retries with backoff and `last_error` set. Under a repoint, it settles the repoint as `Retrying`, which ends the repoint's consent (§13.1).
+The consent that started the repair (the policy, or the repoint's `AcceptDataLoss`) covers this bootstrap, from **that database only**: the bootstrap header is read before anything local changes, and a header of another database (the address now serves another one) follows the identity policy instead (`Refuse`: halt `IdentityChanged`, nothing installed). The operator's `force_bootstrap` is not used, so a later `IDENTITY_CHANGED` still follows its own policy. A bootstrap that starts mid-replay drops the identity before the repair target, so the mixed state is never ready in between. A transient failure (upstream unreachable, session lost, timeout) retries with backoff and `last_error` set. Under a repoint, it settles the repoint as `Retrying`, which ends the repoint's consent (§13.1).
 
 **Salvage.** A slave that halts `Diverged` records its fork point in `__meta.diverged_at` (from the histories, or the master's `last_seq + 1` for a slave ahead of its master). `Slave::diverged_entries()` then returns the local entries `F..=L`.
 
@@ -449,7 +451,7 @@ The consent that started the repair (the policy, or the repoint's `AcceptDataLos
 
 - **Every acknowledged entry is durable on the replica.** It was committed in the same batch as `__changelog[seq]` and `last_seq`, with the same durability as any acknowledgement: in the WAL by default, fsynced with `sync_writes`.
 - **A crash resumes the replay.** The node restarts from its durable `last_seq`, and the persisted `repair_until` keeps it not ready until it passes `S` again.
-- **Promotion is refused while repairing.** `promote` and `promote_checked` return `Error::Config`, and `Status` reports `repairing:<S>`, so a repairing replica is never a failover candidate.
+- **Promotion is refused while repairing.** `promote` and `promote_checked` return `Error::Config`, and `Status` reports `repairing:<S>`, so a repairing replica is never a failover candidate. The final check is on the stopped store (`__meta.repair_until > last_seq`), so a rewind that commits after the in-memory checks (while `promote_checked` asks its peers) is refused too; the directory is unchanged and `promote_checked` hands the slave back, reopened.
 - **A repairing replica is never counted in sync, so its acknowledgements never satisfy a write concern.** The reasoning:
   1. Write concern counts only in-sync replicas (§5.2).
   2. A Tail stream is in sync only after it acknowledges a batch that drained the master's log, or acknowledges the master's `last_seq`.
