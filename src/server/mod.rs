@@ -399,17 +399,18 @@ impl ServerHandle {
         // one references the database through its session's snapshot.
         let mut stuck = false;
         let computations = u32::try_from(verify::MAX_COMPUTATIONS).unwrap_or(u32::MAX);
-        if tokio::time::timeout(
+        let held = tokio::time::timeout(
             Duration::from_secs(5),
             self.state.compute_permits.acquire_many(computations),
         )
-        .await
-        .is_err()
-        {
+        .await;
+        if held.is_err() {
             tracing::warn!(addr = %self.addr, "verify computations did not stop in 5 s");
             stuck = true;
         }
+        // Close while still holding the permits, so no request slips in between.
         self.state.compute_permits.close();
+        drop(held);
         // A Bootstrap that arrives later on an existing connection is refused.
         self.state.bootstraps.close();
         self.state.leases().clear();

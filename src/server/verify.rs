@@ -196,8 +196,7 @@ pub(super) async fn begin(
                     format!("CF {} is missing from the snapshot", e.spec.name),
                 )
             })?;
-        let order = KeyOrder::new(&comparators, e.spec.comparator.as_deref())
-            .map_err(|e| reason_status(pb::Reason::Corrupt, format!("comparator of a CF: {e}")))?;
+        let order = order_for(&comparators, e.spec.comparator.as_deref())?;
         cfs.insert(e.spec.name.clone(), (phys, order));
     }
     let span = tracing::info_span!(
@@ -230,6 +229,19 @@ pub(super) async fn begin(
         session_timeout_ms: u64::try_from(state.cfg.limits.verify_session_timeout.as_millis())
             .unwrap_or(u64::MAX),
     }))
+}
+
+/// The key order of a CF, or `INTERNAL` if its comparator is not registered on this node.
+fn order_for(
+    reg: &crate::tuning::ComparatorRegistry,
+    name: Option<&str>,
+) -> Result<KeyOrder, Status> {
+    KeyOrder::new(reg, name).map_err(|_| {
+        internal_status(format!(
+            "comparator {} is not registered on this node",
+            name.unwrap_or_default()
+        ))
+    })
 }
 
 pub(super) async fn end(
@@ -288,7 +300,7 @@ async fn serve(
             _ = resets.changed() => break reason_status(pb::Reason::UpstreamReset, "server state was replaced"),
             _ = tx.closed() => return,
         };
-        let answer = match answer(&state, req, reset_gen).await {
+        let answer = match answer(&state, req, reset_gen, &tx, &mut resets).await {
             Ok(a) => a,
             Err(status) => break status,
         };
@@ -304,16 +316,26 @@ async fn answer(
     state: &ServerState,
     req: pb::VerifyRangeRequest,
     reset_gen: u64,
+    tx: &Tx,
+    resets: &mut watch::Receiver<u64>,
 ) -> Result<pb::VerifyRangeResponse, Status> {
     let shutting_down = || reason_status(pb::Reason::ShuttingDown, "server is shutting down");
     // At most `MAX_COMPUTATIONS` scans run at once on this server. A request waits for a free
     // slot rather than failing: the client already limits itself to `VERIFY_WINDOW` requests
     // per session, so waiting is the natural backpressure (PROTOCOL.md §9.4). No session is
     // held while waiting.
+    // An unknown session is refused before any waiting. The wait also ends when the client
+    // is gone or the node's state is replaced: a dead client must not run a scan.
+    state.verify_sessions.get(&req.session_id)?;
     let mut shutdown = state.shutdown.clone();
     let permit = tokio::select! {
         p = state.compute_permits.clone().acquire_owned() => p.map_err(|_| shutting_down())?,
         _ = super::stopped(&mut shutdown) => return Err(shutting_down()),
+        _ = resets.changed() => return Err(reason_status(
+            pb::Reason::UpstreamReset,
+            "server state was replaced",
+        )),
+        _ = tx.closed() => return Err(Status::cancelled("client went away")),
     };
     let session = state.verify_sessions.get(&req.session_id)?;
     if session.reset_gen != reset_gen {
@@ -749,6 +771,52 @@ mod tests {
         // The largest allowed listing is fine.
         let (answers, err) = exchange(&mut c, vec![list(&sid, 2, range(None, None), 1024)]).await;
         assert!(err.is_none() && answers.len() == 1);
+    }
+
+    #[test]
+    fn an_unregistered_comparator_is_internal() {
+        let reg = crate::tuning::ComparatorRegistry::default();
+        let e = super::order_for(&reg, Some("nope")).err().unwrap();
+        assert_eq!(e.code(), Code::Internal);
+        assert!(
+            e.message()
+                .contains("comparator nope is not registered on this node"),
+            "{}",
+            e.message()
+        );
+        assert!(super::order_for(&reg, None).is_ok());
+    }
+
+    /// An unknown session is refused at once, even when every computation slot is taken.
+    #[tokio::test]
+    async fn an_unknown_session_does_not_wait_for_a_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, h, state) = standalone_server(dir.path()).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        let mut c = client(h.addr(), "b");
+        let all = state
+            .compute_permits
+            .clone()
+            .acquire_many_owned(super::MAX_COMPUTATIONS as u32)
+            .await
+            .unwrap();
+        let (_, err) = tokio::time::timeout(
+            Duration::from_secs(3),
+            exchange(
+                &mut c,
+                vec![hash(&[7; 16], 1, range(None, None), 0, vec![])],
+            ),
+        )
+        .await
+        .expect("answered without waiting for a slot");
+        assert_eq!(
+            reason(&err.unwrap()),
+            (Code::NotFound, Some(pb::Reason::SessionNotFound))
+        );
+        drop(all);
+        drop(state);
+        h.shutdown().await.unwrap();
+        m.shutdown().await.unwrap();
     }
 
     /// A master that does not serve, plus a separately started server over it. Returns an extra
