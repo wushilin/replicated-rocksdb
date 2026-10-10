@@ -263,24 +263,37 @@ pub struct Choice {
     /// position. This cannot happen with consistent inputs; such a node is not known to be safe
     /// to follow the candidate.
     pub unverifiable: Vec<String>,
+    /// Nodes whose state refuses promotion (`node_id`, `node_state`): a repair replaying
+    /// (`repairing:<seq>`, DESIGN.md §12.1) or a `Corrupt` / `SpecMismatch` halt. They are
+    /// never the candidate, even when they are the most advanced, and are not compared with it.
+    pub not_promotable: Vec<(String, String)>,
+}
+
+/// Whether a node's `node_state` refuses promotion (`Slave::promote` would refuse it).
+fn refuses_promotion(node_state: &str) -> bool {
+    node_state.starts_with("repairing:")
+        || node_state == "halted:Corrupt"
+        || node_state == "halted:SpecMismatch"
 }
 
 /// Compatibility is judged by epoch histories (see [`compare`]). A node whose newest epoch is
 /// empty and differs from the candidate's (for example a wrongly promoted master with no writes) is not safe to follow the
 /// candidate as it is: `demote` it (or rebootstrap it) first.
 ///
-/// Picks the most advanced node holding data (newest epoch, then highest `last_seq`, then
-/// lowest `node_id`) and classifies the others against it. `Err(Config)` if no node holds data.
+/// Picks the most advanced node holding data whose state allows promotion (newest epoch, then
+/// highest `last_seq`, then lowest `node_id`) and classifies the others against it. A node
+/// whose state refuses promotion (a repair replaying, a `Corrupt` or `SpecMismatch` halt) is
+/// listed in [`Choice::not_promotable`] instead. `Err(Config)` if no such node holds data.
 pub fn choose_promotion_candidate(nodes: &[NodeInfo]) -> Result<Choice> {
     let candidate = nodes
         .iter()
-        .filter(|n| n.identity.is_some())
+        .filter(|n| n.identity.is_some() && !refuses_promotion(&n.node_state))
         .max_by(|x, y| {
             x.newest()
                 .cmp(&y.newest())
                 .then_with(|| y.node_id.cmp(&x.node_id))
         })
-        .ok_or_else(|| Error::Config("no node holds data".into()))?
+        .ok_or_else(|| Error::Config("no promotable node holds data".into()))?
         .clone();
     let mut choice = Choice {
         candidate,
@@ -288,11 +301,18 @@ pub fn choose_promotion_candidate(nodes: &[NodeInfo]) -> Result<Choice> {
         diverged: Vec::new(),
         foreign: Vec::new(),
         unverifiable: Vec::new(),
+        not_promotable: Vec::new(),
     };
     for n in nodes
         .iter()
         .filter(|n| n.node_id != choice.candidate.node_id)
     {
+        if refuses_promotion(&n.node_state) {
+            choice
+                .not_promotable
+                .push((n.node_id.clone(), n.node_state.clone()));
+            continue;
+        }
         match compare(&choice.candidate, n) {
             Comparison::Later(Side::A) | Comparison::Equal => {
                 choice.compatible.push(n.node_id.clone())
@@ -629,6 +649,41 @@ mod tests {
             ..node("e", 1, &[(1, 1)], 0, None)
         };
         assert_eq!(compare(&empty, &a), Comparison::Later(Side::B));
+    }
+
+    /// Final review m3: a node that refuses promotion by its state (a repair replaying, a
+    /// `Corrupt` or `SpecMismatch` halt) is never the candidate, even when it is the most
+    /// advanced; it is listed with its state instead.
+    #[test]
+    fn the_chooser_skips_nodes_that_refuse_promotion() {
+        let state = |mut n: NodeInfo, s: &str| {
+            n.node_state = s.into();
+            n
+        };
+        let nodes = vec![
+            node("b", 1, &[(1, 1)], 10, Some(1)),
+            state(node("c", 1, &[(1, 1)], 12, Some(2)), "repairing:15"),
+            state(node("d", 1, &[(1, 1)], 11, Some(3)), "halted:Corrupt"),
+            state(node("e", 1, &[(1, 1)], 11, Some(3)), "halted:SpecMismatch"),
+            state(node("f", 1, &[(1, 1)], 9, Some(4)), "halted:Diverged"),
+        ];
+        let choice = choose_promotion_candidate(&nodes).unwrap();
+        assert_eq!(choice.candidate.node_id, "b");
+        assert_eq!(
+            choice.not_promotable,
+            vec![
+                ("c".to_string(), "repairing:15".to_string()),
+                ("d".to_string(), "halted:Corrupt".to_string()),
+                ("e".to_string(), "halted:SpecMismatch".to_string()),
+            ]
+        );
+        assert_eq!(choice.compatible, vec!["f".to_string()]);
+        assert!(choice.unverifiable.is_empty());
+        let only = vec![state(node("c", 1, &[(1, 1)], 12, Some(2)), "repairing:15")];
+        assert!(matches!(
+            choose_promotion_candidate(&only),
+            Err(Error::Config(_))
+        ));
     }
 
     #[test]

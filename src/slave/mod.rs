@@ -255,8 +255,8 @@ impl Slave {
     /// (`Err(Timeout)` after 10 s). It does not wait for `ReadSnapshot`s: each keeps the
     /// database open until it is dropped.
     ///
-    /// A verify computation that cannot be stopped within 5 s makes this return
-    /// `Err(Timeout)`; the rest of the shutdown still completes.
+    /// A bootstrap job or verify computation of this slave's server that cannot be stopped
+    /// within 5 s makes this return `Err(Timeout)`; the rest of the shutdown still completes.
     pub async fn shutdown(mut self) -> Result<()> {
         // A server that could not stop its computations still lets the rest shut down, but
         // the result is an error: the database may still be referenced.
@@ -295,9 +295,12 @@ impl Slave {
     /// and waits until the database is closed, emulating a process crash.
     pub async fn kill(mut self) -> Result<()> {
         self.inner.shutdown_tx.send_replace(true);
-        if let Some(server) = self.server.take() {
-            server.abort();
-        }
+        // Waits for the server's blocking work (bootstrap jobs, verify computations): each
+        // references the database.
+        let served = match self.server.take() {
+            Some(server) => server.abort().await,
+            None => Ok(()),
+        };
         for task in [
             self.driver.take(),
             self.maintenance.take(),
@@ -313,7 +316,7 @@ impl Slave {
             return Err(Error::Timeout);
         }
         if await_sole_owner(&self.inner, Duration::from_secs(10)).await {
-            Ok(())
+            served
         } else {
             Err(Error::Timeout)
         }

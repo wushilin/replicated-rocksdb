@@ -180,6 +180,12 @@ impl Slave {
     /// is unknown. A peer that reports `role == Master` blocks with `Error::MasterReachable`:
     /// fence it, or `Master::demote` it if it was promoted by mistake.
     ///
+    /// A later peer that is replaying a repair (`node_state = repairing:<seq>`) still blocks
+    /// with `NotMostAdvanced` naming it, although it refuses promotion itself until its replay
+    /// reaches `seq` (which needs an upstream). [`admin::choose_promotion_candidate`] lists such
+    /// nodes in `Choice::not_promotable`; when that replay can never finish, promoting this
+    /// slave with plain `promote` is the operator's explicit decision.
+    ///
     /// This slave's `last_seq` is sampled while it may still be replicating; the failover
     /// runbook requires the old master to be fenced first, so it is no longer advancing.
     pub async fn check_promotion(&self, peers: &[UpstreamConfig]) -> Result<PromotionCheck> {
@@ -213,11 +219,19 @@ impl Slave {
                 check.max_peer_epoch = check.max_peer_epoch.max(info.max_epoch_seen());
             }
             if info.last_seq > 0 && info.last_seq < me.last_seq {
-                let crc = self.inner.store.entry_crc(info.last_seq)?;
+                // A log read: on a blocking thread.
+                let (i, seq) = (self.inner.clone(), info.last_seq);
+                let crc = crate::background::blocking(move || i.store.entry_crc(seq)).await?;
                 me.probes.insert(info.last_seq, crc);
             }
             match compare(&me, &info) {
-                Comparison::Later(Side::B) => later.push((info.node_id, info.last_seq)),
+                Comparison::Later(Side::B) => {
+                    if info.node_state.starts_with("repairing:") {
+                        // Still blocks: it holds entries this slave does not.
+                        tracing::warn!(peer = %info.node_id, node_state = %info.node_state, "promotion check: a later peer is replaying a repair and cannot be promoted until it finishes");
+                    }
+                    later.push((info.node_id, info.last_seq))
+                }
                 // The peer holds entries this slave would discard: refused by default.
                 Comparison::Diverged { fork } if info.last_seq >= fork => {
                     would_discard.push((info.node_id, fork, info.last_seq))

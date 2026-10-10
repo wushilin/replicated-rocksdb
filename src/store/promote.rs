@@ -13,10 +13,22 @@ const BATCH: usize = 1_000;
 
 impl Store {
     /// Why this (stopped) slave's directory must not become a master, read from the store
-    /// itself: the final check of a promotion, which nothing can race. A persisted repair
-    /// target above `last_seq` means some keys hold an upstream's state at that target and the
-    /// rest an older state (DESIGN.md §12.1): a state no node ever had.
+    /// itself: the final check of a promotion, which nothing can race. A bootstrap that began
+    /// (`node_state = bootstrapping`, the identity removed) leaves no data to promote. A
+    /// persisted repair target above `last_seq` means some keys hold an upstream's state at that
+    /// target and the rest an older state (DESIGN.md §12.1): a state no node ever had.
     pub(crate) fn promotion_blocker(&self) -> Result<Option<String>> {
+        let m = self
+            .load_meta()?
+            .ok_or_else(|| Error::corrupt("__meta is empty"))?;
+        if m.identity.is_none()
+            || m.node_state.as_deref() == Some(super::bootstrap::NODE_BOOTSTRAPPING)
+        {
+            return Ok(Some(
+                "cannot promote while a bootstrap has not completed: there is no data to promote"
+                    .into(),
+            ));
+        }
         let last = self.position().last_seq;
         Ok(self.repair_until()?.filter(|&until| until > last).map(|until| {
             format!(
@@ -235,6 +247,41 @@ mod tests {
     use crate::store::bootstrap::BootstrapFinish;
     use crate::store::test_support::apply;
     use crate::types::{CfEntry, CfSpec, Op};
+
+    /// Final review m2: a store whose bootstrap began (no identity, `bootstrapping`) is a
+    /// blocker, so a checked promotion hands the slave back instead of losing it.
+    #[test]
+    fn a_bootstrapping_store_is_not_promotable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Role::Slave, Default::default())
+            .unwrap()
+            .0;
+        assert!(
+            store.promotion_blocker().unwrap().is_some(),
+            "a store that never bootstrapped has no data"
+        );
+        store
+            .finish_bootstrap(&BootstrapFinish {
+                identity: DbIdentity {
+                    db_uuid: uuid::Uuid::from_u128(5),
+                    epoch: 1,
+                },
+                epoch_history: vec![EpochStart {
+                    epoch: 1,
+                    start_seq: 1,
+                    nonce: 0,
+                }],
+                cf_specs: vec![],
+                snapshot_seq: 0,
+                snapshot_crc: None,
+                max_entry_bytes: 1 << 20,
+            })
+            .unwrap();
+        assert_eq!(store.promotion_blocker().unwrap(), None);
+        store.reset_for_bootstrap().unwrap();
+        let why = store.promotion_blocker().unwrap().expect("blocked");
+        assert!(why.contains("bootstrap"), "{why}");
+    }
 
     #[test]
     fn promotion_rewrites_meta_and_rebuilds_the_ttl_index() {

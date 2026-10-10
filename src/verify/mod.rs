@@ -62,7 +62,10 @@ impl VerifyMode {
 /// is right. In a chain A→B→C, a damaged B copies its damage onto a correct C (and further
 /// down). Choosing either is the consent to that; prefer `Report` on nodes whose upstream is
 /// not the master, or verify the upstream first.
+///
+/// Variants may be added, hence `non_exhaustive`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MismatchPolicy {
     /// Report it (status, listener, logs) and keep replicating.
     #[default]
@@ -76,10 +79,13 @@ pub enum MismatchPolicy {
     Repair,
 }
 
-/// Verification settings of a slave (DESIGN.md §12, §16).
+/// Verification settings of a slave (DESIGN.md §12, §16). Fields may be added, hence
+/// `non_exhaustive`: start from `VerifyConfig::default()` and set the fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VerifyConfig {
-    /// Run a verify this often. `None` (default): only on [`Slave::verify_now`](crate::Slave::verify_now).
+    /// Run a verify this long (±10 %) after the previous one ended. `None` (default): only on
+    /// [`Slave::verify_now`](crate::Slave::verify_now).
     pub interval: Option<Duration>,
     /// Mode of the scheduled runs. Default `Quick`.
     pub mode: VerifyMode,

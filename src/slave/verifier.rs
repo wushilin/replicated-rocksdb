@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval_at};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Status, Streaming};
 use tracing::Instrument;
@@ -210,9 +209,29 @@ async fn session(
 /// An open session on the upstream (PROTOCOL.md §9): its `VerifyBegin` answer and the
 /// `VerifyRange` stream used for hashes, listings, fetches and entry CRCs.
 pub(crate) struct UpstreamSession {
-    client: Client,
     pub begin: pb::VerifyBeginResponse,
     pub upstream: Upstream,
+    /// Ends the session upstream if it is dropped without [`close`](Self::close).
+    end: EndOnDrop,
+}
+
+/// Sends a best-effort `VerifyEnd` from its own task when a session is abandoned (a timeout, a
+/// repoint, shutdown, a dropped run): otherwise its snapshot stays pinned and one of the
+/// upstream's `max_verify_sessions` slots stays taken until the session expires.
+struct EndOnDrop {
+    /// `None` once the session was ended.
+    client: Option<Client>,
+    session_id: Vec<u8>,
+}
+
+impl Drop for EndOnDrop {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take()
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            spawn_verify_end(client, std::mem::take(&mut self.session_id));
+        }
+    }
 }
 
 impl UpstreamSession {
@@ -247,11 +266,9 @@ impl UpstreamSession {
         let answers = match opened {
             Ok(Ok(r)) => r.into_inner(),
             failed => {
-                // Do not leave the snapshot pinned upstream until it expires.
-                let end = pb::VerifyEndRequest {
-                    session_id: begin.session_id.clone(),
-                };
-                let _ = tokio::time::timeout(END_TIMEOUT, client.verify_end(end)).await;
+                // Do not leave the snapshot pinned upstream until it expires. Sent from its
+                // own task, so the caller (which may hold the applier) returns at once.
+                spawn_verify_end(client.clone(), begin.session_id.clone());
                 return Err(match failed {
                     Ok(Err(s)) => status_abort(&s),
                     _ => abort(VerifyAbort::Upstream(format!(
@@ -267,26 +284,42 @@ impl UpstreamSession {
             snapshot_seq: begin.snapshot_seq,
             next_id: 0,
         };
+        let end = EndOnDrop {
+            client: Some(client),
+            session_id: begin.session_id.clone(),
+        };
         Ok(UpstreamSession {
-            client,
             begin,
             upstream,
+            end,
         })
     }
 
     /// Ends the session. Best effort and bounded: the upstream also expires idle sessions.
     pub(crate) async fn close(self) {
         let UpstreamSession {
-            mut client,
             begin,
             upstream,
+            mut end,
         } = self;
         drop(upstream);
+        let Some(mut client) = end.client.take() else {
+            return;
+        };
         let end = pb::VerifyEndRequest {
             session_id: begin.session_id,
         };
         let _ = tokio::time::timeout(END_TIMEOUT, client.verify_end(end)).await;
     }
+}
+
+/// Sends a best-effort `VerifyEnd` for `session_id` from its own task (bounded by
+/// `END_TIMEOUT`), so the caller does not wait for it.
+pub(crate) fn spawn_verify_end(mut client: Client, session_id: Vec<u8>) {
+    tokio::spawn(async move {
+        let end = pb::VerifyEndRequest { session_id };
+        let _ = tokio::time::timeout(END_TIMEOUT, client.verify_end(end)).await;
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -379,6 +412,11 @@ async fn compare(
             out: &mut mismatches,
         };
         let compared = compare_cf(upstream, &local, &mut run, &mut ranges).await;
+        if compared.is_err() {
+            // The run is abandoned: the producer stops at its next key, not after its
+            // throttled scan of the whole CF.
+            stop.store(true, Ordering::SeqCst);
+        }
         // Unblocks the producer if the comparison stopped early.
         drop(ranges);
         let keys = producer
@@ -416,7 +454,9 @@ async fn capture(inner: &Arc<Inner>, hold: CaptureHold, s: Seq) -> Result<ReadSn
     .await?;
     let mut states = inner.state_tx.subscribe();
     let timeout = inner.cfg.verify.capture_timeout;
+    // Biased: a reply that is ready wins over a halt seen at the same time.
     let outcome = tokio::select! {
+        biased;
         r = tokio::time::timeout(timeout, reply) => r.ok().and_then(|r| r.ok()),
         _ = async { let _ = states.wait_for(|st| matches!(st, SlaveState::Halted(_))).await; } => None,
     };
@@ -730,19 +770,27 @@ impl LocalSide for Local {
     }
 }
 
-/// Runs a verify every `VerifyConfig::interval` while the slave is streaming. Holds only a
-/// `Weak<Inner>` between runs; shutdown cancels a run in progress.
+/// `every` scaled by a random factor in `[0.9, 1.1]`.
+fn jittered(every: Duration) -> Duration {
+    let unit = (uuid::Uuid::new_v4().as_u128() as u64 % 2001) as f64 / 1000.0; // 0..=2
+    every.mul_f64(0.9 + 0.1 * unit)
+}
+
+/// Runs a verify `VerifyConfig::interval` (±10 %) after the previous run ended (or after the
+/// start), whenever the slave is streaming then. Holds only a `Weak<Inner>` between runs;
+/// shutdown cancels a run in progress.
 pub(crate) fn spawn(inner: &Arc<Inner>) -> Option<JoinHandle<()>> {
     let every = inner.cfg.verify.interval?;
     let mode = inner.cfg.verify.mode;
     let weak = Arc::downgrade(inner);
     let mut shutdown = inner.shutdown_tx.subscribe();
     Some(tokio::spawn(async move {
-        let mut tick = interval_at(tokio::time::Instant::now() + every, every);
-        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
+            // `interval` after the previous run ended, ±10 %: runs never go back to back, and
+            // a fleet started together spreads out instead of hitting its upstream's
+            // `max_verify_sessions` at once.
             tokio::select! {
-                _ = tick.tick() => {}
+                _ = tokio::time::sleep(jittered(every)) => {}
                 _ = shutdown.changed() => return,
             }
             let Some(inner) = weak.upgrade() else { return };
@@ -762,6 +810,18 @@ pub(crate) fn spawn(inner: &Arc<Inner>) -> Option<JoinHandle<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Final review T5-M5: scheduled runs are spaced by the interval ±10 %.
+    #[test]
+    fn the_schedule_is_jittered_by_ten_percent() {
+        let every = Duration::from_secs(100);
+        let seen: Vec<Duration> = (0..200).map(|_| jittered(every)).collect();
+        assert!(
+            seen.iter()
+                .all(|d| *d >= Duration::from_secs(90) && *d <= Duration::from_secs(110))
+        );
+        assert!(seen.iter().any(|d| *d != seen[0]), "not constant");
+    }
 
     /// Final fix wave, I1: refusals that retrying cannot fix are their own abort kind.
     #[test]
@@ -823,6 +883,41 @@ mod tests {
         UpstreamSession::open(inner, &client, VerifyMode::Full, Duration::from_secs(10))
             .await
             .unwrap()
+    }
+
+    /// Final review B-M8: a session dropped without `close` (an abandoned repair, a cancelled
+    /// run) still ends upstream, so it does not hold one of `max_verify_sessions` until it
+    /// expires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_session_frees_its_upstream_slot() {
+        use crate::server::test_client::serving_master;
+        let mdir = tempfile::tempdir().unwrap();
+        let sdir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(mdir.path(), |cfg| {
+            cfg.serve.as_mut().unwrap().limits.max_verify_sessions = 1;
+        })
+        .await;
+        m.create_cf(crate::types::CfSpec::new("c")).unwrap();
+        let inner = inner_for(sdir.path(), m.serve_addr().unwrap());
+        let client = client::connect_now(&inner).await.unwrap();
+        let open =
+            || UpstreamSession::open(&inner, &client, VerifyMode::Quick, Duration::from_secs(5));
+        drop(open().await.unwrap());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let second = loop {
+            match open().await {
+                Ok(s) => break s,
+                Err(Error::VerifyAborted(VerifyAbort::Busy))
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                Err(e) => panic!("the abandoned session still holds the slot: {e:?}"),
+            }
+        };
+        second.close().await;
+        drop(inner);
+        m.shutdown().await.unwrap();
     }
 
     #[tokio::test]

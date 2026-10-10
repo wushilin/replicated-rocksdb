@@ -383,17 +383,23 @@ async fn session(
             };
         }
     }
-    span.in_scope(|| {
-        tracing::info!(
-            decision = hs.decision().as_str_name(),
-            reason = hs.reason().as_str_name(),
-            ?action,
-            "handshake answered"
-        )
-    });
     // The retry arm of the driver loop logs the warning and sets `last_error`.
     let resumes = hs.decision() == pb::Decision::Resume && force != Force::Operator;
-    if let Some(end) = contradicting_resume(after_stream_diverged, resumes) {
+    let contradiction = contradicting_resume(after_stream_diverged, resumes);
+    // Logged with the action actually taken; a retry (repeated on every backoff) at debug.
+    span.in_scope(|| {
+        let (decision, reason) = (hs.decision().as_str_name(), hs.reason().as_str_name());
+        match (&contradiction, &action) {
+            (Some(end), _) => {
+                tracing::debug!(decision, reason, action = ?end, "handshake answered")
+            }
+            (None, Action::Retry(_)) => {
+                tracing::debug!(decision, reason, ?action, "handshake answered")
+            }
+            (None, _) => tracing::info!(decision, reason, ?action, "handshake answered"),
+        }
+    });
+    if let Some(end) = contradiction {
         return end;
     }
     match action {

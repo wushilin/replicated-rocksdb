@@ -190,6 +190,11 @@ async fn narrow<O: Oracle>(
                 matched.len()
             )));
         }
+        if matched[0] && matched[1] {
+            // The node mismatched, yet both halves match: nothing to narrow, never clean.
+            run.range(bounds.lower, bounds.upper);
+            continue;
+        }
         // Right first, so the left half is narrowed (and reported) first.
         if !matched[1] {
             stack.push((right.bounds, idx.start + i..idx.end));
@@ -210,6 +215,7 @@ async fn list_and_diff<O: Oracle>(
     bounds: &Bounds,
     local: &[LocalRecord],
 ) -> Result<()> {
+    let before = run.out.len();
     let mut i = 0;
     let mut page = bounds.clone();
     let mut resume: Option<Vec<u8>> = None;
@@ -267,6 +273,10 @@ async fn list_and_diff<O: Oracle>(
             return Ok(());
         }
         i += 1;
+    }
+    if run.out.len() == before {
+        // The leaf's hash differed, yet its listing shows no difference: never clean.
+        run.range(bounds.lower.clone(), bounds.upper.clone());
     }
     Ok(())
 }
@@ -341,6 +351,8 @@ mod tests {
         hash_batches: Vec<usize>,
         lists: Vec<Bounds>,
         lie: bool,
+        /// Hashes of ranges that hold this key and at least this many keys "mismatch".
+        lie_about: Option<(Vec<u8>, u64)>,
         short_from: Option<usize>,
     }
 
@@ -354,6 +366,7 @@ mod tests {
                 hash_batches: Vec::new(),
                 lists: Vec::new(),
                 lie: false,
+                lie_about: None,
                 short_from: None,
             }
         }
@@ -379,7 +392,11 @@ mod tests {
                     for (k, v) in self.in_range(&r.bounds) {
                         h.add(k, v).unwrap();
                     }
-                    !self.lie && h.finish() == (r.count, r.hash)
+                    let lies = self.lie
+                        || self.lie_about.as_ref().is_some_and(|(k, n)| {
+                            r.count >= *n && r.bounds.contains(&self.order, k)
+                        });
+                    !lies && h.finish() == (r.count, r.hash)
                 })
                 .collect();
             if self.short_from.is_some_and(|n| call >= n) {
@@ -670,12 +687,54 @@ mod tests {
         let mut up = Fake::new(data(40), VerifyMode::Full);
         up.lie = true; // every hash "mismatches", yet the listings are identical
         let out = run(data(40), &mut up, 100, 4, 100).await;
+        // Every leaf is reported as a range (T3-N1): together they cover the whole CF.
+        let bounds: Vec<_> = out
+            .iter()
+            .map(|m| match m {
+                Mismatch::Range { lower, upper, .. } => (lower.clone(), upper.clone()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(bounds.len() > 1, "{out:?}");
+        assert_eq!(bounds.first().unwrap().0, None);
+        assert_eq!(bounds.last().unwrap().1, None);
+        assert!(
+            bounds
+                .windows(2)
+                .all(|w| w[0].1.is_some() && w[0].1 == w[1].0),
+            "contiguous: {out:?}"
+        );
+    }
+
+    /// Final review T3-N1: an unexplained mismatch is reported where it was seen, per node,
+    /// not only as the whole top-level range: a leaf whose listing shows no difference, and a
+    /// node whose two halves both hash equal although it did not.
+    #[tokio::test]
+    async fn an_unexplained_mismatch_is_reported_as_the_node_that_showed_it() {
+        let bound = |k: &str| Some(k.as_bytes().to_vec());
+        // A leaf: every range holding k0005 mismatches, down to the listed leaf.
+        let mut up = Fake::new(data(40), VerifyMode::Full);
+        up.lie_about = Some((b"k0005".to_vec(), 1));
+        let out = run(data(40), &mut up, 100, 4, 100).await;
+        assert_eq!(out.len(), 1, "{out:?}");
+        let Mismatch::Range { lower, upper, .. } = &out[0] else {
+            panic!("{out:?}");
+        };
+        assert!(
+            (lower.is_some() || upper.is_some()) && upper.as_deref() <= Some(&b"k0010"[..]),
+            "a sub-range around k0005, not the whole CF: {out:?}"
+        );
+        // A node: ranges of 20+ keys holding k0005 mismatch; the two halves of the left half
+        // (10 keys each) hash equal.
+        let mut up = Fake::new(data(40), VerifyMode::Full);
+        up.lie_about = Some((b"k0005".to_vec(), 20));
+        let out = run(data(40), &mut up, 100, 4, 100).await;
         assert_eq!(
             out,
             vec![Mismatch::Range {
                 cf: "c".into(),
                 lower: None,
-                upper: None
+                upper: bound("k0020"),
             }]
         );
     }

@@ -160,6 +160,23 @@ impl Inner {
     }
 }
 
+/// Where the local log, whose full epoch history is `local`, leaves the upstream's after a
+/// `DIVERGED` answer `hs`: the first local entry the upstream does not share. The one
+/// computation behind both `Error::Diverged::fork_seq` and the fork point recorded for
+/// `Slave::diverged_entries`.
+pub(crate) fn fork_seq(local: &[EpochStart], local_last: Seq, hs: &pb::HandshakeResponse) -> Seq {
+    let history = epochs_from_pb(&hs.epoch_history);
+    match fork_between(local, &history) {
+        // Rule 8: everything from the next epoch's start (or from the start of a same-numbered
+        // epoch with another nonce) is not on the upstream's history.
+        Some(fork) if fork <= local_last => fork,
+        // Rule 11: the local log runs past the master's.
+        _ if local_last > hs.last_seq => hs.last_seq + 1,
+        // Rule 12: the last entry differs; earlier ones may too (repair finds out).
+        _ => local_last,
+    }
+}
+
 /// `Error::Diverged` for a `DIVERGED` answer: where the local log, whose full epoch history is
 /// `local`, leaves the upstream's (the first record where the two histories differ, exactly:
 /// [`fork_between`]).
@@ -168,17 +185,7 @@ pub(crate) fn divergence(
     local_last: Seq,
     hs: &pb::HandshakeResponse,
 ) -> Error {
-    let history = epochs_from_pb(&hs.epoch_history);
-    let fork = fork_between(local, &history);
-    let fork_seq = match fork {
-        // Rule 8: everything from the next epoch's start (or from the start of a same-numbered
-        // epoch with another nonce) is not on the upstream's history.
-        Some(fork) if fork <= local_last => fork,
-        // Rule 11: the local log runs past the master's.
-        _ if local_last > hs.last_seq => hs.last_seq + 1,
-        // Rule 12: the last entry differs; earlier ones may too (repair finds out).
-        _ => local_last,
-    };
+    let fork_seq = fork_seq(local, local_last, hs);
     Error::Diverged {
         fork_seq,
         local_last_seq: local_last,

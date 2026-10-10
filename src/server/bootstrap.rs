@@ -12,7 +12,7 @@ use crate::auth::Method;
 use crate::codec::ENVELOPE_VERSION;
 use crate::codec::digest::Digest;
 use crate::net::convert::{cf_to_pb, epochs_to_pb, identity_to_pb};
-use crate::net::reason_status;
+use crate::net::{internal_status, reason_status};
 use crate::pb;
 use crate::pb::bootstrap_chunk::Kind;
 use crate::read::ReadSnapshot;
@@ -57,14 +57,21 @@ pub(super) async fn bootstrap(
                 reason_status(pb::Reason::Busy, "too many bootstraps in progress")
             }
         })?;
-    let store = src.store();
-    // Guard first (at a seq no later than the snapshot's), so retention cannot remove
-    // entry S + 1 between taking the snapshot and registering the real guard.
-    let provisional = store.guard(store.position().last_seq);
-    let snap = store.read_snapshot(0).map_err(store_status)?;
-    let meta = snap.meta().map_err(store_status)?;
-    let guard = store.guard(meta.last_seq);
-    drop(provisional);
+    // RocksDB reads, on a blocking thread. Guard first (at a seq no later than the
+    // snapshot's), so retention cannot remove entry S + 1 between taking the snapshot and
+    // registering the real guard. On an error, the guards go here and the permit on return.
+    let source = src.clone();
+    let (snap, meta, guard) = tokio::task::spawn_blocking(move || {
+        let store = source.store();
+        let provisional = store.guard(store.position().last_seq);
+        let snap = store.read_snapshot(0).map_err(store_status)?;
+        let meta = snap.meta().map_err(store_status)?;
+        let guard = store.guard(meta.last_seq);
+        drop(provisional);
+        Ok::<_, Status>((snap, meta, guard))
+    })
+    .await
+    .map_err(|e| internal_status(format!("bootstrap snapshot task failed: {e}")))??;
     let Some(identity) = meta.identity else {
         return Err(reason_status(
             pb::Reason::NotReady,

@@ -112,9 +112,6 @@ pub enum Error {
     /// first handshake with its upstream settled. The later repoint (if any) is in force.
     #[error("the repoint was superseded by a later repoint or the slave shut down")]
     RepointSuperseded,
-    /// The operation is not available in this version of the crate.
-    #[error("not supported by this version: {0}")]
-    Unsupported(String),
     /// `promote_checked` found a reachable peer that is itself a master. Promoting would give
     /// the database two masters: fence it (stop it), or `demote` it if it was promoted by
     /// mistake and has taken no writes, then check again.

@@ -429,8 +429,8 @@ impl Master {
     /// iterator borrowed from one) pins the database, and its directory LOCK, until it is
     /// dropped. Drop those first if the directory must be reopened at once.
     ///
-    /// A verify computation that cannot be stopped within 5 s makes this return
-    /// `Err(Timeout)`; the rest of the shutdown still completes.
+    /// A bootstrap job or verify computation that cannot be stopped within 5 s makes this
+    /// return `Err(Timeout)`; the rest of the shutdown still completes.
     pub async fn shutdown(mut self) -> Result<()> {
         // A server that could not stop its computations still lets the rest shut down, but
         // the result is an error: the database may still be referenced.

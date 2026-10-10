@@ -113,6 +113,7 @@ impl AffectedSet {
                 }
             }
         }
+        set.dedup_ranges();
         Ok(Some(set))
     }
 
@@ -133,6 +134,7 @@ impl AffectedSet {
                 Mismatch::CfSpec { .. } => return None,
             }
         }
+        set.dedup_ranges();
         Some(set)
     }
 
@@ -142,6 +144,16 @@ impl AffectedSet {
         }
         for (cf, ranges) in other.ranges {
             self.ranges.entry(cf).or_default().extend(ranges);
+        }
+        self.dedup_ranges();
+    }
+
+    /// Sorts each CF's ranges by their bound bytes and drops identical ones: a range deleted
+    /// (or reported) several times is fetched, cleared and counted against the budget once.
+    fn dedup_ranges(&mut self) {
+        for ranges in self.ranges.values_mut() {
+            ranges.sort_by(|a, b| (&a.lower, &a.upper).cmp(&(&b.lower, &b.upper)));
+            ranges.dedup();
         }
     }
 
@@ -201,15 +213,16 @@ pub(crate) fn deeper_fork(
     fork_from(offered, local).filter(|&f| f < bound)
 }
 
-/// Finds where the local divergent suffix starts and records it for `Slave::diverged_entries`
-/// (from the histories; for a slave ahead of its master on the same history, the master's
-/// `last_seq + 1`). `None` (recorded as unknown) when neither shows it.
+/// Finds where the local divergent suffix starts and records it for `Slave::diverged_entries`,
+/// with the computation `Error::Diverged` reports ([`super::repoint::fork_seq`]: from the full
+/// epoch histories; for a slave ahead of its master on the same history, the master's
+/// `last_seq + 1`; otherwise the last entry, which differs). `None` (recorded as unknown)
+/// without a local identity.
 pub(crate) async fn record_fork(inner: &Arc<Inner>, hs: &pb::HandshakeResponse) -> Option<Seq> {
     let last = inner.store.position().last_seq;
-    let upstream = epochs_from_pb(&hs.epoch_history);
-    let fork = history_fork(&inner.known_epochs(), last, &upstream).or_else(|| {
-        (hs.upstream_chain.is_empty() && last > hs.last_seq).then_some(hs.last_seq + 1)
-    });
+    let fork = inner
+        .ident()
+        .map(|(_, history)| super::repoint::fork_seq(&history, last, hs));
     if let Err(e) = tracked(inner, move |i| i.store.set_diverged_at(fork)).await {
         tracing::warn!(node = %inner.cfg.identifier, error = %e, "could not record the fork point");
     }
@@ -624,7 +637,6 @@ pub(crate) async fn commit(
         inner.begin_repair(before);
         return Err(e.into());
     }
-    inner.seq_tx.send_replace(keep_through);
     tracing::info!(
         node = %inner.cfg.identifier,
         rewound_to = keep_through,
@@ -632,7 +644,9 @@ pub(crate) async fn commit(
         ready_at,
         "repaired from the upstream"
     );
+    // The listener hears of the rewind before the rewound seq is published (its contract).
     inner.notify(|l| l.on_rewind(keep_through));
+    inner.seq_tx.send_replace(keep_through);
     if failpoint::fire_async("slave-repair-after-rewind").await {
         // Emulated crash right after the rewind: freeze until the test kills the node.
         std::future::pending::<()>().await;
@@ -656,6 +670,42 @@ mod tests {
             start_seq,
             nonce,
         }
+    }
+
+    /// Final review A-M4: repeated or overlapping DeleteRanges with identical bounds are
+    /// fetched and counted once, also across a merge.
+    #[test]
+    fn identical_ranges_are_deduplicated() {
+        let del = |seq, s: &[u8], e: &[u8]| {
+            entry(
+                seq,
+                vec![Op::DeleteRange {
+                    cf: "c".into(),
+                    start: s.to_vec(),
+                    end: e.to_vec(),
+                }],
+            )
+        };
+        let b = |s: &[u8], e: &[u8]| Bounds {
+            lower: Some(s.to_vec()),
+            upper: Some(e.to_vec()),
+        };
+        let mut set = AffectedSet::from_entries(&[
+            del(1, b"m", b"p"),
+            del(2, b"a", b"c"),
+            del(3, b"m", b"p"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(set.ranges["c"], vec![b(b"a", b"c"), b(b"m", b"p")]);
+        let other = AffectedSet::from_entries(&[del(4, b"a", b"c"), del(5, b"x", b"y")])
+            .unwrap()
+            .unwrap();
+        set.merge(other);
+        assert_eq!(
+            set.ranges["c"],
+            vec![b(b"a", b"c"), b(b"m", b"p"), b(b"x", b"y")]
+        );
     }
 
     /// Final fix wave, I1 / A-M6: failures retrying cannot fix are told apart from transient

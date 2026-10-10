@@ -397,11 +397,15 @@ impl ServerHandle {
     }
 
     /// Ends every stream with `SHUTTING_DOWN`, stops accepting calls, and waits (up to 5 s
-    /// each) until every bootstrap job has returned its permit (and dropped its snapshot)
-    /// and the server task has finished.
+    /// each) until every bootstrap job has returned its permit (and dropped its snapshot),
+    /// every verify computation has stopped, and the server task has finished. `Err(Timeout)`
+    /// if a bootstrap job or a verify computation did not stop within 5 s: it may still hold
+    /// the database (the rest of the shutdown still completes).
     pub(crate) async fn shutdown(mut self) -> Result<()> {
         self.shutdown_tx.send_replace(true);
         self.state.cancel.store(true, Ordering::SeqCst);
+        // A bootstrap job owns a snapshot, and with it the database.
+        let mut stuck = false;
         let all =
             u32::try_from(self.state.cfg.limits.max_concurrent_bootstraps).unwrap_or(u32::MAX);
         if tokio::time::timeout(
@@ -412,10 +416,10 @@ impl ServerHandle {
         .is_err()
         {
             tracing::warn!(addr = %self.addr, "bootstrap jobs did not stop in 5 s");
+            stuck = true;
         }
         // Verify computations stop at their next key; wait until none is left, because each
         // one references the database through its session's snapshot.
-        let mut stuck = false;
         let computations = u32::try_from(verify::MAX_COMPUTATIONS).unwrap_or(u32::MAX);
         let held = tokio::time::timeout(
             Duration::from_secs(5),
@@ -451,9 +455,12 @@ impl ServerHandle {
         Ok(())
     }
 
-    /// Stops immediately, without waiting for anything (emulates a crash).
+    /// Stops at once, without any graceful step (emulates a crash), then waits (up to 5 s)
+    /// until the blocking work that still references the database is gone: bootstrap jobs
+    /// and verify computations stop at their next key once `cancel` is set. `Err(Timeout)` if
+    /// one did not stop in time.
     #[cfg_attr(not(feature = "failpoints"), allow(dead_code))] // used by Slave::kill
-    pub(crate) fn abort(mut self) {
+    pub(crate) async fn abort(mut self) -> Result<()> {
         self.shutdown_tx.send_replace(true);
         self.state.cancel.store(true, Ordering::SeqCst);
         self.state.leases().clear();
@@ -463,6 +470,22 @@ impl ServerHandle {
         }
         if let Some(t) = self.task.take() {
             t.abort();
+        }
+        let bootstraps =
+            u32::try_from(self.state.cfg.limits.max_concurrent_bootstraps).unwrap_or(u32::MAX);
+        let computations = u32::try_from(verify::MAX_COMPUTATIONS).unwrap_or(u32::MAX);
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            let b = self.state.bootstraps.acquire_many(bootstraps).await;
+            let c = self.state.compute_permits.acquire_many(computations).await;
+            (b, c)
+        })
+        .await;
+        // Closed while the permits are held: nothing new starts.
+        self.state.compute_permits.close();
+        self.state.bootstraps.close();
+        match drained {
+            Ok(_) => Ok(()),
+            Err(_) => Err(Error::Timeout),
         }
     }
 }

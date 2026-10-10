@@ -165,6 +165,11 @@ pub(crate) async fn install(
             )));
         }
     }
+    // A repoint since this session started: the consent and the header are about the old
+    // upstream. Nothing local has changed yet; the next session decides afresh.
+    if *inner.repoint_tx.borrow() != generation {
+        return Err(SessionEnd::Again);
+    }
     inner.force_bootstrap.clear(generation);
     // Automatic and verify requests are spent once a bootstrap installs.
     inner.auto_rebootstrap.clear();

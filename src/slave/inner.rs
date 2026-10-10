@@ -1169,6 +1169,37 @@ mod tests {
         )
     }
 
+    /// Final review B-M5: the fork recorded for `Slave::diverged_entries` is the one
+    /// `Error::Diverged` reports (`repoint::divergence`): a same-history CRC divergence at the
+    /// last entry (rule 12) records that entry, not "unknown".
+    #[tokio::test]
+    async fn the_recorded_fork_matches_the_reported_divergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inner(dir.path());
+        for _ in 0..3 {
+            apply(&i);
+        }
+        let (id, history) = ident();
+        i.set_ident(Some((id, history.clone())));
+        let hs = crate::pb::HandshakeResponse {
+            decision: crate::pb::Decision::Reject as i32,
+            reason: crate::pb::Reason::Diverged as i32,
+            last_seq: 3,
+            epoch_history: crate::net::convert::epochs_to_pb(&history),
+            ..Default::default()
+        };
+        let reported = match crate::slave::repoint::divergence(&history, 3, &hs) {
+            Error::Diverged { fork_seq, .. } => fork_seq,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(reported, 3);
+        assert_eq!(
+            crate::slave::repair::record_fork(&i, &hs).await,
+            Some(reported)
+        );
+        assert_eq!(i.store.diverged_at().unwrap(), Some(reported));
+    }
+
     fn keys(k: &[u8]) -> AffectedSet {
         let mut set = AffectedSet::default();
         set.keys.entry("c".into()).or_default().insert(k.to_vec());
