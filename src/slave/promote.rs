@@ -87,7 +87,10 @@ impl Slave {
         crate::failpoint::pause("slave-promote-before-shutdown").await;
         let path = cfg.path.clone();
         let tuning = cfg.rocksdb.clone();
-        let slave_cfg = self.inner.cfg.clone();
+        // A refused promotion reopens the slave following the upstream it follows now (a
+        // `repoint` may have replaced the configured one).
+        let mut slave_cfg = self.inner.cfg.clone();
+        slave_cfg.upstream = self.inner.upstream();
         // Snapshots share the database handle; one that outlives the slave keeps the DB open.
         let db = Arc::downgrade(self.inner.store.db());
         self.inner.reset_downstream();
@@ -285,9 +288,9 @@ impl Slave {
     /// check runs on the stopped store: a repair that committed its rewind meanwhile (it is
     /// replaying, DESIGN.md §12.1) or a bootstrap that began meanwhile (no data to promote)
     /// refuses with `Error::Config`, the directory unchanged, and the slave is reopened and
-    /// handed back. It is reopened with the configured `cfg.upstream`: an upstream set by
-    /// `repoint` is not kept (repoint it again). If that reopen fails, the handle is lost
-    /// (`slave` is `None`) and the application reopens the directory.
+    /// handed back, following the upstream it followed before (an upstream set by `repoint`
+    /// is kept). If that reopen fails, the handle is lost (`slave` is `None`) and the
+    /// application reopens the directory.
     pub async fn promote_checked(
         self,
         cfg: MasterConfig,

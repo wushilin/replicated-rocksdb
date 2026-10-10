@@ -129,10 +129,9 @@ impl Node {
     /// stays a slave. Only a failure after the slave began shutting down (an I/O error, a live
     /// `ReadSnapshot` from [`snapshot`](Self::snapshot)) leaves the node `Failed`
     /// ([`reopen`](Self::reopen) opens the unchanged slave again). A refusal found on the
-    /// stopped store (a repair that committed its rewind meanwhile) reopens the slave with the
-    /// upstream it was opened with: an upstream set by [`repoint`](Self::repoint) since is not
-    /// kept, so repoint it again. `Err(NotSlave)` on a master; calls answer `Switching` while
-    /// the check runs.
+    /// stopped store (a repair that committed its rewind meanwhile) reopens the slave, still
+    /// following the same upstream, and keeps it. `Err(NotSlave)` on a master; calls answer
+    /// `Switching` while the check runs.
     pub async fn promote_checked(&self) -> Result<()> {
         let (sw, old) = self.begin_switch(slave_only).await?;
         let Current::Slave(slave) = old else {
@@ -159,8 +158,8 @@ impl Node {
         self.after_promotion(sw, result)
     }
 
-    /// Stores the promoted master, the handed-back slave (recording the upstream it follows),
-    /// or `Failed` when the slave handle was lost.
+    /// Stores the promoted master, the handed-back slave (recording the upstream it follows,
+    /// the source of truth), or `Failed` when the slave handle was lost.
     fn after_promotion(
         &self,
         sw: Switch<'_>,
@@ -225,19 +224,18 @@ impl Node {
         upstream: Option<UpstreamConfig>,
         opts: RejoinOptions,
     ) -> Result<RepointOutcome> {
+        // Validated before the switch: a bad argument changes nothing and publishes nothing.
+        let mut cfg = self.slave_config();
+        if let Some(u) = upstream {
+            cfg.upstream = u;
+        }
+        cfg.validate()?;
         let (sw, old) = self
             .begin_switch(|c| match c {
                 Current::Master(_) | Current::Fenced(_) => Ok(()),
                 other => Err(other.unavailable()),
             })
             .await?;
-        let mut cfg = self.slave_config();
-        if let Some(u) = upstream {
-            cfg.upstream = u;
-        }
-        if let Err(e) = cfg.validate() {
-            return sw.finish(old, Err(e));
-        }
         let fenced = match old {
             Current::Master(master) => {
                 if let Err(e) = master.shutdown_released().await {
@@ -275,8 +273,13 @@ impl Node {
     /// read) is returned and the node stays fenced as it was. `opts.allow_unreachable`
     /// (explicit `AcceptSplitBrainRisk`) skips peers that do not answer; every other reason
     /// still blocks. `Err(Config)` if the node is not fenced (nothing changes). Calls answer
-    /// `Switching` while the check runs. A master that clears the check but fails to open
-    /// leaves the node `Failed`.
+    /// `Switching` while the check runs.
+    ///
+    /// A master that clears the check but then fails to open (an I/O error, its serve port
+    /// taken, ...) leaves the node `Failed`, not fenced: the open may already have started an
+    /// epoch. [`reopen`](Self::reopen) then runs the fence check again **without**
+    /// `AcceptSplitBrainRisk` (the consent given here is not reused), so the node may come
+    /// back fenced and need another `unfence` with consent.
     pub async fn unfence(&self, opts: UnfenceOptions) -> Result<()> {
         let not_fenced = || Error::Config("the node is not fenced".into());
         let (sw, old) = self

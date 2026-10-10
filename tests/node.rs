@@ -180,9 +180,6 @@ async fn the_old_master_restarts_fenced_by_the_new_one() {
     let (b, _) = c.slave("b", a_addr).await;
     a.put("c", b"k", b"v").unwrap();
     b.wait_for_seq(a.last_seq().unwrap(), WAIT).await.unwrap();
-    // Streaming, not only caught up: a slave caught up by its bootstrap still reads
-    // `Bootstrapping` until its next handshake, and refuses promotion.
-    wait_until("b streaming", || b.status().state == SlaveState::Streaming).await;
     a.shutdown().await.unwrap();
     let b = b.promote(c.master_config("b")).await.unwrap();
     let b_addr = b.serve_addr().unwrap();
@@ -507,8 +504,6 @@ async fn the_old_master_rejoins_through_the_node() {
         .unwrap();
     a.put("c", b"k", b"1").unwrap();
     b.wait_for_seq(a.last_seq().unwrap(), WAIT).await.unwrap();
-    // A slave caught up by its bootstrap reads `Bootstrapping` until its next handshake.
-    wait_node(&b, "b streaming", streaming).await;
     a.shutdown().await.unwrap();
     b.promote_checked().await.unwrap();
     b.put("c", b"on b", b"2").unwrap();
@@ -553,8 +548,6 @@ async fn a_running_master_rejoins_a_given_upstream() {
         .unwrap();
     a.put("c", b"k", b"1").unwrap();
     b.wait_for_seq(a.last_seq().unwrap(), WAIT).await.unwrap();
-    // A slave caught up by its bootstrap reads `Bootstrapping` until its next handshake.
-    wait_node(&b, "b streaming", streaming).await;
     a.shutdown().await.unwrap();
     b.promote().await.unwrap();
     b.put("c", b"on b", b"2").unwrap();
@@ -597,6 +590,17 @@ async fn a_rejoin_refused_before_the_rewrite_keeps_the_stored_master() {
         reason: FenceReason::NoPeers,
     };
     assert_eq!(a.state(), fenced);
+    // An invalid upstream is refused before the switch: no state change is published.
+    let rx = a.watch_state();
+    assert!(matches!(
+        a.rejoin_as_slave(
+            Some(UpstreamConfig::new("127.0.0.1", 0)),
+            RejoinOptions::default()
+        )
+        .await,
+        Err(Error::Config(_))
+    ));
+    assert!(!rx.has_changed().unwrap(), "nothing published");
     let raw = RawDb::open(&a_cfg.master.path);
     let err = a
         .rejoin_as_slave(None, RejoinOptions::default())
@@ -786,4 +790,74 @@ async fn a_lost_handle_fails_the_node_and_reopen_recovers() {
     drop(snap);
     b.reopen().await.unwrap();
     wait_node(&b, "b streaming again", streaming).await;
+}
+
+/// A demotion that loses its handle (a live `ReadSnapshot` of the promoted master) leaves the
+/// node `Failed`; the directory is unchanged, so `reopen` finds a stored master (fenced: no
+/// peers).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_demote_that_loses_its_handle_fails_the_node() {
+    let c = Cluster::new();
+    let a = Node::create_master(node_cfg(&c, "a", dead_addr(), &[]))
+        .await
+        .unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let a_addr = a.serve_addr().unwrap();
+    let b = Node::create_slave(node_cfg(&c, "b", a_addr, &[]))
+        .await
+        .unwrap();
+    b.wait_for_seq(a.last_seq().unwrap(), WAIT).await.unwrap();
+    b.promote().await.unwrap();
+    let snap = b.snapshot().unwrap();
+    let err = b.demote().await.unwrap_err();
+    assert!(err.to_string().contains("ReadSnapshot"), "{err}");
+    assert!(matches!(b.state(), NodeState::Failed { .. }));
+    drop(snap);
+    b.reopen().await.unwrap();
+    assert_eq!(
+        b.state(),
+        NodeState::Fenced {
+            reason: FenceReason::NoPeers
+        },
+        "still a stored master"
+    );
+}
+
+/// An unfence whose check clears (here under `AcceptSplitBrainRisk`) but whose master cannot
+/// open (its serve port is taken) leaves the node `Failed`; `reopen` checks the fence again
+/// without the consent and comes back fenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unfence_whose_open_fails_fails_the_node() {
+    let c = Cluster::new();
+    let a_cfg = node_cfg(&c, "a", dead_addr(), &[]);
+    let a = Node::create_master(a_cfg.clone()).await.unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    a.shutdown().await.unwrap();
+    let dead = dead_addr();
+    let mut cfg = a_cfg;
+    cfg.peers = vec![up(dead)];
+    let port = cfg.master.serve.as_ref().unwrap().port;
+    let a = Node::open(cfg).await.unwrap();
+    let fenced = NodeState::Fenced {
+        reason: FenceReason::PeerUnreachable {
+            peer: format!("http://{dead}"),
+        },
+    };
+    assert_eq!(a.state(), fenced);
+    let taken = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let err = a
+        .unfence(UnfenceOptions {
+            allow_unreachable: Some(AcceptSplitBrainRisk),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "the port is taken: {err}");
+    assert!(
+        matches!(a.state(), NodeState::Failed { .. }),
+        "{:?}",
+        a.state()
+    );
+    drop(taken);
+    a.reopen().await.unwrap();
+    assert_eq!(a.state(), fenced, "the consent was not reused");
 }

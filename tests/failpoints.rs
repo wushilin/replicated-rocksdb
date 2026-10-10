@@ -1992,3 +1992,86 @@ async fn a_rejoin_failing_after_the_rewrite_fails_the_node() {
     .await;
     scenario.teardown();
 }
+
+/// Fix round 1 of Task 6: a finished bootstrap leaves `Bootstrapping` when it commits, before
+/// the first Tail answer (here held back), so `wait_for_seq` never returns into a slave that
+/// still reports a bootstrap (and would refuse promotion).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_bootstrap_no_longer_reports_bootstrapping() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let a = Master::open(c.master_config("a")).await.unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    a.put("c", b"k", b"v").unwrap();
+    fail::cfg("slave-before-tail-rpc", "pause").unwrap();
+    let (cfg, ld) = c.slave_config("b", a.serve_addr().unwrap());
+    let b = Slave::open(cfg).await.unwrap();
+    b.wait_for_seq(a.last_seq(), support::WAIT).await.unwrap();
+    assert_eq!(ld.bootstraps(), 1);
+    assert_eq!(b.status().state, SlaveState::Connecting);
+    assert_eq!(b.get("c", b"k").unwrap(), Some(b"v".to_vec()));
+    fail::remove("slave-before-tail-rpc");
+    wait_until("b streaming", || b.status().state == SlaveState::Streaming).await;
+    scenario.teardown();
+}
+
+/// Fix round 1 of Task 6: a promotion refused on the stopped store hands the slave back
+/// following the upstream it was repointed to, not the configured one (here a dead address):
+/// it finishes its replay from that upstream and converges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_promotion_refused_on_the_stopped_store_keeps_the_repointed_upstream() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (a, mut cfg, ld, fork, _) = diverged_slave_and_restored_master(&c).await;
+    for i in 0..3u8 {
+        a.put("c", &[100 + i], b"new").unwrap();
+    }
+    let s = a.last_seq();
+    let a_up = UpstreamConfig::from_addr(a.serve_addr().unwrap());
+    let a_uri = format!("http://{}", a.serve_addr().unwrap());
+    let dead = std::net::SocketAddr::from(([127, 0, 0, 1], support::reserved_port()));
+    cfg.upstream = UpstreamConfig::from_addr(dead);
+    let fetch = Gate::after(0);
+    fetch.install("slave-repair-before-fetch");
+    let _fetch = fetch.open_on_drop();
+    let promoting = Gate::after(0);
+    promoting.install("slave-promote-before-shutdown");
+    let _promoting = promoting.open_on_drop();
+    let d = Slave::open(cfg).await.unwrap();
+    // Polled once: the repoint adopts `a` (repairing with consent), then is dropped.
+    let repair = RepointOptions {
+        on_divergence: replicated_rocksdb::RepointDivergence::Repair {
+            accept_loss: replicated_rocksdb::AcceptDataLoss,
+        },
+    };
+    assert!(
+        tokio::time::timeout(Duration::ZERO, d.repoint(a_up.clone(), repair))
+            .await
+            .is_err()
+    );
+    assert_eq!(d.status().upstream, a_uri);
+    wait_until("the repair's network phase", || fetch.reached()).await;
+    let promotion = tokio::spawn(d.promote_checked(c.master_config("d"), &[]));
+    wait_until("the promotion passed its checks", || promoting.reached()).await;
+    fail::cfg("slave-repair-after-rewind", "1*return").unwrap();
+    fetch.open();
+    fail::remove("slave-repair-before-fetch");
+    wait_until("rewound", || ld.rewinds() == 1).await;
+    promoting.open();
+    fail::remove("slave-promote-before-shutdown");
+    let refused = match promotion.await.unwrap() {
+        Ok(_) => panic!("a mixed state was promoted"),
+        Err(r) => r,
+    };
+    assert!(
+        matches!(refused.error, Error::Config(ref m) if m.contains("repair")),
+        "{:?}",
+        refused.error
+    );
+    fail::remove("slave-repair-after-rewind");
+    let d = refused.into_slave().expect("reopened and handed back");
+    assert_eq!(d.status().upstream, a_uri, "still the repointed upstream");
+    assert!(d.last_seq() >= fork - 1 && d.last_seq() <= s);
+    assert_converged(&a, &[("d", &d)]).await;
+    scenario.teardown();
+}
