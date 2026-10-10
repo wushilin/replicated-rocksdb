@@ -287,17 +287,25 @@ impl ReplicaRegistry {
     ) -> Vec<ReplicaStatus> {
         let epoch = src.identity().map_or(0, |(id, _)| id.epoch);
         let last = src.store().position().last_seq;
-        let mut out: Vec<ReplicaStatus> = self
+        // Copy what is needed under the registry's locks, then read the log without them.
+        let streams: Vec<(Arc<ReplicaCell>, Seq, Seq, bool)> = self
             .streams()
             .values()
             .map(|c| {
                 let p = c.progress();
-                let lag_entries = last.saturating_sub(p.applied_seq);
+                let in_sync = p.in_sync(c.epoch, epoch, lag_max);
+                (c.clone(), p.sent_seq, p.applied_seq, in_sync)
+            })
+            .collect();
+        let mut out: Vec<ReplicaStatus> = streams
+            .into_iter()
+            .map(|(c, sent_seq, applied_seq, in_sync)| {
+                let lag_entries = last.saturating_sub(applied_seq);
                 let lag_ms = if lag_entries == 0 {
                     Some(0)
                 } else {
                     src.store()
-                        .read_entries(p.applied_seq + 1, 1, usize::MAX)
+                        .read_entries(applied_seq + 1, 1, usize::MAX)
                         .ok()
                         .and_then(|v| v.first().map(|e| now_ms.saturating_sub(e.ts_ms)))
                 };
@@ -307,11 +315,11 @@ impl ReplicaRegistry {
                     peer_verified: c.peer_verified,
                     epoch: c.epoch,
                     connected_since: c.connected_since,
-                    sent_seq: p.sent_seq,
-                    applied_seq: p.applied_seq,
+                    sent_seq,
+                    applied_seq,
                     lag_entries,
                     lag_ms,
-                    in_sync: p.in_sync(c.epoch, epoch, lag_max),
+                    in_sync,
                     fetch: c.fetch,
                 }
             })

@@ -19,6 +19,13 @@ pub struct ReapStats {
 
 impl Inner {
     pub(crate) fn reap_round(&self) -> Result<ReapStats> {
+        let _span = tracing::info_span!(
+            "reaper",
+            node_id = %self.cfg.identifier,
+            seq = self.store.position().last_seq,
+            epoch = self.identity().epoch,
+        )
+        .entered();
         let cfg = &self.cfg.reaper;
         let mut stats = ReapStats::default();
         let mut resume: Option<Vec<u8>> = None;

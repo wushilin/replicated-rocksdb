@@ -56,7 +56,11 @@ pub(super) async fn tail(
     // Subscribe before validating, so a reset after validation is never missed.
     let mut resets = src.resets();
     resets.borrow_and_update();
-    let junction = validate(&*src, &r)?;
+    // `validate` reads the log (the CRC at `from_seq - 1`): a blocking thread.
+    let (s, req) = (src.clone(), r.clone());
+    let junction = tokio::task::spawn_blocking(move || validate(&*s, &req))
+        .await
+        .map_err(|e| internal_status(format!("tail validation failed: {e}")))??;
     state.expire_leases(std::time::Instant::now());
     let lease = r
         .bootstrap_lease
@@ -440,8 +444,14 @@ async fn produce(
         // before anything is sent (PROTOCOL.md §7.2, §7.3).
         if let Some(j) = junction.filter(|j| j.seq <= last) {
             junction = None;
-            if let Err(status) = check_junction(&*src, j) {
-                return out.end(status).await;
+            let s = src.clone();
+            match tokio::task::spawn_blocking(move || check_junction(&*s, j)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(status)) => return out.end(status).await,
+                Err(e) => {
+                    let status = internal_status(format!("junction check failed: {e}"));
+                    return out.end(status).await;
+                }
             }
         }
         // Read ahead everything that is available (in blocks of READ_BATCH).

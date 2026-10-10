@@ -778,7 +778,8 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 
 ## 19. Observability
 
-- **`tracing` spans** for each handshake, bootstrap, verify session and reaper round, with `node_id`, `upstream`, `seq` and `epoch` fields. Each applied entry is logged at `trace` level only.
+- **`tracing` spans** named `handshake`, `bootstrap`, `verify` and `reaper`, with fields `node_id` (this node), `upstream` (this node's upstream; absent on the master), `seq` and `epoch` (when known). Both ends of a handshake, bootstrap and verify session open one; the server's also carry `client`, and `verify` carries `mode`. Each applied entry is logged at `trace` level only.
+- `SlaveStatus` carries `lag_ms` and `last_verify` (§16).
 - **Status APIs** (`Slave::status`, `Master::replicas`, `Slave::replicas`, `ReplicaStatus`, the `Status` RPC) are the source for metrics. The crate does not depend on a metrics library. A recommended set for applications to export:
   - `applied_seq`, `origin_last_seq`, lag in seqs and `lag_ms`;
   - state (with halt reason), reconnects, bootstraps;

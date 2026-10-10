@@ -250,13 +250,29 @@ impl Replication for Svc {
                 .map_err(|_| net::invalid_argument("known_identity.db_uuid must be 16 bytes"))?;
         }
         handshake::check_known_epochs(&r).map_err(net::invalid_argument)?;
-        let view = server_view(&*src, r.last_seq)?;
+        // `server_view` reads the log (the CRC at the client's last seq): a blocking thread.
+        let (s, client_last) = (src.clone(), r.last_seq);
+        let view = tokio::task::spawn_blocking(move || server_view(&*s, client_last))
+            .await
+            .map_err(|e| net::internal_status(format!("handshake task failed: {e}")))??;
         let v = handshake::decide(&view, &r);
-        tracing::info!(
-            server = %view.server_id, client = %r.client_id, last_seq = r.last_seq,
-            decision = v.decision.as_str_name(), reason = v.reason.as_str_name(), detail = %v.detail,
-            "handshake"
+        let span = tracing::info_span!(
+            "handshake",
+            node_id = %view.server_id,
+            upstream = view.upstream_chain.first().map(String::as_str),
+            client = %r.client_id,
+            seq = view.last_seq,
+            epoch = view.identity.map(|id| id.epoch),
         );
+        span.in_scope(|| {
+            tracing::info!(
+                client_last_seq = r.last_seq,
+                decision = v.decision.as_str_name(),
+                reason = v.reason.as_str_name(),
+                detail = %v.detail,
+                "handshake"
+            )
+        });
         let identity = view.identity.filter(|_| v.reason != pb::Reason::NotReady);
         Ok(Response::new(pb::HandshakeResponse {
             protocol_version: PROTOCOL_VERSION,
@@ -326,12 +342,14 @@ impl Replication for Svc {
         let r = req.into_inner();
         call.check_client_id(&r.client_id)?;
         let probes: Vec<Seq> = r.probe_seq.into_iter().collect();
-        let info = status::node_info(
-            &*src,
-            &self.0.replicas,
-            self.0.cfg.limits.replica_lag_time_max,
-            &probes,
-        );
+        // `node_info` reads the log and `__meta`: a blocking thread.
+        let replicas = self.0.replicas.clone();
+        let lag_max = self.0.cfg.limits.replica_lag_time_max;
+        let info = tokio::task::spawn_blocking(move || {
+            status::node_info(&*src, &replicas, lag_max, &probes)
+        })
+        .await
+        .map_err(|e| net::internal_status(format!("status task failed: {e}")))?;
         Ok(Response::new(status::to_pb(&info, r.probe_seq)))
     }
 

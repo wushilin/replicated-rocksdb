@@ -84,7 +84,16 @@ pub(super) async fn bootstrap(
             .unwrap_or(u64::MAX),
         epoch_history: epochs_to_pb(&meta.epoch_history),
     };
-    tracing::info!(client = %client_id, snapshot_seq = meta.last_seq, cfs = meta.cf_specs.len(), "serving bootstrap");
+    let chain = src.upstream_chain();
+    let span = tracing::info_span!(
+        "bootstrap",
+        node_id = %src.node_id(),
+        upstream = chain.first().map(String::as_str),
+        client = %client_id,
+        seq = meta.last_seq,
+        epoch = identity.epoch,
+    );
+    span.in_scope(|| tracing::info!(cfs = meta.cf_specs.len(), "serving bootstrap"));
     let (tx, rx) = mpsc::channel(CHANNEL);
     let job = Job {
         state: state.clone(),
@@ -101,6 +110,7 @@ pub(super) async fn bootstrap(
     let (mut stop, mut reset) = (state.shutdown.clone(), job.resets.clone());
     let runtime = job.runtime.clone();
     tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
         let (tx, end) = job.run();
         // The job, and with it the snapshot and (unless leased) the guard, is gone; only then
         // is the permit returned (`ServerHandle::shutdown` waits for all permits). A final

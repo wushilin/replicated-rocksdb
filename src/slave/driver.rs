@@ -10,6 +10,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::WatchStream;
+use tracing::Instrument;
 
 use tonic::Status;
 
@@ -254,10 +255,18 @@ async fn session(
             Err(e) => return SessionEnd::Retry(e.to_string()),
         },
     };
+    let req = handshake_request(inner);
+    let span = tracing::info_span!(
+        "handshake",
+        node_id = %inner.cfg.identifier,
+        upstream = %inner.upstream_uri(),
+        seq = req.last_seq,
+        epoch = req.known_identity.as_ref().map(|id| id.epoch),
+    );
     let hs = match unless_repointed(
         inner,
         generation,
-        c.clone().handshake(handshake_request(inner)),
+        c.clone().handshake(req).instrument(span.clone()),
     )
     .await
     {
@@ -312,6 +321,14 @@ async fn session(
             };
         }
     }
+    span.in_scope(|| {
+        tracing::info!(
+            decision = hs.decision().as_str_name(),
+            reason = hs.reason().as_str_name(),
+            ?action,
+            "handshake answered"
+        )
+    });
     // The retry arm of the driver loop logs the warning and sets `last_error`.
     let resumes = hs.decision() == pb::Decision::Resume && force != Force::Operator;
     if let Some(end) = contradicting_resume(after_stream_diverged, resumes) {
@@ -331,15 +348,29 @@ async fn session(
             }
             Err(end) => end,
         },
-        Action::Bootstrap => match bootstrap::install(inner, generation, &c, &hs).await {
-            Ok(lease) => {
-                // The bootstrap commit wrote `ready` itself.
-                inner.halt_clear_pending.store(false, Ordering::SeqCst);
-                inner.settle_repoint(generation, Ok(RepointOutcome::Bootstrapped));
-                tail(inner, generation, &c, &hs, Some(lease), backoff).await
+        Action::Bootstrap => {
+            // `seq` is the upstream's last_seq at the handshake; the snapshot seq is logged
+            // inside, when the header arrives.
+            let span = tracing::info_span!(
+                "bootstrap",
+                node_id = %inner.cfg.identifier,
+                upstream = %inner.upstream_uri(),
+                seq = hs.last_seq,
+                epoch = hs.identity.as_ref().map(|id| id.epoch),
+            );
+            match bootstrap::install(inner, generation, &c, &hs)
+                .instrument(span)
+                .await
+            {
+                Ok(lease) => {
+                    // The bootstrap commit wrote `ready` itself.
+                    inner.halt_clear_pending.store(false, Ordering::SeqCst);
+                    inner.settle_repoint(generation, Ok(RepointOutcome::Bootstrapped));
+                    tail(inner, generation, &c, &hs, Some(lease), backoff).await
+                }
+                Err(end) => end,
             }
-            Err(end) => end,
-        },
+        }
         Action::Halt(r) => SessionEnd::Halt(r),
         Action::Retry(m) => SessionEnd::Retry(m),
         Action::Again => SessionEnd::Again,
