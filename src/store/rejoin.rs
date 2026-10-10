@@ -274,6 +274,62 @@ mod tests {
         assert_eq!((r.identity.unwrap().epoch, r.burned), (1, Some(3)));
         let m = store.load_meta().unwrap().unwrap();
         assert_eq!(m.epoch_history, vec![rec(1, 1)]);
+        assert_eq!(m.max_burned_epoch, 3);
+    }
+
+    #[test]
+    fn a_newest_epoch_with_entries_trims_and_burns_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_uuid = uuid::Uuid::from_u128(7);
+        let store = open_store(dir.path());
+        apply(
+            &store,
+            vec![Op::CreateCf {
+                spec: CfSpec::new("c"),
+            }],
+        )
+        .unwrap();
+        let put = Op::Put {
+            cf: "c".into(),
+            key: b"a".to_vec(),
+            value: vec![1],
+            expire_at_ms: Some(50),
+        };
+        apply(&store, vec![put]).unwrap();
+        let history = vec![rec(1, 1), rec(2, 2)];
+        let id = DbIdentity { db_uuid, epoch: 2 };
+        store
+            .write_meta(
+                &[
+                    (key::ORIGIN_IDENTITY, &meta::encode_identity(&id)),
+                    (key::EPOCH_HISTORY, &meta::encode_epoch_history(&history)),
+                ],
+                true,
+            )
+            .unwrap();
+        let c = CfEntry {
+            spec: CfSpec::new("c"),
+            create_seq: 1,
+        };
+        store
+            .db()
+            .put_cf(&store.cf(CF_TTL_INDEX), index_key(50, &c, b"a"), [])
+            .unwrap();
+        let before = store.load_meta().unwrap().unwrap().max_burned_epoch;
+        let r = store.rejoin_as_slave().unwrap();
+        assert_eq!((r.identity, r.burned), (Some(id), None));
+        let m = store.load_meta().unwrap().unwrap();
+        assert_eq!(m.role, Role::Slave);
+        assert_eq!(m.identity, Some(id));
+        assert_eq!(m.epoch_history, history);
+        assert_eq!(m.max_burned_epoch, before);
+        assert!(
+            store
+                .db()
+                .iterator_cf(&store.cf(CF_TTL_INDEX), IteratorMode::Start)
+                .next()
+                .is_none()
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use super::meta::{CF_META, MetaSnapshot};
 use crate::error::Result;
 
 /// The stored `__meta` of the database at `path`, read through a read-only open (no LOCK, no
-/// write). `None` when there is no database or it never stored a role (missing directory,
+/// data write; RocksDB may still touch its info LOG). `None` when there is no database or it never stored a role (missing directory,
 /// empty directory, or a crash during first creation).
 pub(crate) fn stored_meta(path: &Path) -> Result<Option<MetaSnapshot>> {
     if !path.join("CURRENT").exists() {

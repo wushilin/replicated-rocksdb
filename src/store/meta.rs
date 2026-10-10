@@ -26,7 +26,9 @@ pub(crate) mod key {
     pub const NODE_STATE: &[u8] = b"node_state";
     pub const MAX_ENTRY_BYTES: &[u8] = b"max_entry_bytes";
     pub const BOOTSTRAP_CFS: &[u8] = b"bootstrap_cfs";
-    /// The highest epoch number this node ever started and then gave up (`Master::demote`, or the empty trailing epochs `Slave::rejoin` drops). A later promotion of this node never reuses it.
+    /// The highest epoch number this node ever started and then gave up (`Master::demote`, or
+    /// the empty trailing epochs `Slave::rejoin` drops). A later promotion of this node never
+    /// reuses it.
     pub const MAX_BURNED_EPOCH: &[u8] = b"max_burned_epoch";
     /// Master that was promoted: how many epoch records its history held before the promotion
     /// (so `demote` can remove every record added since, including per-open epochs).
