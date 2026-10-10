@@ -83,12 +83,13 @@ pub enum Error {
         seq: Seq,
         diverged: Vec<(String, Seq)>,
     },
-    /// `promote_checked` found a reachable peer that is at least as far by position (newest
-    /// epoch, then `last_seq`) but whose compatibility cannot be proven, because the entry that
-    /// would prove it is no longer held. Plain `promote` remains available as an explicit
-    /// operator decision. `diverged` as for `NotMostAdvanced`.
+    /// `promote_checked` reached a peer that answered `Status` with an error (permission
+    /// denied, throttled, another protocol, ...): it is alive and its state is unknown, so it
+    /// may be ahead. `peer` holds its address and the error, `seq` is 0. Plain `promote`
+    /// remains available as an explicit operator decision. `diverged` as for
+    /// `NotMostAdvanced`.
     #[error(
-        "{peer} (last_seq {seq}) is at least as far and its history cannot be verified; promote explicitly if intended (diverged peers: {diverged:?})"
+        "{peer} answered Status with an error, so its state is unknown; promote explicitly if intended (diverged peers: {diverged:?})"
     )]
     PromotionUnverifiable {
         peer: String,

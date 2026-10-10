@@ -234,14 +234,16 @@ offset  size  field
 ```proto
 message Identity   { bytes db_uuid = 1; uint64 epoch = 2; }   // db_uuid: 16 bytes, RFC 9562 UUID
 message CfSpec     { string name = 1; optional string comparator = 2; uint64 create_seq = 3; }
-message EpochStart { uint64 epoch = 1; uint64 start_seq = 2; }
+message EpochStart { uint64 epoch = 1; uint64 start_seq = 2; uint64 nonce = 3; }
 ```
 
 Two identities are equal when both `db_uuid` and `epoch` are equal. In every message that carries a list of `CfSpec`, the list is sorted by `name`, compared as bytes in ascending order.
 
 #### Epoch history
 
-The **epoch history** of a database is the list of `EpochStart { epoch, start_seq }` records, one per epoch, sorted by `epoch` ascending. The first record is always `{1, 1}`. A new epoch starts when the master bumps its epoch (for example after a restore) or when a replica is promoted to master (§6.4). The new record's `start_seq` is the seq of the first entry written in the new epoch, which is the node's `last_seq + 1` at that moment.
+The **epoch history** of a database is the list of `EpochStart { epoch, start_seq, nonce }` records, one per epoch, sorted by `epoch` ascending. The first record is always `{1, 1, n}`. A new epoch starts **every time a master opens an existing database**, when the master bumps its epoch, and when a replica is promoted to master (§6.4). The new record's `start_seq` is the seq of the first entry written in the new epoch, which is the node's `last_seq + 1` at that moment; an epoch that took no writes shares its `start_seq` with the next one. Within one epoch there is exactly one writer process, so two histories can only differ from the start of an epoch on.
+
+`nonce` is a random 64-bit value chosen when the epoch starts. It never takes part in ordering: which of two nodes is later is decided by the epoch number, then `last_seq`. It only decides **identity**: two records with the same `epoch` are the same epoch if and only if their nonces are equal (their `start_seq`s are then equal too). Two histories that hold the same epoch number with different nonces forked at the lower of the two `start_seq`s. (A restored backup that opens and starts epoch `e` again, or two promotions that chose the same number, are told apart this way.)
 
 - `epoch_for(seq)` is the `epoch` of the last record whose `start_seq ≤ seq`. Every entry MUST satisfy `entry.epoch == epoch_for(entry.seq)`.
 - The **fork point after epoch e**, `fork(e)`, is the `start_seq` of the first record whose `epoch > e`, or "none" if there is no such record. Entries with seq `< fork(e)` are shared by every history that contains epoch `e`. Entries at or after `fork(e)` may differ.
@@ -264,7 +266,7 @@ rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
 | `known_identity` | The origin identity the client has data for. Absent if the client has no data. |
 | `last_seq` | The client's `last_seq` (0 if it has no data). |
 | `last_crc32c` | The `crc32c` of the client's entry at `last_seq`, if known. Used to detect divergence. |
-| `known_epoch_start` | The `start_seq` of the record for `known_identity.epoch` in the client's epoch history. Absent if the client has no data. A client with data SHOULD send it: two histories can carry the same epoch *number* with different start seqs (two promotions that chose the same number), and only this field lets the server tell them apart (§6.3). |
+| `known_epochs` | The client's newest epoch records (`epoch`, `start_seq`, `nonce`; §5.5), oldest first and ending with its record of `known_identity.epoch`: the last 5, or all of them when its history is shorter. Empty if the client has no data. A client with data SHOULD send them: they let the server tell apart two epochs with the same number (§6.3) and prove continuity across an epoch change from the history alone, without any entry. A list that does not end with `known_identity.epoch` is ignored. Field 7 (formerly `known_epoch_start`) is reserved. |
 
 ### 6.2 Response
 
@@ -285,10 +287,11 @@ rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
 
 Two derived values are used by rules 8–10:
 
-- The client's epoch is **changed** when `known_identity.epoch < identity.epoch`, or when `known_identity.epoch = identity.epoch`, `known_epoch_start` is present and differs from the `start_seq` of the server's record for that epoch. In the second case the two histories share the epoch number but not the epoch: the client follows another promotion that happened to choose the same number, and it is treated exactly like an older epoch.
-- The **client fork** `cfork` is `fork(known_identity.epoch)` in the server's history, lowered to `min(known_epoch_start, start_seq of the server's record for known_identity.epoch)` when `known_epoch_start` is present and the server has no record of that epoch with that `start_seq` (if the server has no record of the epoch at all, the server's side of the minimum is omitted). Entries before `cfork` are shared; entries at or after it may differ. `cfork` is "none" only when the epoch is changed and the server's history has no later epoch and no differing start, which is an inconsistent history.
+- The client's epoch is **changed** when `known_identity.epoch < identity.epoch`, or when `known_identity.epoch = identity.epoch` and one of the records in `known_epochs` is not in the server's history (another `start_seq` or another `nonce`, or a number the server never had). In the second case the two histories share the epoch number but not the epoch (a restored backup that started the number again, or another promotion that chose it), and the client is treated exactly like one of an older epoch.
+- The **client fork** `cfork` is `fork(known_identity.epoch)` in the server's history, lowered, for every record of `known_epochs` that is not in the server's history, to `min(its start_seq, start_seq of the server's record of the same number)` (if the server has no record of that number, the server's side of the minimum is omitted). Entries before `cfork` are shared; entries at or after it may differ. `cfork` is "none" only when the epoch is changed and the server's history has no later epoch and no differing record, which is an inconsistent history.
+- **Continuity is proven by the history** when every record of `known_epochs` is in the server's history (same `epoch`, `start_seq` and `nonce`): every entry before `cfork` was written by the same processes on both sides.
 
-The server evaluates these rules **in order** and applies the first that matches:
+The server evaluates these rules **in order** (rule 10a before rule 9) and applies the first that matches:
 
 | # | Condition | `decision` | `reason` |
 |---|---|---|---|
@@ -300,9 +303,9 @@ The server evaluates these rules **in order** and applies the first that matches
 | 6 | `known_identity.db_uuid ≠ identity.db_uuid` | `BOOTSTRAP` | `IDENTITY_CHANGED` |
 | 7 | `known_identity.epoch > identity.epoch` | `REJECT` | `STALE_EPOCH` |
 | 8 | The client's epoch is changed and `last_seq ≥ cfork` (or `cfork` is none) | `REJECT` | `DIVERGED` |
-| 9 | The client's epoch is changed, the server holds entry `last_seq`, and its `crc32c` equals `last_crc32c` | `RESUME` | `EPOCH_ADVANCED` |
-| 10a | The client's epoch is changed, `last_crc32c` is present, the server holds entry `last_seq`, and its `crc32c` differs | `REJECT` | `DIVERGED` |
-| 10b | The client's epoch is changed (continuity cannot be proven: the entry is not held, or `last_crc32c` is absent) | `BOOTSTRAP` | `IDENTITY_CHANGED` |
+| 9 | The client's epoch is changed and continuity is proven: by the history (every record of `known_epochs` is in the server's history), or because the server holds entry `last_seq` and its `crc32c` equals `last_crc32c` | `RESUME` | `EPOCH_ADVANCED` |
+| 10a | The client's epoch is changed, `last_crc32c` is present, the server holds entry `last_seq`, and its `crc32c` differs (checked before rule 9) | `REJECT` | `DIVERGED` |
+| 10b | The client's epoch is changed (continuity cannot be proven: `known_epochs` is empty, and the entry is not held or `last_crc32c` is absent) | `BOOTSTRAP` | `IDENTITY_CHANGED` |
 | 11 | `last_seq > server.last_seq` and the server is the master | `REJECT` | `DIVERGED` |
 | 12 | `last_crc32c` present, the server still holds entry `last_seq`, and its `crc32c` differs | `REJECT` | `DIVERGED` |
 | 13 | `last_seq + 1 < first_retained_seq` | `BOOTSTRAP` | `LOG_GAP` |
@@ -311,9 +314,9 @@ The server evaluates these rules **in order** and applies the first that matches
 Notes:
 
 - **Rule 7.** The client follows a newer epoch than the server. Following the server would mix histories. Either the server is a replica that has not yet learned the new epoch (temporary), or it is an old master that came back after a promotion (permanent). The client backs off and retries (§11.2).
-- **Rules 8–10, epoch continuity.** After an epoch bump or a promotion, a replica of an older epoch can keep its data if its history is a prefix of the server's. That holds when its last entry comes before the fork point and the server holds the same entry, proven by `crc32c`. Such a client continues without a bootstrap (`EPOCH_ADVANCED`): it adopts the server's identity and history, which replaces its own record of a same-numbered epoch. A client that has entries at or past the fork point holds writes the new history does not have (`DIVERGED`), and so does a client whose last entry is held by the server with a different `crc32c` (rule 10a: the mismatch is proven). Only when the needed entry is not held (trimmed, or before the server's bootstrap) or the client sent no `last_crc32c` is continuity unprovable, and the client is treated as having a changed identity (rule 10b).
-- **Same epoch number, different start (`known_epoch_start`).** Epoch numbers are not globally coordinated: a promotion that was undone (`demote`) may have handed its number to replicas that followed it, and another node may later start the same number at another seq. Without `known_epoch_start` such a client would get a plain `RESUME` (equal identities) and then receive entries whose epoch contradicts its history. With it, the server sees that the epochs differ and applies rules 8–10 with the fork at the lower of the two start seqs. A server that receives no `known_epoch_start` compares identities only.
-- **Rule 11.** The master commits with fsync, so a replica can never be ahead of it legitimately. If one is, the master has lost history, typically because it was restored from a backup without an epoch bump. Accepting the replica would let the same seq carry different writes on different nodes.
+- **Rules 8–10, epoch continuity.** After a master restart, an epoch bump or a promotion, a replica of an older epoch can keep its data if its history is a prefix of the server's. That holds when its last entry comes before the fork point and its newest records (`known_epochs`), nonces included, are in the server's history: both sides then hold entries written by the same processes. Such a client continues without a bootstrap (`EPOCH_ADVANCED`), even when the server no longer holds the client's last entry: it adopts the server's identity and history, which replaces its own record of a same-numbered epoch. Entry CRCs are a second line of defence: a client whose last entry is held by the server with a different `crc32c` is `DIVERGED` (rule 10a, checked first), and a client that sent no `known_epochs` can still prove continuity by CRC (rule 9). A client that has entries at or past the fork point holds writes the new history does not have (`DIVERGED`). Only a client without `known_epochs` whose entry cannot be compared is treated as having a changed identity (rule 10b).
+- **Same epoch number, another epoch (`known_epochs`).** Epoch numbers are not globally coordinated: a master restored from a backup starts again a number its replicas may already have followed past the restore point, a promotion that was undone (`demote`) may have handed its number to replicas that followed it, and another node may later start the same number. Without `known_epochs` such a client would get a plain `RESUME` (equal identities) and then receive entries whose epoch contradicts its history. With them, the server sees that a record differs (start seq or nonce) and applies rules 8–10 with the fork at the lower of the two start seqs; comparing up to five records also catches histories that forked at an older epoch and later reached the same numbers. A server that receives no `known_epochs` compares identities only.
+- **Rule 11.** The master commits with fsync, so a replica can never be ahead of it legitimately. If one is, the master has lost history, typically because it was restored from a backup. Since every master open starts a new epoch, rule 8 normally catches this first; rule 11 remains as a backstop. Accepting the replica would let the same seq carry different writes on different nodes.
 - **Rule 14 with a replica server.** When the server is a replica, a client can legitimately be ahead of it: the server may have crashed after forwarding entries it had not yet flushed. The answer is still `RESUME`, and the client's Tail waits until the server catches up (§7.3).
 - **Rules 9, 10a and 12, and Tail's `prev_crc32c` check.** "The server holds entry `n`" includes the case where `n` is the server's own `last_seq` and the server knows that entry's `crc32c` from its own position, even if its log no longer contains the entry (right after the server bootstrapped, or after retention emptied its log).
 - `BOOTSTRAP` for `IDENTITY_CHANGED` or `LOG_GAP`, and `REJECT` for `DIVERGED`, are subject to the client's local policies (§11.2). The client may halt or bootstrap.
@@ -321,15 +324,15 @@ Notes:
 
 ### 6.4 Promotion (informative)
 
-A replica is promoted to master by an operator, after the old master has been stopped. The promoted node starts epoch `e' = 1 + max(highest epoch in its history, highest epoch it gave up by demoting, highest epoch reported by the peers it checked)`, appends `{e', last_seq + 1}` to its history, and begins accepting writes at `last_seq + 1`. Its identity keeps the same `db_uuid`. An epoch number SHOULD never be reused: a node that undoes a promotion remembers the number it gave up (`max_burned_epoch`, reported by `Status`), and promotion tooling chooses a number above every epoch any reachable peer reports (identity, every history record and `max_burned_epoch`). A promotion that checks no peers can still choose a number that some unreachable replica already holds; `known_epoch_start` (§6.3) then detects the clash.
+A replica is promoted to master by an operator, after the old master has been stopped. The promoted node starts epoch `e' = 1 + max(highest epoch in its history, highest epoch it gave up by demoting, highest epoch reported by the peers it checked)`, appends `{e', last_seq + 1, fresh nonce}` to its history, and begins accepting writes at `last_seq + 1`. Its identity keeps the same `db_uuid`. An epoch number SHOULD never be reused: a node that undoes a promotion remembers the number it gave up (`max_burned_epoch`, reported by `Status`), and promotion tooling chooses a number above every epoch any reachable peer reports (identity, every history record and `max_burned_epoch`). A promotion that checks no peers can still choose a number that some unreachable replica already holds; `known_epochs` (§6.3) then detects the clash by its nonce.
 
 Other replicas are then pointed at the new master, directly or through a chain. Under §6.3:
 
 - Replicas at or behind the promoted node's `last_seq`, with matching entries, continue at once (rule 9).
 - Replicas that had received entries the promoted node never saw are at or past the fork point and get `DIVERGED` (rule 8). Their divergence policy decides whether they halt or bootstrap. When an operator explicitly re-points a replica, an implementation SHOULD NOT discard its divergent entries without an explicit confirmation.
-- The old master, if restarted and asked by a new-epoch replica, answers `STALE_EPOCH` (rule 7). It can rejoin only as a new replica with an empty directory.
+- The old master, if restarted, starts an epoch of its own (§5.5). A new-epoch replica that asks it gets `STALE_EPOCH` (rule 7) when the old master's number is lower, and `DIVERGED` otherwise (its record of that number has another nonce, or the old master never had the replica's epoch). It can rejoin only as a new replica with an empty directory.
 
-The protocol cannot stop an operator from running two masters at once. If two nodes both start the same epoch number at different seqs, `known_epoch_start` makes the handshake treat them as different epochs (§6.3); if they start it at the same seq, rule 12 detects the divergence wherever the conflicting entry is still retained.
+The protocol cannot stop an operator from running two masters at once. If two nodes both start the same epoch number, their records differ by nonce (and possibly start seq), and `known_epochs` makes the handshake treat them as different epochs (§6.3), wherever the conflicting entries are, retained or not.
 
 ### 6.5 Status
 
@@ -718,7 +721,7 @@ service Replication {
 
 message Identity   { bytes db_uuid = 1; uint64 epoch = 2; }
 message CfSpec     { string name = 1; optional string comparator = 2; uint64 create_seq = 3; }
-message EpochStart { uint64 epoch = 1; uint64 start_seq = 2; }
+message EpochStart { uint64 epoch = 1; uint64 start_seq = 2; uint64 nonce = 3; }
 
 enum Reason {
   REASON_UNSPECIFIED = 0;
@@ -782,7 +785,8 @@ message HandshakeRequest {
   optional Identity known_identity = 4;
   uint64 last_seq                  = 5;
   optional fixed32 last_crc32c     = 6;
-  optional uint64 known_epoch_start = 7;  // start_seq of known_identity.epoch in the client's history
+  reserved 7;                              // was known_epoch_start
+  repeated EpochStart known_epochs = 8;   // the client's newest epoch records (up to 5), oldest first
 }
 
 message HandshakeResponse {
@@ -962,11 +966,11 @@ B → C  heartbeat · heartbeat · …                           (B re-fetches 8
 B → C  entry 901 · …
 ```
 
-**Master restored from backup without an epoch bump.**
+**Master restored from backup without an epoch bump.** Its open started epoch 2 at 4801.
 
 ```
-B → A  Handshake{known_identity:(U,1), last_seq: 5000}     A.last_seq = 4800
-A → B  {decision: REJECT, reason: DIVERGED}               (rule 11)
+B → A  Handshake{known_identity:(U,1), last_seq: 5000, known_epochs:[{1,1,n1}]}     A.last_seq = 4800
+A → B  {decision: REJECT, reason: DIVERGED}               (rule 8: 5000 ≥ fork(1) = 4801)
 B      halts Diverged; keeps serving reads at seq 5000
 ```
 
@@ -978,7 +982,8 @@ B → C  {decision: RESUME, reason: EPOCH_ADVANCED, identity:(U,2), epoch_histor
 C      persists identity (U,2) + history, then Tail{from_seq: 691}     (rule 9)
 D → B  Handshake{known_identity:(U,1), last_seq: 705}
 B → D  {decision: REJECT, reason: DIVERGED}                (rule 8: 705 ≥ fork(1) = 701)
-A → …  restarted old master: any (U,2) replica asking A gets STALE_EPOCH (rule 7)
+A → …  restarted old master: its open starts its own epoch 2 (another nonce); a replica of
+       B's epoch 2 asking A gets DIVERGED (rule 8), one of a later epoch STALE_EPOCH (rule 7)
 ```
 
 [RFC 2119]: https://www.rfc-editor.org/rfc/rfc2119

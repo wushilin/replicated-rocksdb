@@ -166,10 +166,7 @@ impl Inner {
             .max(id.epoch)
             + 1;
         let start = self.store.position().last_seq + 1;
-        history.push(EpochStart {
-            epoch: id.epoch,
-            start_seq: start,
-        });
+        history.push(EpochStart::fresh(id.epoch, start));
         let written = crate::failpoint::io_error("master-bump-epoch-write").and_then(|()| {
             self.store.write_meta(
                 &[

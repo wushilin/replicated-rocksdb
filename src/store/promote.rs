@@ -60,10 +60,7 @@ impl Store {
             .unwrap_or(old.epoch)
             .max(old.epoch);
         let epoch = own.max(m.max_burned_epoch).max(floor) + 1;
-        history.push(EpochStart {
-            epoch,
-            start_seq: m.last_seq + 1,
-        });
+        history.push(EpochStart::fresh(epoch, m.last_seq + 1));
         let identity = DbIdentity {
             db_uuid: old.db_uuid,
             epoch,
@@ -199,10 +196,12 @@ mod tests {
                 EpochStart {
                     epoch: 1,
                     start_seq: 1,
+                    nonce: 0,
                 },
                 EpochStart {
                     epoch: 2,
                     start_seq: 1,
+                    nonce: 0,
                 },
             ];
             store
@@ -262,11 +261,8 @@ mod tests {
         assert_eq!(m.role, Role::Master);
         assert_eq!(m.identity.unwrap().epoch, 3);
         assert_eq!(
-            m.epoch_history.last(),
-            Some(&EpochStart {
-                epoch: 3,
-                start_seq: 3
-            })
+            m.epoch_history.last().map(|e| (e.epoch, e.start_seq)),
+            Some((3, 3))
         );
         assert_eq!(
             m.last_ts, 2_000,
@@ -292,6 +288,7 @@ mod tests {
                     epoch_history: vec![EpochStart {
                         epoch: 1,
                         start_seq: 1,
+                        nonce: 0,
                     }],
                     cf_specs: vec![],
                     snapshot_seq: 0,
@@ -325,7 +322,8 @@ mod tests {
             m.epoch_history,
             vec![EpochStart {
                 epoch: 1,
-                start_seq: 1
+                start_seq: 1,
+                nonce: 0,
             }]
         );
         assert_eq!(m.last_seq, 1);
@@ -355,6 +353,7 @@ mod tests {
                     epoch_history: vec![EpochStart {
                         epoch: 1,
                         start_seq: 1,
+                        nonce: 0,
                     }],
                     cf_specs: vec![],
                     snapshot_seq: 0,

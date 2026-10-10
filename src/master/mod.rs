@@ -53,7 +53,23 @@ pub struct Master {
 
 impl Master {
     /// Opens or creates a master database. Must be called within a tokio runtime.
+    ///
+    /// Every open of an existing database starts a new epoch (a fresh nonce, starting at
+    /// `last_seq + 1`) before the replication port opens: within one epoch there is exactly
+    /// one writer process, so two histories can only differ from an epoch's start on, and a
+    /// database restored from a backup is told apart from the history its replicas followed
+    /// (DESIGN.md §13). Replicas continue across the restart with `EPOCH_ADVANCED`.
     pub async fn open(cfg: MasterConfig) -> Result<Self> {
+        Self::open_with(cfg, true).await
+    }
+
+    /// Opens a database that a promotion just turned into a master: the promotion already
+    /// started its epoch.
+    pub(crate) async fn open_promoted(cfg: MasterConfig) -> Result<Self> {
+        Self::open_with(cfg, false).await
+    }
+
+    async fn open_with(cfg: MasterConfig, new_epoch: bool) -> Result<Self> {
         cfg.validate()?;
         let (store, meta) = Store::open(&cfg.path, Role::Master, cfg.rocksdb.clone())?;
         let mut fresh = false;
@@ -69,10 +85,7 @@ impl Master {
                     db_uuid: uuid::Uuid::new_v4(),
                     epoch: 1,
                 };
-                let history = vec![EpochStart {
-                    epoch: 1,
-                    start_seq: 1,
-                }];
+                let history = vec![EpochStart::fresh(1, 1)];
                 store.write_meta(
                     &[
                         (key::ORIGIN_IDENTITY, &meta::encode_identity(&id)),
@@ -84,12 +97,11 @@ impl Master {
                 (id, history)
             }
         };
-        let bump = cfg.bump_epoch_on_open;
         let inner = Arc::new(Inner::new(store, cfg, meta.last_ts, identity, history));
-        if bump && !fresh {
+        if new_epoch && !fresh {
             inner.bump_epoch()?;
         }
-        // The epoch bump above happens before the replication port opens (DESIGN.md §13).
+        // The new epoch above starts before the replication port opens (DESIGN.md §13).
         let server =
             crate::server::start_for(&inner, inner.cfg.serve.clone(), inner.replicas.clone())
                 .await?;

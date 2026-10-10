@@ -202,7 +202,7 @@ async fn bootstrap_lease_survives_aggressive_retention() {
 }
 
 /// A failed epoch bump fences the master's writer until reopen (the durability of the bump
-/// is unknown); the reopened master is at the old epoch and accepts writes.
+/// is unknown); the reopened master starts the next epoch and accepts writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_epoch_bump_fences_the_master_writer() {
     let (_serial, scenario) = serial().await;
@@ -223,8 +223,10 @@ async fn a_failed_epoch_bump_fences_the_master_writer() {
     ));
     assert_eq!(m.identity().epoch, 1);
     m.shutdown().await.unwrap();
+    // The failed bump persisted nothing: the reopen starts epoch 2 (every open starts one).
     let m = Master::open(c.master_config("a")).await.unwrap();
-    assert_eq!(m.identity().epoch, 1);
+    assert_eq!(m.identity().epoch, 2);
+    assert_eq!(m.epoch_history().len(), 2);
     assert_eq!(m.put("c", b"k", b"v").unwrap(), 2);
     scenario.teardown();
 }

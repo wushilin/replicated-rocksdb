@@ -70,6 +70,7 @@ pub(crate) fn encode_epoch_history(h: &[EpochStart]) -> Vec<u8> {
         .map(|e| pb::EpochStart {
             epoch: e.epoch,
             start_seq: e.start_seq,
+            nonce: e.nonce,
         })
         .collect();
     local::EpochHistory { epochs }.encode_to_vec()
@@ -83,6 +84,7 @@ pub(crate) fn decode_epoch_history(b: &[u8]) -> Result<Vec<EpochStart>> {
         .map(|e| EpochStart {
             epoch: e.epoch,
             start_seq: e.start_seq,
+            nonce: e.nonce,
         })
         .collect())
 }

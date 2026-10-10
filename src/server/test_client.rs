@@ -190,7 +190,7 @@ pub(crate) fn hello(client_id: &str) -> pb::HandshakeRequest {
         known_identity: None,
         last_seq: 0,
         last_crc32c: None,
-        known_epoch_start: None,
+        known_epochs: Vec::new(),
     }
 }
 

@@ -13,7 +13,7 @@ use crate::auth::{AllowMethods, Method, TokenAuthenticator};
 use crate::codec::digest::Digest;
 use crate::codec::{PROTOCOL_VERSION, envelope};
 use crate::log::LogApi;
-use crate::net::convert::identity_to_pb;
+use crate::net::convert::{epochs_to_pb, identity_to_pb};
 use crate::net::reason_of;
 use crate::pb;
 use crate::pb::bootstrap_chunk::Kind as Chunk;
@@ -46,12 +46,10 @@ async fn handshake_reports_the_master_state() {
         (pb::Decision::Bootstrap, pb::Reason::NoLocalState)
     );
     assert_eq!(r.identity, Some(identity_to_pb(&m.identity())));
+    assert_eq!(r.epoch_history, epochs_to_pb(&m.epoch_history()));
     assert_eq!(
-        r.epoch_history,
-        vec![pb::EpochStart {
-            epoch: 1,
-            start_seq: 1
-        }]
+        (r.epoch_history[0].epoch, r.epoch_history[0].start_seq),
+        (1, 1)
     );
     assert_eq!(
         (r.first_retained_seq, r.last_seq, r.origin_last_seq),

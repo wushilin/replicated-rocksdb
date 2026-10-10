@@ -138,8 +138,9 @@ async fn identity_change_with_rebootstrap_policy_converges_directly() {
     assert!(b.list_cfs().iter().all(|s| s.name != "old"));
 }
 
-/// A master restored from an older backup without an epoch bump: a slave that is ahead is
-/// DIVERGED (rule 11) and halts by default, or re-bootstraps with `DivergencePolicy::Rebootstrap`.
+/// A master restored from an older backup without an epoch bump: its open starts a new epoch at
+/// the restore point, so a slave that holds entries past it is DIVERGED (rule 8) and halts by
+/// default, or re-bootstraps with `DivergencePolicy::Rebootstrap`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn master_restored_without_epoch_bump_makes_ahead_slaves_diverge() {
     let c = Cluster::new();
@@ -278,5 +279,51 @@ async fn missing_comparator_halts_until_registered_and_cleared() {
         keys,
         vec![b"b".to_vec(), b"a".to_vec()],
         "reverse order on the slave too"
+    );
+}
+
+/// Addendum §7: a restore without `bump_epoch_on_open` is detected by the epoch history alone.
+/// The restored master writes past the slave's position (so rule 11 does not apply) and trims
+/// the slave's last entry (so no CRC can be compared): only the new epoch its open started
+/// tells the histories apart. Before per-open epochs this resumed silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_without_a_bump_is_diverged_by_the_history_alone() {
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    m.put("c", b"k", b"1").unwrap();
+    let m = c.restart_master_after_backup(m, "a", "a-backup").await;
+    let (s, _) = c.slave("s", m.serve_addr().unwrap()).await;
+    for i in 0..3u8 {
+        m.put("c", &[i], b"lost").unwrap();
+    }
+    assert_converged(&m, &[("s", &s)]).await;
+    let s_last = s.last_seq();
+    let s_cfg = c.slave_config("s", m.serve_addr().unwrap()).0;
+    s.shutdown().await.unwrap();
+    let port = m.serve_addr().unwrap().port();
+    m.shutdown().await.unwrap();
+
+    restore_dir(&c.path("a-backup"), &c.path("a"));
+    let mut mcfg = c.master_config("a");
+    mcfg.serve.as_mut().unwrap().port = port;
+    mcfg.retention.max_entries = Some(1);
+    mcfg.retention.check_interval = Duration::from_millis(20);
+    let m = Master::open(mcfg).await.unwrap();
+    for i in 0..10u8 {
+        m.put("c", &[i], b"new history").unwrap();
+    }
+    assert!(m.last_seq() > s_last);
+    wait_until("the restored master trims the slave's last entry", || {
+        m.first_retained_seq() > s_last
+    })
+    .await;
+
+    let s = Slave::open(s_cfg).await.unwrap();
+    wait_state(&s, "Diverged halt", halted(HaltReason::Diverged)).await;
+    assert_eq!(
+        s.get("c", &[0]).unwrap(),
+        Some(b"lost".to_vec()),
+        "data intact"
     );
 }

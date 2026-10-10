@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::listener::ReplicationListener;
 use crate::store::Store;
 use crate::store::meta::{MetaSnapshot, key};
-use crate::types::{DbIdentity, EpochStart, Seq};
+use crate::types::{DbIdentity, EpochStart, Seq, newest_records};
 
 /// A requested bootstrap, tagged with the repoint generation it was requested for. A request
 /// of an older generation (a session of the previous upstream still winding down) is inert:
@@ -171,6 +171,14 @@ impl Inner {
 
     pub(crate) fn set_ident(&self, v: Option<(DbIdentity, Vec<EpochStart>)>) {
         *self.ident.write().unwrap_or_else(PoisonError::into_inner) = v;
+    }
+
+    /// This slave's newest epoch records, up to the epoch it follows (at most
+    /// `KNOWN_EPOCHS`, oldest first; empty without data).
+    pub(crate) fn known_epochs(&self) -> Vec<EpochStart> {
+        self.ident()
+            .map(|(id, history)| newest_records(&history, id.epoch).to_vec())
+            .unwrap_or_default()
     }
 
     /// Readable and servable: the slave holds a consistent state at some seq.

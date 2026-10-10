@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use replicated_rocksdb::admin::{self, Comparison};
 use replicated_rocksdb::{
-    AllowAll, AllowMethods, CfSpec, DivergencePolicy, EpochStart, Error, HaltReason, LogApi,
-    Master, Method, Op, ReadApi, Role, Slave, SlaveState, UpstreamConfig,
+    AllowAll, AllowMethods, CfSpec, DivergencePolicy, Error, HaltReason, LogApi, Master, Method,
+    Op, ReadApi, Role, Slave, SlaveState, UpstreamConfig,
 };
 use support::{
     Cluster, assert_converged, check_edge_cases, wait_state, wait_until, write_edge_cases,
@@ -68,17 +68,11 @@ async fn promotion_end_to_end() {
     let b = b.promote(mcfg).await.unwrap();
     assert_eq!(b.identity().epoch, 2);
     assert_eq!(
-        b.epoch_history(),
-        vec![
-            EpochStart {
-                epoch: 1,
-                start_seq: 1
-            },
-            EpochStart {
-                epoch: 2,
-                start_seq: fork
-            }
-        ]
+        b.epoch_history()
+            .iter()
+            .map(|e| (e.epoch, e.start_seq))
+            .collect::<Vec<_>>(),
+        vec![(1, 1), (2, fork)]
     );
     let b_addr = b.serve_addr().unwrap();
 
@@ -158,6 +152,13 @@ async fn the_old_master_is_refused_with_stale_epoch_and_the_client_retries() {
     b.put("c", b"k", b"v").unwrap();
     assert_converged(&b, &[("c", &cn)]).await;
     assert_eq!(cn.status().origin_identity.unwrap().epoch, 2);
+    // A reopened old master starts an epoch of its own (here number 2, B's number, with
+    // another nonce: the handshake answers DIVERGED, see the handshake unit tests). B moves on to
+    // epoch 3, so the old master is behind by number: STALE_EPOCH.
+    b.bump_epoch().unwrap();
+    b.put("c", b"k1", b"v1").unwrap();
+    assert_converged(&b, &[("c", &cn)]).await;
+    assert_eq!(cn.status().origin_identity.unwrap().epoch, 3);
 
     // The old master comes back at its old address; C is (wrongly) pointed at it.
     let mut a_cfg = a_cfg;
@@ -298,7 +299,7 @@ async fn promote_checked_refuses_when_a_reachable_peer_is_later() {
     let a = c.master("a").await;
     let a_addr = a.serve_addr().unwrap();
     // B and C tail every entry, so C still holds B's last entry for the CRC probe. D joins
-    // later: it is bootstrapped past entry 1 and cannot prove it holds B's history.
+    // later: it is bootstrapped past entry 1 and does not hold it.
     let (b, _) = c.slave("b", a_addr).await;
     let (cn, _) = c.slave("c", a_addr).await;
     for (name, s) in [("b", &b), ("c", &cn)] {
@@ -325,16 +326,16 @@ async fn promote_checked_refuses_when_a_reachable_peer_is_later() {
     );
     // Refused by default: b comes back untouched and still running.
     let b = refused.into_slave().expect("a refusal returns the slave");
-    // D is ahead too, but its history cannot be verified (bootstrapped past B's last entry):
-    // refused as well, not treated as diverged and ignored.
+    // D is ahead too. It no longer holds B's last entry (bootstrapped past it), but the
+    // epoch histories (nonces included) prove it holds B's history: later, not unverifiable.
     let d_addr = UpstreamConfig::from_addr(d.serve_addr().unwrap());
     let refused = b
         .promote_checked(c.master_config("b"), std::slice::from_ref(&d_addr))
         .await
         .err()
-        .expect("d is unverifiable");
+        .expect("d is later");
     assert!(
-        matches!(&refused.error, Error::PromotionUnverifiable { peer, seq: 2, .. } if peer == "d"),
+        matches!(&refused.error, Error::NotMostAdvanced { leader, seq: 2, .. } if leader == "d"),
         "{refused}"
     );
     let b = refused.into_slave().expect("a refusal returns the slave");
@@ -362,7 +363,7 @@ async fn promote_checked_refuses_when_a_reachable_peer_is_later() {
         .await
         .unwrap();
     assert_eq!(check.unreachable.len(), 1);
-    assert!(check.diverged.is_empty() && check.foreign.is_empty() && check.unverifiable.is_empty());
+    assert!(check.diverged.is_empty() && check.foreign.is_empty());
     let new_master = cn
         .promote_checked(c.master_config("c"), &[UpstreamConfig::from_addr(a_addr)])
         .await
@@ -706,11 +707,11 @@ async fn wrong_promotion_followed_then_undone(
     let (w, _) = reopen(c, "w", a_addr, |_| {}).await;
     let w_master = w.promote(c.master_config("w")).await.unwrap();
     assert_eq!(
-        w_master.epoch_history().last(),
-        Some(&EpochStart {
-            epoch: 2,
-            start_seq: s_w + 1
-        })
+        w_master
+            .epoch_history()
+            .last()
+            .map(|e| (e.epoch, e.start_seq)),
+        Some((2, s_w + 1))
     );
     let (x, lx) = reopen(c, "x", w_master.serve_addr().unwrap(), |_| {}).await;
     wait_until("x adopts w's epoch", || {
@@ -727,11 +728,11 @@ async fn wrong_promotion_followed_then_undone(
         "the undone epoch is burned"
     );
     assert_eq!(
-        x.promotion_info().epoch_history.last(),
-        Some(&EpochStart {
-            epoch: 2,
-            start_seq: s_w + 1
-        })
+        x.promotion_info()
+            .epoch_history
+            .last()
+            .map(|e| (e.epoch, e.start_seq)),
+        Some((2, s_w + 1))
     );
     (w, x, r, lx, s_w)
 }
@@ -783,8 +784,8 @@ async fn promote_checked_never_reuses_a_burned_epoch_and_the_sibling_converges()
     drop(w);
 }
 
-/// Plain `promote` asks no peer and picks epoch 2 again (from another seq). The handshake's
-/// `known_epoch_start` tells the two epochs 2 apart: X is not resumed into a history that
+/// Plain `promote` asks no peer and picks epoch 2 again (from another seq, with another
+/// nonce). The handshake's `known_epochs` tells the two epochs 2 apart: X is not resumed into a history that
 /// contradicts its own (which looped every 50 ms before), it advances to R's epoch 2 and
 /// converges, or it would be refused DIVERGED had it held entries of W's epoch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -794,11 +795,8 @@ async fn a_reused_epoch_number_is_detected_by_its_start_seq() {
     let s_r = r.last_seq();
     let r = r.promote(c.master_config("r")).await.unwrap();
     assert_eq!(
-        r.epoch_history().last(),
-        Some(&EpochStart {
-            epoch: 2,
-            start_seq: s_r + 1
-        }),
+        r.epoch_history().last().map(|e| (e.epoch, e.start_seq)),
+        Some((2, s_r + 1)),
         "same number, other start"
     );
     assert_ne!(s_r, s_w);
@@ -860,5 +858,120 @@ async fn a_throttled_peer_blocks_a_checked_promotion() {
             assert!(peer.contains("too many failed authentication"), "{peer}");
         }
         other => panic!("expected PromotionUnverifiable, got {other:?}"),
+    }
+}
+
+/// Addendum §7: a peer that no longer holds the entry that would prove compatibility is still
+/// compared exactly, by its epoch history (nonces included). C is behind B and B has trimmed
+/// C's last entry: C does not block `promote_checked`, and then follows the new master
+/// without a bootstrap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trimmed_compatible_peer_does_not_block_a_checked_promotion() {
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    let a_addr = a.serve_addr().unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (b, _) = reopen(&c, "b", a_addr, |cfg| {
+        cfg.retention.max_entries = Some(5);
+        cfg.retention.check_interval = Duration::from_millis(20);
+    })
+    .await;
+    let (cn, _) = c.slave("c", a_addr).await;
+    for (name, s) in [("b", &b), ("c", &cn)] {
+        wait_state(s, name, |st| *st == SlaveState::Streaming).await;
+    }
+    a.put("c", b"seen by c", b"v").unwrap();
+    assert_converged(&a, &[("b", &b), ("c", &cn)]).await;
+    let c_last = cn.last_seq();
+    cn.shutdown().await.unwrap();
+    for i in 0..5u8 {
+        a.put("c", &[i], b"only b").unwrap();
+    }
+    assert_converged(&a, &[("b", &b)]).await;
+    wait_until("b keeps only the entries after c's last one", || {
+        b.first_retained_seq() == c_last + 1
+    })
+    .await;
+    a.shutdown().await.unwrap();
+
+    // C answers Status (its upstream is gone).
+    let (cn, lc) = reopen(&c, "c", a_addr, |_| {}).await;
+    let c_up = UpstreamConfig::from_addr(cn.serve_addr().unwrap());
+    let check = b
+        .check_promotion(std::slice::from_ref(&c_up))
+        .await
+        .unwrap();
+    assert!(
+        check.diverged.is_empty() && check.foreign.is_empty() && check.unreachable.is_empty(),
+        "{check:?}"
+    );
+    let b = b
+        .promote_checked(c.master_config("b"), std::slice::from_ref(&c_up))
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(
+        support::WAIT,
+        cn.repoint(
+            UpstreamConfig::from_addr(b.serve_addr().unwrap()),
+            replicated_rocksdb::RepointOptions::default(),
+        ),
+    )
+    .await
+    .expect("repoint settles")
+    .unwrap();
+    assert_eq!(outcome, replicated_rocksdb::RepointOutcome::EpochAdvanced);
+    b.put("c", b"after", b"v").unwrap();
+    assert_converged(&b, &[("c", &cn)]).await;
+    assert_eq!(lc.bootstraps(), 0, "the history proved continuity");
+}
+
+/// Addendum §7: B followed a master that was then restored from a backup. The restored
+/// master's open started epoch 2 again, with another nonce, and D bootstrapped from it past
+/// every entry B holds. The histories alone prove that D holds entries B's history lacks:
+/// promoting B would discard them (`PromotionWouldDiscard`), not "unverifiable".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_on_another_history_blocks_a_checked_promotion_without_its_entries() {
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    a.create_cf(CfSpec::new("c")).unwrap();
+    a.put("c", b"k", b"1").unwrap();
+    let a = c.restart_master_after_backup(a, "a", "a-backup").await;
+    let fork = a.last_seq() + 1;
+    let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
+    for i in 0..3u8 {
+        a.put("c", &[i], b"lost").unwrap();
+    }
+    assert_converged(&a, &[("b", &b)]).await;
+    b.shutdown().await.unwrap();
+    let port = a.serve_addr().unwrap().port();
+    a.shutdown().await.unwrap();
+
+    support::restore_dir(&c.path("a-backup"), &c.path("a"));
+    let mut mcfg = c.master_config("a");
+    mcfg.serve.as_mut().unwrap().port = port;
+    let a = Master::open(mcfg).await.unwrap();
+    assert_eq!(a.identity().epoch, 2, "the same number as the lost epoch");
+    for i in 0..5u8 {
+        a.put("c", &[i], b"new").unwrap();
+    }
+    let (d, _) = c.slave("d", a.serve_addr().unwrap()).await;
+    assert_converged(&a, &[("d", &d)]).await;
+    let d_last = d.last_seq();
+    a.shutdown().await.unwrap();
+
+    let (b, _) = reopen(&c, "b", SocketAddr::from(([127, 0, 0, 1], port)), |_| {}).await;
+    let d_up = UpstreamConfig::from_addr(d.serve_addr().unwrap());
+    let refused = b
+        .promote_checked(c.master_config("b"), std::slice::from_ref(&d_up))
+        .await
+        .err()
+        .expect("d holds entries past the fork");
+    match refused.error {
+        Error::PromotionWouldDiscard {
+            ref peer,
+            fork: f,
+            peer_last_seq,
+        } => assert_eq!((peer.as_str(), f, peer_last_seq), ("d", fork, d_last)),
+        ref e => panic!("expected PromotionWouldDiscard, got {e}"),
     }
 }

@@ -133,11 +133,30 @@ pub struct ValueMeta {
 }
 
 /// Start of one epoch in the epoch history (PROTOCOL.md §5.5).
+///
+/// Which of two nodes is later is decided by `epoch` and `last_seq` only. `nonce` only says
+/// whether two records with the same `epoch` are the same epoch: it is random, created when
+/// the epoch starts (a fresh master, every master open, `bump_epoch`, a promotion), and two
+/// histories that hold the same `epoch` with different nonces forked at the lower of the two
+/// `start_seq`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EpochStart {
     pub epoch: u64,
     /// Seq of the first entry written in this epoch.
     pub start_seq: Seq,
+    /// Random identity of this epoch.
+    pub nonce: u64,
+}
+
+impl EpochStart {
+    /// A new epoch with a fresh random nonce.
+    pub(crate) fn fresh(epoch: u64, start_seq: Seq) -> EpochStart {
+        EpochStart {
+            epoch,
+            start_seq,
+            nonce: uuid::Uuid::new_v4().as_u64_pair().0,
+        }
+    }
 }
 
 /// The epoch an entry with this seq must carry, given a history sorted by epoch.
@@ -155,6 +174,31 @@ pub(crate) fn fork_after(history: &[EpochStart], epoch: u64) -> Option<Seq> {
         .iter()
         .find(|e| e.epoch > epoch)
         .map(|e| e.start_seq)
+}
+
+/// How many of its newest epoch records a node presents to prove its history (PROTOCOL.md
+/// §6.1, `known_epochs`); all of them when it has fewer.
+pub(crate) const KNOWN_EPOCHS: usize = 5;
+
+/// The newest [`KNOWN_EPOCHS`] records of `history` up to and including `epoch`, oldest first.
+pub(crate) fn newest_records(history: &[EpochStart], epoch: u64) -> &[EpochStart] {
+    let end = history.iter().take_while(|e| e.epoch <= epoch).count();
+    &history[end.saturating_sub(KNOWN_EPOCHS)..end]
+}
+
+/// Where a history whose newest records are `newest` (oldest first; the last one is that node's
+/// epoch) leaves `history` (PROTOCOL.md §6.3): the start of the first later epoch in `history`,
+/// lowered to the lower of the two start seqs for every record of `newest` that `history` does
+/// not hold identically (another start or nonce, or no record of that number). `None` when
+/// `history` holds all of `newest` and has no later epoch, or `newest` is empty.
+pub(crate) fn fork_from(history: &[EpochStart], newest: &[EpochStart]) -> Option<Seq> {
+    let mut fork = fork_after(history, newest.last()?.epoch);
+    for k in newest.iter().filter(|k| !history.contains(k)) {
+        let own = history.iter().find(|e| e.epoch == k.epoch);
+        let start = own.map_or(k.start_seq, |o| o.start_seq.min(k.start_seq));
+        fork = Some(fork.map_or(start, |f| f.min(start)));
+    }
+    fork
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +329,51 @@ pub enum IterMode<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rec(epoch: u64, start_seq: Seq, nonce: u64) -> EpochStart {
+        EpochStart {
+            epoch,
+            start_seq,
+            nonce,
+        }
+    }
+
+    #[test]
+    fn up_to_five_newest_records_up_to_an_epoch() {
+        let h: Vec<EpochStart> = (1..=7).map(|e| rec(e, e * 10, e)).collect();
+        assert_eq!(newest_records(&h, 7), &h[2..7]);
+        assert_eq!(
+            newest_records(&h, 3),
+            &h[0..3],
+            "all of them when there are fewer"
+        );
+        assert_eq!(newest_records(&h, 6), &h[1..6]);
+        assert!(newest_records(&h, 0).is_empty());
+    }
+
+    #[test]
+    fn the_fork_from_a_set_of_records_is_the_lowest_difference() {
+        let server = vec![rec(1, 1, 1), rec(2, 10, 2), rec(3, 20, 3), rec(4, 30, 4)];
+        // A prefix: the fork is the next epoch's start.
+        assert_eq!(fork_from(&server, &server[..2]), Some(20));
+        assert_eq!(fork_from(&server, &server), None);
+        // Epoch 3 with another nonce: the histories differ from its start.
+        assert_eq!(
+            fork_from(&server, &[rec(2, 10, 2), rec(3, 20, 9)]),
+            Some(20)
+        );
+        // An older record differs: the fork moves down to it.
+        assert_eq!(
+            fork_from(&server, &[rec(2, 12, 7), rec(3, 20, 3)]),
+            Some(10)
+        );
+        // A number the server never had forks at the client's start.
+        assert_eq!(
+            fork_from(&server[..2], &[rec(1, 1, 1), rec(3, 15, 3)]),
+            Some(15)
+        );
+        assert_eq!(fork_from(&server, &[]), None);
+    }
     use std::time::Duration;
 
     #[test]
@@ -356,14 +445,17 @@ mod tests {
             EpochStart {
                 epoch: 1,
                 start_seq: 1,
+                nonce: 0,
             },
             EpochStart {
                 epoch: 2,
                 start_seq: 701,
+                nonce: 0,
             },
             EpochStart {
                 epoch: 4,
                 start_seq: 900,
+                nonce: 0,
             },
         ];
         assert_eq!(epoch_for(&h, 0), None);

@@ -16,7 +16,7 @@ service Replication {
 
 message Identity   { bytes db_uuid = 1; uint64 epoch = 2; }
 message CfSpec     { string name = 1; optional string comparator = 2; uint64 create_seq = 3; }
-message EpochStart { uint64 epoch = 1; uint64 start_seq = 2; }
+message EpochStart { uint64 epoch = 1; uint64 start_seq = 2; uint64 nonce = 3; }
 
 enum Reason {
   REASON_UNSPECIFIED = 0;
@@ -80,7 +80,8 @@ message HandshakeRequest {
   optional Identity known_identity = 4;
   uint64 last_seq                  = 5;
   optional fixed32 last_crc32c     = 6;
-  optional uint64 known_epoch_start = 7;  // start_seq of known_identity.epoch in the client's history
+  reserved 7;                              // was known_epoch_start
+  repeated EpochStart known_epochs = 8;   // the client's newest epoch records (up to 5), oldest first
 }
 
 message HandshakeResponse {

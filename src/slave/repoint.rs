@@ -11,8 +11,9 @@ use super::inner::Inner;
 use super::state::SlaveState;
 use super::{Slave, UpstreamConfig};
 use crate::error::{Error, Result};
+use crate::net::convert::epochs_from_pb;
 use crate::pb;
-use crate::types::{EpochStart, Seq, fork_after};
+use crate::types::{EpochStart, Seq, fork_after, fork_from};
 
 /// Acknowledges that an operation discards data. A caller constructs it explicitly
 /// (`AcceptDataLoss`) to opt in; nothing in the crate supplies one by default.
@@ -152,18 +153,21 @@ impl Inner {
     }
 }
 
-/// `Error::Diverged` for a `DIVERGED` answer: where the local log leaves the upstream's.
-pub(crate) fn divergence(local_epoch: u64, local_last: Seq, hs: &pb::HandshakeResponse) -> Error {
-    let history: Vec<EpochStart> = hs
-        .epoch_history
-        .iter()
-        .map(|e| EpochStart {
-            epoch: e.epoch,
-            start_seq: e.start_seq,
-        })
-        .collect();
-    let fork_seq = match fork_after(&history, local_epoch) {
-        // Rule 8: everything from the next epoch's start is not on the upstream's history.
+/// `Error::Diverged` for a `DIVERGED` answer: where the local log, whose newest epoch records
+/// are `local` (oldest first), leaves the upstream's.
+pub(crate) fn divergence(
+    local: &[EpochStart],
+    local_last: Seq,
+    hs: &pb::HandshakeResponse,
+) -> Error {
+    let history = epochs_from_pb(&hs.epoch_history);
+    let fork = match local {
+        [] => fork_after(&history, 0),
+        records => fork_from(&history, records),
+    };
+    let fork_seq = match fork {
+        // Rule 8: everything from the next epoch's start (or from the start of a same-numbered
+        // epoch with another nonce) is not on the upstream's history.
         Some(fork) if fork <= local_last => fork,
         // Rule 11: the local log runs past the master's.
         _ if local_last > hs.last_seq => hs.last_seq + 1,

@@ -473,10 +473,12 @@ mod tests {
             EpochStart {
                 epoch: 1,
                 start_seq: 1,
+                nonce: 0,
             },
             EpochStart {
                 epoch: 2,
                 start_seq: 50,
+                nonce: 0,
             },
         ];
         assert_eq!(

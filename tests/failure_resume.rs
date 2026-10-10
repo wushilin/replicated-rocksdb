@@ -157,3 +157,45 @@ async fn a_log_gap_halt_persists_across_restart_until_cleared() {
     assert_converged(&m, &[("b", &b)]).await;
     assert_eq!(listener.bootstraps(), 1);
 }
+
+/// Addendum §7: every master open starts a new epoch, and its followers move to it with
+/// `EPOCH_ADVANCED`, without a bootstrap, even when the master no longer holds a follower's
+/// last entry (the history proves continuity; no CRC is needed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_master_restart_moves_followers_to_the_new_epoch_without_a_bootstrap() {
+    let c = Cluster::new();
+    let mut mcfg = c.master_config("a");
+    mcfg.retention.max_entries = Some(3);
+    mcfg.retention.check_interval = Duration::from_millis(20);
+    let m = Master::open(mcfg.clone()).await.unwrap();
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (b_cfg, listener) = c.slave_config("b", m.serve_addr().unwrap());
+    let b = Slave::open(b_cfg.clone()).await.unwrap();
+    wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
+    m.put("c", b"k", b"v").unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    let b_last = b.last_seq();
+    b.shutdown().await.unwrap();
+    for i in 0..3u8 {
+        m.put("c", &[i], b"w").unwrap();
+    }
+    wait_until("the master keeps only the entries after b's", || {
+        m.first_retained_seq() == b_last + 1
+    })
+    .await;
+    let m = c.restart_master(m, mcfg).await;
+    assert_eq!(m.identity().epoch, 2);
+
+    let b = Slave::open(b_cfg).await.unwrap();
+    wait_until("b adopts the new epoch", || {
+        b.status().origin_identity == Some(m.identity())
+    })
+    .await;
+    wait_state(&b, "streaming", |s| *s == SlaveState::Streaming).await;
+    m.put("c", b"after the restart", b"v").unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    assert_eq!(b.status().origin_identity, Some(m.identity()));
+    assert_eq!(b.promotion_info().epoch_history, m.epoch_history());
+    assert_eq!(listener.bootstraps(), 1, "only the initial bootstrap");
+    listener.assert_no_violations();
+}

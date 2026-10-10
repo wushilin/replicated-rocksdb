@@ -25,7 +25,9 @@ use crate::background::blocking;
 use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 use crate::failpoint;
 use crate::net::DECODE_SLACK;
-use crate::net::convert::{checked_history, entry_from_pb, identity_from_pb, identity_to_pb};
+use crate::net::convert::{
+    checked_history, entry_from_pb, epoch_to_pb, identity_from_pb, identity_to_pb,
+};
 use crate::pb;
 use crate::pb::tail_client_message::Kind as ClientKind;
 use crate::pb::tail_message::Kind;
@@ -231,10 +233,9 @@ fn handshake_request(inner: &Inner) -> pb::HandshakeRequest {
         } else {
             None
         },
-        // Tells the server which promotion's epoch this is, not only its number (PROTOCOL §6.3).
-        known_epoch_start: ident
-            .as_ref()
-            .and_then(|(id, h)| h.iter().find(|e| e.epoch == id.epoch).map(|e| e.start_seq)),
+        // Tells the server which epochs these are, not only the number: start seqs and nonces
+        // of the newest records (PROTOCOL §6.3).
+        known_epochs: inner.known_epochs().iter().map(epoch_to_pb).collect(),
     }
 }
 
@@ -288,9 +289,12 @@ async fn session(
             action = match mode {
                 RepointDivergence::Rebootstrap { .. } => Action::Bootstrap,
                 RepointDivergence::Refuse | RepointDivergence::Repair { .. } => {
-                    let local_epoch = inner.ident().map_or(0, |(id, _)| id.epoch);
                     let err = repoint::mode_error(mode, || {
-                        repoint::divergence(local_epoch, inner.store.position().last_seq, &hs)
+                        repoint::divergence(
+                            &inner.known_epochs(),
+                            inner.store.position().last_seq,
+                            &hs,
+                        )
                     });
                     tracing::warn!(node = %inner.cfg.identifier, error = %err, "repoint refused: diverged");
                     inner.fail_repoint_on_halt(generation, err);

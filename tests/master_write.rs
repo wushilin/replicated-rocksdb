@@ -4,31 +4,56 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{T0, clock, config, log};
-use replicated_rocksdb::{Batch, CfSpec, EpochStart, Error, IterMode, LogApi, Master, Op, ReadApi};
+use replicated_rocksdb::{Batch, CfSpec, Error, IterMode, LogApi, Master, Op, ReadApi};
 
+/// Every open of an existing database starts a new epoch (addendum §7): same `db_uuid`, the
+/// next epoch number, starting at `last_seq + 1`, with a fresh nonce.
 #[tokio::test]
-async fn first_open_creates_identity_and_reopen_keeps_it() {
+async fn first_open_creates_identity_and_reopen_starts_a_new_epoch() {
     let dir = tempfile::tempdir().unwrap();
     let c = clock();
     let m = Master::open(config(dir.path(), &c)).await.unwrap();
     let id = m.identity();
     assert_eq!(id.epoch, 1);
     assert_eq!(
-        m.epoch_history(),
-        vec![EpochStart {
-            epoch: 1,
-            start_seq: 1
-        }]
+        m.epoch_history()
+            .iter()
+            .map(|e| (e.epoch, e.start_seq))
+            .collect::<Vec<_>>(),
+        vec![(1, 1)]
     );
     m.create_cf(CfSpec::new("users")).unwrap();
     m.put("users", b"k", b"v").unwrap();
+    let first = m.epoch_history()[0];
     m.shutdown().await.unwrap();
 
     let m = Master::open(config(dir.path(), &c)).await.unwrap();
-    assert_eq!(m.identity(), id);
+    assert_eq!(m.identity().db_uuid, id.db_uuid);
+    assert_eq!(m.identity().epoch, 2);
+    let history = m.epoch_history();
+    assert_eq!(history[0], first, "the old record is kept as it was");
+    assert_eq!((history[1].epoch, history[1].start_seq), (2, 3));
+    assert_ne!(history[1].nonce, first.nonce);
     assert_eq!(m.last_seq(), 2);
     assert_eq!(m.get("users", b"k").unwrap().unwrap(), b"v");
     assert_eq!(m.put("users", b"k2", b"v").unwrap(), 3);
+    assert_eq!(log(&m).last().unwrap().epoch, 2);
+    m.shutdown().await.unwrap();
+    // An open without writes still starts an epoch (empty epochs share their start seq).
+    Master::open(config(dir.path(), &c))
+        .await
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    let m = Master::open(config(dir.path(), &c)).await.unwrap();
+    assert_eq!(
+        m.epoch_history()
+            .iter()
+            .map(|e| (e.epoch, e.start_seq))
+            .collect::<Vec<_>>(),
+        vec![(1, 1), (2, 3), (3, 4), (4, 4)]
+    );
 }
 
 #[tokio::test]
@@ -176,17 +201,11 @@ async fn bump_epoch_continues_seq_and_tags_new_entries() {
     let entries = log(&m);
     assert_eq!((entries[0].epoch, entries[1].epoch), (1, 2));
     assert_eq!(
-        m.epoch_history(),
-        vec![
-            EpochStart {
-                epoch: 1,
-                start_seq: 1
-            },
-            EpochStart {
-                epoch: 2,
-                start_seq: 2
-            }
-        ]
+        m.epoch_history()
+            .iter()
+            .map(|e| (e.epoch, e.start_seq))
+            .collect::<Vec<_>>(),
+        vec![(1, 1), (2, 2)]
     );
     m.shutdown().await.unwrap();
 
@@ -195,11 +214,8 @@ async fn bump_epoch_continues_seq_and_tags_new_entries() {
     let m = Master::open(cfg).await.unwrap();
     assert_eq!(m.identity().epoch, 3);
     assert_eq!(
-        m.epoch_history().last(),
-        Some(&EpochStart {
-            epoch: 3,
-            start_seq: 3
-        })
+        m.epoch_history().last().map(|e| (e.epoch, e.start_seq)),
+        Some((3, 3))
     );
 }
 
@@ -289,11 +305,11 @@ async fn bump_on_open_is_skipped_for_a_fresh_database() {
     let m = Master::open(cfg).await.unwrap();
     assert_eq!(m.identity().epoch, 1);
     assert_eq!(
-        m.epoch_history(),
-        vec![EpochStart {
-            epoch: 1,
-            start_seq: 1
-        }]
+        m.epoch_history()
+            .iter()
+            .map(|e| (e.epoch, e.start_seq))
+            .collect::<Vec<_>>(),
+        vec![(1, 1)]
     );
 }
 

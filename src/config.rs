@@ -92,7 +92,9 @@ pub struct MasterConfig {
     /// Maximum encoded size of one log entry. Default 16 MiB.
     pub max_entry_bytes: u64,
     pub heartbeat: Duration,
-    /// Set when opening a database restored from a backup (DESIGN.md §13).
+    /// Redundant, kept for compatibility: every open of an existing master database starts a
+    /// new epoch anyway (DESIGN.md §13), so a database restored from a backup never reuses the
+    /// epoch its replicas may have followed past the restore point.
     pub bump_epoch_on_open: bool,
     pub rocksdb: RocksTuning,
     pub clock: Arc<dyn Clock>,

@@ -5,7 +5,7 @@
 //!
 //! 1. Fence the old master (stop it, or cut it off from clients and replicas).
 //! 2. Gather the status of every replica with [`gather`], which also probes the entry CRCs
-//!    that [`compare`] needs ([`node_status`] reads one node).
+//!    that [`compare`] checks as a second line of defence ([`node_status`] reads one node).
 //! 3. Promote the most advanced compatible one: [`choose_promotion_candidate`], then
 //!    [`Slave::promote_checked`](crate::Slave::promote_checked), which refuses if a reachable
 //!    peer is later.
@@ -150,23 +150,17 @@ pub enum Comparison {
     /// Compatible histories; this side holds everything the other holds, and more.
     Later(Side),
     Equal,
-    /// Both hold different entries from `fork` on: a CRC mismatch was proven (or the epoch
-    /// histories fork below both positions).
+    /// Both hold different entries from `fork` on: the epoch histories (nonces included) fork
+    /// below both positions, or a CRC mismatch was proven.
     Diverged {
         fork: Seq,
-    },
-    /// Compatibility cannot be proven: the node that would have to hold the other's last
-    /// entry no longer does (trimmed, or bootstrapped past it), or no probe was taken.
-    /// `later` is the side that is later by position (newest epoch, then `last_seq`); `None`
-    /// when both positions are equal.
-    Unverifiable {
-        later: Option<Side>,
     },
     /// Different databases (different `db_uuid`).
     DifferentDatabase,
 }
 
-/// The first seq whose epoch differs between two histories, if any.
+/// The first seq whose epoch differs between two histories, if any. Records are compared with
+/// their nonces: the same epoch number with another nonce is another epoch.
 fn fork_between(a: &[EpochStart], b: &[EpochStart]) -> Option<Seq> {
     for i in 0..a.len().max(b.len()) {
         match (a.get(i), b.get(i)) {
@@ -182,19 +176,19 @@ fn fork_between(a: &[EpochStart], b: &[EpochStart]) -> Option<Seq> {
 /// Compares two nodes of a topology (addendum §4). A node without data is behind any node
 /// with data; different `db_uuid`s are `DifferentDatabase`.
 ///
-/// Otherwise the nodes are compatible when no seq both hold lies at or past a point where
-/// their epoch histories differ, **and** the shorter node's last entry is present in the
-/// longer node with the same CRC: equal `last_entry_crc` at equal `last_seq`, or the longer
-/// node's probe at the shorter node's `last_seq` ([`NodeInfo::probes`]). The later of two
-/// compatible nodes has the newer epoch, then the higher `last_seq`: a node whose newest
-/// epoch is still empty (a promotion that took no writes) is later than a node of the older
-/// epoch that holds *fewer* entries than its epoch's start, and **diverged** from one that
-/// holds entries at or past that start (`fork` is that epoch's `start_seq`; demoting the
-/// empty-epoch node and promoting the other would lose nothing). Anything that cannot be
-/// shown compatible because of a CRC mismatch is `Diverged`; when the
-/// histories agree, `fork` is then the shorter node's `last_seq` (the first seq known not to
-/// match may be earlier). A comparison that needs a CRC nobody can supply is `Unverifiable`,
-/// never `Compatible` or `Diverged`.
+/// Otherwise the epoch histories decide (addendum §7): every epoch has a random nonce and
+/// exactly one writer process, so two nodes whose histories (nonces included) agree below
+/// both positions hold the same entries up to the shorter node's `last_seq`, and two whose
+/// histories differ below both positions are `Diverged` at the first differing record. Entry
+/// CRCs are a second line of defence only: equal `last_seq`s with different
+/// `last_entry_crc`s, or the longer node's probe at the shorter node's `last_seq`
+/// ([`NodeInfo::probes`]) differing from it, is `Diverged` at that seq; a missing CRC or
+/// probe never makes nodes incomparable. The later of two compatible nodes has the newer
+/// epoch, then the higher `last_seq`: a node whose newest epoch is still empty (a promotion
+/// that took no writes) is later than a node of the older epoch that holds *fewer* entries
+/// than its epoch's start, and **diverged** from one that holds entries at or past that start
+/// (`fork` is that epoch's `start_seq`; demoting the empty-epoch node and promoting the other
+/// would lose nothing).
 pub fn compare(a: &NodeInfo, b: &NodeInfo) -> Comparison {
     let (ia, ib) = match (a.identity, b.identity) {
         (None, None) => return Comparison::Equal,
@@ -219,12 +213,10 @@ pub fn compare(a: &NodeInfo, b: &NodeInfo) -> Comparison {
     let (short, long, long_side) = match a.last_seq.cmp(&b.last_seq) {
         std::cmp::Ordering::Equal => {
             return match (a.last_entry_crc, b.last_entry_crc) {
-                _ if a.last_seq == 0 => by_position.map_or(Comparison::Equal, Comparison::Later),
-                (Some(x), Some(y)) if x == y => {
-                    by_position.map_or(Comparison::Equal, Comparison::Later)
+                (Some(x), Some(y)) if a.last_seq > 0 && x != y => {
+                    Comparison::Diverged { fork: a.last_seq }
                 }
-                (Some(_), Some(_)) => Comparison::Diverged { fork: a.last_seq },
-                _ => Comparison::Unverifiable { later: by_position },
+                _ => by_position.map_or(Comparison::Equal, Comparison::Later),
             };
         }
         std::cmp::Ordering::Less => (a, b, Side::B),
@@ -239,16 +231,13 @@ pub fn compare(a: &NodeInfo, b: &NodeInfo) -> Comparison {
             return Comparison::Diverged { fork: se.start_seq };
         }
     }
-    if short.last_seq > 0 {
-        let held = long.probes.get(&short.last_seq).copied().flatten();
-        match (short.last_entry_crc, held) {
-            (Some(x), Some(y)) if x == y => {}
-            (Some(_), Some(_)) => {
-                return Comparison::Diverged {
-                    fork: short.last_seq,
-                };
-            }
-            _ => return Comparison::Unverifiable { later: by_position },
+    // Second line of defence: a CRC mismatch at the shorter node's last entry.
+    let held = long.probes.get(&short.last_seq).copied().flatten();
+    if let (Some(x), Some(y)) = (short.last_entry_crc, held) {
+        if short.last_seq > 0 && x != y {
+            return Comparison::Diverged {
+                fork: short.last_seq,
+            };
         }
     }
     // Compatible: the longer node holds everything the shorter one holds. Order by position:
@@ -269,13 +258,14 @@ pub struct Choice {
     pub diverged: Vec<(String, Seq)>,
     /// Nodes of another database.
     pub foreign: Vec<String>,
-    /// Nodes whose compatibility with the candidate cannot be proven (see
-    /// [`Comparison::Unverifiable`]). They are not known to be safe to follow it.
+    /// Nodes that compare as later than the candidate although the candidate is the latest by
+    /// position. This cannot happen with consistent inputs; such a node is not known to be safe
+    /// to follow the candidate.
     pub unverifiable: Vec<String>,
 }
 
-/// Compatibility is judged by entries. A node whose newest epoch is empty and differs from the
-/// candidate's (for example a wrongly promoted master with no writes) is not safe to follow the
+/// Compatibility is judged by epoch histories (see [`compare`]). A node whose newest epoch is
+/// empty and differs from the candidate's (for example a wrongly promoted master with no writes) is not safe to follow the
 /// candidate as it is: `demote` it (or rebootstrap it) first.
 ///
 /// Picks the most advanced node holding data (newest epoch, then highest `last_seq`, then
@@ -311,7 +301,6 @@ pub fn choose_promotion_candidate(nodes: &[NodeInfo]) -> Result<Choice> {
             Comparison::Later(Side::B) => choice.unverifiable.push(n.node_id.clone()),
             Comparison::Diverged { fork } => choice.diverged.push((n.node_id.clone(), fork)),
             Comparison::DifferentDatabase => choice.foreign.push(n.node_id.clone()),
-            Comparison::Unverifiable { .. } => choice.unverifiable.push(n.node_id.clone()),
         }
     }
     Ok(choice)
@@ -458,7 +447,12 @@ mod tests {
     fn node(id: &str, uuid: u128, history: &[(u64, Seq)], last: Seq, crc: Option<u32>) -> NodeInfo {
         let epoch_history: Vec<EpochStart> = history
             .iter()
-            .map(|&(epoch, start_seq)| EpochStart { epoch, start_seq })
+            // The same (epoch, start) is the same epoch in these tests: nonce = start.
+            .map(|&(epoch, start_seq)| EpochStart {
+                epoch,
+                start_seq,
+                nonce: start_seq,
+            })
             .collect();
         NodeInfo {
             node_id: id.into(),
@@ -518,18 +512,23 @@ mod tests {
         // one epoch): diverged. Without a probe it cannot be shown compatible: diverged too.
         let other_8 = probed(node("a", 1, &[(1, 1)], 10, Some(1)), 8, Some(7));
         assert_eq!(compare(&other_8, &b), Comparison::Diverged { fork: 8 });
-        // a no longer holds entry 8 (or was not probed): unverifiable, a still later by position.
+        // a no longer holds entry 8 (or was not probed): the shared history (epoch 1, same
+        // nonce) proves b's entries are a's; a is later.
         assert_eq!(
             compare(&node("a", 1, &[(1, 1)], 10, Some(1)), &b),
-            Comparison::Unverifiable {
-                later: Some(Side::A)
-            }
+            Comparison::Later(Side::A)
         );
         assert_eq!(
             compare(&b, &probed(node("a", 1, &[(1, 1)], 10, Some(1)), 8, None)),
-            Comparison::Unverifiable {
-                later: Some(Side::B)
-            }
+            Comparison::Later(Side::B)
+        );
+        // The same epoch number and start with another nonce is another epoch: a master
+        // restored from a backup and reopened. Diverged at that epoch's start.
+        let mut restored = node("r", 1, &[(1, 1), (2, 5)], 9, None);
+        restored.epoch_history[1].nonce = 77;
+        assert_eq!(
+            compare(&node("a", 1, &[(1, 1), (2, 5)], 10, None), &restored),
+            Comparison::Diverged { fork: 5 }
         );
         // Promoted at 11: the old-epoch node behind the fork is behind (its last entry matches);
         // past the fork, diverged.
@@ -594,7 +593,7 @@ mod tests {
             choose_promotion_candidate(&forked).unwrap().diverged,
             vec![("b".to_string(), 10)]
         );
-        // c no longer holds entry 10: b is listed as unverifiable, neither compatible nor diverged.
+        // c no longer holds entry 10: the shared history still proves b compatible.
         let trimmed = vec![
             node("b", 1, &[(1, 1)], 10, Some(1)),
             probed(node("c", 1, &[(1, 1)], 12, None), 10, None),
@@ -602,7 +601,7 @@ mod tests {
         let choice = choose_promotion_candidate(&trimmed).unwrap();
         assert_eq!(
             (choice.unverifiable, choice.compatible, choice.diverged),
-            (vec!["b".to_string()], vec![], vec![])
+            (vec![], vec!["b".to_string()], vec![])
         );
         let tie = vec![
             node("c", 1, &[(1, 1)], 12, Some(1)),
@@ -645,14 +644,9 @@ mod tests {
         let past = probed(node("b", 1, &[(1, 1)], 12, Some(6)), 10, Some(5));
         assert_eq!(compare(&w, &past), Comparison::Diverged { fork: 11 });
         assert_eq!(compare(&past, &w), Comparison::Diverged { fork: 11 });
-        // Equal position with an unverifiable CRC keeps the order by epoch.
+        // Equal position without a CRC: the history decides, ordered by epoch.
         let no_crc = node("b", 1, &[(1, 1)], 10, None);
-        assert_eq!(
-            compare(&w, &no_crc),
-            Comparison::Unverifiable {
-                later: Some(Side::A)
-            }
-        );
+        assert_eq!(compare(&w, &no_crc), Comparison::Later(Side::A));
     }
 
     #[test]

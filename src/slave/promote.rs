@@ -33,7 +33,7 @@ impl Slave {
     /// has seen itself (its history, and any epoch it gave up with `Master::demote`). If another
     /// node was promoted by mistake, demoted again, and replicas followed it in between, they
     /// may hold the same epoch number this promotion picks. The handshake still tells the two
-    /// epochs apart by their start seq (PROTOCOL.md §6.3, `known_epoch_start`), so no history
+    /// epochs apart by their nonce (PROTOCOL.md §6.3, `known_epochs`), so no history
     /// is mixed, but [`promote_checked`](Self::promote_checked), which chooses an epoch above
     /// every epoch its reachable peers report, is the safe path.
     pub async fn promote(self, cfg: MasterConfig) -> Result<Master> {
@@ -90,7 +90,7 @@ impl Slave {
             Ok(())
         })
         .await?;
-        Master::open(cfg).await
+        Master::open_promoted(cfg).await
     }
 }
 
@@ -105,9 +105,6 @@ pub struct PromotionCheck {
     pub diverged: Vec<(String, Seq)>,
     /// Peers of another database.
     pub foreign: Vec<String>,
-    /// Peers behind this slave whose history cannot be verified against it (`node_id`,
-    /// `last_seq`): following it may discard entries they hold.
-    pub unverifiable: Vec<(String, Seq)>,
     /// The highest epoch number any reachable peer of this database reported (its identity,
     /// every record of its history, and the epoch it burned by demoting). `promote_checked`
     /// starts an epoch above it, so an epoch number is never reused.
@@ -124,20 +121,19 @@ impl Slave {
         node_info(&*self.inner, &self.inner.replicas, lag_max, &[])
     }
 
-    /// Asks every reachable peer for its `Status` and **refuses by default** (addendum §4):
-    /// `Error::NotMostAdvanced` if a peer is proven to hold more of the log, and
-    /// `Error::PromotionUnverifiable` if a peer is at least as far by position but its history
-    /// cannot be verified (the entry that would prove it is trimmed or before its bootstrap),
+    /// Asks every reachable peer for its `Status` and **refuses by default** (addendum §4, §7):
+    /// `Error::NotMostAdvanced` if a peer holds more of a compatible history,
     /// `Error::MasterReachable` if a peer reports `role == Master`, and
-    /// `Error::PromotionWouldDiscard` (below).
-    /// Each peer is probed at this slave's `last_seq`, and this slave's entry at the peer's
-    /// `last_seq` is read locally, so [`admin::compare`] can check the shorter node's last
-    /// entry. A peer whose history forks from this slave's at `fork` and that holds entries at
-    /// or past it blocks with `Error::PromotionWouldDiscard` (promoting this slave would
-    /// discard them; promote that node instead, or use plain `promote` to accept the loss).
-    /// A diverged peer with nothing at or past the fork is only reported (in the result, and
-    /// in a refusal's error); unreachable peers (no answer within `admin::STATUS_TIMEOUT`), foreign
-    /// peers and unverifiable peers that are behind are reported too: the operator decides.
+    /// `Error::PromotionWouldDiscard` (below). Compatibility is decided by the epoch histories,
+    /// nonces included ([`admin::compare`]), so a peer whose entries were trimmed is never
+    /// incomparable; each peer is also probed at this slave's `last_seq`, and this slave's
+    /// entry at the peer's `last_seq` is read locally, so a CRC mismatch is caught as a second
+    /// line of defence. A peer whose history forks from this slave's at `fork` and that holds
+    /// entries at or past it blocks with `Error::PromotionWouldDiscard` (promoting this slave
+    /// would discard them; promote that node instead, or use plain `promote` to accept the
+    /// loss). A diverged peer with nothing at or past the fork is only reported (in the
+    /// result, and in a refusal's error); unreachable peers (no answer within
+    /// `admin::STATUS_TIMEOUT`) and foreign peers are reported too: the operator decides.
     /// A peer that is reachable but answered `Status` with an error (permission denied, another
     /// protocol, ...) blocks as `PromotionUnverifiable` (`seq` 0, the error in `peer`): its state
     /// is unknown. A peer that reports `role == Master` blocks with `Error::MasterReachable`:
@@ -148,8 +144,7 @@ impl Slave {
     pub async fn check_promotion(&self, peers: &[UpstreamConfig]) -> Result<PromotionCheck> {
         let mut me = self.promotion_info();
         let mut check = PromotionCheck::default();
-        let (mut later, mut unverified_ahead, mut would_discard) =
-            (Vec::new(), Vec::new(), Vec::new());
+        let (mut later, mut unanswered, mut would_discard) = (Vec::new(), Vec::new(), Vec::new());
         for peer in peers {
             let probe = Some(me.last_seq).filter(|&s| s > 0);
             let info = match admin::status_classified(peer, &me.node_id, probe).await {
@@ -160,10 +155,10 @@ impl Slave {
                     continue;
                 }
                 // The peer is alive but its state is unknown (refused the call, spoke another
-                // protocol, ...): it may be ahead, so it blocks like an unverifiable peer.
+                // protocol, ...): it may be ahead, so it blocks as unverifiable.
                 Err(admin::StatusFailure::Answered(e)) => {
                     tracing::warn!(peer = %peer.uri(), error = %e, "promotion check: peer answered with an error");
-                    unverified_ahead.push((format!("{} ({e})", peer.uri()), 0));
+                    unanswered.push((format!("{} ({e})", peer.uri()), 0));
                     continue;
                 }
             };
@@ -182,12 +177,6 @@ impl Slave {
             }
             match compare(&me, &info) {
                 Comparison::Later(Side::B) => later.push((info.node_id, info.last_seq)),
-                Comparison::Unverifiable {
-                    later: Some(Side::B) | None,
-                } => unverified_ahead.push((info.node_id, info.last_seq)),
-                Comparison::Unverifiable {
-                    later: Some(Side::A),
-                } => check.unverifiable.push((info.node_id, info.last_seq)),
                 // The peer holds entries this slave would discard: refused by default.
                 Comparison::Diverged { fork } if info.last_seq >= fork => {
                     would_discard.push((info.node_id, fork, info.last_seq))
@@ -204,7 +193,7 @@ impl Slave {
                 diverged: check.diverged,
             });
         }
-        if let Some((peer, seq)) = unverified_ahead.into_iter().next() {
+        if let Some((peer, seq)) = unanswered.into_iter().next() {
             return Err(Error::PromotionUnverifiable {
                 peer,
                 seq,
@@ -227,7 +216,7 @@ impl Slave {
     /// promotion that some replica followed. **A refusal hands the slave back untouched and still running**
     /// ([`PromoteRefused::into_slave`]): the checks of `promote` (bootstrapping, no data,
     /// halted `Corrupt`/`SpecMismatch`, wrong `cfg.path`, invalid `cfg`), a later reachable peer
-    /// (`Error::NotMostAdvanced`), a peer at least as far whose history cannot be verified
+    /// (`Error::NotMostAdvanced`), a peer that answered `Status` with an error
     /// (`Error::PromotionUnverifiable`), a peer that reports itself a master
     /// (`Error::MasterReachable`), a peer holding entries at or past a fork with this slave
     /// (`Error::PromotionWouldDiscard`), or a peer check that could not run.
@@ -252,7 +241,6 @@ impl Slave {
                 if !check.unreachable.is_empty()
                     || !check.diverged.is_empty()
                     || !check.foreign.is_empty()
-                    || !check.unverifiable.is_empty()
                 {
                     tracing::warn!(
                         ?check,

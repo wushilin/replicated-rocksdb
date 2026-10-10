@@ -215,6 +215,9 @@ async fn repoint_to_a_stale_master_keeps_retrying() {
         RepointOutcome::EpochAdvanced
     );
     b.put("c", b"k2", b"v2").unwrap();
+    // The reopened old master starts an epoch of its own, numbered 2 like B's (another nonce:
+    // that would be DIVERGED). B moves on to epoch 3, so the old master is behind: STALE_EPOCH.
+    b.bump_epoch().unwrap();
     assert_converged(&b, &[("c", &cn)]).await;
 
     let mut a_cfg = a_cfg;

@@ -151,10 +151,12 @@ mod tests {
             EpochStart {
                 epoch: 1,
                 start_seq: 1,
+                nonce: 0,
             },
             EpochStart {
                 epoch: 2,
                 start_seq: 11,
+                nonce: 0,
             },
         ];
         let entry = |seq, epoch| LogEntry::new(seq, epoch, 0, bytes::Bytes::new());

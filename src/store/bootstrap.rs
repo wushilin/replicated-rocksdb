@@ -348,10 +348,12 @@ mod tests {
                 EpochStart {
                     epoch: 1,
                     start_seq: 1,
+                    nonce: 0,
                 },
                 EpochStart {
                     epoch: 2,
                     start_seq: 3,
+                    nonce: 0,
                 },
             ],
             cf_specs: cfs,
@@ -793,10 +795,12 @@ mod tests {
             EpochStart {
                 epoch: 1,
                 start_seq: 1,
+                nonce: 0,
             },
             EpochStart {
                 epoch: 3,
                 start_seq: 40,
+                nonce: 0,
             },
         ];
         store.adopt_identity(&id, &h).unwrap();

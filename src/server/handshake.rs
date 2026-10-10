@@ -2,8 +2,9 @@
 //! [`ServerView`] and this module decides, so every rule is unit-tested in isolation.
 
 use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
+use crate::net::convert::epoch_from_pb;
 use crate::pb;
-use crate::types::{DbIdentity, EpochStart, Seq, fork_after};
+use crate::types::{DbIdentity, EpochStart, Seq, fork_after, fork_from};
 
 /// What the server knows about itself when answering one handshake.
 #[derive(Clone, Debug)]
@@ -38,7 +39,8 @@ fn verdict(decision: pb::Decision, reason: pb::Reason, detail: impl Into<String>
     }
 }
 
-/// Evaluates PROTOCOL.md §6.3 rules 1–14 (with 10a/10b) in order; the first match wins.
+/// Evaluates PROTOCOL.md §6.3 rules 1–14 (with 10a/10b) in order, 10a before 9; the first
+/// match wins.
 pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
     use pb::Decision::{Bootstrap, Reject, Resume};
     use pb::Reason as R;
@@ -91,7 +93,13 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
         );
         return verdict(Reject, R::StaleEpoch, d);
     }
-    if let Some(cfork) = changed_epoch_fork(v, known.epoch, ident.epoch, r.known_epoch_start) {
+    // The client's newest records count only if they end with its own epoch.
+    let known_records: Vec<EpochStart> = r.known_epochs.iter().map(epoch_from_pb).collect();
+    let known_records = match known_records.last() {
+        Some(k) if k.epoch == known.epoch => known_records,
+        _ => Vec::new(),
+    };
+    if let Some(cfork) = changed_epoch_fork(v, known.epoch, ident.epoch, &known_records) {
         // 8: the client holds entries at or past the point where its history leaves the server's.
         match cfork {
             Some(fork) if r.last_seq >= fork => {
@@ -110,17 +118,21 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
                 return verdict(Reject, R::Diverged, d);
             }
         }
-        // 9: continuity proven by the CRC of the client's last entry.
-        if client_crc_matches {
+        // 10a: a mismatch the server can prove below the fork outweighs any other evidence.
+        if r.last_crc32c.is_some() && v.crc_at_client_last.is_some() && !client_crc_matches {
+            return verdict(Reject, R::Diverged, format!("entry {} differs", r.last_seq));
+        }
+        // 9: continuity is proven by the history (the client's newest records, nonces included,
+        // are all in the server's history, and the client holds nothing at or past the fork) or
+        // by the CRC of the client's last entry.
+        let history_proves =
+            !known_records.is_empty() && known_records.iter().all(|k| v.epoch_history.contains(k));
+        if history_proves || client_crc_matches {
             return verdict(
                 Resume,
                 R::EpochAdvanced,
                 format!("epoch {} -> {}", known.epoch, ident.epoch),
             );
-        }
-        // 10a: a proven mismatch below the fork.
-        if r.last_crc32c.is_some() && v.crc_at_client_last.is_some() {
-            return verdict(Reject, R::Diverged, format!("entry {} differs", r.last_seq));
         }
         // 10b
         return verdict(
@@ -155,33 +167,24 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
 }
 
 /// `Some(cfork)` when the client's epoch is *changed* (PROTOCOL.md §6.3): an older epoch number,
-/// or the same number with another start seq (`known_epoch_start`) than the server's record of
-/// it. `cfork` is where the client's history leaves the server's (`None`: inconsistent).
-/// `None` when the client follows the server's epoch.
+/// or one of the client's newest records (`known_epochs`, its own epoch last) is not in the
+/// server's history (another start seq or another nonce, or a number the server never had).
+/// `cfork` is where the client's history leaves the server's (`None`: inconsistent). `None`
+/// when the client follows the server's epoch.
 fn changed_epoch_fork(
     v: &ServerView,
     known_epoch: u64,
     server_epoch: u64,
-    known_start: Option<Seq>,
+    known: &[EpochStart],
 ) -> Option<Option<Seq>> {
-    let server_start = v
-        .epoch_history
-        .iter()
-        .find(|e| e.epoch == known_epoch)
-        .map(|e| e.start_seq);
-    // The client's epoch began at another seq than the server's epoch of the same number (or
-    // the server never had that epoch): the histories differ from the lower start on.
-    let start_fork = known_start
-        .filter(|&k| server_start != Some(k))
-        .map(|k| server_start.map_or(k, |s| s.min(k)));
-    if known_epoch == server_epoch && start_fork.is_none() {
+    let differs = known.iter().any(|k| !v.epoch_history.contains(k));
+    if known_epoch == server_epoch && !differs {
         return None;
     }
-    let fork = match (fork_after(&v.epoch_history, known_epoch), start_fork) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    };
-    Some(fork)
+    if known.is_empty() {
+        return Some(fork_after(&v.epoch_history, known_epoch));
+    }
+    Some(fork_from(&v.epoch_history, known))
 }
 
 #[cfg(test)]
@@ -194,7 +197,28 @@ mod tests {
         uuid::Uuid::from_u128(0x1234)
     }
 
-    /// A master at epoch 2 (fork after epoch 1 at seq 101), last_seq 200, log from 50.
+    fn record(epoch: u64, start_seq: Seq, nonce: u64) -> EpochStart {
+        EpochStart {
+            epoch,
+            start_seq,
+            nonce,
+        }
+    }
+
+    /// The client's newest records, oldest first.
+    fn known(records: &[(u64, Seq, u64)]) -> Vec<pb::EpochStart> {
+        records
+            .iter()
+            .map(|&(epoch, start_seq, nonce)| pb::EpochStart {
+                epoch,
+                start_seq,
+                nonce,
+            })
+            .collect()
+    }
+
+    /// A master at epoch 2 (fork after epoch 1 at seq 101; nonces 11 and 22), last_seq 200, log
+    /// from 50.
     fn master() -> ServerView {
         ServerView {
             server_id: "a".into(),
@@ -204,16 +228,7 @@ mod tests {
                 db_uuid: uuid(),
                 epoch: 2,
             }),
-            epoch_history: vec![
-                EpochStart {
-                    epoch: 1,
-                    start_seq: 1,
-                },
-                EpochStart {
-                    epoch: 2,
-                    start_seq: 101,
-                },
-            ],
+            epoch_history: vec![record(1, 1, 11), record(2, 101, 22)],
             upstream_chain: vec![],
             last_seq: 200,
             first_retained_seq: 50,
@@ -242,7 +257,7 @@ mod tests {
             }),
             last_seq: 150,
             last_crc32c: Some(0xAAAA),
-            known_epoch_start: Some(101),
+            known_epochs: known(&[(1, 1, 11), (2, 101, 22)]),
         }
     }
 
@@ -250,7 +265,7 @@ mod tests {
     fn epoch_1(last_seq: Seq) -> pb::HandshakeRequest {
         let mut r = req();
         r.known_identity.as_mut().unwrap().epoch = 1;
-        r.known_epoch_start = Some(1);
+        r.known_epochs = known(&[(1, 1, 11)]);
         r.last_seq = last_seq;
         r
     }
@@ -335,9 +350,9 @@ mod tests {
     fn rule_08_diverged_at_or_past_fork() {
         let r = epoch_1(101);
         check(&master(), &r, Reject, R::Diverged);
-        // Without known_epoch_start (the field is optional) the fork is the same.
+        // Without known_epochs (the field is optional) the fork is the same.
         let mut r = epoch_1(101);
-        r.known_epoch_start = None;
+        r.known_epochs = Vec::new();
         check(&master(), &r, Reject, R::Diverged);
     }
 
@@ -358,10 +373,27 @@ mod tests {
         check(&replica(), &r, Resume, R::EpochAdvanced);
     }
 
+    /// The history proves continuity without any entry: the client's record of epoch 1, nonce
+    /// included, is in the server's history, so a trimmed entry or a missing CRC is no obstacle.
+    #[test]
+    fn rule_09_the_history_proves_continuity_without_the_entry() {
+        let mut r = epoch_1(30);
+        let mut v = master();
+        v.crc_at_client_last = None; // entry 30 was trimmed
+        check(&v, &r, Resume, R::EpochAdvanced);
+        r.last_crc32c = None;
+        check(&master(), &r, Resume, R::EpochAdvanced);
+        // Still: a proven CRC mismatch wins over the history.
+        let mut r = epoch_1(30);
+        r.last_crc32c = Some(0xBBBB);
+        check(&master(), &r, Reject, R::Diverged);
+    }
+
     #[test]
     fn rule_10b_epoch_change_without_proof() {
+        // No record sent: only the CRC can prove continuity.
         let mut r = epoch_1(30);
-        r.last_crc32c = Some(0xAAAA);
+        r.known_epochs = Vec::new();
         let mut v = master();
         v.crc_at_client_last = None; // entry 30 was trimmed
         check(&v, &r, Bootstrap, R::IdentityChanged);
@@ -371,13 +403,41 @@ mod tests {
         check(&v, &r, Bootstrap, R::IdentityChanged);
     }
 
+    /// Restoring a master from a backup without a bump: the restored node opens a new epoch 2
+    /// at 101 with another nonce. A client of the lost epoch 2 holding entries from 101 on is
+    /// DIVERGED by the history alone, even with matching CRCs.
+    #[test]
+    fn the_same_epoch_with_another_nonce_is_another_epoch() {
+        let mut r = req();
+        r.known_epochs = known(&[(1, 1, 11), (2, 101, 23)]);
+        check(&master(), &r, Reject, R::Diverged);
+        check(&replica(), &r, Reject, R::Diverged);
+        // Below the start nothing differs, but only the CRC proves it.
+        r.last_seq = 100;
+        check(&master(), &r, Resume, R::EpochAdvanced);
+        let mut v = master();
+        v.crc_at_client_last = None;
+        check(&v, &r, Bootstrap, R::IdentityChanged);
+    }
+
+    /// Up to five newest records are compared, not only the client's own epoch: an older
+    /// record with another nonce (a history that forked earlier and reached the same numbers)
+    /// moves the fork down to it.
+    #[test]
+    fn every_record_the_client_sends_is_checked() {
+        let mut r = req();
+        r.known_epochs = known(&[(1, 1, 99), (2, 101, 22)]);
+        check(&master(), &r, Reject, R::Diverged);
+        // Records that do not end with the client's own epoch are ignored: identities decide.
+        let mut r = req();
+        r.known_epochs = known(&[(1, 1, 11)]);
+        check(&master(), &r, Resume, R::Unspecified);
+    }
+
     #[test]
     fn rule_08_inconsistent_history_fails_closed() {
         let mut v = master();
-        v.epoch_history = vec![EpochStart {
-            epoch: 1,
-            start_seq: 1,
-        }];
+        v.epoch_history = vec![record(1, 1, 11)];
         let r = epoch_1(100);
         check(&v, &r, Reject, R::Diverged);
     }
@@ -389,7 +449,7 @@ mod tests {
         // The client has nothing at or past min(81, 101) = 81, and the server holds its last
         // entry with the same CRC: continuity is proven, the client adopts the server's epoch.
         let mut r = req();
-        r.known_epoch_start = Some(81);
+        r.known_epochs = known(&[(1, 1, 11), (2, 81, 33)]);
         r.last_seq = 80;
         check(&master(), &r, Resume, R::EpochAdvanced);
         check(&replica(), &r, Resume, R::EpochAdvanced);
@@ -397,7 +457,7 @@ mod tests {
         r.last_seq = 81;
         check(&master(), &r, Reject, R::Diverged);
         let mut r = req();
-        r.known_epoch_start = Some(121);
+        r.known_epochs = known(&[(1, 1, 11), (2, 121, 33)]);
         r.last_seq = 101;
         check(&master(), &r, Reject, R::Diverged);
         r.last_seq = 100;
@@ -411,7 +471,7 @@ mod tests {
         // The same start (or none sent) is the same epoch: plain resume.
         check(&master(), &req(), Resume, R::Unspecified);
         let mut r = req();
-        r.known_epoch_start = None;
+        r.known_epochs = Vec::new();
         check(&master(), &r, Resume, R::Unspecified);
     }
 
@@ -424,18 +484,9 @@ mod tests {
             db_uuid: uuid(),
             epoch: 3,
         });
-        v.epoch_history = vec![
-            EpochStart {
-                epoch: 1,
-                start_seq: 1,
-            },
-            EpochStart {
-                epoch: 3,
-                start_seq: 101,
-            },
-        ];
+        v.epoch_history = vec![record(1, 1, 11), record(3, 101, 33)];
         let mut r = req(); // epoch 2 from 81
-        r.known_epoch_start = Some(81);
+        r.known_epochs = known(&[(1, 1, 11), (2, 81, 22)]);
         r.last_seq = 90;
         check(&v, &r, Reject, R::Diverged);
         r.last_seq = 80;

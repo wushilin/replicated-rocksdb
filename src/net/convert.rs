@@ -39,22 +39,28 @@ pub(crate) fn cf_from_pb(p: &pb::CfSpec) -> CfEntry {
     }
 }
 
+pub(crate) fn epoch_to_pb(e: &EpochStart) -> pb::EpochStart {
+    pb::EpochStart {
+        epoch: e.epoch,
+        start_seq: e.start_seq,
+        nonce: e.nonce,
+    }
+}
+
+pub(crate) fn epoch_from_pb(e: &pb::EpochStart) -> EpochStart {
+    EpochStart {
+        epoch: e.epoch,
+        start_seq: e.start_seq,
+        nonce: e.nonce,
+    }
+}
+
 pub(crate) fn epochs_to_pb(h: &[EpochStart]) -> Vec<pb::EpochStart> {
-    h.iter()
-        .map(|e| pb::EpochStart {
-            epoch: e.epoch,
-            start_seq: e.start_seq,
-        })
-        .collect()
+    h.iter().map(epoch_to_pb).collect()
 }
 
 pub(crate) fn epochs_from_pb(h: &[pb::EpochStart]) -> Vec<EpochStart> {
-    h.iter()
-        .map(|e| EpochStart {
-            epoch: e.epoch,
-            start_seq: e.start_seq,
-        })
-        .collect()
+    h.iter().map(epoch_from_pb).collect()
 }
 
 /// Validates an epoch history received from upstream (PROTOCOL.md §5.5) for `identity`:
@@ -143,10 +149,12 @@ mod tests {
             EpochStart {
                 epoch: 1,
                 start_seq: 1,
+                nonce: 0,
             },
             EpochStart {
                 epoch: 3,
                 start_seq: 70,
+                nonce: 0,
             },
         ];
         assert_eq!(epochs_from_pb(&epochs_to_pb(&h)), h);
@@ -160,14 +168,19 @@ mod tests {
         };
         let h = |v: &[(u64, u64)]| {
             v.iter()
-                .map(|&(epoch, start_seq)| pb::EpochStart { epoch, start_seq })
+                .map(|&(epoch, start_seq)| pb::EpochStart {
+                    epoch,
+                    start_seq,
+                    nonce: 0,
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(
             checked_history(&id(1), &h(&[(1, 1)])).unwrap(),
             vec![EpochStart {
                 epoch: 1,
-                start_seq: 1
+                start_seq: 1,
+                nonce: 0,
             }]
         );
         checked_history(&id(3), &h(&[(1, 1), (2, 50), (3, 50)])).unwrap();
