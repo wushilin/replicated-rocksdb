@@ -8,8 +8,9 @@ use std::time::Duration;
 use tokio::sync::{Mutex, MutexGuard};
 
 use replicated_rocksdb::{
-    CfSpec, Error, HaltReason, LogApi, Master, MismatchPolicy, ReadApi, RepointOptions,
-    RepointOutcome, Slave, SlaveState, UpstreamConfig, VerifyAbort, VerifyMode, WriteConcern,
+    CfSpec, Error, HaltReason, LogApi, Master, MismatchPolicy, ReadApi, RejoinOptions,
+    RepointOptions, RepointOutcome, Slave, SlaveState, UpstreamConfig, VerifyAbort, VerifyMode,
+    WriteConcern,
 };
 use support::{Cluster, assert_converged, wait_until};
 
@@ -1777,5 +1778,42 @@ async fn an_automatic_bootstrap_is_pinned_to_the_database_the_handshake_answered
         Some(b"x".to_vec())
     );
     drop(z);
+    scenario.teardown();
+}
+
+/// A crash right after the rejoin rewrite batch (before the slave opens) leaves a slave
+/// directory that reopens as a slave and still refuses the divergence (consent is never
+/// persisted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_after_the_rejoin_rewrite_reopens_as_a_halting_slave() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (_, b, _) = support::failover(&c, true).await;
+
+    fail::cfg("rejoin-after-rewrite", "1*return").unwrap();
+    let (cfg, _) = c.slave_config("a", b.serve_addr().unwrap());
+    let err = Slave::rejoin(
+        cfg.clone(),
+        RejoinOptions {
+            on_divergence: replicated_rocksdb::RepointDivergence::Repair {
+                accept_loss: replicated_rocksdb::AcceptDataLoss,
+            },
+        },
+    )
+    .await
+    .err()
+    .expect("the crash");
+    assert!(matches!(err, Error::Io(_)), "{err}");
+    fail::remove("rejoin-after-rewrite");
+    assert_eq!(
+        support::RawDb::open(&c.path("a")).meta(b"role"),
+        Some(b"slave".to_vec())
+    );
+    let a = Slave::open(cfg).await.unwrap();
+    wait_until("a halts Diverged", || {
+        a.status().state == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
+    assert_eq!(a.get("c", b"only on a").unwrap(), Some(b"2".to_vec()));
     scenario.teardown();
 }

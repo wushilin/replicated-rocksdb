@@ -9,7 +9,6 @@ pub(crate) mod meta;
 pub(crate) mod offline;
 pub(crate) mod promote;
 pub(crate) mod read;
-#[allow(dead_code)] // consumed by Slave::rejoin (Plan 4 Task 3); remove then
 pub(crate) mod rejoin;
 pub(crate) mod repair;
 pub(crate) mod repl;

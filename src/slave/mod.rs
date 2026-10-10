@@ -18,10 +18,10 @@ mod state;
 mod verifier;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
@@ -61,22 +61,51 @@ impl Slave {
     /// Opens or creates a slave database and starts replicating. Must be called within a
     /// tokio runtime. Local data is readable at once unless a bootstrap was interrupted.
     pub async fn open(cfg: SlaveConfig) -> Result<Self> {
+        Self::start(cfg, None).await.map(|(slave, _)| slave)
+    }
+
+    /// Opens the slave. With `settle`, the first handshake is armed as a repoint (generation 0)
+    /// with that divergence mode before the driver starts, so it never follows
+    /// `cfg.on_divergence`; the receiver gets that handshake's outcome, exactly as
+    /// `Slave::repoint` returns it (`Slave::rejoin`).
+    async fn start(
+        cfg: SlaveConfig,
+        settle: Option<RepointDivergence>,
+    ) -> Result<(Self, Option<oneshot::Receiver<Result<RepointOutcome>>>)> {
         cfg.validate()?;
         let (store, meta) = Store::open(&cfg.path, Role::Slave, cfg.rocksdb.clone())?;
         let inner = Arc::new(Inner::new(store, cfg, &meta)?);
+        let settled = settle.map(|mode| {
+            let (reply, settled) = oneshot::channel();
+            // Same lock order as `Slave::repoint`: `pending`, then the mode.
+            let mut pending = inner.pending_repoint();
+            *inner
+                .repoint_divergence
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(mode);
+            *pending = Some(repoint::PendingRepoint {
+                generation: *inner.repoint_tx.borrow(),
+                halt_error: None,
+                reply,
+            });
+            settled
+        });
         let server =
             crate::server::start_for(&inner, inner.cfg.serve.clone(), inner.replicas.clone())
                 .await?;
         let driver = driver::spawn(&inner);
         let maintenance = maintenance::spawn(&inner);
         let verifier = verifier::spawn(&inner);
-        Ok(Slave {
-            inner,
-            driver: Some(driver),
-            maintenance: Some(maintenance),
-            verifier,
-            server,
-        })
+        Ok((
+            Slave {
+                inner,
+                driver: Some(driver),
+                maintenance: Some(maintenance),
+                verifier,
+                server,
+            },
+            settled,
+        ))
     }
 
     /// Direct downstream replicas of this slave (see `Master::replicas`). Empty when it does

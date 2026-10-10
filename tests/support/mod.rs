@@ -161,6 +161,29 @@ impl Cluster {
     }
 }
 
+/// A (master) → B (slave), in sync. With `a_ahead`, B stops first and A takes two entries B
+/// never sees. A stops; B reopens and is promoted (plain `promote`: A is down). Returns A's
+/// master config, B as the new master, and the first seq B does not share with A.
+pub async fn failover(c: &Cluster, a_ahead: bool) -> (MasterConfig, Master, Seq) {
+    let a_cfg = c.master_config("a");
+    let a = Master::open(a_cfg.clone()).await.unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (b_cfg, _) = c.slave_config("b", a.serve_addr().unwrap());
+    let b = Slave::open(b_cfg.clone()).await.unwrap();
+    a.put("c", b"k", b"1").unwrap();
+    assert_converged(&a, &[("b", &b)]).await;
+    b.shutdown().await.unwrap();
+    if a_ahead {
+        a.put("c", b"only on a", b"2").unwrap();
+        a.put("c", b"also only on a", b"3").unwrap();
+    }
+    a.shutdown().await.unwrap();
+    let b = Slave::open(b_cfg).await.unwrap();
+    let fork = b.last_seq() + 1;
+    let b = b.promote(c.master_config("b")).await.unwrap();
+    (a_cfg, b, fork)
+}
+
 /// Polls `f` every 20 ms; panics after 30 s.
 pub async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + WAIT;

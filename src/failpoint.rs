@@ -25,6 +25,8 @@
 //! `cfg_callback`),
 //! `slave-promote-before-shutdown` (a promotion passed its checks, the slave still runs;
 //! `pause` or `cfg_callback`),
+//! `rejoin-after-rewrite` (`Slave::rejoin` committed its rewrite batch, before the slave
+//! opens; `return` makes it fail with `Err(Io)`, as a crash there would),
 //! `slave-snapshot-after-check` (`Slave::snapshot` checked readiness, before the snapshot;
 //! `cfg_callback`).
 //!
