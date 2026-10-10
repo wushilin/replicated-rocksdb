@@ -99,6 +99,33 @@ impl Slave {
         self.inner.store.position().last_seq
     }
 
+    /// Last applied seq (the same as `LogApi::last_seq` and [`applied_seq`](Self::applied_seq),
+    /// without the import).
+    pub fn last_seq(&self) -> Seq {
+        self.inner.store.position().last_seq
+    }
+
+    /// Waits until the slave is `Streaming` (connected and tailing its upstream).
+    /// `Err(Halted(reason))` if it halts first, `Err(Timeout)` after `timeout`.
+    pub async fn wait_streaming(&self, timeout: Duration) -> Result<()> {
+        let mut states = self.inner.state_tx.subscribe();
+        let wait = async {
+            loop {
+                match &*states.borrow_and_update() {
+                    SlaveState::Streaming => return Ok(()),
+                    SlaveState::Halted(r) => return Err(Error::Halted(*r)),
+                    _ => {}
+                }
+                if states.changed().await.is_err() {
+                    return Err(Error::NotReady);
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait)
+            .await
+            .map_err(|_| Error::Timeout)?
+    }
+
     /// Waits until `applied_seq() >= seq`. `Err(Halted(reason))` if the slave halts first,
     /// `Err(Timeout)` after `timeout`.
     pub async fn wait_for_seq(&self, seq: Seq, timeout: Duration) -> Result<()> {

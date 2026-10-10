@@ -313,14 +313,14 @@ pub const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Queries a node's `Status` over the network (within [`STATUS_TIMEOUT`]). `client_id`
 /// identifies the caller (it must be a valid node identifier); `upstream` carries the
 /// address, TLS and credentials. A peer that cannot be reached is
-/// `Err(Error::PeerUnreachable { peer, reason })`.
+/// `Err(Error::PeerUnreachable { peer, reason, source })`, with a one-line `reason`.
 pub async fn node_status(upstream: &UpstreamConfig, client_id: &str) -> Result<NodeInfo> {
     node_status_probed(upstream, client_id, None).await
 }
 
 /// [`node_status`], also asking for the CRC of the node's entry at `probe_seq`.
 ///
-/// `Err(PeerUnreachable { peer, reason })` when no answer could be had (connect error, the
+/// `Err(PeerUnreachable { peer, reason, source })` when no answer could be had (connect error, the
 /// [`STATUS_TIMEOUT`], a transport failure); `Err(Config)` with the status text when the peer
 /// answered with an error (permission denied, another protocol, ...) or an undecodable answer.
 pub async fn node_status_probed(
@@ -331,9 +331,10 @@ pub async fn node_status_probed(
     status_classified(upstream, client_id, probe_seq)
         .await
         .map_err(|f| match f {
-            StatusFailure::Unreachable(reason) => Error::PeerUnreachable {
+            StatusFailure::Unreachable { reason, source } => Error::PeerUnreachable {
                 peer: upstream.uri(),
                 reason,
+                source,
             },
             StatusFailure::Answered(m) => Error::Config(m),
         })
@@ -342,8 +343,42 @@ pub async fn node_status_probed(
 /// Why a `Status` call failed: the peer could not be reached, or it was reached and answered
 /// with an error (or an undecodable answer), so its state is unknown but it is alive.
 pub(crate) enum StatusFailure {
-    Unreachable(String),
+    /// `reason` is one short line; `source` keeps the whole error.
+    Unreachable {
+        reason: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
     Answered(String),
+}
+
+impl StatusFailure {
+    fn unreachable(e: impl std::error::Error + Send + Sync + 'static) -> StatusFailure {
+        StatusFailure::Unreachable {
+            reason: short_reason(&e),
+            source: Some(Box::new(e)),
+        }
+    }
+}
+
+/// One short line for an operator: the innermost cause of `e` (transport errors wrap the
+/// useful message, such as "Connection refused", several levels deep), first line only.
+fn short_reason(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut root = e;
+    while let Some(next) = root.source() {
+        root = next;
+    }
+    let text = root.to_string();
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        e.to_string()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    } else {
+        line.to_string()
+    }
 }
 
 /// Unreachable: connect errors, the timeout, and statuses `Unavailable`, `DeadlineExceeded`,
@@ -355,24 +390,22 @@ pub(crate) async fn status_classified(
 ) -> std::result::Result<NodeInfo, StatusFailure> {
     let uri = upstream.uri();
     let mut c = crate::slave::connect_upstream(upstream, client_id, STATUS_TIMEOUT)
-        .map_err(|e| StatusFailure::Unreachable(format!("Status from {uri}: {e}")))?;
+        .map_err(StatusFailure::unreachable)?;
     let call = c.status(pb::StatusRequest {
         client_id: client_id.to_string(),
         probe_seq,
     });
     let r = tokio::time::timeout(STATUS_TIMEOUT, call)
         .await
-        .map_err(|_| {
-            StatusFailure::Unreachable(format!(
-                "Status from {uri}: no answer within {STATUS_TIMEOUT:?}"
-            ))
+        .map_err(|_| StatusFailure::Unreachable {
+            reason: format!("no answer within {STATUS_TIMEOUT:?}"),
+            source: None,
         })?
         .map_err(|s| {
-            let m = format!("Status from {uri}: {}: {}", s.code(), s.message());
             if is_transport_failure(&s) {
-                StatusFailure::Unreachable(m)
+                StatusFailure::unreachable(s)
             } else {
-                StatusFailure::Answered(m)
+                StatusFailure::Answered(format!("Status from {uri}: {}: {}", s.code(), s.message()))
             }
         })?;
     NodeInfo::from_pb(r.into_inner(), probe_seq)
@@ -395,8 +428,9 @@ fn is_transport_failure(s: &tonic::Status) -> bool {
 pub struct Gathered {
     /// Every node that answered, with probes at the other nodes' `last_seq`s below its own.
     pub nodes: Vec<NodeInfo>,
-    /// Nodes that did not answer, or answered with an error (address, error text);
-    /// `Slave::check_promotion` treats the latter as blocking instead.
+    /// Nodes that did not answer, or answered with an error (address, a one-line reason for
+    /// the former, the error text for the latter); `Slave::check_promotion` treats the latter
+    /// as blocking instead.
     pub unreachable: Vec<(String, String)>,
 }
 
@@ -409,6 +443,8 @@ pub async fn gather(nodes: &[UpstreamConfig], client_id: &str) -> Gathered {
     for up in nodes {
         match node_status(up, client_id).await {
             Ok(info) => reached.push((up, info)),
+            // One short line: the address is already in the pair.
+            Err(Error::PeerUnreachable { reason, .. }) => out.unreachable.push((up.uri(), reason)),
             Err(e) => out.unreachable.push((up.uri(), e.to_string())),
         }
     }
@@ -478,6 +514,36 @@ mod tests {
         n
     }
 
+    #[derive(Debug)]
+    struct Wrapped(&'static str, Option<Box<Wrapped>>);
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|e| e as _)
+        }
+    }
+
+    /// The reason for an unreachable peer is the root cause, one line.
+    #[test]
+    fn unreachable_reasons_are_the_root_cause_on_one_line() {
+        let chain = Wrapped(
+            "transport error",
+            Some(Box::new(Wrapped(
+                "tcp connect error",
+                Some(Box::new(Wrapped(
+                    "Connection refused (os error 111)\nat line 2",
+                    None,
+                ))),
+            ))),
+        );
+        assert_eq!(short_reason(&chain), "Connection refused (os error 111)");
+        assert_eq!(short_reason(&Wrapped("just this", None)), "just this");
+    }
+
     /// M8: an unreachable peer is reported as such, not as a configuration error.
     #[tokio::test]
     async fn an_unreachable_peer_is_peer_unreachable() {
@@ -488,9 +554,14 @@ mod tests {
             .port();
         let up = UpstreamConfig::new("127.0.0.1", port);
         match node_status(&up, "operator").await {
-            Err(Error::PeerUnreachable { peer, reason }) => {
+            Err(Error::PeerUnreachable {
+                peer,
+                reason,
+                source,
+            }) => {
                 assert_eq!(peer, up.uri());
-                assert!(!reason.is_empty());
+                assert!(!reason.is_empty() && !reason.contains('\n'), "{reason:?}");
+                assert!(source.is_some(), "the whole chain is kept");
             }
             other => panic!("expected PeerUnreachable, got {other:?}"),
         }

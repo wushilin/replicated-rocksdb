@@ -100,11 +100,29 @@ pub struct MasterConfig {
     pub clock: Arc<dyn Clock>,
     /// Replication server. `None` runs an embedded, non-replicating master.
     pub serve: Option<ServeConfig>,
-    /// Default write concern of every write method. Default: asynchronous (no acks awaited).
+    /// Default write concern of every data write method (CF operations are exempt). Default:
+    /// asynchronous (no acks awaited).
     pub write_concern: WriteConcern,
 }
 
 impl MasterConfig {
+    /// The configuration to promote a slave with: the same identifier, path, retention,
+    /// heartbeat, RocksDB tuning and clock, and `serve` as given (usually the slave's own).
+    /// Everything else is the default.
+    pub fn from_slave_config(
+        slave: &crate::slave::SlaveConfig,
+        serve: Option<ServeConfig>,
+    ) -> Self {
+        MasterConfig {
+            retention: slave.retention.clone(),
+            heartbeat: slave.heartbeat,
+            rocksdb: slave.rocksdb.clone(),
+            clock: slave.clock.clone(),
+            serve,
+            ..MasterConfig::new(slave.identifier.clone(), slave.path.clone())
+        }
+    }
+
     pub fn new(identifier: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         MasterConfig {
             identifier: identifier.into(),

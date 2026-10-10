@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use replicated_rocksdb::{
     AllowAll, CfSpec, Error, FetchConfig, Master, MasterConfig, ReadApi, Seq, ServeConfig, Slave,
-    SlaveConfig, SlaveState, UpstreamConfig, WriteConcern,
+    SlaveConfig, UpstreamConfig, WriteConcern,
 };
 
 /// Writes block (fsync, then waiting for acks), so from async code run them on the blocking
@@ -43,9 +43,7 @@ async fn open_slave(
     let mut cfg = SlaveConfig::new(name, dir.join(name), UpstreamConfig::from_addr(addr));
     cfg.fetch = fetch;
     let slave = Slave::open(cfg).await?;
-    while slave.status().state != SlaveState::Streaming {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    slave.wait_streaming(Duration::from_secs(10)).await?;
     Ok(slave)
 }
 
@@ -53,8 +51,9 @@ async fn open_slave(
 async fn main() -> Result<(), Box<dyn StdError>> {
     let dir = tempfile::tempdir()?;
 
-    // ---- Concern in the config: applies to EVERY write on this master (put, write,
-    // create_cf, ...) unless a call overrides it with the `*_with` variants.
+    // ---- Concern in the config: applies to EVERY data write on this master (put, write,
+    // delete, ...) unless a call overrides it with the `*_with` variants. CF operations are
+    // exempt: they carry no user data.
     let mut cfg = MasterConfig::new("master", dir.path().join("master"));
     cfg.serve = Some(ServeConfig::new(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -68,17 +67,19 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let master = Arc::new(Master::open(cfg).await?);
     let addr = master.serve_addr().unwrap();
 
-    // 1. No replica yet => even create_cf is refused, and nothing is written (no seq used).
-    match master.create_cf(CfSpec::new("kv")) {
+    // 1. No replica yet. Creating a CF needs none (CF operations ignore the write concern),
+    // but a data write is refused, and nothing is written (no seq used).
+    master.create_cf(CfSpec::new("kv"))?;
+    let m = master.clone();
+    match tokio::task::spawn_blocking(move || m.put("kv", b"early", b"x")).await? {
         Err(Error::NotEnoughReplicas { required, in_sync }) => {
-            println!("create_cf refused: {in_sync} in sync, {required} required (nothing written)")
+            println!("put refused: {in_sync} in sync, {required} required (nothing written)")
         }
         other => panic!("unexpected: {other:?}"),
     }
     // So attach a replica first: one that is connected and caught up counts as in sync.
     let fast = open_slave(dir.path(), "fast", addr, FetchConfig::default()).await?;
-    wait_in_sync(&master, 1).await;
-    master.create_cf(CfSpec::new("kv"))?; // now allowed by the configured concern (1)
+    master.wait_in_sync(1, Duration::from_secs(10)).await?;
 
     // 2. Success: the call returns only after `fast` acknowledged the entry.
     let seq = put_with(&master, b"a", b"1", WriteConcern::in_sync(1)).await?;
@@ -111,7 +112,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         max_batch_bytes: 1 << 20,
     };
     let slow = open_slave(dir.path(), "slow", addr, slow_fetch).await?;
-    wait_in_sync(&master, 2).await;
+    master.wait_in_sync(2, Duration::from_secs(10)).await?;
     let tight = WriteConcern {
         min_insync_replicas: 2,
         ack_timeout: Duration::from_millis(200),
@@ -146,10 +147,4 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         .await?;
     println!("done");
     Ok(())
-}
-
-async fn wait_in_sync(master: &Master, n: usize) {
-    while master.replicas().iter().filter(|r| r.in_sync).count() < n {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }

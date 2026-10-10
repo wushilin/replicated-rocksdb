@@ -81,7 +81,6 @@ mod tests {
 
     use crate::config::WriteConcern;
     use crate::error::Error;
-    use crate::log::LogApi;
     use crate::server::test_client::{
         TailExt, ack, client, eventually, next_batch, serving_master, tail_req,
     };

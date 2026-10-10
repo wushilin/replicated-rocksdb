@@ -3,7 +3,7 @@ mod common;
 use std::time::Duration;
 
 use common::{clock, config, log};
-use replicated_rocksdb::{Batch, CfSpec, LogApi, Master, Op, ReadApi, ReapStats};
+use replicated_rocksdb::{Batch, CfSpec, Master, Op, ReadApi, ReapStats};
 
 async fn master(
     dir: &std::path::Path,

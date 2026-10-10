@@ -4,8 +4,8 @@ mod support;
 
 use replicated_rocksdb::admin;
 use replicated_rocksdb::{
-    AcceptDataLoss, CfSpec, Error, HaltAction, HaltReason, LogApi, Master, ReadApi,
-    RepointDivergence, RepointOptions, RepointOutcome, Slave, SlaveState, UpstreamConfig,
+    AcceptDataLoss, CfSpec, Error, HaltAction, HaltReason, Master, ReadApi, RepointDivergence,
+    RepointOptions, RepointOutcome, Slave, SlaveState, UpstreamConfig,
 };
 use support::{Cluster, assert_converged, wait_state, wait_until};
 

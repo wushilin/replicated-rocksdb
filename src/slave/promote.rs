@@ -149,9 +149,9 @@ impl Slave {
             let probe = Some(me.last_seq).filter(|&s| s > 0);
             let info = match admin::status_classified(peer, &me.node_id, probe).await {
                 Ok(info) => info,
-                Err(admin::StatusFailure::Unreachable(e)) => {
-                    tracing::warn!(peer = %peer.uri(), error = %e, "promotion check: peer unreachable");
-                    check.unreachable.push((peer.uri(), e));
+                Err(admin::StatusFailure::Unreachable { reason, source }) => {
+                    tracing::warn!(peer = %peer.uri(), reason = %reason, error = ?source, "promotion check: peer unreachable");
+                    check.unreachable.push((peer.uri(), reason));
                     continue;
                 }
                 // The peer is alive but its state is unknown (refused the call, spoke another
@@ -272,6 +272,23 @@ impl PromoteRefused {
     /// The slave, still running, if the promotion was refused before it changed anything.
     pub fn into_slave(self) -> Option<Slave> {
         self.slave.map(|s| *s)
+    }
+
+    /// The error and the slave (if it was handed back), to keep the slave while still
+    /// propagating the error with `?`:
+    ///
+    /// ```ignore
+    /// let master = match slave.promote_checked(cfg, &peers).await {
+    ///     Ok(master) => master,
+    ///     Err(refused) => {
+    ///         let (error, slave) = refused.into_parts();
+    ///         keep_replicating(slave);
+    ///         return Err(error.into());
+    ///     }
+    /// };
+    /// ```
+    pub fn into_parts(self) -> (Error, Option<Slave>) {
+        (self.error, self.slave.map(|s| *s))
     }
 }
 

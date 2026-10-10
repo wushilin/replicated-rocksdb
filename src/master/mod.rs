@@ -113,6 +113,37 @@ impl Master {
         })
     }
 
+    /// The seq of the last committed entry (the same as `LogApi::last_seq`, without the
+    /// import).
+    pub fn last_seq(&self) -> Seq {
+        self.inner.store.position().last_seq
+    }
+
+    /// Waits until at least `n` direct replicas are in sync (see [`replicas`](Self::replicas)),
+    /// for example before writes with `min_insync_replicas = n`. `Err(Timeout)` after
+    /// `timeout`; `Err(Config)` if `n > 0` and this master does not serve replication.
+    pub async fn wait_in_sync(&self, n: usize, timeout: Duration) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        if self.server.is_none() {
+            return Err(crate::Error::Config(
+                "this master does not serve replication".into(),
+            ));
+        }
+        let wait = async {
+            loop {
+                if self.replicas().iter().filter(|r| r.in_sync).count() >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(timeout, wait)
+            .await
+            .map_err(|_| crate::Error::Timeout)
+    }
+
     /// The origin identity (`db_uuid` and current epoch) stamped on every entry.
     pub fn identity(&self) -> DbIdentity {
         self.inner.identity()
@@ -257,12 +288,13 @@ impl Master {
     ///
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     ///
-    /// With a configured `MasterConfig::write_concern` it also waits for in-sync
-    /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
-    /// not undo the write; see [`write_with`](Self::write_with)).
+    /// **Exempt from `MasterConfig::write_concern`** (DESIGN.md §5.2): a CF operation carries
+    /// no user data and converges once replicated, so it always commits asynchronously
+    /// (fsynced on the master, no acks awaited). A fresh master configured with
+    /// `min_insync_replicas = 1` can therefore create its CFs before any replica exists.
     pub fn create_cf(&self, spec: CfSpec) -> Result<Seq> {
         validate_cf_name(&spec.name)?;
-        self.inner.commit_with(&self.inner.cfg.write_concern, |_| {
+        self.inner.commit_with(&WriteConcern::default(), |_| {
             Ok(vec![Op::CreateCf { spec }])
         })
     }
@@ -272,14 +304,12 @@ impl Master {
     ///
     /// Blocks until the entry is fsynced. Async callers should use `spawn_blocking`.
     ///
-    /// With a configured `MasterConfig::write_concern` it also waits for in-sync
-    /// acknowledgements and can return `NotEnoughReplicas` or `AckTimeout` (an `AckTimeout` does
-    /// not undo the write; see [`write_with`](Self::write_with)).
+    /// **Exempt from `MasterConfig::write_concern`**, like [`create_cf`](Self::create_cf).
     pub fn drop_cf(&self, name: &str) -> Result<Seq> {
         validate_cf_name(name)?;
         let op = Op::DropCf { name: name.into() };
         self.inner
-            .commit_with(&self.inner.cfg.write_concern, |_| Ok(vec![op]))
+            .commit_with(&WriteConcern::default(), |_| Ok(vec![op]))
     }
 
     /// Reads the current value of `key`, or `None` if absent or expired.
@@ -433,6 +463,23 @@ impl DemoteRefused {
     /// The master, still running, if the demotion was refused before it changed anything.
     pub fn into_master(self) -> Option<Master> {
         self.master.map(|m| *m)
+    }
+
+    /// The error and the master (if it was handed back), to keep the master while still
+    /// propagating the error with `?`:
+    ///
+    /// ```ignore
+    /// let slave = match master.demote(cfg).await {
+    ///     Ok(slave) => slave,
+    ///     Err(refused) => {
+    ///         let (error, master) = refused.into_parts();
+    ///         keep_serving(master);
+    ///         return Err(error.into());
+    ///     }
+    /// };
+    /// ```
+    pub fn into_parts(self) -> (crate::Error, Option<Master>) {
+        (self.error, self.master.map(|m| *m))
     }
 }
 

@@ -134,10 +134,16 @@ pub enum Error {
         peer_last_seq: Seq,
     },
     /// `admin::node_status` (and `node_status_probed`) could not get an answer from `peer`:
-    /// connect error, timeout, or a transport failure. A peer that answered with an error
-    /// status is reported as `Config` with the status text instead.
+    /// connect error, timeout, or a transport failure. `reason` is one short line (the root
+    /// cause); the whole chain is available through `source` (and `{:?}`). A peer that answered
+    /// with an error status is reported as `Config` with the status text instead.
     #[error("{peer} is unreachable: {reason}")]
-    PeerUnreachable { peer: String, reason: String },
+    PeerUnreachable {
+        peer: String,
+        reason: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
     #[error(transparent)]
     RocksDb(#[from] rocksdb::Error),
     #[error(transparent)]

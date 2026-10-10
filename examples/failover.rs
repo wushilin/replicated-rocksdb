@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use replicated_rocksdb::admin::{choose_promotion_candidate, gather};
 use replicated_rocksdb::{
-    AcceptDataLoss, AllowAll, CfSpec, Error, LogApi, Master, MasterConfig, ReadApi,
-    RepointDivergence, RepointOptions, ServeConfig, Slave, SlaveConfig, SlaveState, UpstreamConfig,
+    AcceptDataLoss, AllowAll, CfSpec, Error, Master, MasterConfig, ReadApi, RepointDivergence,
+    RepointOptions, ServeConfig, Slave, SlaveConfig, UpstreamConfig,
 };
 
 type Res<T> = Result<T, Box<dyn StdError>>;
@@ -44,17 +44,11 @@ fn replica_cfg(dir: &Path, id: &str, upstream: SocketAddr) -> SlaveConfig {
     cfg
 }
 
-/// The config to promote replica `id` with: same directory, now serving as a master.
+/// The config to promote replica `id` with: same identifier, directory, retention, tuning
+/// and clock as its `SlaveConfig`, now serving as a master.
 fn master_cfg(dir: &Path, id: &str) -> MasterConfig {
-    let mut cfg = MasterConfig::new(id, dir.join(id));
-    cfg.serve = Some(serve());
-    cfg
-}
-
-async fn streaming(s: &Slave) {
-    while s.status().state != SlaveState::Streaming {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let slave_cfg = replica_cfg(dir, id, ([127, 0, 0, 1], 0).into());
+    MasterConfig::from_slave_config(&slave_cfg, Some(serve()))
 }
 
 /// Master A with replicas B and C. B stops early (so it is BEHIND), A writes two more
@@ -70,8 +64,8 @@ async fn crash_scenario(dir: &Path) -> Res<(Slave, Slave, SocketAddr)> {
     let b_cfg = replica_cfg(dir, "B", a_addr);
     let b = Slave::open(b_cfg.clone()).await?;
     let c = Slave::open(replica_cfg(dir, "C", a_addr)).await?;
-    streaming(&b).await;
-    streaming(&c).await;
+    b.wait_streaming(WAIT).await?;
+    c.wait_streaming(WAIT).await?;
 
     let seq = a.put("kv", b"k1", b"written while everyone was up")?;
     b.wait_for_seq(seq, WAIT).await?;
@@ -112,10 +106,7 @@ async fn main() -> Res<()> {
         println!("  {} role={:?} last_seq={}", n.node_id, n.role, n.last_seq);
     }
     for (addr, why) in &gathered.unreachable {
-        println!(
-            "  unreachable: {addr} ({})",
-            why.lines().next().unwrap_or("")
-        );
+        println!("  unreachable: {addr} ({why})");
     }
     let choice = choose_promotion_candidate(&gathered.nodes)?;
     println!(
@@ -146,10 +137,14 @@ async fn main() -> Res<()> {
         UpstreamConfig::from_addr(b_addr),
         UpstreamConfig::from_addr(a_addr),
     ];
-    let new_master = c
-        .promote_checked(master_cfg(dir, "C"), &peers)
-        .await
-        .map_err(|e| e.to_string())?;
+    // `into_parts` keeps the slave of a refusal while `?` propagates the error.
+    let new_master = match c.promote_checked(master_cfg(dir, "C"), &peers).await {
+        Ok(master) => master,
+        Err(refused) => {
+            let (error, _slave) = refused.into_parts();
+            return Err(error.into());
+        }
+    };
     let new_addr = new_master.serve_addr().unwrap();
     println!(
         "C is now master, epoch {}, serving on {new_addr}",

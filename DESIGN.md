@@ -182,7 +182,7 @@ The same rules are in the rustdoc for `Master::put`, `Master::write` and `Master
 
 ### 5.2 Write concern (in-sync replicas)
 
-`MasterConfig::write_concern: WriteConcern { min_insync_replicas, ack_timeout }` (default `0` = asynchronous, `5 s`) applies to every write method; `Master::write_with(batch, concern)` and `Master::put_with(cf, key, value, concern)` override it per call. A direct replica of the master is **in sync** while its Tail stream is open, it follows the master's current identity, and its acknowledged seq reached the master's `last_seq` within `ServeLimits::replica_lag_time_max` (default 10 s; PROTOCOL.md §7.6). Replicas of replicas do not count, and each replica node counts once (by its best open stream), however many streams it has open. A node that serves must have `heartbeat * 2 <= replica_lag_time_max` (checked by `MasterConfig` and `SlaveConfig` validation, `Error::Config` otherwise): an idle replica acks once per heartbeat, so a longer heartbeat would drop healthy replicas out of sync.
+`MasterConfig::write_concern: WriteConcern { min_insync_replicas, ack_timeout }` (default `0` = asynchronous, `5 s`) applies to every data write method; `Master::write_with(batch, concern)` and `Master::put_with(cf, key, value, concern)` override it per call. **CF operations are exempt:** `create_cf` and `drop_cf` carry no user data and converge once replicated, so they always commit asynchronously (fsynced on the master, no acks awaited), whatever the configured concern; a fresh master with `min_insync_replicas = 1` can create its CFs before any replica exists. `Master::wait_in_sync(n, timeout)` waits until at least `n` direct replicas are in sync (`Err(Timeout)` otherwise). A direct replica of the master is **in sync** while its Tail stream is open, it follows the master's current identity, and its acknowledged seq reached the master's `last_seq` within `ServeLimits::replica_lag_time_max` (default 10 s; PROTOCOL.md §7.6). Replicas of replicas do not count, and each replica node counts once (by its best open stream), however many streams it has open. A node that serves must have `heartbeat * 2 <= replica_lag_time_max` (checked by `MasterConfig` and `SlaveConfig` validation, `Error::Config` otherwise): an idle replica acks once per heartbeat, so a longer heartbeat would drop healthy replicas out of sync.
 
 With `min_insync_replicas = N > 0`:
 1. Under the writer lock, after the entry is built and validated (a fenced writer, an unknown CF, an oversized entry or an invalid range report their own error first) and just before the commit: if fewer than N replicas are in sync → `Error::NotEnoughReplicas { required, in_sync }`. Nothing is written and no seq is consumed.
@@ -386,7 +386,7 @@ Normative messages: PROTOCOL.md §9.
 - **Epoch numbers are never reused.** `promote_checked` starts an epoch above every epoch any reachable peer of the database reports (its identity, every history record and its `max_burned_epoch`; `PromotionCheck::max_peer_epoch`), and every promotion stays above the node's own `max_burned_epoch`. Plain `promote` checks no peer: it can still pick a number an unreachable replica holds. The handshake's `known_epochs` (PROTOCOL.md §6.3) then tells the two epochs apart by their nonce and applies the epoch-change rules (`DIVERGED` from the lower start seq on), so histories never mix; `promote_checked` remains the safe path. A slave that nevertheless receives an entry whose epoch contradicts its history ends the session with a backed-off retry and `last_error` set, never an immediate re-handshake loop.
 - Ordering is by position: newest epoch, then `last_seq`. A node whose newest epoch is still empty (a promotion that has taken no writes) is therefore the latest of the nodes that can be shown compatible, but it is `Diverged { fork: start_seq }` from a node that holds entries at or past that epoch's `start_seq`; demoting the empty-epoch node and promoting the other would lose nothing. `promote_checked` refuses with `Error::MasterReachable { peer }` when any reachable peer reports `role == Master` (fence it, or `demote` it first), and with `PromotionUnverifiable` (`seq` 0) when a peer is reachable but answered `Status` with an error (permission denied, unimplemented, protocol mismatch): only connect errors, the 5 s timeout and the statuses `Unavailable`, `DeadlineExceeded`, `Cancelled` and `Unknown` with a transport error as its source count as unreachable. The check samples this slave's `last_seq` while it may still replicate; the runbook requires the old master to be fenced first.
 - After `Master::demote`, replicas that had already followed the wrongly promoted master are refused by it with `STALE_EPOCH` until they are repointed at the real master.
-- `promote_checked` and `demote` refuse by default and **hand the untouched, still-running node back**: `Err(PromoteRefused { error, slave })` / `Err(DemoteRefused { error, master })`, with `into_slave()` / `into_master()`. Only a failure after the node has started shutting down for the change (an I/O error during shutdown, a `ReadSnapshot` that still holds the database, a failure while rewriting `__meta`) loses the handle (`None`); the directory is then reopened by the application. Plain `promote` keeps its behaviour: a refusal shuts the slave down with its directory unchanged.
+- `promote_checked` and `demote` refuse by default and **hand the untouched, still-running node back**: `Err(PromoteRefused { error, slave })` / `Err(DemoteRefused { error, master })`, with `into_slave()` / `into_master()`, or `into_parts()` → `(Error, Option<node>)` to keep the node while propagating the error with `?`. Only a failure after the node has started shutting down for the change (an I/O error during shutdown, a `ReadSnapshot` that still holds the database, a failure while rewriting `__meta`) loses the handle (`None`); the directory is then reopened by the application. Plain `promote` keeps its behaviour: a refusal shuts the slave down with its directory unchanged.
 
 **Repoint.** `Slave::repoint(upstream, RepointOptions) -> Result<RepointOutcome>` switches a running slave to another upstream; reads keep being served. It closes the current upstream stream (a bootstrap in progress is abandoned and starts from scratch against the new upstream), clears a halt (in memory: `node_state = ready` is persisted only once the new upstream is accepted, so a restart before that reopens the slave still halted and the operator repoints again), forgets the old upstream chain, and handshakes the new upstream under all the normal rules (loop detection, `STALE_EPOCH`, epoch continuity). It returns once that handshake settles: `Resumed`, `EpochAdvanced`, `Bootstrapped`, or `Retrying { last_error }` when the new upstream cannot be used yet (unreachable, `STALE_EPOCH`, `NOT_READY`; the slave keeps retrying it). The new upstream is not persisted: after a restart, open the slave with it. A repoint replaced by a later one, or by a shutdown, before it settles returns `Error::RepointSuperseded`. `SlaveStatus.upstream` is the current target.
 
@@ -539,9 +539,17 @@ pub struct MasterConfig {
     pub write_concern: WriteConcern,    // { min_insync_replicas: 0 (async), ack_timeout: 5 s } (§5.2)
 }
 
+impl MasterConfig {
+    pub fn new(identifier: impl Into<String>, path: impl Into<PathBuf>) -> Self;
+    pub fn from_slave_config(slave: &SlaveConfig, serve: Option<ServeConfig>) -> Self;
+                                        // to promote: same identifier, path, retention, heartbeat,
+                                        // tuning and clock
+}
+
 impl Master {
-    pub async fn open(cfg: MasterConfig) -> Result<Self>;
+    pub async fn open(cfg: MasterConfig) -> Result<Self>;   // starts a new epoch (§13)
     pub fn identity(&self) -> DbIdentity;
+    pub fn last_seq(&self) -> Seq;                          // also via LogApi
     pub fn serve_addr(&self) -> Option<SocketAddr>;     // bound replication address (port 0 picks one)
 
     pub fn put(&self, cf: &str, k: &[u8], v: &[u8]) -> Result<Seq>;
@@ -551,11 +559,12 @@ impl Master {
     pub fn write(&self, batch: Batch) -> Result<Seq>;
     pub fn write_with(&self, batch: Batch, concern: WriteConcern) -> Result<Seq>;   // §5.2
     pub fn put_with(&self, cf: &str, k: &[u8], v: &[u8], concern: WriteConcern) -> Result<Seq>;
-    pub fn create_cf(&self, spec: CfSpec) -> Result<Seq>;
+    pub fn create_cf(&self, spec: CfSpec) -> Result<Seq>;   // CF ops ignore the write concern (§5.2)
     pub fn drop_cf(&self, name: &str) -> Result<Seq>;
 
     pub fn snapshot(&self) -> Result<ReadSnapshot>;
     pub fn replicas(&self) -> Vec<ReplicaStatus>;      // direct downstream only
+    pub async fn wait_in_sync(&self, n: usize, timeout: Duration) -> Result<()>;   // Err(Timeout)
     pub fn bump_epoch(&self) -> Result<DbIdentity>;
     pub fn can_demote(&self) -> Result<()>;           // Err(Config) says why demote would be refused
     pub async fn demote(self, cfg: SlaveConfig) -> Result<Slave, DemoteRefused>;  // undo an unused promotion (§13.1);
@@ -643,8 +652,10 @@ impl Slave {
     pub async fn open(cfg: SlaveConfig) -> Result<Self>;   // serves local data immediately unless Bootstrapping
     pub fn status(&self) -> SlaveStatus;
     pub fn applied_seq(&self) -> Seq;
+    pub fn last_seq(&self) -> Seq;                       // = applied_seq; also via LogApi
     pub fn serve_addr(&self) -> Option<SocketAddr>;     // when serve is configured
     pub async fn wait_for_seq(&self, seq: Seq, timeout: Duration) -> Result<()>;
+    pub async fn wait_streaming(&self, timeout: Duration) -> Result<()>;   // Err(Halted(r)) | Err(Timeout)
     pub fn watch_state(&self) -> watch::Receiver<SlaveState>;
     pub async fn verify_now(&self, mode: VerifyMode) -> Result<VerifyReport>;
     pub async fn clear_halt(&self, action: HaltAction) -> Result<()>;   // operator action
@@ -693,7 +704,8 @@ pub struct PromotionCheck {                     // Slave::check_promotion; Defau
     pub max_peer_epoch: u64,
 }
 pub async fn node_status(upstream: &UpstreamConfig, client_id: &str) -> Result<NodeInfo>;  // 5 s timeout;
-                                                // unreachable → Error::PeerUnreachable { peer, reason }
+                                                // unreachable → Error::PeerUnreachable { peer, reason, source }:
+                                                // `reason` is one line (the root cause), `source` the whole chain
 pub async fn node_status_probed(upstream: &UpstreamConfig, client_id: &str, probe_seq: Option<Seq>) -> Result<NodeInfo>;
 pub async fn gather(nodes: &[UpstreamConfig], client_id: &str) -> Gathered;   // { nodes (probed), unreachable }
 ```
@@ -704,7 +716,7 @@ See §5.1. `Master::get`, `Master::put`, `Master::write` and the crate-level doc
 
 ### 16.2 Errors
 
-`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }`, `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), `Diverged { fork_seq, local_last_seq, divergent_entries }` (a refused `repoint`), `RepointSuperseded`, `Unsupported`, `PeerUnreachable { peer, reason }` (`admin::node_status*` got no answer), `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
+`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }`, `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), `Diverged { fork_seq, local_last_seq, divergent_entries }` (a refused `repoint`), `RepointSuperseded`, `Unsupported`, `PeerUnreachable { peer, reason, source }` (`admin::node_status*` got no answer; `reason` is one line), `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
 
 ### 16.3 Persisted vs runtime slave state
 

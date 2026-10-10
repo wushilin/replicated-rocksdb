@@ -5,7 +5,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use replicated_rocksdb::{CfSpec, Error, LogApi, Master, SlaveState, UpstreamConfig, WriteConcern};
+use replicated_rocksdb::{CfSpec, Error, Master, SlaveState, UpstreamConfig, WriteConcern};
 use support::{Cluster, assert_converged, wait_state, wait_until};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -74,6 +74,8 @@ async fn an_acknowledged_write_survives_losing_the_master() {
     assert_eq!(new_master.get("c", b"acked").unwrap(), Some(b"v".to_vec()));
 }
 
+/// The configured write concern applies to every data write; CF operations are exempt
+/// (addendum §8): a fresh master with `min_insync_replicas = 1` creates its CF with no replica.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_configured_write_concern_applies_to_every_write() {
     let c = Cluster::new();
@@ -83,7 +85,12 @@ async fn the_configured_write_concern_applies_to_every_write() {
         ack_timeout: Duration::from_secs(10),
     };
     let m = Master::open(cfg).await.unwrap();
-    let r = m.create_cf(CfSpec::new("c"));
+    assert_eq!(
+        m.create_cf(CfSpec::new("c")).unwrap(),
+        1,
+        "no replica needed"
+    );
+    let r = m.put("c", b"k", b"v");
     assert!(
         matches!(
             r,
@@ -94,7 +101,7 @@ async fn the_configured_write_concern_applies_to_every_write() {
         ),
         "{r:?}"
     );
-    assert_eq!(m.last_seq(), 0);
+    assert_eq!(m.last_seq(), 1, "the refused write consumed no seq");
     // An explicit asynchronous write needs no replica.
     assert_eq!(
         m.write_with(replicated_rocksdb::Batch::new(), WriteConcern::default())
@@ -103,15 +110,19 @@ async fn the_configured_write_concern_applies_to_every_write() {
         Some("batch is empty".into())
     );
     let (b, _) = c.slave("b", m.serve_addr().unwrap()).await;
-    // The slave bootstraps the empty database (S = 0) and tails; then it is in sync.
-    wait_until("b in sync", || m.replicas().iter().any(|r| r.in_sync)).await;
+    m.wait_in_sync(1, support::WAIT).await.unwrap();
     let m = Arc::new(m);
     let m2 = m.clone();
-    tokio::task::spawn_blocking(move || m2.create_cf(CfSpec::new("c")))
+    tokio::task::spawn_blocking(move || m2.put("c", b"k", b"v"))
         .await
         .unwrap()
         .unwrap();
     assert_converged(&*m, &[("b", &b)]).await;
+    m.drop_cf("c").unwrap();
+    assert!(matches!(
+        m.wait_in_sync(2, Duration::from_millis(100)).await,
+        Err(Error::Timeout)
+    ));
 }
 
 /// Kafka-style in-sync (PROTOCOL.md §7.6): under a steady stream of writes the master is

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use replicated_rocksdb::{
-    CfSpec, HaltReason, Master, MasterConfig, ReadApi, ServeConfig, Slave, SlaveConfig, SlaveState,
+    CfSpec, HaltReason, Master, MasterConfig, ReadApi, ServeConfig, Slave, SlaveConfig,
     TlsClientConfig, TlsIdentity, TlsServerConfig, TokenAuthenticator, TokenCredentials,
     UpstreamConfig,
 };
@@ -101,8 +101,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         upstream_with("wrong-token"),
     ))
     .await?;
-    while bad.status().state != SlaveState::Halted(HaltReason::AuthRejected) {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    // `wait_streaming` reports the halt instead of waiting forever.
+    match bad.wait_streaming(Duration::from_secs(10)).await {
+        Err(replicated_rocksdb::Error::Halted(HaltReason::AuthRejected)) => {}
+        other => panic!("expected an AuthRejected halt, got {other:?}"),
     }
     println!("replica with the wrong token: {:?}", bad.status().state);
 

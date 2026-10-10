@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use replicated_rocksdb::{
-    AllowAll, CfSpec, FetchConfig, LogApi, Master, MasterConfig, ReadApi, ServeConfig, Slave,
-    SlaveConfig, SlaveState, UpstreamConfig,
+    AllowAll, CfSpec, FetchConfig, Master, MasterConfig, ReadApi, ServeConfig, Slave, SlaveConfig,
+    SlaveState, UpstreamConfig,
 };
 
 #[tokio::main]
@@ -62,12 +62,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // ---- Monitoring ------------------------------------------------------------------------
     // Wait until the master considers the replica "in sync" (fully caught up recently).
     // This is the signal `WriteConcern` uses (see the `write_concern` example).
-    for _ in 0..200 {
-        if master.replicas().iter().any(|r| r.in_sync) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    master.wait_in_sync(1, Duration::from_secs(10)).await?;
     for r in master.replicas() {
         println!(
             "master sees replica {:?}: applied_seq={} lag_entries={} lag_ms={:?} in_sync={}",
@@ -108,9 +103,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     bcfg.fetch = batched;
     let batched_slave = Slave::open(bcfg).await?;
     // Let it finish its bootstrap and attach, so the next write travels through the log.
-    while master.replicas().len() < 2 || batched_slave.status().state != SlaveState::Streaming {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    batched_slave
+        .wait_streaming(Duration::from_secs(10))
+        .await?;
+    master.wait_in_sync(2, Duration::from_secs(10)).await?;
     let seq = master.put("users", b"carol", b"Carol C.")?;
     let t = std::time::Instant::now();
     slave.wait_for_seq(seq, Duration::from_secs(10)).await?;
