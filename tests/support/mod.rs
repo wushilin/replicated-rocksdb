@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use replicated_rocksdb::{
     AllowAll, Backoff, CfSpec, IterMode, LogApi, LogEntry, ManualClock, Master, MasterConfig,
-    ReadApi, ReplicationListener, Seq, ServeConfig, Slave, SlaveConfig, SlaveState, UpstreamConfig,
-    ValueMeta, VerifyReport,
+    NodeConfig, ReadApi, ReplicationListener, Seq, ServeConfig, Slave, SlaveConfig, SlaveState,
+    UpstreamConfig, ValueMeta, VerifyReport,
 };
 
 pub const T0: u64 = 1_700_000_000_000;
@@ -182,6 +182,21 @@ pub async fn failover(c: &Cluster, a_ahead: bool) -> (MasterConfig, Master, Seq)
     let fork = b.last_seq() + 1;
     let b = b.promote(c.master_config("b")).await.unwrap();
     (a_cfg, b, fork)
+}
+
+/// `NodeConfig` of node `name`: master and slave share path, identifier and serve port, so the
+/// node keeps its address in both roles. `upstream` is the slave role's default upstream.
+pub fn node_cfg(c: &Cluster, name: &str, upstream: SocketAddr, peers: &[SocketAddr]) -> NodeConfig {
+    let master = c.master_config(name);
+    let (mut slave, _) = c.slave_config(name, upstream);
+    slave.serve = master.serve.clone();
+    let mut cfg = NodeConfig::new(master, slave);
+    cfg.peers = peers
+        .iter()
+        .copied()
+        .map(UpstreamConfig::from_addr)
+        .collect();
+    cfg
 }
 
 /// Polls `f` every 20 ms; panics after 30 s.

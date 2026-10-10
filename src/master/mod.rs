@@ -332,6 +332,11 @@ impl Master {
         self.inner.bump_epoch()
     }
 
+    /// The directory this master runs on.
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.inner.cfg.path
+    }
+
     /// The master as a replication source, for server tests.
     #[cfg(test)]
     pub(crate) fn log_source(&self) -> Arc<dyn crate::source::LogSource> {

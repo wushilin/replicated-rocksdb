@@ -79,7 +79,7 @@ pub mod listener;
 mod slave;
 
 pub use listener::ReplicationListener;
-pub use node::{AcceptSplitBrainRisk, FenceReason, NodeState, UnfenceOptions};
+pub use node::{AcceptSplitBrainRisk, FenceReason, Node, NodeConfig, NodeState, UnfenceOptions};
 pub use slave::{
     AcceptDataLoss, Backoff, DivergencePolicy, FetchConfig, GapPolicy, HaltAction, HaltReason,
     IdentityPolicy, PromoteRefused, PromotionCheck, RejoinOptions, RepointDivergence,

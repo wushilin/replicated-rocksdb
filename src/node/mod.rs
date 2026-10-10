@@ -1,7 +1,11 @@
 //! A handle that holds either role and switches it explicitly (DESIGN.md §13.2).
 
-#[allow(dead_code)] // consumed by the Node fenced open (Plan 4 Task 5); remove then
+mod config;
 pub(crate) mod fence;
+mod handle;
+mod switch;
 mod types;
 
+pub use config::NodeConfig;
+pub use handle::Node;
 pub use types::{AcceptSplitBrainRisk, FenceReason, NodeState, UnfenceOptions};

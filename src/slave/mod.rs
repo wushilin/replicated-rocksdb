@@ -130,6 +130,18 @@ impl Slave {
         self.inner.status()
     }
 
+    /// The directory this slave runs on.
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.inner.cfg.path
+    }
+
+    /// Reads this slave's current upstream address (`SlaveStatus::upstream`) without keeping
+    /// the slave alive: `None` once it is gone. For the `Node` state forwarder.
+    pub(crate) fn upstream_reader(&self) -> impl Fn() -> Option<String> + Send + 'static {
+        let inner = Arc::downgrade(&self.inner);
+        move || inner.upgrade().map(|i| i.upstream_uri())
+    }
+
     /// Last applied seq.
     pub fn applied_seq(&self) -> Seq {
         self.inner.store.position().last_seq
