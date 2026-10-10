@@ -1196,3 +1196,59 @@ async fn a_reset_releases_a_stalled_bootstraps_snapshot_and_slot() {
         .await;
     assert!(next.is_ok(), "the slot is free again: {:?}", next.err());
 }
+
+/// Final review T4-M6: the verify RPCs are a method of their own. A credential without
+/// `Method::Verify` gets `PERMISSION_DENIED` on `VerifyBegin`, `VerifyRange` and `VerifyEnd`;
+/// a call without a token gets `UNAUTHENTICATED`.
+#[tokio::test]
+async fn the_verify_rpcs_require_the_verify_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let (m, _) = serving_master(dir.path(), |cfg| {
+        let serve = cfg.serve.as_mut().unwrap();
+        let token = Arc::new(TokenAuthenticator::new(["t"]));
+        serve.authenticator =
+            Arc::new(AllowMethods::new(token, &[Method::Handshake, Method::Tail]));
+        serve.allow_plaintext_token = true;
+    })
+    .await;
+    m.create_cf(crate::types::CfSpec::new("c")).unwrap();
+    let addr = m.serve_addr().unwrap();
+    let with = |token| {
+        client_with(
+            addr,
+            Meta {
+                node_id: "b",
+                token,
+                version: Some(PROTOCOL_VERSION),
+            },
+        )
+    };
+    for (token, code) in [
+        (Some("t"), Code::PermissionDenied),
+        (None, Code::Unauthenticated),
+    ] {
+        let mut c = with(token);
+        let e = c
+            .verify_begin(pb::VerifyBeginRequest {
+                client_id: "b".into(),
+                mode: pb::VerifyMode::Quick as i32,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), code, "VerifyBegin with {token:?}");
+        let req = pb::VerifyRangeRequest {
+            session_id: vec![0; 16],
+            request_id: 1,
+            kind: None,
+        };
+        let e = c.verify_range(tokio_stream::iter([req])).await.unwrap_err();
+        assert_eq!(e.code(), code, "VerifyRange with {token:?}");
+        let e = c
+            .verify_end(pb::VerifyEndRequest {
+                session_id: vec![0; 16],
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), code, "VerifyEnd with {token:?}");
+    }
+}

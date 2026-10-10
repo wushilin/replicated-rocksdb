@@ -5,7 +5,9 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use replicated_rocksdb::{CfSpec, Error, Master, SlaveState, UpstreamConfig, WriteConcern};
+use replicated_rocksdb::{
+    CfSpec, Error, Master, ReadApi, SlaveState, UpstreamConfig, WriteConcern,
+};
 use support::{Cluster, assert_converged, wait_state, wait_until};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -161,4 +163,24 @@ async fn concurrent_writers_keep_the_replica_in_sync() {
     }
     assert!(total > 10, "{total} writes");
     assert_converged(&*m, &[("b", &b)]).await;
+}
+
+/// Final review M2.1: CF operations are exempt from the configured write concern (addendum
+/// §8): with `min_insync_replicas = 1` and no replica at all, `create_cf` and `drop_cf` both
+/// succeed, while a put is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cf_operations_need_no_replica_under_a_write_concern() {
+    let c = Cluster::new();
+    let mut cfg = c.master_config("a");
+    cfg.write_concern = WriteConcern::in_sync(1);
+    let m = Master::open(cfg).await.unwrap();
+    m.create_cf(CfSpec::new("c"))
+        .expect("create_cf needs no replica");
+    assert!(matches!(
+        m.put("c", b"k", b"v"),
+        Err(Error::NotEnoughReplicas { .. })
+    ));
+    m.drop_cf("c").expect("drop_cf needs no replica");
+    assert!(m.list_cfs().iter().all(|s| s.name != "c"));
+    assert_eq!(m.last_seq(), 2, "both CF operations were logged");
 }

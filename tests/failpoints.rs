@@ -780,9 +780,9 @@ async fn diverged_slave_and_restored_master(
 
 /// User-requested (b): the leader becomes unavailable in the middle of a repair's replay.
 /// The slave keeps its repair target: reads answer `NotReady`, `Status` reports
-/// `repairing:<S>`, it cannot be promoted, it serves no downstream handshake, and the master
-/// never counts it as in sync (its acks of replayed entries satisfy no write concern). When
-/// the leader is back, it resumes the replay and converges without a bootstrap.
+/// `repairing:<S>`, it cannot be promoted, it serves no downstream handshake, and here the
+/// master does not count it as in sync. When the leader is back, it resumes the replay and
+/// converges without a bootstrap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_leader_lost_mid_replay_keeps_the_repair_target_and_resumes() {
     let (_serial, scenario) = serial().await;
@@ -817,7 +817,10 @@ async fn the_leader_lost_mid_replay_keeps_the_repair_target_and_resumes() {
     fail::remove("slave-repair-after-rewind");
     wait_until("the leader holds the third entry", || held.reached()).await;
     wait_until("two entries replayed", || d.last_seq() == fork + 1).await;
-    // Its acks of replayed entries never make it an in-sync replica (DESIGN.md §12.1).
+    // Illustration only, not a proof: here its acks of replayed entries have not made it an
+    // in-sync replica, so a write concern of 1 is refused. The guarantee itself is structural
+    // (DESIGN.md §12.1: a replica in sync acknowledged everything the master had, and a
+    // replaying slave is behind the master's `S`); this test does not exercise every timing.
     let mine = a.replicas().into_iter().find(|r| r.node_id == "d");
     assert!(
         mine.is_some_and(|r| !r.in_sync && r.applied_seq < s),

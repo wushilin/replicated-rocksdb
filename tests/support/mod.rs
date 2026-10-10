@@ -117,9 +117,8 @@ impl Cluster {
         let mut o = rocksdb::Options::default();
         o.create_if_missing(false);
         let db = rocksdb::DB::open_cf(&o, &path, &names).unwrap();
-        let prefix = format!("u:{cf}:");
         let handle = db
-            .cf_handle(names.iter().find(|n| n.starts_with(&prefix)).unwrap())
+            .cf_handle(names.iter().find(|n| logical_cf(n) == Some(cf)).unwrap())
             .unwrap();
         db.delete_cf(&handle, key).unwrap();
     }
@@ -413,6 +412,14 @@ pub struct RawDb {
     names: Vec<String>,
 }
 
+/// The logical name of a physical user CF `u:{name}:{create_seq}`, split at the last `:` (a
+/// logical name may itself contain `:`); `None` for any other CF.
+pub fn logical_cf(physical: &str) -> Option<&str> {
+    let rest = physical.strip_prefix("u:")?;
+    let (name, seq) = rest.rsplit_once(':')?;
+    seq.parse::<u64>().ok().map(|_| name)
+}
+
 /// A key ordering for [`RawDb::open_with`].
 pub type KeyCmp = fn(&[u8], &[u8]) -> std::cmp::Ordering;
 
@@ -428,7 +435,7 @@ impl RawDb {
             .map(|n| {
                 let mut opts = rocksdb::Options::default();
                 for &(cf, name, f) in comparators {
-                    if n.starts_with(&format!("u:{cf}:")) {
+                    if logical_cf(n) == Some(cf) {
                         opts.set_comparator(name, Box::new(f));
                     }
                 }
@@ -442,8 +449,7 @@ impl RawDb {
 
     /// The physical CF of logical CF `name` (`u:{name}:{create_seq}`); there must be one.
     fn cf(&self, name: &str) -> Arc<rocksdb::BoundColumnFamily<'_>> {
-        let prefix = format!("u:{name}:");
-        let mut found = self.names.iter().filter(|n| n.starts_with(&prefix));
+        let mut found = self.names.iter().filter(|n| logical_cf(n) == Some(name));
         let physical = found
             .next()
             .unwrap_or_else(|| panic!("no physical CF for {name}"));
@@ -493,4 +499,21 @@ impl RawDb {
         env[last] ^= 0xFF;
         self.put(cf, key, &env);
     }
+}
+
+#[test]
+fn physical_cf_names_are_matched_exactly() {
+    assert_eq!(logical_cf("u:a:3"), Some("a"));
+    assert_eq!(
+        logical_cf("u:a:b:12"),
+        Some("a:b"),
+        "split at the last colon"
+    );
+    assert_eq!(
+        logical_cf("u:a:b:12").filter(|n| *n == "a"),
+        None,
+        "a is not a:b"
+    );
+    assert_eq!(logical_cf("__meta"), None);
+    assert_eq!(logical_cf("u:a:x"), None);
 }

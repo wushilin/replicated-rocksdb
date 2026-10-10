@@ -132,11 +132,9 @@ async fn keys_deleted_on_disk_are_reported_in_both_modes() {
         ),
     ];
     for mode in [VerifyMode::Quick, VerifyMode::Full] {
-        assert_eq!(
-            b.verify_now(mode).await.unwrap().mismatches,
-            expected,
-            "{mode:?}"
-        );
+        let report = b.verify_now(mode).await.unwrap();
+        assert_eq!(report.mismatches, expected, "{mode:?}");
+        assert_eq!(report.keys_checked, u64::from(KEYS) - 2, "{mode:?}");
     }
 }
 
@@ -156,11 +154,9 @@ async fn extra_keys_on_disk_are_reported_with_no_upstream_value() {
         mismatch("data", b"zzz", Some(8), None),
     ];
     for mode in [VerifyMode::Quick, VerifyMode::Full] {
-        assert_eq!(
-            b.verify_now(mode).await.unwrap().mismatches,
-            expected,
-            "{mode:?}"
-        );
+        let report = b.verify_now(mode).await.unwrap();
+        assert_eq!(report.mismatches, expected, "{mode:?}");
+        assert_eq!(report.keys_checked, u64::from(KEYS) + 2, "{mode:?}");
     }
 }
 

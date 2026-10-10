@@ -518,3 +518,58 @@ async fn consent_to_lose_data_ends_when_its_repoint_settles() {
     );
     drop(b);
 }
+
+/// Final review B-M13: a repoint's `Repair { accept_loss }` consent is single-use too. After
+/// the repoint settled `Repaired`, the upstream is restored from a backup (D is ahead of it
+/// again: `DIVERGED`). D halts `Diverged` with its data intact: no second repair, rewind or
+/// bootstrap on the strength of the old consent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repair_consent_ends_when_its_repoint_settles() {
+    let c = Cluster::new();
+    let (b_cfg, d, _, ld) = diverged_pair(&c).await;
+    let b = Slave::open(b_cfg).await.unwrap();
+    let b = b.promote(c.master_config("b")).await.unwrap();
+    let repair = RepointOptions {
+        on_divergence: RepointDivergence::Repair {
+            accept_loss: AcceptDataLoss,
+        },
+    };
+    assert!(matches!(
+        repoint(&d, up(b.serve_addr().unwrap()), repair)
+            .await
+            .unwrap(),
+        RepointOutcome::Repaired { .. }
+    ));
+    assert_converged(&b, &[("d", &d)]).await;
+    assert_eq!((ld.bootstraps(), ld.rewinds()), (1, 1));
+
+    // Back up B, write past the backup (D follows), then restore B without an epoch bump.
+    let b = c.restart_master_after_backup(b, "b", "b-backup").await;
+    let port = b.serve_addr().unwrap().port();
+    b.put("c", b"after the backup", b"1").unwrap();
+    b.put("c", b"after the backup 2", b"2").unwrap();
+    assert_converged(&b, &[("d", &d)]).await;
+    let last = d.last_seq();
+    b.shutdown().await.unwrap();
+    support::restore_dir(&c.path("b-backup"), &c.path("b"));
+    let mut cfg = c.master_config("b");
+    cfg.serve.as_mut().unwrap().port = port;
+    let b = Master::open(cfg).await.unwrap();
+
+    wait_state(&d, "Diverged halt", |s| {
+        *s == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
+    assert_eq!(d.last_seq(), last, "nothing discarded");
+    assert_eq!(
+        d.get("c", b"after the backup 2").unwrap(),
+        Some(b"2".to_vec()),
+        "data intact"
+    );
+    assert_eq!(
+        (ld.bootstraps(), ld.rewinds()),
+        (1, 1),
+        "the settled repoint's consent was not reused"
+    );
+    drop(b);
+}
