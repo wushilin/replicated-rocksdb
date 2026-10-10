@@ -21,13 +21,15 @@ pub struct AcceptDataLoss;
 
 /// What a repoint does when the new upstream answers `DIVERGED`. The slave's configured
 /// `on_divergence` policy is not used after an explicit repoint: the repoint's mode decides
-/// every `DIVERGED` answer (handshake, Tail or Bootstrap) until the next repoint or a restart.
+/// every `DIVERGED` answer until the next repoint or a restart.
 ///
-/// **Consent to lose data is single-use.** `Rebootstrap` and `Repair` apply only while their own
-/// repoint is in progress. Once that repoint settles (with any outcome, including
-/// `Retrying` and an error), the mode becomes `Refuse`: a later, unrelated `DIVERGED` halts
-/// the slave with its data intact instead of discarding it again. Repoint again with the
-/// consent to apply it once more.
+/// **Consent to lose data is single-use, and in practice covers the repoint's first handshake
+/// only.** `Rebootstrap` and `Repair` apply only while their own repoint is in progress, and a
+/// repoint settles as soon as that handshake is answered (with any outcome, including
+/// `Retrying` and an error); the mode then becomes `Refuse`. A `DIVERGED` that arrives later —
+/// from the Tail or Bootstrap that follows the handshake, or from any later session — halts the
+/// slave with its data intact instead of discarding it again. Repoint again with the consent to
+/// apply it once more.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RepointDivergence {
     /// `repoint` returns `Error::Diverged`; the slave halts `Diverged` with its data intact

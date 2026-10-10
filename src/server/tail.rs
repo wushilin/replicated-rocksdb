@@ -184,6 +184,13 @@ fn check_junction(src: &dyn LogSource, j: Junction) -> Result<(), Status> {
     }
 }
 
+/// Whether the producer may read entries from `next`, given one reading `last` of the node's
+/// `last_seq`. Never while a junction is unchecked: nothing at or after `from_seq` may be read
+/// before the client's `prev_crc32c` was compared.
+fn may_read_ahead(junction: Option<Junction>, ahead_empty: bool, next: Seq, last: Seq) -> bool {
+    junction.is_none() && ahead_empty && next <= last
+}
+
 fn heartbeat(src: &dyn LogSource) -> pb::TailMessage {
     pb::TailMessage {
         kind: Some(Kind::Heartbeat(pb::Heartbeat {
@@ -425,16 +432,20 @@ async fn produce(
         if let Some(status) = stream.violation() {
             return out.end(status).await;
         }
+        // One reading of the node's position per iteration: the junction check and the
+        // read-ahead must agree on it, or an entry committed in between could let `from_seq` be
+        // read (and sent) before `prev_crc32c` was checked.
+        let last = src.store().position().last_seq;
         // As soon as the server holds `from_seq - 1`, the client's `prev_crc32c` is checked,
         // before anything is sent (PROTOCOL.md §7.2, §7.3).
-        if let Some(j) = junction.filter(|j| j.seq <= src.store().position().last_seq) {
+        if let Some(j) = junction.filter(|j| j.seq <= last) {
             junction = None;
             if let Err(status) = check_junction(&*src, j) {
                 return out.end(status).await;
             }
         }
         // Read ahead everything that is available (in blocks of READ_BATCH).
-        if ahead.is_empty() && next <= src.store().position().last_seq {
+        if may_read_ahead(junction, ahead.is_empty(), next, last) {
             let s = src.clone();
             let read = tokio::task::spawn_blocking(move || {
                 s.store().read_entries(next, READ_BATCH, fetch.max_bytes)
@@ -532,6 +543,21 @@ async fn produce(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The node may pass the junction between two readings of its position. With one reading
+    /// per iteration, the junction is checked first and only a later iteration reads ahead:
+    /// nothing at or after `from_seq` is read before `prev_crc32c` was compared.
+    #[test]
+    fn nothing_is_read_ahead_while_the_junction_is_unchecked() {
+        let j = Junction { seq: 10, crc: 7 };
+        assert!(!may_read_ahead(Some(j), true, 11, 12));
+        assert!(may_read_ahead(None, true, 11, 12));
+        assert!(
+            !may_read_ahead(None, false, 11, 12),
+            "entries already read ahead go first"
+        );
+        assert!(!may_read_ahead(None, true, 13, 12), "nothing new yet");
+    }
 
     fn req(min: u32, wait_ms: u32, max: u32) -> pb::TailRequest {
         pb::TailRequest {

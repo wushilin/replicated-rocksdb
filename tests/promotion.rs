@@ -827,3 +827,38 @@ async fn a_reused_epoch_number_is_detected_by_its_start_seq() {
     lx.assert_no_violations();
     drop(w);
 }
+
+/// A peer that throttles the promotion check (too many failed authentications from this
+/// address) answers `BUSY`: it is alive and its state is unknown, so a checked promotion is
+/// refused as unverifiable instead of ignoring the peer as unreachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_throttled_peer_blocks_a_checked_promotion() {
+    use replicated_rocksdb::{TokenAuthenticator, TokenCredentials};
+    use std::sync::Arc;
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (b, _) = c.slave("b", a.serve_addr().unwrap()).await;
+    let (mut cfg, _) = c.slave_config("c", a.serve_addr().unwrap());
+    let mut serve = c.serve();
+    serve.authenticator = Arc::new(TokenAuthenticator::new(["s3cret"]));
+    serve.allow_plaintext_token = true;
+    serve.limits.max_auth_failures_per_minute = 1;
+    cfg.serve = Some(serve);
+    let peer = Slave::open(cfg).await.unwrap();
+    assert_converged(&a, &[("b", &b), ("c", &peer)]).await;
+    let addr = peer.serve_addr().unwrap();
+    // One failed authentication from 127.0.0.1 uses up the peer's budget for this address.
+    let mut wrong = UpstreamConfig::from_addr(addr);
+    wrong.credentials = Arc::new(TokenCredentials::new("wrong"));
+    assert!(admin::node_status(&wrong, "b").await.is_err());
+    let mut right = UpstreamConfig::from_addr(addr);
+    right.credentials = Arc::new(TokenCredentials::new("s3cret"));
+    match b.check_promotion(&[right]).await {
+        Err(Error::PromotionUnverifiable { peer, seq, .. }) => {
+            assert_eq!(seq, 0, "its state is unknown");
+            assert!(peer.contains("too many failed authentication"), "{peer}");
+        }
+        other => panic!("expected PromotionUnverifiable, got {other:?}"),
+    }
+}

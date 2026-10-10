@@ -443,6 +443,18 @@ pub async fn gather(nodes: &[UpstreamConfig], client_id: &str) -> Gathered {
 mod tests {
     use super::*;
 
+    /// A throttled answer (`BUSY`: `RESOURCE_EXHAUSTED`) comes from a live peer whose state is
+    /// unknown: answered with an error, never a transport failure (unreachable).
+    #[test]
+    fn a_throttled_status_answer_is_not_a_transport_failure() {
+        let busy = crate::net::reason_status(pb::Reason::Busy, "too many failed attempts");
+        assert_eq!(busy.code(), tonic::Code::ResourceExhausted);
+        assert!(!is_transport_failure(&busy));
+        assert!(is_transport_failure(&tonic::Status::unavailable(
+            "connection refused"
+        )));
+    }
+
     fn node(id: &str, uuid: u128, history: &[(u64, Seq)], last: Seq, crc: Option<u32>) -> NodeInfo {
         let epoch_history: Vec<EpochStart> = history
             .iter()

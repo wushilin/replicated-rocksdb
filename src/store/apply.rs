@@ -178,7 +178,8 @@ impl Store {
                 // spec (its comparator may differ) and must not be reused for this entry.
                 let leftover = self.db().get_cf(&self.cf(CF_META), key::CF_CREATE_INTENT)?;
                 if let Some(prev) = leftover.map(|v| meta::decode_cf_entry(&v)).transpose()? {
-                    if prev.physical_name() == physical
+                    let orphan = prev.physical_name();
+                    if orphan == physical
                         && prev != entry
                         && reuse.is_none()
                         && self.db().cf_handle(&physical).is_some()
@@ -187,6 +188,17 @@ impl Store {
                             "physical CF {physical} was created for {:?} by an unfinished commit; entry {} creates {:?}",
                             prev.spec, p.seq, entry.spec
                         )));
+                    }
+                    // A leftover of another physical name: the intent below overwrites the only
+                    // record of it, so drop it now, or the next open would find a physical CF
+                    // that `__meta` does not know.
+                    if orphan != physical
+                        && !live.values().any(|c| c.physical == orphan)
+                        && !pending.iter().any(|c| c.physical == orphan)
+                        && self.db().cf_handle(&orphan).is_some()
+                    {
+                        tracing::warn!(cf = %orphan, "dropping a column family left by an unfinished create");
+                        self.db().drop_cf(&orphan)?;
                     }
                 }
                 // Record the intent durably first: a crash after create_cf leaves a CF whose
@@ -643,6 +655,42 @@ mod tests {
         store.commit(a, false).unwrap();
         assert!(matches!(store.commit(b, false), Err(Error::Corrupt(_))));
         assert_eq!(store.position().last_seq, 1);
+    }
+
+    /// A failed create left `u:a:1` and its intent; the next create at the same seq is for
+    /// another name. The orphan is dropped before its intent is overwritten, or the next open
+    /// would find a physical CF that `__meta` does not know.
+    #[test]
+    fn an_orphan_of_another_name_is_dropped_before_its_intent_is_replaced() {
+        use crate::store::{Store, meta};
+        use crate::types::{CfEntry, Role};
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = open_store(dir.path());
+            let orphan = CfEntry {
+                spec: CfSpec::new("a"),
+                create_seq: 1,
+            };
+            store
+                .db()
+                .create_cf(orphan.physical_name(), &rocksdb::Options::default())
+                .unwrap();
+            store
+                .write_meta(
+                    &[(key::CF_CREATE_INTENT, &meta::encode_cf_entry(&orphan))],
+                    true,
+                )
+                .unwrap();
+            assert_eq!(apply(&store, vec![create("b")]).unwrap(), 1);
+            assert!(
+                store.db().cf_handle("u:a:1").is_none(),
+                "the orphan is gone"
+            );
+        }
+        let (_store, m) = Store::open(dir.path(), Role::Master, RocksTuning::new())
+            .expect("reopens: no physical CF unknown to __meta");
+        let names: Vec<&str> = m.cf_specs.iter().map(|e| e.spec.name.as_str()).collect();
+        assert_eq!(names, vec!["b"]);
     }
 
     /// M3: a physical CF left by a commit that failed after `create_cf` is reused only by the
