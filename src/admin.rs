@@ -161,7 +161,7 @@ pub enum Comparison {
 
 /// The first seq whose epoch differs between two histories, if any. Records are compared with
 /// their nonces: the same epoch number with another nonce is another epoch.
-fn fork_between(a: &[EpochStart], b: &[EpochStart]) -> Option<Seq> {
+pub(crate) fn fork_between(a: &[EpochStart], b: &[EpochStart]) -> Option<Seq> {
     for i in 0..a.len().max(b.len()) {
         match (a.get(i), b.get(i)) {
             (Some(x), Some(y)) if x == y => continue,

@@ -423,6 +423,8 @@ async fn demote_is_refused_once_the_new_epoch_has_entries() {
     let a_addr = a.serve_addr().unwrap();
     a.create_cf(CfSpec::new("c")).unwrap();
     let (b, _) = c.slave("b", a_addr).await;
+    // Streaming, not only converged: a promotion is refused while the bootstrap is finishing.
+    wait_state(&b, "b", |st| *st == SlaveState::Streaming).await;
     assert_converged(&a, &[("b", &b)]).await;
     a.shutdown().await.unwrap();
     let b_master = b.promote(c.master_config("b")).await.unwrap();
@@ -974,4 +976,41 @@ async fn a_peer_on_another_history_blocks_a_checked_promotion_without_its_entrie
         } => assert_eq!((peer.as_str(), f, peer_last_seq), ("d", fork, d_last)),
         ref e => panic!("expected PromotionWouldDiscard, got {e}"),
     }
+}
+
+/// A wrong promotion survives a restart of the promoted node (its open starts one more epoch),
+/// and `demote` still undoes it: the history returns to the one from before the promotion, so
+/// the node resumes from the real master with no bootstrap and no loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn demote_after_a_restart_undoes_the_promotion_and_every_epoch_since() {
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    let a_addr = a.serve_addr().unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (b, _) = c.slave("b", a_addr).await;
+    wait_state(&b, "b", |st| *st == SlaveState::Streaming).await;
+    for i in 0..5u8 {
+        a.put("c", &[i], &[i]).unwrap();
+    }
+    assert_converged(&a, &[("b", &b)]).await;
+    let before = support::dump(&b);
+    let history = b.promotion_info().epoch_history;
+
+    // Promoted by mistake (epoch 2), restarted (its open starts epoch 3), then demoted.
+    let b_master = b.promote(c.master_config("b")).await.unwrap();
+    assert_eq!(b_master.identity().epoch, 2);
+    let b_master = c.restart_master(b_master, c.master_config("b")).await;
+    assert_eq!(b_master.identity().epoch, 3);
+    assert_eq!(b_master.epoch_history().len(), 3);
+    b_master.can_demote().unwrap();
+    let (b_cfg, lb) = c.slave_config("b", a_addr);
+    let b = b_master.demote(b_cfg).await.unwrap();
+    assert_eq!(b.status().origin_identity.unwrap().epoch, 1);
+    assert_eq!(b.promotion_info().epoch_history, history);
+    support::assert_same("b after demote", &before, &support::dump(&b));
+
+    // The real master is still A: b resumes without a bootstrap.
+    a.put("c", b"after", b"v").unwrap();
+    assert_converged(&a, &[("b", &b)]).await;
+    assert_eq!(lb.bootstraps(), 0);
 }

@@ -189,14 +189,23 @@ pub(crate) fn newest_records(history: &[EpochStart], epoch: u64) -> &[EpochStart
 /// Where a history whose newest records are `newest` (oldest first; the last one is that node's
 /// epoch) leaves `history` (PROTOCOL.md §6.3): the start of the first later epoch in `history`,
 /// lowered to the lower of the two start seqs for every record of `newest` that `history` does
-/// not hold identically (another start or nonce, or no record of that number). `None` when
-/// `history` holds all of `newest` and has no later epoch, or `newest` is empty.
+/// not hold identically (another start or nonce, or no record of that number), and to the start
+/// of every record of `history` inside the range of `newest` (from its first epoch to its last)
+/// that `newest` has no record of the same number for. `None` when `history` holds all of
+/// `newest`, has nothing else in that range and no later epoch, or `newest` is empty.
 pub(crate) fn fork_from(history: &[EpochStart], newest: &[EpochStart]) -> Option<Seq> {
-    let mut fork = fork_after(history, newest.last()?.epoch);
+    let (first, last) = (newest.first()?.epoch, newest.last()?.epoch);
+    let mut fork = fork_after(history, last);
+    let mut lower = |start: Seq| fork = Some(fork.map_or(start, |f| f.min(start)));
     for k in newest.iter().filter(|k| !history.contains(k)) {
         let own = history.iter().find(|e| e.epoch == k.epoch);
-        let start = own.map_or(k.start_seq, |o| o.start_seq.min(k.start_seq));
-        fork = Some(fork.map_or(start, |f| f.min(start)));
+        lower(own.map_or(k.start_seq, |o| o.start_seq.min(k.start_seq)));
+    }
+    for e in history
+        .iter()
+        .filter(|e| (first..=last).contains(&e.epoch) && !newest.iter().any(|k| k.epoch == e.epoch))
+    {
+        lower(e.start_seq);
     }
     fork
 }
@@ -367,9 +376,20 @@ mod tests {
             fork_from(&server, &[rec(2, 12, 7), rec(3, 20, 3)]),
             Some(10)
         );
-        // A number the server never had forks at the client's start.
+        // A record the server has and the client lacks, inside the client's range: the
+        // histories differ from its start on (server 2@10 is missing from the client).
+        let other = vec![rec(1, 1, 1), rec(2, 10, 2), rec(4, 30, 4)];
+        assert_eq!(fork_from(&other, &[rec(1, 1, 1), rec(3, 15, 3)]), Some(10));
+        // Outside the range (older than the client's first record) nothing is compared.
+        assert_eq!(fork_from(&other, &[rec(2, 10, 2), rec(4, 30, 4)]), None);
+        // A number the server never had forks at the client's start (the server's epoch 2 lies
+        // inside the client's range too, and the client lacks it: lower still).
         assert_eq!(
             fork_from(&server[..2], &[rec(1, 1, 1), rec(3, 15, 3)]),
+            Some(10)
+        );
+        assert_eq!(
+            fork_from(&server[..1], &[rec(1, 1, 1), rec(3, 15, 3)]),
             Some(15)
         );
         assert_eq!(fork_from(&server, &[]), None);

@@ -39,6 +39,22 @@ fn verdict(decision: pb::Decision, reason: pb::Reason, detail: impl Into<String>
     }
 }
 
+/// Malformed `known_epochs` (PROTOCOL.md §6.1) are an `INVALID_ARGUMENT`: the epochs must be
+/// strictly increasing (so sorted, without duplicates) and, when present, end with the epoch of
+/// `known_identity`.
+pub(crate) fn check_known_epochs(r: &pb::HandshakeRequest) -> Result<(), String> {
+    let Some(last) = r.known_epochs.last() else {
+        return Ok(());
+    };
+    if r.known_epochs.windows(2).any(|w| w[0].epoch >= w[1].epoch) {
+        return Err("known_epochs must have strictly increasing epochs".into());
+    }
+    match &r.known_identity {
+        Some(k) if k.epoch == last.epoch => Ok(()),
+        _ => Err("known_epochs must end with the epoch of known_identity".into()),
+    }
+}
+
 /// Evaluates PROTOCOL.md §6.3 rules 1–14 (with 10a/10b) in order, 10a before 9; the first
 /// match wins.
 pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
@@ -125,8 +141,13 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
         // 9: continuity is proven by the history (the client's newest records, nonces included,
         // are all in the server's history, and the client holds nothing at or past the fork) or
         // by the CRC of the client's last entry.
-        let history_proves =
-            !known_records.is_empty() && known_records.iter().all(|k| v.epoch_history.contains(k));
+        // Records of epochs that took no entries yet (`start_seq > last_seq`) hold nothing the
+        // server could contradict, so they do not count (this agrees with `admin::compare`).
+        let held: Vec<&EpochStart> = known_records
+            .iter()
+            .filter(|k| k.start_seq <= r.last_seq)
+            .collect();
+        let history_proves = !held.is_empty() && held.iter().all(|k| v.epoch_history.contains(k));
         if history_proves || client_crc_matches {
             return verdict(
                 Resume,
@@ -412,11 +433,17 @@ mod tests {
         r.known_epochs = known(&[(1, 1, 11), (2, 101, 23)]);
         check(&master(), &r, Reject, R::Diverged);
         check(&replica(), &r, Reject, R::Diverged);
-        // Below the start nothing differs, but only the CRC proves it.
+        // Below the start nothing differs: the client's epoch 2 holds no entry yet, so only
+        // its record of epoch 1 counts, and the history proves continuity without any CRC.
         r.last_seq = 100;
         check(&master(), &r, Resume, R::EpochAdvanced);
         let mut v = master();
         v.crc_at_client_last = None;
+        check(&v, &r, Resume, R::EpochAdvanced);
+        // With nothing but empty epochs there is no record to prove it: only the CRC can.
+        let mut r = req();
+        r.known_epochs = known(&[(2, 101, 23)]);
+        r.last_seq = 100;
         check(&v, &r, Bootstrap, R::IdentityChanged);
     }
 
@@ -462,11 +489,15 @@ mod tests {
         check(&master(), &r, Reject, R::Diverged);
         r.last_seq = 100;
         check(&master(), &r, Resume, R::EpochAdvanced);
-        // Below the fork, a proven CRC mismatch is DIVERGED; no proof is IDENTITY_CHANGED.
+        // Below the fork, a proven CRC mismatch is DIVERGED. Without the entry, the record of
+        // epoch 1 (the client's epoch 2 holds no entry yet) still proves continuity.
         r.last_crc32c = Some(0xBBBB);
         check(&master(), &r, Reject, R::Diverged);
         let mut v = master();
         v.crc_at_client_last = None;
+        check(&v, &r, Resume, R::EpochAdvanced);
+        // Only an empty epoch is sent: nothing proves it but a CRC.
+        r.known_epochs = known(&[(2, 121, 33)]);
         check(&v, &r, Bootstrap, R::IdentityChanged);
         // The same start (or none sent) is the same epoch: plain resume.
         check(&master(), &req(), Resume, R::Unspecified);

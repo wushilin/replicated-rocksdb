@@ -291,7 +291,7 @@ async fn session(
                 RepointDivergence::Refuse | RepointDivergence::Repair { .. } => {
                     let err = repoint::mode_error(mode, || {
                         repoint::divergence(
-                            &inner.known_epochs(),
+                            &inner.ident().map(|(_, h)| h).unwrap_or_default(),
                             inner.store.position().last_seq,
                             &hs,
                         )

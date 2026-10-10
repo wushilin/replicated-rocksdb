@@ -3,7 +3,7 @@
 use rocksdb::{IteratorMode, WriteBatch, WriteOptions};
 
 use super::Store;
-use super::meta::{self, CF_CHANGELOG, CF_META, CF_TTL_INDEX, key};
+use super::meta::{self, CF_CHANGELOG, CF_META, CF_TTL_INDEX, MetaSnapshot, key};
 use super::ttl::index_key;
 use crate::codec::envelope;
 use crate::error::{Error, Result};
@@ -53,6 +53,7 @@ impl Store {
             .identity
             .ok_or_else(|| Error::Config("this slave has no data to promote".into()))?;
         let mut history = m.epoch_history;
+        let history_len = history.len();
         let own = history
             .iter()
             .map(|e| e.epoch)
@@ -86,6 +87,12 @@ impl Store {
             meta::encode_epoch_history(&history),
         );
         batch.put_cf(&meta_cf, key::LAST_TS, last_ts.to_be_bytes());
+        // Where `demote` returns to, however many epochs (per-open ones) are added later.
+        batch.put_cf(
+            &meta_cf,
+            key::PROMOTED_FROM_LEN,
+            (history_len as u64).to_be_bytes(),
+        );
         for k in [key::NODE_STATE, key::MAX_ENTRY_BYTES, key::BOOTSTRAP_CFS] {
             batch.delete_cf(&meta_cf, k);
         }
@@ -96,7 +103,41 @@ impl Store {
     }
 }
 
+/// How many epoch records a demotion keeps. A promoted master returns to the history it had
+/// before the promotion, removing every record added since (the promotion's own and the ones
+/// per-open epochs added), provided no entry was written after the promotion started
+/// (`last_seq <` the first removed record's `start_seq`). Without a promotion record (a
+/// master that was never promoted) only the newest epoch is undone.
+pub(crate) fn demotion_keep(m: &MetaSnapshot) -> Result<usize> {
+    let len = m.epoch_history.len();
+    let keep = match m.promoted_from_len {
+        Some(n) if n >= 1 && n < len => n,
+        _ => len.saturating_sub(1),
+    };
+    if keep == 0 || len < 2 {
+        return Err(Error::Config(
+            "nothing to undo: this is the database's first epoch".into(),
+        ));
+    }
+    let first_removed = m.epoch_history[keep];
+    if m.last_seq >= first_removed.start_seq {
+        return Err(Error::Config(format!(
+            "epoch {} already has entries ({}..={}); demoting would discard them",
+            first_removed.epoch, first_removed.start_seq, m.last_seq
+        )));
+    }
+    Ok(keep)
+}
+
 impl Store {
+    /// Whether a demotion would be allowed now (same rule as [`Store::demote_to_slave`]).
+    pub(crate) fn check_demote(&self) -> Result<()> {
+        let m = self
+            .load_meta()?
+            .ok_or_else(|| Error::corrupt("__meta is empty"))?;
+        demotion_keep(&m).map(|_| ())
+    }
+
     /// `__meta.max_burned_epoch`: the highest epoch number this node gave up by demoting
     /// (0 if none). Reported by `Status` so promotion tooling never reuses it.
     pub(crate) fn max_burned_epoch(&self) -> Result<u64> {
@@ -107,12 +148,13 @@ impl Store {
     }
 
     /// Undoes a promotion that has not taken writes (addendum §4): one synced batch sets
-    /// role = slave and restores the identity and history from before the newest epoch,
-    /// whose record is removed. The removed epoch number is **burned**: it is kept in
-    /// `max_burned_epoch` (same batch), and a later promotion of this node never reuses it,
-    /// because replicas that followed the undone promotion may still hold it.
-    /// Refused (`Error::Config`, nothing written) if the newest epoch
-    /// already has entries, or if there is no earlier epoch to return to.
+    /// role = slave and restores the identity and history from before the promotion
+    /// (`promoted_from_len`), removing every record added since, also the ones that restarts
+    /// of the master added (see `demotion_keep`). The highest removed epoch number is
+    /// **burned**: it is kept in `max_burned_epoch` (same batch), and a later promotion of
+    /// this node never reuses it, because replicas that followed the undone promotion may
+    /// still hold it. Refused (`Error::Config`, nothing written) if an entry was written
+    /// since the promotion started, or if there is no earlier epoch to return to.
     pub(crate) fn demote_to_slave(&self) -> Result<DbIdentity> {
         let m = self
             .load_meta()?
@@ -120,22 +162,11 @@ impl Store {
         let id = m
             .identity
             .ok_or_else(|| Error::corrupt("a master without identity"))?;
+        let keep = demotion_keep(&m)?;
         let mut history = m.epoch_history;
-        let newest = *history
-            .last()
-            .ok_or_else(|| Error::corrupt("a master without epoch history"))?;
-        if history.len() < 2 {
-            return Err(Error::Config(
-                "nothing to undo: this is the database's first epoch".into(),
-            ));
-        }
-        if m.last_seq >= newest.start_seq {
-            return Err(Error::Config(format!(
-                "epoch {} already has entries ({}..={}); demoting would discard them",
-                newest.epoch, newest.start_seq, m.last_seq
-            )));
-        }
-        history.pop();
+        // Every removed epoch number is burned (the highest one covers them all).
+        let burned = history[keep..].iter().map(|e| e.epoch).max().unwrap_or(0);
+        history.truncate(keep);
         let previous = DbIdentity {
             db_uuid: id.db_uuid,
             epoch: history.last().map_or(1, |e| e.epoch),
@@ -161,8 +192,9 @@ impl Store {
         batch.put_cf(
             &meta_cf,
             key::MAX_BURNED_EPOCH,
-            m.max_burned_epoch.max(newest.epoch).to_be_bytes(),
+            m.max_burned_epoch.max(burned).to_be_bytes(),
         );
+        batch.delete_cf(&meta_cf, key::PROMOTED_FROM_LEN);
         batch.delete_cf(&meta_cf, key::LAST_TS);
         let mut wo = WriteOptions::default();
         wo.set_sync(true);

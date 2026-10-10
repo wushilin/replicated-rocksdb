@@ -136,6 +136,25 @@ async fn malformed_handshake_input_is_invalid_argument() {
         "INVALID_ARGUMENT carries ErrorInfo"
     );
 
+    // known_epochs: not increasing, or not ending with known_identity's epoch.
+    let ep = |epoch, start_seq| pb::EpochStart {
+        epoch,
+        start_seq,
+        nonce: 1,
+    };
+    for (bad, what) in [
+        (vec![ep(2, 5), ep(1, 1)], "unsorted"),
+        (vec![ep(1, 1), ep(1, 1)], "duplicate"),
+        (vec![ep(1, 1), ep(2, 5)], "not the identity's epoch"),
+    ] {
+        let mut r = hello("b");
+        r.known_identity = Some(identity_to_pb(&m.identity()));
+        r.known_identity.as_mut().unwrap().epoch = 1;
+        r.known_epochs = bad;
+        let e = c.handshake(r).await.unwrap_err();
+        assert_eq!(e.code(), Code::InvalidArgument, "known_epochs {what}");
+    }
+
     // An empty client_id (the node-id metadata is "b", so it would also mismatch).
     assert_eq!(
         c.handshake(hello("")).await.unwrap_err().code(),

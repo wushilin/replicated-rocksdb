@@ -241,6 +241,7 @@ impl Replication for Svc {
             crate::net::convert::identity_from_pb(known)
                 .map_err(|_| net::invalid_argument("known_identity.db_uuid must be 16 bytes"))?;
         }
+        handshake::check_known_epochs(&r).map_err(net::invalid_argument)?;
         let view = server_view(&*src, r.last_seq)?;
         let v = handshake::decide(&view, &r);
         tracing::info!(

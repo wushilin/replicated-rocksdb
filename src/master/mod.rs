@@ -326,26 +326,17 @@ impl Master {
         self.server.as_ref().map(ServerHandle::addr)
     }
 
-    /// Whether [`demote`](Self::demote) would be allowed now: the newest epoch has no entries
-    /// yet (`last_seq < its start_seq`) and there is an earlier epoch to return to.
-    /// `Err(Config)` says why not. The master keeps running either way.
+    /// Whether [`demote`](Self::demote) would be allowed now: no entry was written since the
+    /// promotion started (`last_seq <` the start of the first epoch the promotion added) and
+    /// there is an earlier epoch to return to. Epochs that restarts of this master added after
+    /// the promotion do not count: they are undone too. `Err(Config)` says why not. The master
+    /// keeps running either way.
     pub fn can_demote(&self) -> Result<()> {
-        let history = self.epoch_history();
-        let last = self.last_seq();
-        match history.last() {
-            _ if history.len() < 2 => Err(crate::Error::Config(
-                "nothing to undo: this is the database's first epoch".into(),
-            )),
-            Some(newest) if last >= newest.start_seq => Err(crate::Error::Config(format!(
-                "epoch {} already has entries ({}..={last}); demoting would discard them",
-                newest.epoch, newest.start_seq
-            ))),
-            _ => Ok(()),
-        }
+        self.inner.store.check_demote()
     }
 
-    /// Undoes a promotion of the wrong node (addendum §4): allowed only while the newest epoch
-    /// has no entries, so nothing is lost. Persists role = slave, restores the identity and
+    /// Undoes a promotion of the wrong node (addendum §4): allowed only while no entry was written
+    /// since the promotion started (restarts in between are undone too), so nothing is lost. Persists role = slave, restores the identity and
     /// epoch history from before the promotion, and opens the directory as a slave with `cfg`
     /// (`cfg.path` must be this master's path).
     ///

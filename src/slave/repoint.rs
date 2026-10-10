@@ -10,10 +10,11 @@ use super::driver::SessionEnd;
 use super::inner::Inner;
 use super::state::SlaveState;
 use super::{Slave, UpstreamConfig};
+use crate::admin::fork_between;
 use crate::error::{Error, Result};
 use crate::net::convert::epochs_from_pb;
 use crate::pb;
-use crate::types::{EpochStart, Seq, fork_after, fork_from};
+use crate::types::{EpochStart, Seq};
 
 /// Acknowledges that an operation discards data. A caller constructs it explicitly
 /// (`AcceptDataLoss`) to opt in; nothing in the crate supplies one by default.
@@ -153,18 +154,16 @@ impl Inner {
     }
 }
 
-/// `Error::Diverged` for a `DIVERGED` answer: where the local log, whose newest epoch records
-/// are `local` (oldest first), leaves the upstream's.
+/// `Error::Diverged` for a `DIVERGED` answer: where the local log, whose full epoch history is
+/// `local`, leaves the upstream's (the first record where the two histories differ, exactly:
+/// [`fork_between`]).
 pub(crate) fn divergence(
     local: &[EpochStart],
     local_last: Seq,
     hs: &pb::HandshakeResponse,
 ) -> Error {
     let history = epochs_from_pb(&hs.epoch_history);
-    let fork = match local {
-        [] => fork_after(&history, 0),
-        records => fork_from(&history, records),
-    };
+    let fork = fork_between(local, &history);
     let fork_seq = match fork {
         // Rule 8: everything from the next epoch's start (or from the start of a same-numbered
         // epoch with another nonce) is not on the upstream's history.

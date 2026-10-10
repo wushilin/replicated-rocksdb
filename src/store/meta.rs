@@ -29,6 +29,9 @@ pub(crate) mod key {
     /// The highest epoch number this node ever started and then gave up (`Master::demote`).
     /// A later promotion of this node never reuses it.
     pub const MAX_BURNED_EPOCH: &[u8] = b"max_burned_epoch";
+    /// Master that was promoted: how many epoch records its history held before the promotion
+    /// (so `demote` can remove every record added since, including per-open epochs).
+    pub const PROMOTED_FROM_LEN: &[u8] = b"promoted_from_len";
 }
 
 pub(crate) fn be64(b: &[u8]) -> Result<u64> {
@@ -153,6 +156,9 @@ pub(crate) struct MetaSnapshot {
     pub bootstrap_cfs: Vec<CfEntry>,
     /// The highest epoch number this node started and gave up by demoting; 0 if none.
     pub max_burned_epoch: u64,
+    /// Master only: the length of the epoch history before the promotion that made this node a
+    /// master; `None` if it was never promoted (or demoted since).
+    pub promoted_from_len: Option<usize>,
 }
 
 impl MetaSnapshot {
@@ -203,6 +209,9 @@ impl MetaSnapshot {
                 .transpose()?
                 .unwrap_or_default(),
             max_burned_epoch: u64_or(key::MAX_BURNED_EPOCH, 0)?,
+            promoted_from_len: get(key::PROMOTED_FROM_LEN)?
+                .map(|v| be64(&v).map(|n| n as usize))
+                .transpose()?,
         }))
     }
 }
