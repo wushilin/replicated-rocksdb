@@ -144,11 +144,13 @@ pub(crate) fn status_end(inner: &Inner, generation: u64, s: &Status) -> SessionE
             None => {}
         }
     }
-    end_for(
-        inner,
-        generation,
-        policy::after_status(s, &inner.policies()),
-    )
+    let action = policy::after_status(s, &inner.policies());
+    if action == Action::Repair {
+        // Under the configured `DivergencePolicy::Repair` too: a RESUME on the next handshake
+        // contradicts this stream and is retried with backoff (`contradicting_resume`).
+        inner.diverged_on_stream.store(true, Ordering::SeqCst);
+    }
+    end_for(inner, generation, action)
 }
 
 /// Starts the driver. It holds only a `Weak<Inner>` while it waits (halted, or backing off),
@@ -258,13 +260,8 @@ fn clear_halt_for_repoint(inner: &Inner) {
 async fn commit_halt_clear(inner: &Arc<Inner>) {
     if inner.halt_clear_pending.swap(false, Ordering::SeqCst) {
         let i = inner.clone();
-        let r = blocking(move || {
-            i.store
-                .write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true)?;
-            // The fork point of the cleared halt is stale from now on.
-            i.store.set_diverged_at(None)
-        })
-        .await;
+        // `ready`, and the cleared halt's fork point forgotten, in one synced batch.
+        let r = blocking(move || i.store.clear_halt_meta(&NodeState::Ready.encode())).await;
         if let Err(e) = r {
             tracing::warn!(node = %inner.cfg.identifier, error = %e, "could not persist the cleared halt");
             inner.halt_clear_pending.store(true, Ordering::SeqCst);
@@ -396,7 +393,7 @@ async fn session(
                 return match run_repair(inner, generation, fetch).await {
                     Ok(_) => SessionEnd::Again,
                     Err(RepairEnd::Fallback) => {
-                        bootstrap_then_tail(inner, generation, &c, &hs, backoff).await
+                        fallback_bootstrap(inner, generation, &c, &hs, hs_uuid, backoff).await
                     }
                     Err(RepairEnd::End(end)) => end,
                 };
@@ -412,7 +409,7 @@ async fn session(
             }
             Err(end) => end,
         },
-        Action::Bootstrap => bootstrap_then_tail(inner, generation, &c, &hs, backoff).await,
+        Action::Bootstrap => bootstrap_then_tail(inner, generation, &c, &hs, None, backoff).await,
         Action::Repair => {
             let fetch = repair::prepare_divergence(inner, &c, &hs);
             match run_repair(inner, generation, fetch).await {
@@ -431,7 +428,7 @@ async fn session(
                 // The consent to discard the divergent suffix (the policy, or the repoint's
                 // `Repair { accept_loss }`) covers a bootstrap from this same upstream.
                 Err(RepairEnd::Fallback) => {
-                    bootstrap_then_tail(inner, generation, &c, &hs, backoff).await
+                    fallback_bootstrap(inner, generation, &c, &hs, hs_uuid, backoff).await
                 }
                 Err(RepairEnd::End(end)) => end,
             }
@@ -447,12 +444,14 @@ async fn session(
     }
 }
 
-/// Bootstraps from the upstream that answered `hs`, then tails.
+/// Bootstraps from the upstream that answered `hs`, then tails. With `expected`, only from
+/// that database (see `bootstrap::install`).
 async fn bootstrap_then_tail(
     inner: &Arc<Inner>,
     generation: u64,
     c: &Client,
     hs: &pb::HandshakeResponse,
+    expected: Option<uuid::Uuid>,
     backoff: &mut BackoffState,
 ) -> SessionEnd {
     // `seq` is the upstream's last_seq at the handshake; the snapshot seq is logged inside,
@@ -464,7 +463,7 @@ async fn bootstrap_then_tail(
         seq = hs.last_seq,
         epoch = hs.identity.as_ref().map(|id| id.epoch),
     );
-    match bootstrap::install(inner, generation, c, hs)
+    match bootstrap::install(inner, generation, c, hs, expected)
         .instrument(span)
         .await
     {
@@ -476,6 +475,25 @@ async fn bootstrap_then_tail(
         }
         Err(end) => end,
     }
+}
+
+/// A repair that cannot be done bootstraps from the same upstream, in this session, and only
+/// from the database the consent covered (the one that answered `hs`): the address may serve
+/// another one by now.
+async fn fallback_bootstrap(
+    inner: &Arc<Inner>,
+    generation: u64,
+    c: &Client,
+    hs: &pb::HandshakeResponse,
+    hs_uuid: Option<uuid::Uuid>,
+    backoff: &mut BackoffState,
+) -> SessionEnd {
+    // Test hook: the repair fell back; the bootstrap has not started.
+    failpoint::pause("slave-repair-before-fallback").await;
+    let Some(expected) = hs_uuid else {
+        return SessionEnd::Retry("repair fallback: the handshake carried no identity".into());
+    };
+    bootstrap_then_tail(inner, generation, c, hs, Some(expected), backoff).await
 }
 
 /// Runs a repair: the network phase `fetch` bounded by `REPAIR_TIMEOUT` and abandoned on a
@@ -727,6 +745,30 @@ mod tests {
         assert_eq!(choose_force(false, false, false), Force::None);
         assert_eq!(choose_force(true, true, false), Force::Operator);
         assert_eq!(choose_force(true, false, true), Force::Operator);
+    }
+
+    /// Fix round 1, B-M2: a Tail stream that ends `DIVERGED` under the configured
+    /// `DivergencePolicy::Repair` marks the stream, so a RESUME that contradicts it is retried
+    /// with backoff instead of tailing again every 50 ms.
+    #[test]
+    fn a_diverged_stream_under_the_repair_policy_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, meta) = crate::store::Store::open(
+            dir.path(),
+            crate::types::Role::Slave,
+            crate::tuning::RocksTuning::new(),
+        )
+        .unwrap();
+        let mut cfg = crate::slave::config::SlaveConfig::new(
+            "t",
+            dir.path(),
+            crate::slave::config::UpstreamConfig::new("127.0.0.1", 1),
+        );
+        cfg.on_divergence = crate::slave::config::DivergencePolicy::Repair;
+        let inner = Inner::new(store, cfg, &meta).unwrap();
+        let s = crate::net::reason_status(pb::Reason::Diverged, "x");
+        assert!(matches!(status_end(&inner, 0, &s), SessionEnd::Again));
+        assert!(inner.diverged_on_stream.load(Ordering::SeqCst));
     }
 
     /// M6: `max_batch_bytes = 0` is the server default (1 MiB), not 0, in the decode limit.

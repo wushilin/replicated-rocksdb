@@ -225,12 +225,15 @@ impl Inner {
         // A repair interrupted before replay reached its target stays not ready, also when a
         // halt rewrote `node_state` since (DESIGN.md §12.1). A target at or below `last_seq`
         // was reached (the crash came before it was removed).
-        let repair_until = match ident {
-            Some(_) => store
-                .repair_until()?
-                .filter(|&until| until > last_seq)
-                .unwrap_or(0),
-            None => 0,
+        let repair_until = match (&ident, store.repair_until()?) {
+            (Some(_), Some(until)) if until > last_seq => until,
+            (_, Some(_)) => {
+                // Reached (the crash came between the commit of the target and its removal),
+                // or a bootstrap is in progress: nothing to wait for.
+                store.clear_repair_until()?;
+                0
+            }
+            (_, None) => 0,
         };
         // The entry at last_seq, if still in the log, gives the lag's time base after a restart.
         let last_applied_ts = match last_seq {
@@ -712,6 +715,11 @@ impl Inner {
         if until == 0 || seq < until {
             return;
         }
+        if crate::failpoint::fire("slave-repair-before-finish") {
+            // Emulated crash between the commit of the target and its removal: nothing more
+            // happens here until the test kills the node.
+            return;
+        }
         if let Err(e) = self.store.clear_repair_until() {
             // Harmless: on restart, a `repair_until` at or below `last_seq` is ignored.
             tracing::warn!(node = %self.cfg.identifier, error = %e, "could not persist the end of a repair");
@@ -1071,6 +1079,7 @@ mod tests {
         }
         let i = inner(dir.path());
         assert_eq!(i.repairing(), None, "already reached");
+        assert_eq!(i.store.repair_until().unwrap(), None, "and removed on open");
     }
 
     /// A verify's repair request is scoped like its rebootstrap request: one repoint

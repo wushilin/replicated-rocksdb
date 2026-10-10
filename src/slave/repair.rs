@@ -360,6 +360,28 @@ fn pending_target(
     Ok(s.max(repairing.unwrap_or(0)))
 }
 
+/// The identity and epoch history the data at the session's `S` belongs to, read by the
+/// upstream through the session's snapshot: what the rewind stores. The handshake that started
+/// the repair (and its consent) saw the same history, or the repair falls back: the upstream
+/// moved to another history in between (the identity alone, without nonces, cannot show it).
+fn snapshot_history(
+    hs: &pb::HandshakeResponse,
+    begin: &pb::VerifyBeginResponse,
+) -> std::result::Result<(DbIdentity, Vec<EpochStart>), RepairError> {
+    let identity = begin
+        .identity
+        .as_ref()
+        .ok_or_else(|| RepairError::Retry("VerifyBegin without identity".into()))?;
+    let identity: DbIdentity = identity_from_pb(identity)?;
+    if begin.identity != hs.identity || begin.epoch_history != hs.epoch_history {
+        return Err(fallback(
+            "the upstream's epoch history at the snapshot differs from its handshake",
+        ));
+    }
+    let history = checked_history(&identity, &begin.epoch_history)?;
+    Ok((identity, history))
+}
+
 /// Collects fetched records of one CF: checks every envelope and counts the byte budget,
 /// stopping the fetch on a problem.
 struct Fetched {
@@ -414,12 +436,7 @@ async fn prepare(
     ready_at: Seq,
     set: AffectedSet,
 ) -> std::result::Result<Rewind, RepairError> {
-    let identity = hs
-        .identity
-        .as_ref()
-        .ok_or_else(|| RepairError::Retry("handshake without identity".into()))?;
-    let identity: DbIdentity = identity_from_pb(identity)?;
-    let history = checked_history(&identity, &hs.epoch_history)?;
+    let (identity, history) = snapshot_history(hs, &session.begin)?;
     let upstream_cfs: Vec<CfEntry> = session.begin.cf_specs.iter().map(cf_from_pb).collect();
     // Test hook: the session pins `S`; nothing is fetched yet.
     failpoint::pause("slave-repair-before-fetch").await;
@@ -611,6 +628,39 @@ mod tests {
         let now = vec![rec(1, 1, 1), rec(2, 10, 2), rec(3, 15, 9)];
         assert_eq!(history_fork(&lost, 25, &now), Some(15));
         assert_eq!(history_fork(&lost, 14, &now), None);
+    }
+
+    /// Fix round 1, A-M2: the rewind stores the history read through the session's snapshot,
+    /// and a history that differs from the handshake's (same identity, another nonce) falls
+    /// back instead of being mixed with the handshake's.
+    #[test]
+    fn the_stored_history_is_the_snapshots_and_must_match_the_handshake() {
+        use crate::net::convert::{epochs_to_pb, identity_to_pb};
+        let id = DbIdentity {
+            db_uuid: uuid::Uuid::from_u128(7),
+            epoch: 2,
+        };
+        let h = vec![rec(1, 1, 1), rec(2, 10, 2)];
+        let hs = pb::HandshakeResponse {
+            identity: Some(identity_to_pb(&id)),
+            epoch_history: epochs_to_pb(&h),
+            ..Default::default()
+        };
+        let begin = |history: &[EpochStart]| pb::VerifyBeginResponse {
+            identity: Some(identity_to_pb(&id)),
+            epoch_history: epochs_to_pb(history),
+            ..Default::default()
+        };
+        assert_eq!(snapshot_history(&hs, &begin(&h)).unwrap(), (id, h.clone()));
+        let other = vec![rec(1, 1, 1), rec(2, 10, 99)];
+        assert!(matches!(
+            snapshot_history(&hs, &begin(&other)),
+            Err(RepairError::Fallback(_))
+        ));
+        assert!(matches!(
+            snapshot_history(&hs, &begin(&[])),
+            Err(RepairError::Fallback(_))
+        ));
     }
 
     #[test]

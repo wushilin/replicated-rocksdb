@@ -60,14 +60,18 @@ impl Store {
     /// between the limit computation and the delete. `first_retained` is published after
     /// the delete; a momentarily stale (too low) value is harmless because
     /// `entries_after` checks continuity and yields `Err(Gap)` rather than skipping entries.
+    ///
+    /// `first` and `last` are read under that lock too: a repair's rewind (which lowers
+    /// `last_seq` and publishes `first_retained`) holds it for its whole commit, so a trim never
+    /// decides from a position the rewind has replaced.
     pub(crate) fn trim_changelog(&self, now_ms: u64, r: &Retention) -> Result<u64> {
+        let guards = self.guards.lock().unwrap_or_else(PoisonError::into_inner);
         let first = self.first_retained_seq();
         let last = self.position().last_seq;
         if first > last {
             return Ok(0);
         }
         // Entries in [first, cut) are deleted.
-        let guards = self.guards.lock().unwrap_or_else(PoisonError::into_inner);
         let guard_limit = guards
             .held
             .values()

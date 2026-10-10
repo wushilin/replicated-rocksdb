@@ -448,6 +448,12 @@ impl RawDb {
         self.db.cf_handle(physical).unwrap()
     }
 
+    /// A `__meta` value as stored.
+    pub fn meta(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let meta = self.db.cf_handle("__meta").unwrap();
+        self.db.get_cf(&meta, key).unwrap()
+    }
+
     /// `__meta.last_seq` as stored: the node's durable position.
     pub fn last_seq(&self) -> u64 {
         let meta = self.db.cf_handle("__meta").unwrap();

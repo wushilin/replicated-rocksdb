@@ -163,6 +163,7 @@ message VerifyBeginResponse {
   uint64   snapshot_seq       = 3;
   repeated CfSpec cf_specs    = 4;
   uint64   session_timeout_ms = 5;
+  repeated EpochStart epoch_history = 6;   // as of the snapshot, like identity and cf_specs
 }
 
 message KeyRange  { string cf = 1; optional bytes lower = 2; optional bytes upper = 3; }

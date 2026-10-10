@@ -176,6 +176,18 @@ impl Store {
         }
     }
 
+    /// Persists a cleared halt: `node_state` set to `state` and the recorded fork point
+    /// removed, in one synced batch (a crash between the two would leave a stale fork point).
+    pub(crate) fn clear_halt_meta(&self, state: &[u8]) -> Result<()> {
+        let meta_cf = self.cf(CF_META);
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&meta_cf, key::NODE_STATE, state);
+        batch.delete_cf(&meta_cf, key::DIVERGED_AT);
+        let mut wo = WriteOptions::default();
+        wo.set_sync(true);
+        Ok(self.db().write_opt(batch, &wo)?)
+    }
+
     pub(crate) fn diverged_at(&self) -> Result<Option<Seq>> {
         let raw = self.db().get_cf(&self.cf(CF_META), key::DIVERGED_AT)?;
         raw.map(|v| meta::be64(&v)).transpose()

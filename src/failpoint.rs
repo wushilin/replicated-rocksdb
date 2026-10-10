@@ -13,7 +13,15 @@
 //! `slave-repair-before-fetch` (a repair's verify session is open, nothing fetched yet;
 //! `pause` or `cfg_callback`),
 //! `slave-repair-after-rewind` (a repair committed its rewind; `return` freezes the driver
-//! until the test kills the node, `pause` holds it until the point is removed).
+//! until the test kills the node, `pause` holds it until the point is removed),
+//! `slave-repair-before-finish` (replay committed the repair's target; `return` leaves the
+//! target in place, as a crash before its removal would),
+//! `slave-repair-before-fallback` (a repair fell back, before its bootstrap; `pause` or
+//! `cfg_callback`),
+//! `slave-promote-before-shutdown` (a promotion passed its checks, the slave still runs;
+//! `pause` or `cfg_callback`),
+//! `slave-snapshot-after-check` (`Slave::snapshot` checked readiness, before the snapshot;
+//! `cfg_callback`).
 //!
 //! Configure with `fail::cfg(name, "1*return")` to make the point fire once, or
 //! `fail::cfg(name, "pause")` to block the thread there until `fail::remove(name)`.

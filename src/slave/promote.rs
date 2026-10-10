@@ -42,7 +42,9 @@ impl Slave {
             self.shutdown().await?;
             return Err(Error::Config(msg));
         }
-        self.promote_now(cfg, 0).await
+        self.promote_now(cfg, 0, false)
+            .await
+            .map_err(|refused| refused.error)
     }
 
     /// Why `promote(cfg)` would be refused before it changes anything, if it would.
@@ -69,23 +71,40 @@ impl Slave {
         }
     }
 
-    /// The irreversible part of `promote`: from here on a failure loses the slave handle.
-    /// The new epoch is above `epoch_floor` (the highest epoch the peers reported).
-    async fn promote_now(self, cfg: MasterConfig, epoch_floor: u64) -> Result<Master> {
+    /// The irreversible part of `promote`: from here on a failure loses the slave handle,
+    /// except for the final check on the stopped store (an unfinished repair, DESIGN.md
+    /// §12.1), which leaves the directory unchanged; with `reopen` the slave is then reopened
+    /// and handed back. The new epoch is above `epoch_floor` (the highest epoch the peers
+    /// reported).
+    async fn promote_now(
+        self,
+        cfg: MasterConfig,
+        epoch_floor: u64,
+        reopen: bool,
+    ) -> std::result::Result<Master, PromoteRefused> {
+        let lost = |error| PromoteRefused { error, slave: None };
+        // Test hook: the promotion passed its checks; the slave is still running.
+        crate::failpoint::pause("slave-promote-before-shutdown").await;
         let path = cfg.path.clone();
         let tuning = cfg.rocksdb.clone();
+        let slave_cfg = self.inner.cfg.clone();
         // Snapshots share the database handle; one that outlives the slave keeps the DB open.
         let db = Arc::downgrade(self.inner.store.db());
         self.inner.reset_downstream();
-        self.shutdown().await?;
+        self.shutdown().await.map_err(lost)?;
         if db.strong_count() > 0 {
-            return Err(Error::Config(
+            return Err(lost(Error::Config(
                 "a ReadSnapshot of this slave is still open and keeps the database open; drop it and reopen the slave"
                     .into(),
-            ));
+            )));
         }
-        crate::background::blocking(move || {
+        // The checks above ran while the slave was replicating; a repair may have committed
+        // its rewind since. The stopped store decides.
+        let promoted = crate::background::blocking(move || {
             let (store, _) = Store::open(&path, Role::Slave, tuning)?;
+            if let Some(why) = store.promotion_blocker()? {
+                return Ok(Err(why));
+            }
             let indexed = store.rebuild_ttl_index()?;
             let identity = store.promote_to_master(epoch_floor)?;
             tracing::info!(
@@ -93,10 +112,26 @@ impl Slave {
                 ttl_entries = indexed,
                 "slave promoted to master"
             );
-            Ok(())
+            Ok(Ok(()))
         })
-        .await?;
-        Master::open_promoted(cfg).await
+        .await
+        .map_err(lost)?;
+        if let Err(why) = promoted {
+            tracing::warn!(error = %why, "promotion refused on the stopped store");
+            let error = Error::Config(why);
+            let slave = match reopen {
+                true => match Slave::open(slave_cfg).await {
+                    Ok(s) => Some(Box::new(s)),
+                    Err(e) => {
+                        tracing::error!(error = %e, "could not reopen the slave after the refused promotion");
+                        None
+                    }
+                },
+                false => None,
+            };
+            return Err(PromoteRefused { error, slave });
+        }
+        Master::open_promoted(cfg).await.map_err(lost)
     }
 }
 
@@ -230,7 +265,10 @@ impl Slave {
     /// Only a failure after the slave has started shutting down for the promotion loses the
     /// handle (`PromoteRefused::slave` is `None`): an I/O error during shutdown, a
     /// `ReadSnapshot` that still holds the database (`Error::Config`; drop it and reopen the
-    /// directory as a slave, which is unchanged), or a failure while rewriting it.
+    /// directory as a slave, which is unchanged), or a failure while rewriting it. One final
+    /// check runs on the stopped store: a repair that committed its rewind meanwhile (it is
+    /// replaying, DESIGN.md §12.1) refuses with `Error::Config`, the directory unchanged, and
+    /// the slave is reopened and handed back.
     pub async fn promote_checked(
         self,
         cfg: MasterConfig,
@@ -253,9 +291,7 @@ impl Slave {
                         "promoting despite unreachable, diverged or foreign peers"
                     );
                 }
-                self.promote_now(cfg, check.max_peer_epoch)
-                    .await
-                    .map_err(|error| PromoteRefused { error, slave: None })
+                self.promote_now(cfg, check.max_peer_epoch, true).await
             }
             Err(error) => Err(PromoteRefused {
                 error,

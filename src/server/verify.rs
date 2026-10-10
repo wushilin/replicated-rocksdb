@@ -15,7 +15,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use super::{ServerState, VerifyRangeStream, call_info, store_status};
 use crate::auth::Method;
-use crate::net::convert::{cf_to_pb, identity_to_pb};
+use crate::net::convert::{cf_to_pb, epochs_to_pb, identity_to_pb};
 use crate::net::{self, internal_status, reason_status};
 use crate::pb;
 use crate::pb::verify_range_request::Kind as ReqKind;
@@ -236,6 +236,7 @@ pub(super) async fn begin(
         cf_specs: meta.cf_specs.iter().map(cf_to_pb).collect(),
         session_timeout_ms: u64::try_from(state.cfg.limits.verify_session_timeout.as_millis())
             .unwrap_or(u64::MAX),
+        epoch_history: epochs_to_pb(&meta.epoch_history),
     }))
 }
 

@@ -12,6 +12,19 @@ use crate::types::{DbIdentity, EpochStart, LogEntry, Role};
 const BATCH: usize = 1_000;
 
 impl Store {
+    /// Why this (stopped) slave's directory must not become a master, read from the store
+    /// itself: the final check of a promotion, which nothing can race. A persisted repair
+    /// target above `last_seq` means some keys hold an upstream's state at that target and the
+    /// rest an older state (DESIGN.md §12.1): a state no node ever had.
+    pub(crate) fn promotion_blocker(&self) -> Result<Option<String>> {
+        let last = self.position().last_seq;
+        Ok(self.repair_until()?.filter(|&until| until > last).map(|until| {
+            format!(
+                "cannot promote while a repair replays up to seq {until} (at {last}): the data is not a consistent state yet"
+            )
+        }))
+    }
+
     /// Rebuilds the derived `__ttl_index` from a full scan of the envelopes: cleared, then one
     /// entry per stored value that has an expiry. Returns how many entries were added.
     pub(crate) fn rebuild_ttl_index(&self) -> Result<u64> {
@@ -46,6 +59,9 @@ impl Store {
     /// it never reuses a number this node gave up by demoting, nor one at or below `floor`
     /// (the highest epoch the caller saw on its peers, 0 for none).
     pub(crate) fn promote_to_master(&self, floor: u64) -> Result<DbIdentity> {
+        if let Some(why) = self.promotion_blocker()? {
+            return Err(Error::Config(why));
+        }
         let m = self
             .load_meta()?
             .ok_or_else(|| Error::corrupt("__meta is empty"))?;
@@ -93,7 +109,14 @@ impl Store {
             key::PROMOTED_FROM_LEN,
             (history_len as u64).to_be_bytes(),
         );
-        for k in [key::NODE_STATE, key::MAX_ENTRY_BYTES, key::BOOTSTRAP_CFS] {
+        // A repair target at or below `last_seq` was reached; a fork point is the slave's.
+        for k in [
+            key::NODE_STATE,
+            key::MAX_ENTRY_BYTES,
+            key::BOOTSTRAP_CFS,
+            key::REPAIR_UNTIL,
+            key::DIVERGED_AT,
+        ] {
             batch.delete_cf(&meta_cf, k);
         }
         let mut wo = WriteOptions::default();

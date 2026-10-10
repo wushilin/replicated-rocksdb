@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use tonic::Streaming;
 
 use super::client::Client;
+use super::config::IdentityPolicy;
 use super::driver::{SessionEnd, status_end, unless_repointed};
 use super::inner::Inner;
 use super::state::{HaltReason, SlaveState};
@@ -101,37 +102,19 @@ async fn next(
 }
 
 /// Replaces all local state with the upstream's snapshot. Returns the lease to present in
-/// the following Tail. On any failure the slave stays in `bootstrapping` (persisted) and the
-/// next session starts over.
+/// the following Tail. On any failure after the reset the slave stays in `bootstrapping`
+/// (persisted) and the next session starts over.
+///
+/// The header is read before anything local changes. With `expected` (a repair's fallback:
+/// its consent covers only that database), a header of another database follows the identity
+/// policy instead: `Refuse` halts `IdentityChanged`, nothing is installed.
 pub(crate) async fn install(
     inner: &Arc<Inner>,
     generation: u64,
     c: &Client,
     hs: &pb::HandshakeResponse,
+    expected: Option<uuid::Uuid>,
 ) -> std::result::Result<Vec<u8>, SessionEnd> {
-    inner.force_bootstrap.clear(generation);
-    // A verify's request is spent once a bootstrap installs.
-    inner.verify_rebootstrap.clear();
-    // A verify waiting for a seq of the old state can never be served now.
-    inner.cancel_capture();
-    // A bootstrap replaces everything a repair would have fixed (the store removes the
-    // persisted `repair_until` and `diverged_at` with the rest of the state).
-    inner.clear_pending_repair();
-    inner.begin_repair(0);
-    // The snapshot's last entry is not transferred: its ts_ms is unknown until the next entry.
-    inner.last_applied_ts.store(0, Ordering::SeqCst);
-    inner.pending_ts.store(0, Ordering::SeqCst);
-    inner.set_ident(None);
-    inner.reset_downstream();
-    inner.seq_tx.send_replace(0);
-    inner.set_state(SlaveState::Bootstrapping {
-        target_seq: 0,
-        records: 0,
-    });
-    blocking(inner, |i| i.store.reset_for_bootstrap())
-        .await
-        .map_err(|e| retry(format!("could not reset for bootstrap: {e}")))?;
-
     let limit = usize::try_from(hs.max_entry_bytes)
         .unwrap_or(usize::MAX)
         .max(MAX_BOOTSTRAP_CHUNK_BYTES)
@@ -153,6 +136,40 @@ pub(crate) async fn install(
         return Err(retry("bootstrap stream did not start with a header"));
     };
     let plan = Plan::from_header(header)?;
+    if let Some(want) = expected
+        && plan.identity.db_uuid != want
+    {
+        tracing::warn!(node = %inner.cfg.identifier, expected = %want, got = %plan.identity.db_uuid, "the fallback bootstrap is from another database");
+        match inner.cfg.on_identity_change {
+            IdentityPolicy::Refuse => return Err(SessionEnd::Halt(HaltReason::IdentityChanged)),
+            // Configured consent to replace the data with another database.
+            IdentityPolicy::Rebootstrap => {}
+        }
+    }
+    inner.force_bootstrap.clear(generation);
+    // A verify's request is spent once a bootstrap installs.
+    inner.verify_rebootstrap.clear();
+    // A verify waiting for a seq of the old state can never be served now.
+    inner.cancel_capture();
+    // A bootstrap replaces everything a repair would have fixed (the store removes the
+    // persisted `repair_until` and `diverged_at` with the rest of the state).
+    inner.clear_pending_repair();
+    // Not ready first (no identity), then the repair target goes: a mid-replay mixed state is
+    // never ready, not even between the two.
+    inner.set_ident(None);
+    inner.begin_repair(0);
+    // The snapshot's last entry is not transferred: its ts_ms is unknown until the next entry.
+    inner.last_applied_ts.store(0, Ordering::SeqCst);
+    inner.pending_ts.store(0, Ordering::SeqCst);
+    inner.reset_downstream();
+    inner.seq_tx.send_replace(0);
+    inner.set_state(SlaveState::Bootstrapping {
+        target_seq: 0,
+        records: 0,
+    });
+    blocking(inner, |i| i.store.reset_for_bootstrap())
+        .await
+        .map_err(|e| retry(format!("could not reset for bootstrap: {e}")))?;
     let s = plan.snapshot_seq;
     tracing::info!(node = %inner.cfg.identifier, snapshot_seq = s, cfs = plan.cfs.len(), "bootstrapping");
     inner.notify(|l| l.on_bootstrap_begin(s));

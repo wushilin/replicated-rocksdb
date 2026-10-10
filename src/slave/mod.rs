@@ -29,7 +29,6 @@ use crate::read::{ReadApi, ReadSnapshot};
 use crate::server::replicas::ReplicaStatus;
 use crate::server::{ServerHandle, await_sole_owner};
 use crate::store::Store;
-use crate::store::meta::key;
 use crate::store::read::DbIter;
 use crate::types::{CfSpec, Direction, IterMode, LogEntry, Role, Seq, ValueMeta};
 use crate::verify::{VerifyMode, VerifyReport};
@@ -209,14 +208,10 @@ impl Slave {
             return Err(Error::Config("the slave is not halted".into()));
         };
         let i = self.inner.clone();
-        crate::background::blocking(move || {
-            i.store
-                .write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true)?;
-            // The halt is gone, and with it the fork point it recorded: a later `Diverged`
-            // halt records its own (or none), never this stale one.
-            i.store.set_diverged_at(None)
-        })
-        .await?;
+        // The halt is gone, and with it the fork point it recorded (one synced batch): a later
+        // `Diverged` halt records its own (or none), never this stale one.
+        crate::background::blocking(move || i.store.clear_halt_meta(&NodeState::Ready.encode()))
+            .await?;
         if matches!(action, HaltAction::Rebootstrap { .. }) {
             self.inner.force_bootstrap.request(generation);
         }
@@ -231,7 +226,13 @@ impl Slave {
     /// while a repair replays.
     pub fn snapshot(&self) -> Result<ReadSnapshot> {
         self.check_ready()?;
-        self.inner.store.read_snapshot(self.inner.now_ms())
+        // Test hook: between the readiness check and the snapshot.
+        crate::failpoint::fire("slave-snapshot-after-check");
+        let snap = self.inner.store.read_snapshot(self.inner.now_ms())?;
+        // A repair marks the slave not ready before its rewind becomes visible: checked again
+        // after the snapshot, a snapshot that could hold the rewind is never handed out.
+        self.check_ready()?;
+        Ok(snap)
     }
 
     /// A missing CF on a node that stopped being ready (a bootstrap began) is `NotReady`.
@@ -329,26 +330,39 @@ impl ReadApi for Slave {
     fn get_with_meta(&self, cf: &str, key: &[u8]) -> Result<Option<(Vec<u8>, ValueMeta)>> {
         self.check_ready()?;
         let cf = self.live_cf(cf)?;
-        self.inner.store.live_ctx(self.inner.now_ms()).get(&cf, key)
+        let v = self
+            .inner
+            .store
+            .live_ctx(self.inner.now_ms())
+            .get(&cf, key)?;
+        // Checked again after the read, as `snapshot` does (a repair's rewind may have landed).
+        self.check_ready()?;
+        Ok(v)
     }
 
     fn iter(&self, cf: &str, mode: IterMode<'_>) -> Result<DbIter<'_>> {
         self.check_ready()?;
         let cf = self.live_cf(cf)?;
-        self.inner
+        let it = self
+            .inner
             .store
             .live_ctx(self.inner.now_ms())
-            .iter(cf, mode, None)
+            .iter(cf, mode, None)?;
+        // The iterator reads a fixed view taken now: checked again, as `snapshot` does.
+        self.check_ready()?;
+        Ok(it)
     }
 
     fn prefix_iter(&self, cf: &str, prefix: &[u8]) -> Result<DbIter<'_>> {
         self.check_ready()?;
         let cf = self.live_cf(cf)?;
-        self.inner.store.live_ctx(self.inner.now_ms()).iter(
+        let it = self.inner.store.live_ctx(self.inner.now_ms()).iter(
             cf,
             IterMode::From(prefix, Direction::Forward),
             Some(prefix),
-        )
+        )?;
+        self.check_ready()?;
+        Ok(it)
     }
 
     /// Empty while bootstrapping.

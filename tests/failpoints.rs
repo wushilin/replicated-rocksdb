@@ -592,6 +592,20 @@ impl Gate {
         m.lock().unwrap().2 = true;
         cv.notify_all();
     }
+
+    /// Opens the gate when dropped, so a failing assertion fails the test instead of leaving a
+    /// worker blocked in the gate (and the runtime's drop waiting for it).
+    fn open_on_drop(&self) -> OpenOnDrop {
+        OpenOnDrop(self.clone())
+    }
+}
+
+struct OpenOnDrop(Gate);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
 }
 
 /// While a repair replays (`repair_until` above `last_seq`): reads answer `NotReady`, `Status`
@@ -799,6 +813,7 @@ async fn the_leader_lost_mid_replay_keeps_the_repair_target_and_resumes() {
     // sends the third: the slave cannot have received more.
     let held = Gate::after(2);
     held.install("server-tail-after-entry");
+    let _held = held.open_on_drop();
     fail::remove("slave-repair-after-rewind");
     wait_until("the leader holds the third entry", || held.reached()).await;
     wait_until("two entries replayed", || d.last_seq() == fork + 1).await;
@@ -872,6 +887,7 @@ async fn leader_writes_between_the_snapshot_and_the_fetch_are_replayed() {
     a.put("c", &[100], b"new").unwrap();
     let gate = Gate::after(0);
     gate.install("slave-repair-before-fetch");
+    let _gate = gate.open_on_drop();
     fail::cfg("slave-repair-after-rewind", "pause").unwrap();
     let d = Slave::open(cfg).await.unwrap();
     wait_until("the session is open, nothing fetched yet", || {
@@ -891,7 +907,28 @@ async fn leader_writes_between_the_snapshot_and_the_fetch_are_replayed() {
     wait_until("rewound", || ld.rewinds() == 1).await;
     assert_eq!(d.last_seq(), fork - 1);
     let d = assert_repairing(d, &c, s).await;
+    // The leader sends the replay up to `S` (here one entry, `fork`), then is held: the slave
+    // becomes ready at exactly `S` and must hold the leader's state at `S`, not a later one
+    // (a fetch that read live state would show the writes made after `S`).
+    let at_s = Gate::after(usize::try_from(s - (fork - 1)).unwrap());
+    at_s.install("server-tail-after-entry");
+    let _at_s = at_s.open_on_drop();
     fail::remove("slave-repair-after-rewind");
+    wait_until("ready at S, the rest held", || {
+        at_s.reached() && d.last_seq() == s && d.get("c", &[0]).is_ok()
+    })
+    .await;
+    assert_eq!(d.promotion_info().node_state, "ready");
+    for k in [1u8, 3, 5, 6, 7, 8] {
+        assert_eq!(
+            d.get("c", &[k]).unwrap(),
+            Some(b"base".to_vec()),
+            "key {k} as of S"
+        );
+    }
+    assert_eq!(d.get("c", &[100]).unwrap(), Some(b"new".to_vec()));
+    at_s.open();
+    fail::remove("server-tail-after-entry");
     assert_converged(&a, &[("d", &d)]).await;
     assert_eq!(d.get("c", &[1]).unwrap(), Some(b"after-s".to_vec()));
     assert_eq!(d.get("c", &[5]).unwrap(), None);
@@ -948,5 +985,253 @@ async fn a_repair_whose_snapshot_history_is_lost_upstream_never_becomes_ready() 
     assert_eq!(d.get("c", &[50]).unwrap(), Some(b"h2".to_vec()));
     assert_eq!(d.get("c", &[51]).unwrap(), None);
     assert!(d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
+    scenario.teardown();
+}
+
+/// Fix round 1, A-I1 = B-I1: a promotion checked while the slave was still ready (its repair
+/// in the network phase) must not promote the mixed state the rewind leaves behind. The final
+/// check is on the store itself, after the slave stopped: the promotion is refused and the
+/// slave is handed back, reopened, and finishes its replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rewind_during_a_checked_promotion_refuses_the_promotion() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (a, cfg, ld, fork, _) = diverged_slave_and_restored_master(&c).await;
+    for i in 0..3u8 {
+        a.put("c", &[100 + i], b"new").unwrap();
+    }
+    let s = a.last_seq();
+    let fetch = Gate::after(0);
+    fetch.install("slave-repair-before-fetch");
+    let _fetch = fetch.open_on_drop();
+    let promoting = Gate::after(0);
+    promoting.install("slave-promote-before-shutdown");
+    let _promoting = promoting.open_on_drop();
+    let d = Slave::open(cfg).await.unwrap();
+    wait_until("the repair's network phase", || fetch.reached()).await;
+    assert!(d.get("c", &[0]).is_ok(), "still ready while fetching");
+    let promotion = tokio::spawn(d.promote_checked(c.master_config("d"), &[]));
+    wait_until("the promotion passed its checks", || promoting.reached()).await;
+    // The rewind commits now; the replay is frozen right after it.
+    fail::cfg("slave-repair-after-rewind", "1*return").unwrap();
+    fetch.open();
+    fail::remove("slave-repair-before-fetch");
+    wait_until("rewound", || ld.rewinds() == 1).await;
+    promoting.open();
+    fail::remove("slave-promote-before-shutdown");
+    let refused = match promotion.await.unwrap() {
+        Ok(_) => panic!("a mixed state was promoted"),
+        Err(r) => r,
+    };
+    assert!(
+        matches!(refused.error, Error::Config(ref m) if m.contains("repair")),
+        "{:?}",
+        refused.error
+    );
+    fail::remove("slave-repair-after-rewind");
+    // Still a slave (its directory was not promoted), at the fork or replaying towards `S`.
+    let d = refused.into_slave().expect("reopened and handed back");
+    assert!(d.last_seq() >= fork - 1 && d.last_seq() <= s);
+    assert_converged(&a, &[("d", &d)]).await;
+    assert!(d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
+    assert_eq!(ld.bootstraps(), 1);
+    scenario.teardown();
+}
+
+/// Fix round 1, B-I2: a repair that falls back bootstraps only from the database its consent
+/// covered. Here the upstream's address serves another database by the time the fallback
+/// bootstrap starts: the identity policy (`Refuse` by default) halts, nothing is installed and
+/// the local data stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fallback_bootstrap_from_another_database_follows_the_identity_policy() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    a.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..20u8 {
+        a.put("c", &[i], b"base").unwrap();
+    }
+    let (mut cfg, ld) = c.slave_config("d", a.serve_addr().unwrap());
+    cfg.on_divergence = replicated_rocksdb::DivergencePolicy::Repair;
+    cfg.repair_max_bytes = 4096;
+    let d = Slave::open(cfg.clone()).await.unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    let a = c.restart_master_after_backup(a, "a", "a-backup").await;
+    a.put("c", &[1], b"lost").unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    d.shutdown().await.unwrap();
+    let port = a.serve_addr().unwrap().port();
+    a.shutdown().await.unwrap();
+    support::restore_dir(&c.path("a-backup"), &c.path("a"));
+    let mut mcfg = c.master_config("a");
+    mcfg.serve.as_mut().unwrap().port = port;
+    let a = Master::open(mcfg).await.unwrap();
+    // Key 1's value at `S` is larger than `repair_max_bytes`: the fetch falls back.
+    a.put("c", &[1], &[9u8; 8192]).unwrap();
+
+    let gate = Gate::after(0);
+    gate.install("slave-repair-before-fallback");
+    let _gate = gate.open_on_drop();
+    let d = Slave::open(cfg).await.unwrap();
+    wait_until("the repair fell back", || gate.reached()).await;
+    // The address now serves another database.
+    a.shutdown().await.unwrap();
+    let mut xcfg = c.master_config("x");
+    xcfg.serve.as_mut().unwrap().port = port;
+    let x = Master::open(xcfg).await.unwrap();
+    x.create_cf(CfSpec::new("c")).unwrap();
+    x.put("c", b"foreign", b"y").unwrap();
+    gate.open();
+    fail::remove("slave-repair-before-fallback");
+
+    support::wait_state(&d, "IdentityChanged halt", |s| {
+        *s == SlaveState::Halted(HaltReason::IdentityChanged)
+    })
+    .await;
+    assert_eq!(
+        ld.bootstraps(),
+        1,
+        "nothing installed from the other database"
+    );
+    assert_eq!(
+        d.get("c", &[1]).unwrap(),
+        Some(b"lost".to_vec()),
+        "local data intact"
+    );
+    assert_eq!(d.get("c", b"foreign").unwrap(), None);
+    drop(x);
+    scenario.teardown();
+}
+
+/// Fix round 1, A-I2 (i): a crash after part of the replay (`T < last_seq < S`). On restart
+/// the persisted target keeps the slave not ready (`repairing:<S>`) at its durable position,
+/// and it resumes the replay from there and converges, without a bootstrap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_mid_replay_resumes_after_a_restart() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (a, cfg, ld, fork, _) = diverged_slave_and_restored_master(&c).await;
+    for i in 0..6u8 {
+        a.put("c", &[100 + i], b"new").unwrap();
+    }
+    let s = a.last_seq();
+    let held = Gate::after(2);
+    held.install("server-tail-after-entry");
+    let _held = held.open_on_drop();
+    let d = Slave::open(cfg.clone()).await.unwrap();
+    wait_until("two entries replayed, the third held", || {
+        held.reached() && d.last_seq() == fork + 1
+    })
+    .await;
+    assert_eq!(ld.rewinds(), 1);
+    d.kill().await.unwrap();
+    // Every later Tail of the leader is held too, until the restarted slave was checked.
+    let again = Gate::after(0);
+    again.install("server-tail-after-entry");
+    let _again = again.open_on_drop();
+    held.open();
+    {
+        let raw = support::RawDb::open(&cfg.path);
+        assert_eq!(raw.last_seq(), fork + 1, "two replayed entries are durable");
+        assert_eq!(raw.meta(b"repair_until"), Some(s.to_be_bytes().to_vec()));
+    }
+    let d = Slave::open(cfg).await.unwrap();
+    assert!(matches!(d.get("c", &[0]), Err(Error::NotReady)));
+    assert_eq!(d.promotion_info().node_state, format!("repairing:{s}"));
+    wait_until("the restarted slave reached the leader", || again.reached()).await;
+    assert_eq!(d.last_seq(), fork + 1);
+    let d = assert_repairing(d, &c, s).await;
+    again.open();
+    fail::remove("server-tail-after-entry");
+    assert_converged(&a, &[("d", &d)]).await;
+    assert!(d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
+    assert_eq!(ld.bootstraps(), 1, "only the initial bootstrap");
+    assert_eq!(ld.rewinds(), 1);
+    scenario.teardown();
+}
+
+/// Fix round 1, A-I2 (ii): a crash after the commit of `S` but before the repair target is
+/// removed. On restart the target is at `last_seq`, so it is reached: the slave is ready at
+/// once (no stuck NotReady), its state is the leader's at `S`, and the stale target is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_between_reaching_s_and_clearing_the_target_is_ready_after_a_restart() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (a, cfg, ld, _fork, _) = diverged_slave_and_restored_master(&c).await;
+    for i in 0..3u8 {
+        a.put("c", &[100 + i], b"new").unwrap();
+    }
+    let s = a.last_seq();
+    fail::cfg("slave-repair-before-finish", "1*return").unwrap();
+    let d = Slave::open(cfg.clone()).await.unwrap();
+    wait_until("S committed", || d.last_seq() == s).await;
+    assert!(
+        matches!(d.get("c", &[0]), Err(Error::NotReady)),
+        "frozen before the target is removed"
+    );
+    d.kill().await.unwrap();
+    fail::remove("slave-repair-before-finish");
+    {
+        let raw = support::RawDb::open(&cfg.path);
+        assert_eq!(raw.last_seq(), s);
+        assert_eq!(raw.meta(b"repair_until"), Some(s.to_be_bytes().to_vec()));
+    }
+    let d = Slave::open(cfg.clone()).await.unwrap();
+    assert_eq!(
+        d.get("c", &[1]).unwrap(),
+        Some(b"base".to_vec()),
+        "ready at once"
+    );
+    assert_eq!(d.promotion_info().node_state, "ready");
+    assert_converged(&a, &[("d", &d)]).await;
+    assert!(d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
+    assert_eq!(ld.bootstraps(), 1);
+    d.shutdown().await.unwrap();
+    assert_eq!(
+        support::RawDb::open(&cfg.path).meta(b"repair_until"),
+        None,
+        "the reached target was removed on open"
+    );
+    scenario.teardown();
+}
+
+/// Fix round 1, B-M1: `Slave::snapshot` checked readiness while the slave was still ready
+/// (its repair in the network phase), then the rewind landed before the snapshot was taken.
+/// The snapshot would hold the mixed state: it is refused with `NotReady` instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_racing_a_rewind_is_refused() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (a, cfg, ld, _fork, _) = diverged_slave_and_restored_master(&c).await;
+    for i in 0..3u8 {
+        a.put("c", &[100 + i], b"new").unwrap();
+    }
+    let fetch = Gate::after(0);
+    fetch.install("slave-repair-before-fetch");
+    let _fetch = fetch.open_on_drop();
+    let d = std::sync::Arc::new(Slave::open(cfg).await.unwrap());
+    wait_until("the repair's network phase", || fetch.reached()).await;
+    let checked = Gate::after(0);
+    checked.install("slave-snapshot-after-check");
+    let _checked = checked.open_on_drop();
+    let snapping = {
+        let d = d.clone();
+        tokio::task::spawn_blocking(move || d.snapshot().map(|s| s.seq()))
+    };
+    wait_until("the snapshot passed its readiness check", || {
+        checked.reached()
+    })
+    .await;
+    fail::cfg("slave-repair-after-rewind", "pause").unwrap();
+    fetch.open();
+    fail::remove("slave-repair-before-fetch");
+    wait_until("rewound", || ld.rewinds() == 1).await;
+    checked.open();
+    fail::remove("slave-snapshot-after-check");
+    let got = snapping.await.unwrap();
+    assert!(matches!(got, Err(Error::NotReady)), "{got:?}");
+    fail::remove("slave-repair-after-rewind");
+    assert_converged(&a, &[("d", &*d)]).await;
+    assert!(d.snapshot().is_ok());
     scenario.teardown();
 }

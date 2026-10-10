@@ -549,12 +549,13 @@ enum VerifyMode { VERIFY_MODE_UNSPECIFIED = 0; QUICK = 1; FULL = 2; }
 
 message VerifyBeginRequest  { string client_id = 1; VerifyMode mode = 2; }
 message VerifyBeginResponse { bytes session_id = 1; Identity identity = 2; uint64 snapshot_seq = 3;
-                              repeated CfSpec cf_specs = 4; uint64 session_timeout_ms = 5; }
+                              repeated CfSpec cf_specs = 4; uint64 session_timeout_ms = 5;
+                              repeated EpochStart epoch_history = 6; }
 message VerifyEndRequest    { bytes session_id = 1; }
 message VerifyEndResponse   {}
 ```
 
-1. The server takes a snapshot, reads `S` and the CF list through it, and returns them with a random 16-byte `session_id`. It fails with `RESOURCE_EXHAUSTED` / `BUSY` if it already has `max_verify_sessions` open.
+1. The server takes a snapshot, reads `S`, its identity, its epoch history and the CF list through it, and returns them with a random 16-byte `session_id`. (A repair stores that epoch history, the one the data at `S` belongs to; it falls back to a bootstrap if it differs from the handshake's.) It fails with `RESOURCE_EXHAUSTED` / `BUSY` if it already has `max_verify_sessions` open.
 2. If the client's identity differs from `identity`, the client ends the session. Otherwise the client captures a snapshot of its own state **at exactly seq `S`**: it applies entries up to `S` and takes the snapshot before applying `S + 1`. If it is already past `S`, it calls `VerifyEnd` and retries later.
 3. The client compares the CF lists. Any difference is a mismatch, and only CFs present on both sides are compared further.
 4. The client sends range requests (§9.2) on a `VerifyRange` stream.
@@ -892,6 +893,7 @@ message VerifyBeginResponse {
   uint64   snapshot_seq       = 3;
   repeated CfSpec cf_specs    = 4;
   uint64   session_timeout_ms = 5;
+  repeated EpochStart epoch_history = 6;   // as of the snapshot, like identity and cf_specs
 }
 
 message KeyRange  { string cf = 1; optional bytes lower = 2; optional bytes upper = 3; }
