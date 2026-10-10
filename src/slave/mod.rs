@@ -173,10 +173,12 @@ impl Slave {
     }
 
     /// On a slave halted `Diverged`: its local entries past the fork point, for salvage
-    /// (DESIGN.md §12.1). The fork point is recorded when the slave halts, from the epoch
-    /// histories (or, for a slave ahead of its master, the master's `last_seq + 1`).
-    /// `Err(Config)` if the slave is not halted `Diverged`, or the fork point is not known
-    /// (neither shows it); `Err(Gap)` if local retention already removed part of the suffix.
+    /// (DESIGN.md §12.1). The fork point is recorded when a handshake answer halts the slave,
+    /// from the epoch histories (or, for a slave ahead of its master, the master's
+    /// `last_seq + 1`), and forgotten when the halt is cleared. `Err(Config)` if the slave is
+    /// not halted `Diverged`, or the fork point is not known (neither shows it, or the halt
+    /// came from a Tail stream that ended `DIVERGED`; `clear_halt(Retry)` handshakes again);
+    /// `Err(Gap)` if local retention already removed part of the suffix.
     /// Reads the whole suffix into memory.
     pub fn diverged_entries(&self) -> Result<Vec<LogEntry>> {
         if self.inner.state() != SlaveState::Halted(HaltReason::Diverged) {
@@ -209,7 +211,10 @@ impl Slave {
         let i = self.inner.clone();
         crate::background::blocking(move || {
             i.store
-                .write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true)
+                .write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true)?;
+            // The halt is gone, and with it the fork point it recorded: a later `Diverged`
+            // halt records its own (or none), never this stale one.
+            i.store.set_diverged_at(None)
         })
         .await?;
         if matches!(action, HaltAction::Rebootstrap { .. }) {

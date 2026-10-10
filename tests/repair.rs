@@ -125,6 +125,15 @@ async fn a_halted_diverged_slave_lists_its_divergent_entries() {
         Some(b"x".to_vec()),
         "data intact and readable"
     );
+    // Clearing the halt forgets the fork point; the next refusal records it again.
+    d.clear_halt(replicated_rocksdb::HaltAction::Retry)
+        .await
+        .unwrap();
+    wait_state(&d, "Diverged again", |s| {
+        *s == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
+    assert_eq!(d.diverged_entries().unwrap().len(), 4);
     drop(a);
 }
 

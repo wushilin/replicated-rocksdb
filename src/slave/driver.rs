@@ -260,7 +260,9 @@ async fn commit_halt_clear(inner: &Arc<Inner>) {
         let i = inner.clone();
         let r = blocking(move || {
             i.store
-                .write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true)
+                .write_meta(&[(key::NODE_STATE, &NodeState::Ready.encode())], true)?;
+            // The fork point of the cleared halt is stale from now on.
+            i.store.set_diverged_at(None)
         })
         .await;
         if let Err(e) = r {
