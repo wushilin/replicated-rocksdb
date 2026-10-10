@@ -182,8 +182,9 @@ impl Slave {
     /// protocol, ...) blocks as `PromotionUnverifiable` (`seq` 0, the error in `peer`): its state
     /// is unknown. So does a peer whose TLS handshake is rejected (its certificate does not
     /// verify) and a peer entry that cannot be used at all (an invalid address or TLS
-    /// configuration): these are misconfigurations, not unreachable peers. A peer that reports `role == Master` blocks with `Error::MasterReachable`:
-    /// fence it, or `Master::demote` it if it was promoted by mistake.
+    /// configuration): these are misconfigurations, not unreachable peers. A peer that reports
+    /// `role == Master` blocks with `Error::MasterReachable`: fence it, or `Master::demote` it
+    /// if it was promoted by mistake.
     ///
     /// A later peer that is replaying a repair (`node_state = repairing:<seq>`) still blocks
     /// with `NotMostAdvanced` naming it, although it refuses promotion itself until its replay

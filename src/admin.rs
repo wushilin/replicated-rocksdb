@@ -47,8 +47,8 @@ pub struct NodeInfo {
     /// entry there, `None` if it does not hold that entry. [`compare`] uses the longer node's
     /// probe at the shorter node's `last_seq`; [`gather`] and `Slave::check_promotion` fill it.
     pub probes: BTreeMap<Seq, Option<u32>>,
-    /// The highest epoch number this node started as a master and gave up with
-    /// `Master::demote` (0 if none). Replicas that followed that promotion may hold it, so a
+    /// The highest epoch number this node started as a master and gave up (`Master::demote`,
+    /// or the empty trailing epochs `Slave::rejoin` dropped; 0 if none). Replicas that followed that promotion may hold it, so a
     /// promotion never reuses it (`Slave::promote_checked` chooses a higher epoch).
     pub max_burned_epoch: u64,
 }

@@ -31,7 +31,7 @@ Master(A) ──► Slave(B) ──► Slave(C)
 | Master | yes (only via the gated writer) | always | none |
 | Slave | never (no write methods exist) | optional (`serve: Some(..)`) | exactly one (master or slave) |
 
-- The role is persisted in `__meta`. Opening a slave directory as `Master` (or vice versa) is refused.
+- The role is persisted in `__meta`. Opening a slave directory as `Master` (or vice versa) is refused; the only role changes are the explicit `Slave::promote*`, `Master::demote` and `Slave::rejoin` (§13.1, §13.2).
 - Every node has an `identifier` that **must be unique within the topology** (1–128 chars of `[A-Za-z0-9._-]`). Loop detection, bootstrap leases and status reporting all rely on it.
 
 ## 3. Storage layout
@@ -68,7 +68,7 @@ Master(A) ──► Slave(B) ──► Slave(C)
 | `bootstrap_cfs` | slave | physical CFs created by a bootstrap that has not finished, written (synced) before each is created; part of the known CF set at open, dropped by the next bootstrap reset |
 | `cf_specs` | all | live user CFs: `Vec<CfSpec>` plus `create_seq`, sorted by name |
 | `pending_cf_drops` | all | physical CFs logically dropped, awaiting physical drop |
-| `max_burned_epoch` | all | the highest epoch number this node started and gave up with `Master::demote` (absent = 0). Survives bootstraps; a later promotion of the node starts above it, and `Status` reports it (§13.1) |
+| `max_burned_epoch` | all | the highest epoch number this node started and gave up: with `Master::demote`, or the empty trailing epochs `Slave::rejoin` drops (absent = 0). Survives bootstraps; a later promotion of the node starts above it, and `Status` reports it (§13.1) |
 | `promoted_from_len` | master | the length of the epoch history before the promotion that made this node a master (absent for a master that was never promoted). `Master::demote` restores the history to this length (§13.1). |
 | `cf_create_intent` | all | the `CfEntry` being created; written with fsync before the physical CF is created, cleared in the `CreateCf` commit batch |
 
@@ -528,7 +528,18 @@ With `min_insync_replicas ≥ 1`, the most advanced in-sync replica holds every 
 
 After promotion:
 - Former siblings and downstream slaves re-pointed at the new master continue if they are at or behind its `last_seq` with matching entries. Those that received entries it never saw are `DIVERGED` and follow their divergence policy.
-- The old master can never rejoin as master. A restart starts an epoch of its own; replicas of the new history refuse to follow it (`STALE_EPOCH` while its number is lower, retried and reported; `DIVERGED` otherwise). To reuse the machine, wipe its directory and start it as a new slave, which bootstraps.
+- The old master can never rejoin as master. A restart starts an epoch of its own; replicas of the new history refuse to follow it (`STALE_EPOCH` while its number is lower, retried and reported; `DIVERGED` otherwise). Opened through `Node`, a stored master starts **fenced** and a peer check finds the new master (§13.2). To reuse the machine, turn it into a slave of the new master with `Node::rejoin_as_slave` (or `Slave::rejoin`), which keeps its data when its log is a prefix of the new master's and refuses (`Diverged`) otherwise; wiping its directory and starting a new slave remains possible.
+### 13.2 `Node`: one handle, explicit role switches, fenced open, rejoin
+
+`Node` holds one database directory in either role and is shared as `Arc<Node>`. Role changes happen only through explicit calls on it, and every caller sees the new role on its next call. `NodeConfig { master, slave, peers, unchecked_master }` names the same directory and identifier in both role configs.
+
+- **State.** `Node::state()` / `watch_state()`: `Master { identity }`, `Fenced { reason }`, `Slave { state, upstream }` (the slave's own states, forwarded live; `upstream` is the one the slave currently follows), `Switching`, `Failed { error }`, `Stopped`. A slave reports `Connecting` (not `Bootstrapping`) as soon as its bootstrap has committed, so a promotion is not refused for the rest of the handshake window.
+- **Calls.** Reads (`get`, `get_with_meta`, `multi_get`, `list_cfs`, `snapshot`) work in both roles; writes are master-only (`NotMaster`); slave admin (`repoint`, `clear_halt`, `verify_now`, `diverged_entries`, `status`, `wait_*`) is slave-only (`NotSlave`). `Fenced` answers `Fenced { reason }`, `Failed`/`Stopped` `NodeFailed`. `repoint` also replaces the upstream used by later reopens of the slave role.
+- **Concurrency.** A `tokio::sync::RwLock` holds the role. Sync calls use `try_read` and return `Switching` while a switch holds or waits for the lock: no caller ever blocks behind a switch. Async slave-admin calls hold the read lock across their await, so a switch waits for them. A switch takes the write lock, moves the running handle out, calls the consuming core operation (`promote_checked`, `promote`, `demote`, `rejoin`), and stores the result; a refusal hands the old handle back and it is put back running, **reopened with the upstream it currently follows** (also when the refusal happened on the stopped store, where the core reopens with the configured one). A lost handle (a failure after shutdown began, a live `ReadSnapshot`, a switch future dropped before it finished) makes the node `Failed`; `reopen` opens the stored role again.
+- **Fenced open.** `Node::open` of a directory whose stored role is `master` opens nothing at first: no epoch, no port, no reads or writes (the data of a returning old master may be divergent; nothing reads it as current). It runs the fence check once: read this node's `NodeInfo` from the closed store (read-only open; nothing written), ask every peer for `Status` (5 s each, concurrently), and clear only if all of these hold: at least one peer is configured; every peer answered; no peer is a master; no peer is later than or diverged from this node (`admin::compare`, with CRC probes); no peer is of another database; **no peer holds an epoch history record this node lacks** (at any epoch number: another writer existed, so `PeerDiverged`); and no peer knows an epoch at or above this node's newest one through its identity or `max_burned_epoch`. `UnfenceOptions::allow_unreachable: Some(AcceptSplitBrainRisk)` waives **only** unreachable peers: an error answer and every answered peer's evidence keep the fence. A peer entry that cannot be used locally (an invalid address or TLS configuration, a rejected TLS handshake) counts as an answered error, not as unreachable, so consent never skips a peer that was not contacted; `promote_checked` shares this classification and refuses such peers as `PromotionUnverifiable`. Cleared: the master opens (and starts its epoch); otherwise the node stays `Fenced { reason }` (`NoPeers`, `PeerUnreachable`, `PeerIsMaster`, `PeerAhead`, `PeerDiverged`, `PeerError`) until the application calls `unfence` or `rejoin_as_slave`. Nothing re-checks automatically. `NodeConfig::unchecked_master: Some(AcceptSplitBrainRisk)` skips the check. If the check itself fails (the local store cannot be read), `Node::open` returns the error and no node exists. If the master fails to open after a clearing `unfence`, the node is `Failed`; `reopen` runs the check again and never carries the earlier consent.
+- **Rejoin.** `Slave::rejoin(cfg, RejoinOptions)` (and `Node::rejoin_as_slave` from `Master` or `Fenced`) turns a stopped master into a slave without a wipe. One synced batch: `role = slave`; the trailing epoch records with `start_seq > last_seq` (restarts without writes, an empty promotion epoch) are dropped and their highest number burned into `max_burned_epoch`; `origin_identity` follows the newest remaining record (same batch); the master-only keys (`__ttl_index`, `promoted_from_len`, `last_ts`) are removed and the slave starts ready. The role is persisted before the first handshake: a slave never writes and divergence halts by default, and consent is never persisted, so a crash after the batch reopens as a slave that halts `Diverged` if it diverged. The first handshake is armed as a repoint (generation 0) with `RejoinOptions::on_divergence` (default `Refuse`) and settles with the outcomes and single-use consent of `repoint` (§13.1): after a failover the new master runs a newer epoch, so a prefix log answers `EpochAdvanced`; a log with entries the new master lacks is `Diverged` and halts with its data intact (`diverged_entries`), resolved only with `AcceptDataLoss` (`Repair` or `Rebootstrap`, at rejoin or by a later `repoint`/`clear_halt`).
+- **Known limitation.** With TLS 1.3 a rejected client certificate surfaces to the client as a broken pipe on first use, which is indistinguishable from a dropped connection: such a peer is still classified as unreachable.
+
 ## 14. Auth and TLS
 
 ```rust
@@ -805,6 +816,23 @@ impl Slave {
 }
 impl ReadApi for Slave {}  impl LogApi for Slave {}
 // A Slave has no write methods. Writing to it is a compile error.
+impl Slave { pub async fn rejoin(cfg: SlaveConfig, opts: RejoinOptions)
+                 -> Result<(Slave, Result<RepointOutcome>)>; }   // former master -> slave, no wipe (§13.2)
+
+// ---------------- Node: one handle for either role (§13.2) ----------------
+pub struct NodeConfig { pub master: MasterConfig, pub slave: SlaveConfig,
+                        pub peers: Vec<UpstreamConfig>,
+                        pub unchecked_master: Option<AcceptSplitBrainRisk> }
+pub struct Node { .. }   // Send + Sync; share as Arc<Node>
+impl Node {
+    pub async fn create_master(cfg: NodeConfig) / create_slave(cfg) / open(cfg) -> Result<Node>;
+    pub async fn from_master(Master, NodeConfig) / from_slave(Slave, NodeConfig) -> Result<Node>;
+    pub fn state(&self) -> NodeState; pub fn watch_state(&self) -> watch::Receiver<NodeState>;
+    // reads (both roles), writes (master), slave admin (slave) as on Master/Slave
+    pub async fn promote_checked(&self) / promote(&self) / demote(&self) -> Result<()>;
+    pub async fn rejoin_as_slave(&self, Option<UpstreamConfig>, RejoinOptions) -> Result<RepointOutcome>;
+    pub async fn unfence(&self, UnfenceOptions) / reopen(&self) / shutdown(&self) -> Result<()>;
+}
 
 // ---------------- admin: failover tooling (§13.1) ----------------
 #[non_exhaustive]
@@ -814,7 +842,7 @@ pub struct NodeInfo {                           // NodeInfo::new(node_id, role),
     pub last_ts_ms: u64, pub node_state: String, pub upstream: Option<String>,
     pub replicas: Vec<ReplicaSummary>,          // { node_id, applied_seq, in_sync }
     pub probes: BTreeMap<Seq, Option<u32>>,     // CRCs at probed seqs (Status.probe_seq)
-    pub max_burned_epoch: u64,                  // epoch given up by Master::demote; never reused
+    pub max_burned_epoch: u64,                  // epoch given up by Master::demote / Slave::rejoin; never reused
 }
 #[non_exhaustive]
 pub enum Comparison {
@@ -930,7 +958,8 @@ replicated-rocksdb/
     server/           replication gRPC server (shared by master & slave): handshake decisions,
                       tail, bootstrap + leases, verify sessions, limits
     master/           writer, reaper, open/identity/epoch
-    slave/            upstream client, applier, bootstrap install, verifier, halt handling
+    slave/            upstream client, applier, bootstrap install, verifier, halt handling, rejoin
+    node/             Node handle: role switches, fence check, state forwarding
     auth.rs           traits + Token/AllowAll/Mtls impls, auth-failure rate limit
     admin.rs          failover tooling: NodeInfo, compare, choose_promotion_candidate, node_status
     listener.rs  config.rs  error.rs
@@ -965,11 +994,13 @@ Dependencies: `rocksdb`, `tokio`, `tonic` (tls), `prost`, `tonic-types` (ErrorIn
 - Entry over `max_entry_bytes` is rejected on the master. A large valid entry passes through the chain.
 - Injected corruption on a slave is detected by `Full` verify and localised to the key. A key that exists only on the upstream, between the slave's chunk boundaries, is found.
 - **Repair:** a diverged slave with puts, deletes and range deletes in its suffix (and no entry before the fork in its own log) repairs without a bootstrap and matches under `Full` verify, also while the new leader keeps writing to the affected keys during the fetch and the replay, and when it writes them between the snapshot and the fetch; `repoint(.., Repair { AcceptDataLoss })` returns `Repaired` and verifies clean; a CF op in the suffix, a trimmed local suffix, an upstream without the fork point and more than `repair_max_bytes` fall back to a bootstrap; a crash right after the rewind stays `NotReady` (`repairing:<S>`) until replay passes `S` (before and after a restart with no upstream, and after a persisted halt during the replay), then converges; a leader lost mid-replay leaves the slave not ready, not promotable, not serving downstream and not in sync, and it resumes without a bootstrap when the leader is back; an upstream whose history is lost below `S` mid-replay never makes the slave ready on a mixed state; `MismatchPolicy::Repair` fixes corrupted, missing and extra keys and `Range` mismatches; `diverged_entries` returns the suffix of a halted slave.
+- **Node:** create/open per role; fenced open (no peers, unreachable peer and `allow_unreachable`, old master fenced by the new one, `unchecked_master`, unfence with behind slaves); promotion under concurrent writers (`NotMaster`/`Switching` only); refused promote keeps the slave; demote; `watch_state` sees `Switching`; a cancelled switch and a lost handle leave `Failed` and `reopen` recovers; rejoin resume, trailing empty epoch burned, diverged refused, repair with consent, crash after the rewrite.
 - Wire codec matches the PROTOCOL.md §15 test vectors.
 
 ## 22. Decisions and future work
 
 **Decided**
+- A stored master opened through `Node` is fenced until a peer check clears it; a former master becomes a slave only through the explicit `rejoin`, which never wipes and never discards entries without `AcceptDataLoss`.
 - No `update` or compare-and-set API. Read-modify-write is done by the application under its own lock (§5.1).
 - `LogEntry.ops` is opaque bytes, forwarded verbatim; the CRC covers the header fields and the ops.
 - Divergence is detected from the epoch histories (nonces included), with CRC comparison and the rejection of slaves ahead of the master as backstops. It is resolved only by policy (`DivergencePolicy::Repair` or `Rebootstrap`) or with explicit consent: a `repoint` refuses by default and discards entries only with `AcceptDataLoss`. Repair rewrites only the keys the divergent suffix touched (§12.1) and falls back to a bootstrap whenever it cannot prove the result.
