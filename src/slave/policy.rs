@@ -45,7 +45,8 @@ pub(crate) enum Force {
     Operator,
     /// A verify run found mismatches under `MismatchPolicy::Rebootstrap`, against this very
     /// upstream and database (the caller checked). Consent to re-copy, not to lose data on
-    /// divergence or a foreign database: only RESUME and BOOTSTRAP answers become a bootstrap.
+    /// divergence or a foreign database: only RESUME and BOOTSTRAP/{NO_LOCAL_STATE, LOG_GAP}
+    /// answers become a bootstrap; anything else follows the normal table.
     Verify,
 }
 
@@ -65,7 +66,8 @@ pub(crate) fn after_handshake(r: &pb::HandshakeResponse, p: &Policies, force: Fo
     }
     if force == Force::Verify
         && (decision == Decision::Resume
-            || (decision == Decision::Bootstrap && reason != Reason::IdentityChanged))
+            || (decision == Decision::Bootstrap
+                && matches!(reason, Reason::NoLocalState | Reason::LogGap)))
     {
         return Action::Bootstrap;
     }
@@ -322,6 +324,30 @@ mod tests {
             verify(Bootstrap, Reason::IdentityChanged),
             Action::Halt(HaltReason::IdentityChanged)
         );
+    }
+
+    /// N1: a verify rebootstrap converts only an explicit allowlist of BOOTSTRAP reasons; a
+    /// malformed or unknown combination follows the normal table.
+    #[test]
+    fn a_verify_rebootstrap_converts_only_the_need_data_bootstrap_reasons() {
+        for p in [&DEFAULTS, &OPPOSITE] {
+            for r in [
+                Reason::Unspecified,
+                Reason::Diverged,
+                Reason::StaleEpoch,
+                Reason::EpochAdvanced,
+                Reason::NotReady,
+                Reason::Busy,
+                Reason::Corrupt,
+                Reason::UpstreamReset,
+            ] {
+                assert_eq!(
+                    after_handshake(&answer(Decision::Bootstrap, r), p, Force::Verify),
+                    after_handshake(&answer(Decision::Bootstrap, r), p, Force::None),
+                    "BOOTSTRAP/{r:?}"
+                );
+            }
+        }
     }
 
     #[test]

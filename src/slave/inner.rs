@@ -325,6 +325,10 @@ impl Inner {
             }
         });
         if changed {
+            // A halt means the operator decides: a stale automatic consent must not outlive it.
+            if matches!(s, SlaveState::Halted(_)) {
+                self.verify_rebootstrap.clear();
+            }
             self.notify(|l| l.on_state_change(&s));
         }
     }
@@ -781,6 +785,21 @@ mod tests {
         let old = i.hold_applier();
         let _newer = i.hold_applier();
         old.target(99).await.unwrap()
+    }
+
+    /// A halt means the operator decides: it ends a pending verify rebootstrap, so
+    /// `clear_halt(Retry)` followed by RESUME just resumes.
+    #[test]
+    fn any_halt_expires_a_pending_verify_rebootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inner(dir.path());
+        let id = uuid::Uuid::from_u128(1);
+        i.verify_rebootstrap.request(0, id);
+        i.set_state(SlaveState::Streaming);
+        assert!(i.verify_rebootstrap.pending_for(0), "other states keep it");
+        i.set_state(SlaveState::Halted(HaltReason::Diverged));
+        assert!(!i.verify_rebootstrap.pending_for(0));
+        assert!(!i.verify_rebootstrap.applies(0, Some(id)));
     }
 
     #[test]

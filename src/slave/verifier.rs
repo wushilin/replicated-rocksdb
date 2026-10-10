@@ -229,7 +229,14 @@ async fn compare(
     let snap = Arc::new(capture(inner, hold, s).await?);
     debug_assert_eq!(snap.seq(), s);
     let meta_snap = snap.clone();
-    let local_cfs = blocking(move || meta_snap.meta()).await?.cf_specs;
+    // Counted like every blocking read that holds the snapshot: shutdown waits for it.
+    let work = inner.verify_work.enter();
+    let local_cfs = blocking(move || {
+        let _work = work;
+        meta_snap.meta()
+    })
+    .await?
+    .cf_specs;
     let upstream_cfs: Vec<CfEntry> = begin.cf_specs.iter().map(cf_from_pb).collect();
     let (mut mismatches, common) = compare_specs(&local_cfs, &upstream_cfs);
 

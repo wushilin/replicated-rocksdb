@@ -284,14 +284,12 @@ async fn session(
         .as_ref()
         .and_then(|i| identity_from_pb(i).ok())
         .map(|i| i.db_uuid);
-    let force = if inner.force_bootstrap.is_requested_for(generation) {
-        Force::Operator
-    } else if inner.verify_rebootstrap.applies(generation, hs_uuid) {
-        Force::Verify
-    } else {
-        Force::None
-    };
     let after_stream_diverged = inner.diverged_on_stream.swap(false, Ordering::SeqCst);
+    let force = choose_force(
+        inner.force_bootstrap.is_requested_for(generation),
+        inner.verify_rebootstrap.applies(generation, hs_uuid),
+        after_stream_diverged,
+    );
     let mut action = policy::after_handshake(&hs, &inner.policies(), force);
     // An explicit repoint never resolves divergence by the configured policy.
     if let Some(mode) = inner.repoint_mode() {
@@ -315,7 +313,8 @@ async fn session(
         }
     }
     // The retry arm of the driver loop logs the warning and sets `last_error`.
-    if let Some(end) = contradicting_resume(after_stream_diverged, &action) {
+    let resumes = hs.decision() == pb::Decision::Resume && force != Force::Operator;
+    if let Some(end) = contradicting_resume(after_stream_diverged, resumes) {
         return end;
     }
     match action {
@@ -364,9 +363,23 @@ const CONTRADICTION: &str = "upstream reported DIVERGED on the stream but not in
 /// A handshake that answers RESUME right after the stream ended `DIVERGED` contradicts the
 /// upstream's own report: retry with the normal reconnect backoff (and `last_error` set), not
 /// the fixed `AGAIN_PAUSE`, so a misbehaving upstream is not hammered.
-fn contradicting_resume(after_stream_diverged: bool, action: &Action) -> Option<SessionEnd> {
-    (after_stream_diverged && matches!(action, Action::Tail | Action::AdoptEpochThenTail))
-        .then(|| SessionEnd::Retry(CONTRADICTION.to_string()))
+///
+/// `resumes` is about the handshake answer itself (RESUME, not forced by the operator), not the
+/// action: a pending verify rebootstrap must not turn the contradiction into a bootstrap.
+fn contradicting_resume(after_stream_diverged: bool, resumes: bool) -> Option<SessionEnd> {
+    (after_stream_diverged && resumes).then(|| SessionEnd::Retry(CONTRADICTION.to_string()))
+}
+
+/// Which pending request, if any, applies to this handshake. The operator's consent counts as
+/// before; a verify's never applies right after a stream reported DIVERGED.
+fn choose_force(operator: bool, verify_applies: bool, after_stream_diverged: bool) -> Force {
+    if operator {
+        Force::Operator
+    } else if verify_applies && !after_stream_diverged {
+        Force::Verify
+    } else {
+        Force::None
+    }
 }
 
 /// RESUME / EPOCH_ADVANCED: persist the new identity and history atomically, then tail.
@@ -509,14 +522,22 @@ mod tests {
 
     #[test]
     fn resume_after_a_stream_diverged_is_retried_with_backoff() {
-        for a in [Action::Tail, Action::AdoptEpochThenTail] {
-            assert!(
-                matches!(contradicting_resume(true, &a), Some(SessionEnd::Retry(m)) if m == CONTRADICTION)
-            );
-            assert!(contradicting_resume(false, &a).is_none());
-        }
-        assert!(contradicting_resume(true, &Action::Bootstrap).is_none());
-        assert!(contradicting_resume(true, &Action::Again).is_none());
+        assert!(
+            matches!(contradicting_resume(true, true), Some(SessionEnd::Retry(m)) if m == CONTRADICTION)
+        );
+        assert!(contradicting_resume(false, true).is_none());
+        assert!(contradicting_resume(true, false).is_none());
+    }
+
+    /// I5: a verify request never applies right after a stream reported DIVERGED, whatever the
+    /// handshake answers; the operator's own consent is unchanged.
+    #[test]
+    fn a_verify_request_never_applies_after_a_diverged_stream() {
+        assert_eq!(choose_force(false, true, false), Force::Verify);
+        assert_eq!(choose_force(false, true, true), Force::None);
+        assert_eq!(choose_force(false, false, false), Force::None);
+        assert_eq!(choose_force(true, true, false), Force::Operator);
+        assert_eq!(choose_force(true, false, true), Force::Operator);
     }
 
     /// M6: `max_batch_bytes = 0` is the server default (1 MiB), not 0, in the decode limit.
