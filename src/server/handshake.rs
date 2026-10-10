@@ -89,7 +89,10 @@ pub(crate) fn decide(v: &ServerView, r: &pb::HandshakeRequest) -> Verdict {
         return verdict(
             Reject,
             R::NotReady,
-            format!("{} is bootstrapping", v.server_id),
+            format!(
+                "{} is not ready (bootstrapping, or replaying a repair)",
+                v.server_id
+            ),
         );
     };
     // 5

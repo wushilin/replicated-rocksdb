@@ -32,6 +32,12 @@ pub(crate) mod key {
     /// Master that was promoted: how many epoch records its history held before the promotion
     /// (so `demote` can remove every record added since, including per-open epochs).
     pub const PROMOTED_FROM_LEN: &[u8] = b"promoted_from_len";
+    /// The first seq of the local divergent suffix, recorded when a slave halts `Diverged`
+    /// (`Slave::diverged_entries`). Cleared by a repair or a bootstrap.
+    pub const DIVERGED_AT: &[u8] = b"diverged_at";
+    /// While a repair replays (DESIGN.md §12.1): reads answer `NotReady` until `last_seq`
+    /// reaches this seq. Kept apart from `node_state`, which a halt rewrites.
+    pub const REPAIR_UNTIL: &[u8] = b"repair_until";
 }
 
 pub(crate) fn be64(b: &[u8]) -> Result<u64> {

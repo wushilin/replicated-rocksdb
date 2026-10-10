@@ -79,7 +79,8 @@ async fn failover_runbook_end_to_end() {
 }
 
 /// D holds entries the new master never saw. Repoint refuses by default and keeps D's data
-/// readable; `Repair` is not available yet; `Rebootstrap` with `AcceptDataLoss` converges.
+/// readable, and the divergent suffix can be salvaged; `Repair` with `AcceptDataLoss` drops
+/// only that suffix and converges without a bootstrap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn divergence_is_refused_unless_data_loss_is_accepted() {
     let c = Cluster::new();
@@ -124,26 +125,27 @@ async fn divergence_is_refused_unless_data_loss_is_accepted() {
         "data intact and readable"
     );
 
+    let d_last = d.last_seq();
+    assert_eq!(
+        d.diverged_entries()
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect::<Vec<_>>(),
+        (fork..=d_last).collect::<Vec<_>>(),
+        "the divergent suffix can be salvaged"
+    );
+
     let repair = RepointOptions {
         on_divergence: RepointDivergence::Repair {
             accept_loss: AcceptDataLoss,
         },
     };
-    assert!(matches!(
-        repoint(&d, b_up.clone(), repair).await,
-        Err(Error::Unsupported(_))
-    ));
-    assert_eq!(d.status().state, SlaveState::Halted(HaltReason::Diverged));
-    assert_eq!(d.get("c", b"also only on d").unwrap(), Some(b"3".to_vec()));
-
-    let rebootstrap = RepointOptions {
-        on_divergence: RepointDivergence::Rebootstrap {
-            accept_loss: AcceptDataLoss,
-        },
-    };
     assert_eq!(
-        repoint(&d, b_up, rebootstrap).await.unwrap(),
-        RepointOutcome::Bootstrapped
+        repoint(&d, b_up, repair).await.unwrap(),
+        RepointOutcome::Repaired {
+            discarded: fork..=d_last
+        }
     );
     b.put("c", b"after", b"4").unwrap();
     assert_converged(&b, &[("d", &d)]).await;
@@ -152,7 +154,15 @@ async fn divergence_is_refused_unless_data_loss_is_accepted() {
         None,
         "the divergent entries were discarded"
     );
-    assert_eq!(ld.bootstraps(), 2);
+    assert_eq!(d.get("c", b"k").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(ld.bootstraps(), 1, "repaired without a bootstrap");
+    assert_eq!(ld.rewinds(), 1);
+    assert!(
+        d.verify_now(replicated_rocksdb::VerifyMode::Full)
+            .await
+            .unwrap()
+            .is_clean()
+    );
 }
 
 /// Repointing at itself or at its own downstream halts `LoopDetected` (data intact); a

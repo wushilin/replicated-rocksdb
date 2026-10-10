@@ -25,10 +25,12 @@ pub struct AcceptDataLoss;
 /// `on_divergence` policy is not used after an explicit repoint: the repoint's mode decides
 /// every `DIVERGED` answer until the next repoint or a restart.
 ///
-/// **Consent to lose data is single-use, and in practice covers the repoint's first handshake
-/// only.** `Rebootstrap` and `Repair` apply only while their own repoint is in progress, and a
-/// repoint settles as soon as that handshake is answered (with any outcome, including
-/// `Retrying` and an error); the mode then becomes `Refuse`. A `DIVERGED` that arrives later —
+/// **Consent to lose data is single-use: it lasts until its own repoint settles.**
+/// `Rebootstrap` and `Repair` apply only while their repoint is in progress. A repoint settles
+/// when its first handshake is answered; with `Repair`, when the repair that answer started has
+/// committed (`Repaired`), failed (`Retrying`), or fallen back to a bootstrap from the same
+/// upstream (`Bootstrapped`). Any outcome settles it, including `Retrying` and an error; the
+/// mode then becomes `Refuse`. A `DIVERGED` that arrives later —
 /// from the Tail or Bootstrap that follows the handshake, or from any later session — halts the
 /// slave with its data intact instead of discarding it again. Repoint again with the consent to
 /// apply it once more.
@@ -38,9 +40,12 @@ pub enum RepointDivergence {
     /// and readable.
     #[default]
     Refuse,
-    /// Discard only the divergent suffix and resume (DESIGN.md §22, Plan 3). **Not available in
-    /// this version:** `repoint` returns `Error::Unsupported` and the slave halts
-    /// `Diverged` with its data intact. It needs verify sessions (Plan 3).
+    /// Discard only the divergent suffix (DESIGN.md §12.1): the keys it touched are taken from
+    /// the new upstream, the suffix is dropped, and the slave replays the upstream's history
+    /// (`Repaired { discarded }`; reads answer `NotReady` until replay reaches the upstream's
+    /// snapshot seq). When repair cannot be proven safe (a CF operation in the suffix, entries
+    /// no longer retained, too much to fetch), the slave bootstraps from the new upstream
+    /// instead (`Bootstrapped`).
     Repair { accept_loss: AcceptDataLoss },
     /// Discard all local data and bootstrap from the new upstream, if this repoint's upstream
     /// answers `DIVERGED` before the repoint settles.
@@ -65,8 +70,9 @@ pub enum RepointOutcome {
     /// unprovable epoch change or log gap under the configured policies, or
     /// `RepointDivergence::Rebootstrap`).
     Bootstrapped,
-    /// The divergent suffix `discarded` was rolled back (Plan 3; never returned by this
-    /// version).
+    /// The divergent suffix `discarded` was rolled back and the keys it touched were taken
+    /// from the new upstream (`RepointDivergence::Repair`). Reads answer `NotReady` until the
+    /// slave has replayed up to the upstream's snapshot seq.
     Repaired { discarded: RangeInclusive<Seq> },
     /// The new upstream could not be used yet (unreachable, `STALE_EPOCH`, `NOT_READY`, …).
     /// The slave keeps retrying it with backoff; `last_error` says why.
@@ -180,17 +186,6 @@ pub(crate) fn divergence(
     }
 }
 
-/// The error a repoint reports when `mode` halts on divergence: `diverged` for `Refuse`,
-/// `Unsupported` for `Repair`.
-pub(crate) fn mode_error(mode: RepointDivergence, diverged: impl FnOnce() -> Error) -> Error {
-    match mode {
-        RepointDivergence::Repair { .. } => {
-            Error::Unsupported("divergence repair needs verify sessions (Plan 3)".into())
-        }
-        _ => diverged(),
-    }
-}
-
 impl Slave {
     /// Switches this slave to another upstream at runtime, without reopening; reads keep
     /// being served throughout. The new upstream is not persisted: after a restart, open
@@ -203,7 +198,8 @@ impl Slave {
     /// upstream is handshaken under all the normal rules (loop detection, `STALE_EPOCH`,
     /// epoch continuity). `repoint` returns once that first handshake settles:
     ///
-    /// - `Ok(Resumed | EpochAdvanced | Bootstrapped)`: replicating from the new upstream.
+    /// - `Ok(Resumed | EpochAdvanced | Bootstrapped | Repaired { .. })`: replicating from the
+    ///   new upstream.
     /// - `Ok(Retrying { .. })`: the new upstream cannot be used yet (unreachable,
     ///   `STALE_EPOCH`, `NOT_READY`); the slave keeps retrying it.
     /// - `Err(Diverged { .. })` (with `RepointDivergence::Refuse`, the default): the local log
@@ -211,8 +207,9 @@ impl Slave {
     ///   implicitly:** the slave halts `Diverged`, its data intact and readable. Discarding
     ///   the divergent entries takes an explicit [`AcceptDataLoss`]:
     ///   `RepointDivergence::Rebootstrap { accept_loss: AcceptDataLoss }`.
-    ///   `RepointDivergence::Repair` returns `Err(Unsupported)` in this version (it needs
-    ///   Plan 3's verify sessions) and also leaves the slave halted with its data intact.
+    ///   `RepointDivergence::Repair { accept_loss: AcceptDataLoss }` discards only the
+    ///   divergent suffix and returns `Ok(Repaired { discarded })` (or `Ok(Bootstrapped)` when
+    ///   repair is not possible, `Ok(Retrying)` when it failed for a transient reason).
     ///   The consent is single-use: it covers `DIVERGED` answers until this repoint settles
     ///   (this call returns), then the mode reverts to `Refuse` (see [`RepointDivergence`]).
     /// - `Err(Halted(LoopDetected))`: the new upstream is this slave or replicates from it;

@@ -543,3 +543,410 @@ async fn lag_ms_is_the_age_of_the_oldest_received_unapplied_entry() {
     assert_eq!(b.status().lag_ms, Some(0));
     scenario.teardown();
 }
+
+/// A failpoint callback (`fail::cfg_callback`) that lets the first `skip` evaluations pass,
+/// then records that it was reached and blocks the evaluating thread until [`Gate::open`];
+/// every evaluation after that passes.
+#[derive(Clone, Default)]
+struct Gate {
+    skip: usize,
+    state: std::sync::Arc<(std::sync::Mutex<GateState>, std::sync::Condvar)>,
+}
+
+/// (evaluations, reached, open)
+type GateState = (usize, bool, bool);
+
+impl Gate {
+    fn after(skip: usize) -> Gate {
+        Gate {
+            skip,
+            ..Gate::default()
+        }
+    }
+
+    fn install(&self, name: &str) {
+        let gate = self.clone();
+        fail::cfg_callback(name, move || gate.block()).unwrap();
+    }
+
+    fn block(&self) {
+        let (m, cv) = &*self.state;
+        let mut s = m.lock().unwrap();
+        s.0 += 1;
+        if s.0 <= self.skip || s.2 {
+            return;
+        }
+        s.1 = true;
+        cv.notify_all();
+        while !s.2 {
+            s = cv.wait(s).unwrap();
+        }
+    }
+
+    fn reached(&self) -> bool {
+        self.state.0.lock().unwrap().1
+    }
+
+    fn open(&self) {
+        let (m, cv) = &*self.state;
+        m.lock().unwrap().2 = true;
+        cv.notify_all();
+    }
+}
+
+/// While a repair replays (`repair_until` above `last_seq`): reads answer `NotReady`, `Status`
+/// reports `repairing:<s>`, and a promotion is refused (the slave is handed back running).
+async fn assert_repairing(d: Slave, c: &Cluster, s: u64) -> Slave {
+    assert!(
+        matches!(d.get("c", &[0]), Err(Error::NotReady)),
+        "mixed state is never served"
+    );
+    assert!(matches!(d.snapshot(), Err(Error::NotReady)));
+    assert_eq!(d.promotion_info().node_state, format!("repairing:{s}"));
+    assert!(matches!(
+        d.verify_now(VerifyMode::Quick).await,
+        Err(Error::NotReady)
+    ));
+    let Err(refused) = d.promote_checked(c.master_config("d"), &[]).await else {
+        panic!("a repairing slave is not promotable");
+    };
+    assert!(
+        matches!(refused.error, Error::Config(ref m) if m.contains("repair")),
+        "{:?}",
+        refused.error
+    );
+    refused.into_slave().expect("handed back running")
+}
+
+/// A slave killed right after its repair committed holds keys at the upstream's snapshot `S`
+/// next to keys at the fork: it stays `NotReady` until replay passes `S` — after a restart with
+/// no upstream (`node_state` `repairing:<S>`), and after a halt that rewrote `node_state`
+/// during the replay — then converges, without any bootstrap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crash_mid_repair_then_converge() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (mut cfg, first) = c.slave_config("d", a.serve_addr().unwrap());
+    cfg.on_divergence = replicated_rocksdb::DivergencePolicy::Repair;
+    let d = Slave::open(cfg.clone()).await.unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    for i in 0..20u8 {
+        a.put("c", &[i], b"base").unwrap();
+    }
+    assert_converged(&a, &[("d", &d)]).await;
+
+    // D receives entries the restored master will not have.
+    let a = c.restart_master_after_backup(a, "a", "a-backup").await;
+    let fork = a.last_seq() + 1;
+    a.put("c", &[1], b"lost").unwrap();
+    a.delete("c", &[2]).unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    d.shutdown().await.unwrap();
+    let port = a.serve_addr().unwrap().port();
+    a.shutdown().await.unwrap();
+    support::restore_dir(&c.path("a-backup"), &c.path("a"));
+    let mut mcfg = c.master_config("a");
+    mcfg.serve.as_mut().unwrap().port = port;
+    let a = Master::open(mcfg).await.unwrap();
+    for i in 0..5u8 {
+        a.put("c", &[100 + i], b"new").unwrap(); // so replay must run past the rewind point
+    }
+    let s = a.last_seq();
+
+    fail::cfg("slave-repair-after-rewind", "1*return").unwrap();
+    let listener = std::sync::Arc::new(support::RecordingListener::default());
+    let mut frozen_cfg = cfg.clone();
+    frozen_cfg.listener = Some(listener.clone());
+    let d = Slave::open(frozen_cfg).await.unwrap();
+    wait_until("frozen right after the rewind", || listener.rewinds() == 1).await;
+    assert!(
+        matches!(d.get("c", &[0]), Err(Error::NotReady)),
+        "mixed state is never served"
+    );
+    assert_eq!(
+        d.promotion_info().node_state,
+        format!("repairing:{s}"),
+        "before the crash"
+    );
+    d.kill().await.unwrap();
+    fail::remove("slave-repair-after-rewind");
+    assert_eq!(listener.bootstraps(), 0);
+    assert_eq!(
+        support::RawDb::open(&cfg.path).last_seq(),
+        fork - 1,
+        "rewound to the fork"
+    );
+
+    // Restarted with no reachable upstream: still not ready, and Status says why.
+    let dead = std::net::SocketAddr::from(([127, 0, 0, 1], support::reserved_port()));
+    let (mut lonely, _) = c.slave_config("d", dead);
+    lonely.listener = None;
+    let d = Slave::open(lonely).await.unwrap();
+    assert!(matches!(d.get("c", &[0]), Err(Error::NotReady)));
+    assert_eq!(
+        d.promotion_info().node_state,
+        format!("repairing:{s}"),
+        "after the restart"
+    );
+    d.shutdown().await.unwrap();
+
+    // A halt that persists (another database: IdentityChanged) rewrites node_state; the
+    // repair target survives it, also across a restart.
+    let x = c.master("x").await;
+    let (mut foreign, _) = c.slave_config("d", x.serve_addr().unwrap());
+    foreign.listener = None;
+    let d = Slave::open(foreign).await.unwrap();
+    d.wait_streaming(support::WAIT).await.unwrap_err();
+    assert!(matches!(d.get("c", &[0]), Err(Error::NotReady)));
+    d.shutdown().await.unwrap();
+    let d = Slave::open(cfg).await.unwrap();
+    assert_eq!(
+        d.status().state,
+        SlaveState::Halted(replicated_rocksdb::HaltReason::IdentityChanged)
+    );
+    assert!(
+        matches!(d.get("c", &[0]), Err(Error::NotReady)),
+        "a halted slave mid-replay is not ready either"
+    );
+    d.clear_halt(replicated_rocksdb::HaltAction::Retry)
+        .await
+        .unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    assert_eq!(d.get("c", &[1]).unwrap(), Some(b"base".to_vec()));
+    assert_eq!(first.bootstraps(), 1, "only the initial bootstrap, ever");
+    assert!(
+        d.verify_now(replicated_rocksdb::VerifyMode::Full)
+            .await
+            .unwrap()
+            .is_clean()
+    );
+    drop(x);
+    scenario.teardown();
+}
+
+/// A slave `d` (repairing on divergence, one entry per Tail batch) that received entries the
+/// restored master `a` will not have, at seqs `fork..`; `a` is restored from its backup with
+/// its own new history. Returns the master, `d`'s config, `fork` and the master's config.
+async fn diverged_slave_and_restored_master(
+    c: &Cluster,
+) -> (
+    Master,
+    replicated_rocksdb::SlaveConfig,
+    std::sync::Arc<support::RecordingListener>,
+    u64,
+    replicated_rocksdb::MasterConfig,
+) {
+    let a = c.master("a").await;
+    a.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..20u8 {
+        a.put("c", &[i], b"base").unwrap();
+    }
+    let (mut cfg, ld) = c.slave_config("d", a.serve_addr().unwrap());
+    cfg.on_divergence = replicated_rocksdb::DivergencePolicy::Repair;
+    // One entry per Tail batch, so the replay can be stopped between entries.
+    cfg.fetch.max_batch_bytes = 1;
+    let d = Slave::open(cfg.clone()).await.unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    let a = c.restart_master_after_backup(a, "a", "a-backup").await;
+    let fork = a.last_seq() + 1;
+    a.put("c", &[1], b"lost").unwrap();
+    a.delete_range("c", &[5], &[9]).unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    d.shutdown().await.unwrap();
+    let port = a.serve_addr().unwrap().port();
+    a.shutdown().await.unwrap();
+    support::restore_dir(&c.path("a-backup"), &c.path("a"));
+    let mut mcfg = c.master_config("a");
+    mcfg.serve.as_mut().unwrap().port = port;
+    let a = Master::open(mcfg.clone()).await.unwrap();
+    (a, cfg, ld, fork, mcfg)
+}
+
+/// User-requested (b): the leader becomes unavailable in the middle of a repair's replay.
+/// The slave keeps its repair target: reads answer `NotReady`, `Status` reports
+/// `repairing:<S>`, it cannot be promoted, it serves no downstream handshake, and the master
+/// never counts it as in sync (its acks of replayed entries satisfy no write concern). When
+/// the leader is back, it resumes the replay and converges without a bootstrap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_leader_lost_mid_replay_keeps_the_repair_target_and_resumes() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (a, cfg, ld, fork, mcfg) = diverged_slave_and_restored_master(&c).await;
+    for i in 0..6u8 {
+        a.put("c", &[100 + i], b"new").unwrap();
+    }
+    a.put("c", &[6], b"new").unwrap(); // inside the lost range delete
+    let s = a.last_seq();
+
+    fail::cfg("slave-repair-after-rewind", "pause").unwrap();
+    let d = Slave::open(cfg.clone()).await.unwrap();
+    wait_until("rewound", || ld.rewinds() == 1).await;
+    assert_eq!(d.last_seq(), fork - 1, "rewound to the fork");
+    let d = assert_repairing(d, &c, s).await;
+    // A downstream replica of `d` is refused while `d` repairs.
+    let (e_cfg, le) = c.slave_config("e", d.serve_addr().unwrap());
+    let e = Slave::open(e_cfg).await.unwrap();
+    wait_until("e refused by d", || {
+        e.status()
+            .last_error
+            .is_some_and(|m| m.contains("NOT_READY"))
+    })
+    .await;
+
+    // The leader sends two entries of the replay, then its Tail producer is held before it
+    // sends the third: the slave cannot have received more.
+    let held = Gate::after(2);
+    held.install("server-tail-after-entry");
+    fail::remove("slave-repair-after-rewind");
+    wait_until("the leader holds the third entry", || held.reached()).await;
+    wait_until("two entries replayed", || d.last_seq() == fork + 1).await;
+    // Its acks of replayed entries never make it an in-sync replica (DESIGN.md §12.1).
+    let mine = a.replicas().into_iter().find(|r| r.node_id == "d");
+    assert!(
+        mine.is_some_and(|r| !r.in_sync && r.applied_seq < s),
+        "{:?}",
+        a.replicas()
+    );
+    let concern = WriteConcern {
+        min_insync_replicas: 1,
+        ack_timeout: Duration::from_secs(1),
+    };
+    assert!(matches!(
+        a.put_with("c", b"needs-an-in-sync-replica", b"v", concern),
+        Err(Error::NotEnoughReplicas { .. })
+    ));
+    assert_eq!(a.last_seq(), s, "nothing was written");
+    // The leader goes away with the rest of the replay unsent.
+    let stopping = tokio::spawn(a.shutdown());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    held.open();
+    fail::remove("server-tail-after-entry");
+    stopping.await.unwrap().unwrap();
+    wait_until("the stream to the lost leader ended", || {
+        d.status().state == SlaveState::Connecting && d.status().last_error.is_some()
+    })
+    .await;
+    let mid = d.last_seq();
+    assert!(
+        (fork + 1..=fork + 2).contains(&mid) && mid < s,
+        "mid-replay: {mid}, fork {fork}, S {s}"
+    );
+    let d = assert_repairing(d, &c, s).await;
+    tokio::time::sleep(Duration::from_millis(300)).await; // a few failed reconnects
+    assert_eq!(d.last_seq(), mid);
+    let d = assert_repairing(d, &c, s).await;
+    assert!(
+        e.status()
+            .last_error
+            .is_some_and(|m| m.contains("NOT_READY")),
+        "{:?}",
+        e.status().last_error
+    );
+    assert_eq!(e.status().origin_identity, None, "e got nothing from d");
+
+    // The leader is back: the replay resumes where it stopped.
+    let a = Master::open(mcfg).await.unwrap();
+    assert_converged(&a, &[("d", &d), ("e", &e)]).await;
+    assert_eq!(d.get("c", &[1]).unwrap(), Some(b"base".to_vec()));
+    assert_eq!(d.get("c", &[6]).unwrap(), Some(b"new".to_vec()));
+    assert_eq!(d.get("c", &[7]).unwrap(), Some(b"base".to_vec()));
+    assert_eq!(ld.bootstraps(), 1, "only the initial bootstrap");
+    assert_eq!(ld.rewinds(), 1);
+    assert_eq!(le.bootstraps(), 1, "e bootstraps from d once it is ready");
+    assert!(d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
+    ld.assert_no_violations();
+    scenario.teardown();
+}
+
+/// User-requested (a), deterministic: the repair's session has pinned the leader's snapshot
+/// `S`, and the leader writes to the affected keys (puts, deletes, a range delete) before the
+/// slave fetches. The slave takes the keys as of `S` (it reports `repairing:<S>`, not a later
+/// seq), replays the writes after `S`, and matches the leader exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leader_writes_between_the_snapshot_and_the_fetch_are_replayed() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (a, cfg, ld, fork, _) = diverged_slave_and_restored_master(&c).await;
+    a.put("c", &[100], b"new").unwrap();
+    let gate = Gate::after(0);
+    gate.install("slave-repair-before-fetch");
+    fail::cfg("slave-repair-after-rewind", "pause").unwrap();
+    let d = Slave::open(cfg).await.unwrap();
+    wait_until("the session is open, nothing fetched yet", || {
+        gate.reached()
+    })
+    .await;
+    let s = a.last_seq();
+    a.put("c", &[1], b"after-s").unwrap();
+    a.delete("c", &[3]).unwrap();
+    a.delete_range("c", &[5], &[8]).unwrap();
+    a.put("c", &[6], b"after-s").unwrap();
+    a.put("c", &[5], b"before-the-range-delete-was-undone")
+        .unwrap();
+    a.delete("c", &[5]).unwrap();
+    gate.open();
+    fail::remove("slave-repair-before-fetch");
+    wait_until("rewound", || ld.rewinds() == 1).await;
+    assert_eq!(d.last_seq(), fork - 1);
+    let d = assert_repairing(d, &c, s).await;
+    fail::remove("slave-repair-after-rewind");
+    assert_converged(&a, &[("d", &d)]).await;
+    assert_eq!(d.get("c", &[1]).unwrap(), Some(b"after-s".to_vec()));
+    assert_eq!(d.get("c", &[5]).unwrap(), None);
+    assert_eq!(d.get("c", &[7]).unwrap(), None);
+    assert_eq!(d.get("c", &[8]).unwrap(), Some(b"base".to_vec()));
+    assert!(d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
+    assert_eq!(ld.bootstraps(), 1);
+    scenario.teardown();
+}
+
+/// The upstream's history changes below the repair's `S` while the slave replays (the master
+/// is restored from an older backup): the keys taken at `S` hold writes the new history never
+/// had, so replaying it can never produce that state. The slave treats it as a divergence
+/// (here: `Repair`, which cannot repair it and bootstraps) instead of becoming ready on a
+/// mixed state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repair_whose_snapshot_history_is_lost_upstream_never_becomes_ready() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (a, cfg, ld, fork, _) = diverged_slave_and_restored_master(&c).await;
+    a.put("c", &[50], b"h2").unwrap(); // seq fork, kept below
+    // A backup holding only that entry of the new history.
+    let a = c.restart_master_after_backup(a, "a", "a-backup2").await;
+    // Lost again below. Key 1 is one the slave's divergent suffix touched, so the repair
+    // takes it as of `S`; nothing after `fork` that survives writes it again.
+    a.put("c", &[1], b"h2-lost").unwrap();
+    a.put("c", &[51], b"h2-lost").unwrap();
+    let s = a.last_seq();
+
+    fail::cfg("slave-repair-after-rewind", "pause").unwrap();
+    let d = Slave::open(cfg).await.unwrap();
+    wait_until("rewound", || ld.rewinds() == 1).await;
+    assert_eq!(d.last_seq(), fork - 1);
+    // `d` holds key 1 as of `S` ("h2-lost").
+    let d = assert_repairing(d, &c, s).await;
+
+    // The master is restored from the second backup: everything after `fork` is lost and a
+    // new epoch starts there. Key 1 is never written again.
+    let port = a.serve_addr().unwrap().port();
+    a.shutdown().await.unwrap();
+    support::restore_dir(&c.path("a-backup2"), &c.path("a"));
+    let mut mcfg = c.master_config("a");
+    mcfg.serve.as_mut().unwrap().port = port;
+    let a = Master::open(mcfg).await.unwrap();
+    for i in 0..3u8 {
+        a.put("c", &[60 + i], b"h3").unwrap();
+    }
+    assert!(a.last_seq() >= s, "replay would pass S on the new history");
+    fail::remove("slave-repair-after-rewind");
+
+    wait_until("the fallback bootstrap", || ld.bootstraps() == 2).await;
+    assert_converged(&a, &[("d", &d)]).await;
+    assert_eq!(d.get("c", &[1]).unwrap(), Some(b"base".to_vec()));
+    assert_eq!(d.get("c", &[50]).unwrap(), Some(b"h2".to_vec()));
+    assert_eq!(d.get("c", &[51]).unwrap(), None);
+    assert!(d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
+    scenario.teardown();
+}

@@ -15,6 +15,7 @@ use tracing::Instrument;
 
 use super::client::{self, Client};
 use super::inner::{CaptureHold, CaptureMiss, Inner, VerifyWork};
+use super::repair::AffectedSet;
 use super::state::SlaveState;
 use crate::background::blocking;
 use crate::error::{Error, Result};
@@ -42,7 +43,6 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
 /// The longest `VerifyEnd` may take: it is best effort and delays the report.
 const END_TIMEOUT: Duration = Duration::from_secs(2);
 /// The most key bytes one `FetchKeys` request carries (the server accepts 4 MiB requests).
-#[allow(dead_code)] // used by repair
 pub(crate) const FETCH_REQUEST_BYTES: usize = 1 << 20;
 
 /// Sets the run's stop flag when the run ends or is dropped (cancelled, or its `verify_now`
@@ -89,6 +89,10 @@ pub(crate) async fn verify(inner: &Arc<Inner>, mode: VerifyMode) -> Result<Verif
     let Some((identity, _)) = inner.ident() else {
         return Err(Error::NotReady);
     };
+    // Mid-repair the local state is a mix of two seqs (DESIGN.md §12.1): nothing to compare.
+    if inner.repairing().is_some() {
+        return Err(Error::NotReady);
+    }
     // The repoint generation the run belongs to, read before it connects to the current
     // upstream: a repoint during the run makes its policy action inert.
     let generation = *inner.repoint_tx.borrow();
@@ -115,17 +119,18 @@ pub(crate) async fn verify(inner: &Arc<Inner>, mode: VerifyMode) -> Result<Verif
     result
 }
 
-/// Whether a report with mismatches may start a re-bootstrap. Never on a halted slave (it may
-/// be on another history than its upstream: a divergence the handshake refused), and never when
-/// the slave was repointed during the run (the report is about the old upstream).
-fn may_rebootstrap(
+/// Whether a report with mismatches may start its policy's action (`Rebootstrap` or `Repair`).
+/// Never on a halted slave (it may be on another history than its upstream: a divergence the
+/// handshake refused), and never when the slave was repointed during the run (the report is
+/// about the old upstream).
+fn may_act(
     policy: MismatchPolicy,
     clean: bool,
     halted: bool,
     started_generation: u64,
     generation: u64,
 ) -> bool {
-    !clean && !halted && started_generation == generation && policy == MismatchPolicy::Rebootstrap
+    !clean && !halted && started_generation == generation && policy != MismatchPolicy::Report
 }
 
 fn finish(inner: &Inner, report: &VerifyReport, started_generation: u64, verified: DbIdentity) {
@@ -145,15 +150,27 @@ fn finish(inner: &Inner, report: &VerifyReport, started_generation: u64, verifie
             "verify found mismatches"
         );
         let policy = inner.cfg.verify.on_mismatch;
-        if may_rebootstrap(policy, false, halted, started_generation, generation) {
+        if may_act(policy, false, halted, started_generation, generation) {
+            // A CF that differs cannot be repaired key by key: re-bootstrap instead.
+            let repair = match policy {
+                MismatchPolicy::Repair => AffectedSet::from_mismatches(&report.mismatches),
+                MismatchPolicy::Report | MismatchPolicy::Rebootstrap => None,
+            };
             // Consent to re-copy from the upstream that was verified, nothing more: not the
             // operator's `force_bootstrap`, which also overrides DIVERGED and IDENTITY_CHANGED.
-            inner
-                .verify_rebootstrap
-                .request(started_generation, verified.db_uuid);
+            match repair {
+                Some(set) => {
+                    inner.request_repair(started_generation, verified.db_uuid, set);
+                }
+                None => {
+                    inner
+                        .verify_rebootstrap
+                        .request(started_generation, verified.db_uuid);
+                }
+            }
             inner.rebootstrap.notify_one();
-        } else if policy == MismatchPolicy::Rebootstrap && started_generation != generation {
-            tracing::warn!("the slave was repointed during the run; not re-bootstrapping");
+        } else if policy != MismatchPolicy::Report && started_generation != generation {
+            tracing::warn!("the slave was repointed during the run; not acting on its report");
         }
     }
     inner.set_last_verify(report.clone());
@@ -411,7 +428,6 @@ async fn capture(inner: &Arc<Inner>, hold: CaptureHold, s: Seq) -> Result<ReadSn
 
 /// How many of `keys` the next `FetchKeys` request carries: at most `MAX_LIST_LIMIT` keys and
 /// [`FETCH_REQUEST_BYTES`] of keys, but always at least one.
-#[allow(dead_code)] // used by repair
 fn fetch_batch_len(keys: &[Vec<u8>]) -> usize {
     let mut n = 0;
     let mut bytes = 0;
@@ -467,13 +483,11 @@ pub(crate) struct Upstream {
     tx: mpsc::Sender<pb::VerifyRangeRequest>,
     answers: Streaming<pb::VerifyRangeResponse>,
     session_id: Vec<u8>,
-    #[allow(dead_code)] // read by `entry_crc`, used by repair
+    /// The session's `S`: `entry_crc` never asks for a later seq (the upstream refuses it).
     snapshot_seq: Seq,
     next_id: u64,
 }
 
-// `fetch_keys`, `fetch_range` and `entry_crc` are used by repair (Task 10) and the tests.
-#[allow(dead_code)]
 impl Upstream {
     async fn send(&mut self, kind: ReqKind) -> Result<u64> {
         self.next_id += 1;
@@ -1147,18 +1161,22 @@ mod tests {
     /// generation the run started in.
     #[test]
     fn a_rebootstrap_needs_a_mismatch_a_live_slave_and_the_same_generation() {
-        use MismatchPolicy::{Rebootstrap, Report};
+        use MismatchPolicy::{Rebootstrap, Repair, Report};
         // (policy, clean, halted, started, now) -> acts
         let rows = [
             (Rebootstrap, false, false, 2, 2, true),
             (Rebootstrap, true, false, 2, 2, false),
             (Rebootstrap, false, true, 2, 2, false),
             (Rebootstrap, false, false, 2, 3, false),
+            (Repair, false, false, 2, 2, true),
+            (Repair, true, false, 2, 2, false),
+            (Repair, false, true, 2, 2, false),
+            (Repair, false, false, 2, 3, false),
             (Report, false, false, 2, 2, false),
         ];
         for (policy, clean, halted, started, now, acts) in rows {
             assert_eq!(
-                may_rebootstrap(policy, clean, halted, started, now),
+                may_act(policy, clean, halted, started, now),
                 acts,
                 "{policy:?} clean={clean} halted={halted} {started}->{now}"
             );

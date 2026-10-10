@@ -10,6 +10,7 @@ use tokio::sync::{Notify, oneshot, watch};
 
 use super::config::{SlaveConfig, UpstreamConfig};
 use super::policy::Policies;
+use super::repair::AffectedSet;
 use super::repoint::PendingRepoint;
 use super::state::{HaltReason, NodeState, SlaveState, SlaveStatus, lag_ms};
 use crate::error::{Error, Result};
@@ -91,8 +92,21 @@ impl VerifyRebootstrap {
     }
 }
 
-/// Blocking work of verify runs that still references the database (scans on blocking threads
-/// outlive a cancelled run for a moment). `Slave::shutdown` waits for it to drain.
+/// Keys a verify asked to repair (`MismatchPolicy::Repair`). Like [`VerifyRebootstrap`] it is
+/// consent only to re-copy those keys from the upstream that was verified: it applies to one
+/// repoint generation and one database identity, is acted on only after a RESUME answer from
+/// that database (never on DIVERGED or IDENTITY_CHANGED), and any halt drops it.
+pub(crate) struct PendingRepair {
+    generation: u64,
+    db_uuid: uuid::Uuid,
+    /// Bumped by every merge: a repair that committed an older version leaves the newer keys
+    /// queued.
+    version: u64,
+    set: AffectedSet,
+}
+
+/// Blocking work of verify runs and repairs that still references the database (scans on
+/// blocking threads outlive a cancelled run for a moment). `Slave::shutdown` waits for it.
 #[derive(Default)]
 pub(crate) struct VerifyWork(AtomicUsize);
 
@@ -182,8 +196,13 @@ pub(crate) struct Inner {
     pub rebootstrap: Notify,
     /// The re-bootstrap a verify asked for, if any (see [`VerifyRebootstrap`]).
     pub verify_rebootstrap: VerifyRebootstrap,
-    /// Blocking work of verify runs; shutdown waits for it.
+    /// Blocking work of verify runs and repairs; shutdown waits for it.
     pub verify_work: Arc<VerifyWork>,
+    /// Non-zero while a repair waits for replay to reach this seq: reads answer `NotReady`
+    /// (DESIGN.md §12.1). Mirrors `__meta.repair_until`.
+    repair_until: AtomicU64,
+    /// Keys a verify asked to repair (`MismatchPolicy::Repair`), done at the next RESUME.
+    pending_repair: Mutex<Option<PendingRepair>>,
 }
 
 impl Inner {
@@ -203,6 +222,16 @@ impl Inner {
             NodeState::Ready | NodeState::Bootstrapping => SlaveState::Connecting,
         };
         let last_seq = store.position().last_seq;
+        // A repair interrupted before replay reached its target stays not ready, also when a
+        // halt rewrote `node_state` since (DESIGN.md §12.1). A target at or below `last_seq`
+        // was reached (the crash came before it was removed).
+        let repair_until = match ident {
+            Some(_) => store
+                .repair_until()?
+                .filter(|&until| until > last_seq)
+                .unwrap_or(0),
+            None => 0,
+        };
         // The entry at last_seq, if still in the log, gives the lag's time base after a restart.
         let last_applied_ts = match last_seq {
             0 => 0,
@@ -246,6 +275,8 @@ impl Inner {
             rebootstrap: Notify::new(),
             verify_rebootstrap: VerifyRebootstrap::default(),
             verify_work: Arc::default(),
+            repair_until: AtomicU64::new(repair_until),
+            pending_repair: Mutex::new(None),
         })
     }
 
@@ -301,12 +332,14 @@ impl Inner {
             .unwrap_or_default()
     }
 
-    /// Readable and servable: the slave holds a consistent state at some seq.
+    /// Readable and servable: the slave holds a consistent state at some seq (not during a
+    /// bootstrap, nor while a repair replays up to its target).
     pub(crate) fn is_ready(&self) -> bool {
         self.ident
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .is_some()
+            && self.repair_until.load(Ordering::SeqCst) == 0
     }
 
     pub(crate) fn now_ms(&self) -> u64 {
@@ -331,6 +364,7 @@ impl Inner {
             // A halt means the operator decides: a stale automatic consent must not outlive it.
             if matches!(s, SlaveState::Halted(_)) {
                 self.verify_rebootstrap.clear();
+                self.clear_pending_repair();
             }
             self.notify(|l| l.on_state_change(&s));
         }
@@ -510,7 +544,11 @@ impl CaptureHold {
     pub(crate) fn target(&self, seq: Seq) -> oneshot::Receiver<CaptureReply> {
         let (tx, rx) = oneshot::channel();
         let mut slot = self.inner.capture();
-        if slot.owner != self.id || matches!(slot.state, Capture::Cancelled) {
+        // A repairing slave holds a mix of two seqs until replay reaches the repair's target.
+        if slot.owner != self.id
+            || matches!(slot.state, Capture::Cancelled)
+            || self.inner.repairing().is_some()
+        {
             let _ = tx.send(Err(CaptureMiss::Cancelled));
             return rx;
         }
@@ -625,7 +663,10 @@ impl Inner {
             }
         };
         let Some((want, tx)) = tx else { return };
-        let reply = if want == seq {
+        let reply = if self.repairing().is_some() {
+            // Replaying after a repair: the state at `seq` is not one the upstream ever had.
+            Err(CaptureMiss::Cancelled)
+        } else if want == seq {
             self.snapshot_at(seq)
         } else {
             Err(CaptureMiss::Passed(seq))
@@ -645,6 +686,113 @@ impl Inner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+}
+
+impl Inner {
+    /// `Some(seq)` while a repair waits for replay to reach `seq` (reads answer `NotReady`).
+    pub(crate) fn repairing(&self) -> Option<Seq> {
+        match self.repair_until.load(Ordering::SeqCst) {
+            0 => None,
+            seq => Some(seq),
+        }
+    }
+
+    /// Refuses reads, serving, captures and promotion until `ready_at` is applied again;
+    /// 0 = ready now. The caller persists the same target (`Store::rewind`).
+    pub(crate) fn begin_repair(&self, ready_at: Seq) {
+        self.repair_until.store(ready_at, Ordering::SeqCst);
+    }
+
+    /// Called by the applier on its blocking thread right after committing `seq`, before the
+    /// next entry can commit: a repair is complete once replay has reached its target
+    /// (DESIGN.md §12.1). The persisted target is removed first, then the node is ready.
+    pub(crate) fn finish_repair_at(&self, seq: Seq) {
+        let until = self.repair_until.load(Ordering::SeqCst);
+        if until == 0 || seq < until {
+            return;
+        }
+        if let Err(e) = self.store.clear_repair_until() {
+            // Harmless: on restart, a `repair_until` at or below `last_seq` is ignored.
+            tracing::warn!(node = %self.cfg.identifier, error = %e, "could not persist the end of a repair");
+        }
+        self.repair_until.store(0, Ordering::SeqCst);
+        tracing::info!(node = %self.cfg.identifier, seq, "repair complete: replay reached the upstream's snapshot");
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, Option<PendingRepair>> {
+        self.pending_repair
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Queues `set` for repair from the upstream of `generation` with database `db_uuid`
+    /// (`MismatchPolicy::Repair`). Merged into a queued request of the same scope; a request of
+    /// another scope is replaced.
+    pub(crate) fn request_repair(&self, generation: u64, db_uuid: uuid::Uuid, set: AffectedSet) {
+        let mut pending = self.pending();
+        match pending.as_mut() {
+            Some(p) if p.generation == generation && p.db_uuid == db_uuid => {
+                p.set.merge(set);
+                p.version += 1;
+            }
+            _ => {
+                *pending = Some(PendingRepair {
+                    generation,
+                    db_uuid,
+                    version: 0,
+                    set,
+                })
+            }
+        }
+    }
+
+    /// The keys waiting to be repaired, with their version, if the request covers a RESUME
+    /// answer in `generation` from database `db_uuid` (`None`: the answer carried no
+    /// identity). A request for another database is dropped; one of another generation is
+    /// inert. Left queued: a repair takes it only once it committed, so an interrupted one is
+    /// retried.
+    pub(crate) fn pending_repair(
+        &self,
+        generation: u64,
+        db_uuid: Option<uuid::Uuid>,
+    ) -> Option<(u64, AffectedSet)> {
+        let mut pending = self.pending();
+        let p = pending.as_ref()?;
+        if p.generation != generation {
+            return None;
+        }
+        match db_uuid {
+            Some(id) if id == p.db_uuid => Some((p.version, p.set.clone())),
+            Some(_) => {
+                tracing::warn!(node = %self.cfg.identifier, "the upstream is another database; dropping the verify's repair request");
+                *pending = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Whether a repair request for `generation` is queued (the tail loop then ends its
+    /// stream to handshake again and repair).
+    pub(crate) fn has_pending_repair(&self, generation: u64) -> bool {
+        self.pending()
+            .as_ref()
+            .is_some_and(|p| p.generation == generation)
+    }
+
+    /// Removes the request once a repair of its `version` committed (a newer merge stays).
+    pub(crate) fn take_pending_repair(&self, version: u64) {
+        let mut pending = self.pending();
+        if pending.as_ref().is_some_and(|p| p.version == version) {
+            *pending = None;
+        }
+    }
+
+    /// Drops any queued request (a bootstrap replaces everything it would fix; a halt means
+    /// the operator decides).
+    pub(crate) fn clear_pending_repair(&self) {
+        *self.pending() = None;
     }
 }
 
@@ -837,6 +985,134 @@ mod tests {
         r.request(3, a);
         r.clear();
         assert!(!r.applies(3, Some(a)));
+    }
+
+    fn ident() -> (DbIdentity, Vec<EpochStart>) {
+        (
+            DbIdentity {
+                db_uuid: uuid::Uuid::from_u128(9),
+                epoch: 1,
+            },
+            vec![EpochStart {
+                epoch: 1,
+                start_seq: 1,
+                nonce: 0,
+            }],
+        )
+    }
+
+    fn keys(k: &[u8]) -> AffectedSet {
+        let mut set = AffectedSet::default();
+        set.keys.entry("c".into()).or_default().insert(k.to_vec());
+        set
+    }
+
+    /// While a repair replays, the slave is not ready, refuses every capture (target and
+    /// after-commit), and becomes ready (with the persisted target removed) only once the
+    /// applier commits the target seq.
+    #[tokio::test]
+    async fn a_repairing_slave_is_not_ready_and_refuses_captures_until_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inner(dir.path());
+        i.set_ident(Some(ident()));
+        apply(&i);
+        assert!(i.is_ready());
+        i.begin_repair(3);
+        assert_eq!(i.repairing(), Some(3));
+        assert!(!i.is_ready());
+        let hold = i.hold_applier();
+        assert!(matches!(
+            hold.target(1).await.unwrap(),
+            Err(CaptureMiss::Cancelled)
+        ));
+        drop(hold);
+        let hold = i.hold_applier();
+        i.repair_until.store(0, Ordering::SeqCst); // let the target be set...
+        let rx = hold.target(2);
+        i.begin_repair(3); // ...then the repair begins before the applier gets there
+        apply(&i);
+        assert!(matches!(rx.await.unwrap(), Err(CaptureMiss::Cancelled)));
+        drop(hold);
+        i.finish_repair_at(2);
+        assert!(!i.is_ready(), "below the target");
+        i.store
+            .write_meta(&[(key::REPAIR_UNTIL, &3u64.to_be_bytes())], true)
+            .unwrap();
+        apply(&i);
+        i.finish_repair_at(3);
+        assert!(i.is_ready());
+        assert_eq!(i.store.repair_until().unwrap(), None, "persisted end");
+    }
+
+    /// The persisted target survives a restart while it is above `last_seq`, also when a halt
+    /// was persisted since; one at or below `last_seq` was reached and is ignored.
+    #[test]
+    fn a_reopened_slave_keeps_an_unreached_repair_target() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let i = inner(dir.path());
+            i.store.adopt_identity(&ident().0, &ident().1).unwrap();
+            apply(&i);
+            i.store
+                .write_meta(&[(key::REPAIR_UNTIL, &5u64.to_be_bytes())], true)
+                .unwrap();
+            i.halt(HaltReason::IdentityChanged);
+        }
+        let i = inner(dir.path());
+        assert_eq!(i.state(), SlaveState::Halted(HaltReason::IdentityChanged));
+        assert_eq!(i.repairing(), Some(5));
+        assert!(!i.is_ready());
+        drop(i);
+        {
+            let i = inner(dir.path());
+            i.store
+                .write_meta(&[(key::REPAIR_UNTIL, &1u64.to_be_bytes())], true)
+                .unwrap();
+        }
+        let i = inner(dir.path());
+        assert_eq!(i.repairing(), None, "already reached");
+    }
+
+    /// A verify's repair request is scoped like its rebootstrap request: one repoint
+    /// generation, one database; another database drops it, any halt drops it, and a repair
+    /// that committed an older version leaves newer keys queued.
+    #[test]
+    fn a_pending_repair_is_scoped_to_one_generation_and_one_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inner(dir.path());
+        let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        assert!(i.pending_repair(0, Some(a)).is_none());
+        i.request_repair(1, a, keys(b"x"));
+        assert!(i.has_pending_repair(1) && !i.has_pending_repair(2));
+        assert!(i.pending_repair(2, Some(a)).is_none(), "another generation");
+        assert!(
+            i.pending_repair(1, None).is_none(),
+            "an answer without identity"
+        );
+        let (v0, set) = i.pending_repair(1, Some(a)).expect("queued");
+        assert_eq!(set, keys(b"x"));
+        i.request_repair(1, a, keys(b"y"));
+        let (v1, set) = i.pending_repair(1, Some(a)).unwrap();
+        assert_ne!(v0, v1);
+        assert_eq!(set.keys["c"].len(), 2, "merged");
+        i.take_pending_repair(v0);
+        assert!(i.has_pending_repair(1), "a newer merge stays queued");
+        i.take_pending_repair(v1);
+        assert!(!i.has_pending_repair(1));
+        // Another database expires it for good.
+        i.request_repair(1, a, keys(b"x"));
+        assert!(i.pending_repair(1, Some(b)).is_none());
+        assert!(!i.has_pending_repair(1));
+        // A request of another scope replaces the old one.
+        i.request_repair(1, a, keys(b"x"));
+        i.request_repair(2, b, keys(b"z"));
+        assert!(i.pending_repair(1, Some(a)).is_none());
+        assert_eq!(i.pending_repair(2, Some(b)).unwrap().1, keys(b"z"));
+        // Any halt drops it.
+        i.set_state(SlaveState::Streaming);
+        assert!(i.has_pending_repair(2));
+        i.set_state(SlaveState::Halted(HaltReason::Diverged));
+        assert!(!i.has_pending_repair(2));
     }
 
     #[tokio::test]

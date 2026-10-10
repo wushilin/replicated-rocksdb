@@ -18,8 +18,9 @@ impl Slave {
     /// Turns this slave into the master. **Operator action: stop or fence the old master
     /// first** — the crate cannot detect two live masters, only the divergence they cause.
     ///
-    /// Refused with `Error::Config` while bootstrapping, without data, when halted with
-    /// `Corrupt` or `SpecMismatch`, or if `cfg.path` is not this slave's path. Every
+    /// Refused with `Error::Config` while bootstrapping, while a repair replays (DESIGN.md
+    /// §12.1), without data, when halted with `Corrupt` or `SpecMismatch`, or if `cfg.path` is
+    /// not this slave's path. Every
     /// `ReadSnapshot` taken from this slave must be dropped first: one that is alive keeps
     /// the database open and the promotion fails. In every failure case the slave has been
     /// shut down and its directory is unchanged, so it can be reopened as a slave (after the
@@ -53,6 +54,11 @@ impl Slave {
             SlaveState::Halted(r @ (HaltReason::Corrupt | HaltReason::SpecMismatch)) => {
                 Some(format!("cannot promote a slave halted with {r:?}"))
             }
+            // Keys at the upstream's snapshot next to keys at the fork (DESIGN.md §12.1).
+            _ if self.inner.repairing().is_some() => Some(format!(
+                "cannot promote while a repair replays up to seq {}: the data is not a consistent state yet",
+                self.inner.repairing().unwrap_or_default()
+            )),
             _ if !self.inner.is_ready() => {
                 Some("this slave has no consistent data to promote".to_string())
             }

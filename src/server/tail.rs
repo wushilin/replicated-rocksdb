@@ -118,7 +118,7 @@ fn validate(src: &dyn LogSource, r: &pb::TailRequest) -> Result<Option<Junction>
     let Some((server_id, _)) = ident else {
         return Err(reason_status(
             pb::Reason::NotReady,
-            "server is bootstrapping",
+            "server is not ready (bootstrapping, or replaying a repair)",
         ));
     };
     let want = r

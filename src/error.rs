@@ -4,8 +4,9 @@ use crate::types::{Role, Seq};
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// A slave that is still bootstrapping cannot serve reads yet.
-    #[error("node is not ready: it is bootstrapping")]
+    /// A slave that is bootstrapping, or replaying a repair up to its upstream's snapshot
+    /// (DESIGN.md §12.1), cannot serve reads yet.
+    #[error("node is not ready: it is bootstrapping, or replaying a repair")]
     NotReady,
     #[error("no such column family: {0}")]
     NoSuchCf(String),

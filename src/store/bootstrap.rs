@@ -96,6 +96,8 @@ impl Store {
                 key::ORIGIN_IDENTITY,
                 key::EPOCH_HISTORY,
                 key::MAX_ENTRY_BYTES,
+                key::DIVERGED_AT,
+                key::REPAIR_UNTIL,
             ] {
                 batch.delete_cf(&meta_cf, k);
             }

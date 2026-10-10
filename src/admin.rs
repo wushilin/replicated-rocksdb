@@ -37,7 +37,8 @@ pub struct NodeInfo {
     pub last_entry_crc: Option<u32>,
     /// `ts_ms` of the entry at `last_seq`; 0 if it is no longer retained.
     pub last_ts_ms: u64,
-    /// `ready`, `bootstrapping` or `halted:<Reason>`.
+    /// `ready`, `bootstrapping`, `halted:<Reason>` or `repairing:<seq>` (a repair replays up
+    /// to `seq`; the node is not ready and refuses promotion until then, DESIGN.md §12.1).
     pub node_state: String,
     /// The upstream address; `None` on the master.
     pub upstream: Option<String>,

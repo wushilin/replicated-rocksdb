@@ -11,9 +11,10 @@ use crate::verify::VerifyReport;
 /// listener is then not called again until the process restarts.
 ///
 /// Delivery is at-most-once across crashes. Within a process, `on_entry` seqs are strictly
-/// increasing between bootstraps; after `on_bootstrap_complete(S)` delivery continues at
-/// `S + 1` (state was replaced wholesale, so rebuild derived state). For at-least-once
-/// delivery keep your own cursor and use `LogApi::entries_since`.
+/// increasing between bootstraps and rewinds; after `on_bootstrap_complete(S)` or
+/// `on_rewind(S)` delivery continues at `S + 1` (state was replaced wholesale, or in part, so
+/// rebuild derived state). For at-least-once delivery keep your own cursor and use
+/// `LogApi::entries_since`.
 pub trait ReplicationListener: Send + Sync + 'static {
     fn on_entry(&self, _entry: &LogEntry) {}
     fn on_bootstrap_begin(&self, _snapshot_seq: Seq) {}
@@ -23,4 +24,9 @@ pub trait ReplicationListener: Send + Sync + 'static {
     /// Mismatches are in `report.mismatches`; under `MismatchPolicy::Rebootstrap` the
     /// re-bootstrap has already been requested.
     fn on_verify_complete(&self, _report: &VerifyReport) {}
+    /// A repair (DESIGN.md §12.1) rewrote some keys and moved the applied position back to
+    /// `last_seq`. Entries after it are delivered again (`on_entry` continues at
+    /// `last_seq + 1`); derived state of the keys involved should be rebuilt from reads once
+    /// the slave is ready again.
+    fn on_rewind(&self, _last_seq: Seq) {}
 }

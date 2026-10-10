@@ -95,6 +95,9 @@ pub(crate) async fn apply(
         i.store
             .commit(prepared, i.cfg.sync_writes)
             .map_err(Failure::Commit)?;
+        // A repair is complete once replay reaches its target (DESIGN.md §12.1). Before the
+        // capture below, so a verify waiting for exactly that seq is served.
+        i.finish_repair_at(e.seq);
         // Still on the applier's thread, before the next entry can commit: a verify waiting
         // for this seq gets a snapshot of exactly this state (DESIGN.md §12).
         i.capture_after_commit(e.seq);

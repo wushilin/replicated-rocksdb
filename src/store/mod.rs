@@ -7,6 +7,7 @@ pub(crate) mod log;
 pub(crate) mod meta;
 pub(crate) mod promote;
 pub(crate) mod read;
+pub(crate) mod repair;
 pub(crate) mod repl;
 pub(crate) mod retention;
 pub(crate) mod snapshot;

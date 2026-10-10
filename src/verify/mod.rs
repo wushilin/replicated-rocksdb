@@ -54,7 +54,14 @@ impl VerifyMode {
     }
 }
 
-/// What a slave does when a verify run finds a difference.
+/// What a slave does when a verify run finds a difference. Not applied while the slave is
+/// halted (it may be on another history than its upstream), nor to a report about an upstream
+/// the slave was repointed away from during the run.
+///
+/// **Verify cannot tell which side is damaged:** `Rebootstrap` and `Repair` assume the upstream
+/// is right. In a chain A→B→C, a damaged B copies its damage onto a correct C (and further
+/// down). Choosing either is the consent to that; prefer `Report` on nodes whose upstream is
+/// not the master, or verify the upstream first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MismatchPolicy {
     /// Report it (status, listener, logs) and keep replicating.
@@ -62,6 +69,11 @@ pub enum MismatchPolicy {
     Report,
     /// Report it, then discard local data and bootstrap from the upstream.
     Rebootstrap,
+    /// Report it, then take the reported keys and ranges from the upstream that was verified
+    /// (DESIGN.md §12.1), without a bootstrap: they are rewritten as of a fresh snapshot of the
+    /// upstream, and reads answer `NotReady` until the slave has replayed up to it. A `CfSpec`
+    /// mismatch, or a repair that cannot be done, re-bootstraps from that upstream instead.
+    Repair,
 }
 
 /// Verification settings of a slave (DESIGN.md §12, §16).

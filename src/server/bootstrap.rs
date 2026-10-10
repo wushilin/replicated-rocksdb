@@ -42,7 +42,7 @@ pub(super) async fn bootstrap(
     if !src.is_ready() {
         return Err(reason_status(
             pb::Reason::NotReady,
-            "server is bootstrapping",
+            "server is not ready (bootstrapping, or replaying a repair)",
         ));
     }
     let permit = state

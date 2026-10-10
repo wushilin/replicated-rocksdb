@@ -20,6 +20,7 @@ use super::client::{self, Client};
 use super::config::BackoffState;
 use super::inner::Inner;
 use super::policy::{self, Action, Force};
+use super::repair::{self, RepairError};
 use super::repoint::{self, RepointDivergence, RepointOutcome};
 use super::state::{HaltReason, NodeState, SlaveState};
 use crate::background::blocking;
@@ -27,7 +28,7 @@ use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 use crate::failpoint;
 use crate::net::DECODE_SLACK;
 use crate::net::convert::{
-    checked_history, entry_from_pb, epoch_to_pb, identity_from_pb, identity_to_pb,
+    checked_history, entry_from_pb, epoch_to_pb, epochs_from_pb, identity_from_pb, identity_to_pb,
 };
 use crate::pb;
 use crate::pb::tail_client_message::Kind as ClientKind;
@@ -58,7 +59,56 @@ pub(crate) fn end_for(inner: &Inner, generation: u64, action: Action) -> Session
             inner.force_bootstrap.request(generation);
             SessionEnd::Again
         }
-        Action::Again | Action::Tail | Action::AdoptEpochThenTail => SessionEnd::Again,
+        // A failed call carries no handshake to repair from: the next handshake answers
+        // `DIVERGED` and repairs.
+        Action::Again | Action::Tail | Action::AdoptEpochThenTail | Action::Repair => {
+            SessionEnd::Again
+        }
+    }
+}
+
+/// How a repair that did not commit ends.
+enum RepairEnd {
+    /// It cannot be done: bootstrap from the upstream that answered, in this session.
+    Fallback,
+    End(SessionEnd),
+}
+
+/// A fallback bootstraps (from the same upstream, in this session); a transient failure is
+/// retried with backoff.
+fn repair_failed(inner: &Inner, e: RepairError) -> RepairEnd {
+    match e {
+        RepairError::Fallback(why) => {
+            tracing::warn!(node = %inner.cfg.identifier, reason = %why, "repair not possible; bootstrapping instead");
+            RepairEnd::Fallback
+        }
+        RepairError::Retry(why) => {
+            RepairEnd::End(SessionEnd::Retry(format!("repair failed: {why}")))
+        }
+    }
+}
+
+/// While a repair replays up to `S` (DESIGN.md §12.1), the keys it took hold the upstream's
+/// state at `S`. A RESUME from an upstream whose history now leaves this slave's at or below
+/// `S` (it lost entries up to `S`: a restored backup, a failover to a node that had not
+/// received them) can never complete that state: replaying its history would make the slave
+/// ready on a mix of two histories. The answer is turned into the divergence it is, so the
+/// divergence policy (or the repoint's mode) decides; a repair then falls back to a bootstrap.
+fn repair_target_lost(inner: &Inner, hs: &mut pb::HandshakeResponse) {
+    let Some(until) = inner.repairing() else {
+        return;
+    };
+    if hs.decision() != pb::Decision::Resume {
+        return;
+    }
+    let upstream = epochs_from_pb(&hs.epoch_history);
+    if let Some(fork) = repair::history_fork(&inner.known_epochs(), until, &upstream) {
+        tracing::warn!(node = %inner.cfg.identifier, fork, repair_until = until, "the upstream's history leaves the repair's snapshot history; treating it as diverged");
+        hs.set_decision(pb::Decision::Reject);
+        hs.set_reason(pb::Reason::Diverged);
+        hs.detail = format!(
+            "the upstream's history leaves this slave's at {fork}, below the repair target {until}"
+        );
     }
 }
 
@@ -263,7 +313,7 @@ async fn session(
         seq = req.last_seq,
         epoch = req.known_identity.as_ref().map(|id| id.epoch),
     );
-    let hs = match unless_repointed(
+    let mut hs = match unless_repointed(
         inner,
         generation,
         c.clone().handshake(req).instrument(span.clone()),
@@ -288,6 +338,7 @@ async fn session(
     } else {
         inner.note_contact();
     }
+    repair_target_lost(inner, &mut hs);
     let hs_uuid = hs
         .identity
         .as_ref()
@@ -306,14 +357,13 @@ async fn session(
         if diverged && force != Force::Operator {
             action = match mode {
                 RepointDivergence::Rebootstrap { .. } => Action::Bootstrap,
-                RepointDivergence::Refuse | RepointDivergence::Repair { .. } => {
-                    let err = repoint::mode_error(mode, || {
-                        repoint::divergence(
-                            &inner.ident().map(|(_, h)| h).unwrap_or_default(),
-                            inner.store.position().last_seq,
-                            &hs,
-                        )
-                    });
+                RepointDivergence::Repair { .. } => Action::Repair,
+                RepointDivergence::Refuse => {
+                    let err = repoint::divergence(
+                        &inner.ident().map(|(_, h)| h).unwrap_or_default(),
+                        inner.store.position().last_seq,
+                        &hs,
+                    );
                     tracing::warn!(node = %inner.cfg.identifier, error = %err, "repoint refused: diverged");
                     inner.fail_repoint_on_halt(generation, err);
                     Action::Halt(HaltReason::Diverged)
@@ -337,6 +387,18 @@ async fn session(
     match action {
         Action::Tail => {
             commit_halt_clear(inner).await;
+            if inner.pending_repair(generation, hs_uuid).is_some() {
+                // A verify reported keys to repair (`MismatchPolicy::Repair`) and this is the
+                // upstream it verified: fix them, then handshake again from the new position.
+                let fetch = repair::prepare_pending(inner, generation, &c, &hs);
+                return match run_repair(inner, generation, fetch).await {
+                    Ok(_) => SessionEnd::Again,
+                    Err(RepairEnd::Fallback) => {
+                        bootstrap_then_tail(inner, generation, &c, &hs, backoff).await
+                    }
+                    Err(RepairEnd::End(end)) => end,
+                };
+            }
             inner.settle_repoint(generation, Ok(RepointOutcome::Resumed));
             tail(inner, generation, &c, &hs, None, backoff).await
         }
@@ -348,33 +410,107 @@ async fn session(
             }
             Err(end) => end,
         },
-        Action::Bootstrap => {
-            // `seq` is the upstream's last_seq at the handshake; the snapshot seq is logged
-            // inside, when the header arrives.
-            let span = tracing::info_span!(
-                "bootstrap",
-                node_id = %inner.cfg.identifier,
-                upstream = %inner.upstream_uri(),
-                seq = hs.last_seq,
-                epoch = hs.identity.as_ref().map(|id| id.epoch),
-            );
-            match bootstrap::install(inner, generation, &c, &hs)
-                .instrument(span)
-                .await
-            {
-                Ok(lease) => {
-                    // The bootstrap commit wrote `ready` itself.
+        Action::Bootstrap => bootstrap_then_tail(inner, generation, &c, &hs, backoff).await,
+        Action::Repair => {
+            let fetch = repair::prepare_divergence(inner, &c, &hs);
+            match run_repair(inner, generation, fetch).await {
+                Ok(r) => {
+                    // The rewind batch wrote `node_state = ready` itself.
                     inner.halt_clear_pending.store(false, Ordering::SeqCst);
-                    inner.settle_repoint(generation, Ok(RepointOutcome::Bootstrapped));
-                    tail(inner, generation, &c, &hs, Some(lease), backoff).await
+                    inner.settle_repoint(
+                        generation,
+                        Ok(RepointOutcome::Repaired {
+                            discarded: r.discarded,
+                        }),
+                    );
+                    // Handshake again from the rewound position, then tail.
+                    SessionEnd::Again
                 }
-                Err(end) => end,
+                // The consent to discard the divergent suffix (the policy, or the repoint's
+                // `Repair { accept_loss }`) covers a bootstrap from this same upstream.
+                Err(RepairEnd::Fallback) => {
+                    bootstrap_then_tail(inner, generation, &c, &hs, backoff).await
+                }
+                Err(RepairEnd::End(end)) => end,
             }
+        }
+        Action::Halt(HaltReason::Diverged) => {
+            // Where the local suffix starts, for `Slave::diverged_entries`.
+            repair::record_fork(inner, &hs).await;
+            SessionEnd::Halt(HaltReason::Diverged)
         }
         Action::Halt(r) => SessionEnd::Halt(r),
         Action::Retry(m) => SessionEnd::Retry(m),
         Action::Again => SessionEnd::Again,
     }
+}
+
+/// Bootstraps from the upstream that answered `hs`, then tails.
+async fn bootstrap_then_tail(
+    inner: &Arc<Inner>,
+    generation: u64,
+    c: &Client,
+    hs: &pb::HandshakeResponse,
+    backoff: &mut BackoffState,
+) -> SessionEnd {
+    // `seq` is the upstream's last_seq at the handshake; the snapshot seq is logged inside,
+    // when the header arrives.
+    let span = tracing::info_span!(
+        "bootstrap",
+        node_id = %inner.cfg.identifier,
+        upstream = %inner.upstream_uri(),
+        seq = hs.last_seq,
+        epoch = hs.identity.as_ref().map(|id| id.epoch),
+    );
+    match bootstrap::install(inner, generation, c, hs)
+        .instrument(span)
+        .await
+    {
+        Ok(lease) => {
+            // The bootstrap commit wrote `ready` itself.
+            inner.halt_clear_pending.store(false, Ordering::SeqCst);
+            inner.settle_repoint(generation, Ok(RepointOutcome::Bootstrapped));
+            tail(inner, generation, c, hs, Some(lease), backoff).await
+        }
+        Err(end) => end,
+    }
+}
+
+/// Runs a repair: the network phase `fetch` bounded by `REPAIR_TIMEOUT` and abandoned on a
+/// repoint (it writes nothing), then the local commit, which always runs to completion once
+/// started.
+async fn run_repair(
+    inner: &Arc<Inner>,
+    generation: u64,
+    fetch: impl Future<Output = Result<repair::Prepared, RepairError>>,
+) -> Result<repair::Repaired, RepairEnd> {
+    let span = repair_span(inner);
+    let bounded = tokio::time::timeout(repair::REPAIR_TIMEOUT, fetch.instrument(span.clone()));
+    let prepared = match unless_repointed(inner, generation, bounded).await {
+        Err(end) => return Err(RepairEnd::End(end)),
+        Ok(Ok(Ok(p))) => p,
+        Ok(Ok(Err(e))) => return Err(repair_failed(inner, e)),
+        Ok(Err(_)) => {
+            return Err(RepairEnd::End(SessionEnd::Retry(format!(
+                "repair: no answer within {:?}",
+                repair::REPAIR_TIMEOUT
+            ))));
+        }
+    };
+    repair::commit(inner, prepared)
+        .instrument(span)
+        .await
+        .map_err(|e| repair_failed(inner, e))
+}
+
+fn repair_span(inner: &Inner) -> tracing::Span {
+    tracing::info_span!(
+        "repair",
+        node_id = %inner.cfg.identifier,
+        upstream = %inner.upstream_uri(),
+        seq = inner.store.position().last_seq,
+        epoch = inner.ident().map(|(id, _)| id.epoch),
+    )
 }
 
 /// The Tail decode limit (PROTOCOL.md §11.4): `max(max_entry_bytes, max_batch_bytes)` plus
@@ -488,11 +624,13 @@ async fn tail(
     loop {
         let received = tokio::select! {
             r = unless_repointed(inner, generation, tokio::time::timeout(idle, stream.message())) => r,
-            // A verify asked for a re-bootstrap (`MismatchPolicy::Rebootstrap`): handshake again,
-            // which bootstraps because the request is set. A stale wake-up is ignored.
+            // A verify asked for a re-bootstrap (`MismatchPolicy::Rebootstrap`) or a repair
+            // (`MismatchPolicy::Repair`): handshake again, which bootstraps or repairs because
+            // the request is set. A stale wake-up is ignored.
             _ = inner.rebootstrap.notified() => {
                 if inner.force_bootstrap.is_requested_for(generation)
                     || inner.verify_rebootstrap.pending_for(generation)
+                    || inner.has_pending_repair(generation)
                 {
                     return SessionEnd::Again;
                 }

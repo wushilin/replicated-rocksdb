@@ -12,7 +12,8 @@ pub(crate) trait LogSource: Send + Sync + 'static {
     /// This node's configured identifier (`server_id` in the handshake).
     fn node_id(&self) -> &str;
     fn role(&self) -> Role;
-    /// False while this node is bootstrapping itself (it has no consistent state).
+    /// False while this node is bootstrapping itself, or replaying a repair (it has no
+    /// consistent state).
     fn is_ready(&self) -> bool;
     /// Origin identity and epoch history, read together.
     fn identity(&self) -> Option<(DbIdentity, Vec<EpochStart>)>;
@@ -30,7 +31,7 @@ pub(crate) trait LogSource: Send + Sync + 'static {
     /// Bumped whenever every served stream must end with `UPSTREAM_RESET` (an epoch bump on
     /// the master, an epoch adoption or a bootstrap on a slave).
     fn resets(&self) -> watch::Receiver<u64>;
-    /// `ready`, `bootstrapping` or `halted:<Reason>` (the `Status` RPC).
+    /// `ready`, `bootstrapping`, `halted:<Reason>` or `repairing:<seq>` (the `Status` RPC).
     fn node_state(&self) -> String {
         "ready".into()
     }

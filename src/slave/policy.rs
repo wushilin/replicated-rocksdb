@@ -23,6 +23,9 @@ pub(crate) enum Action {
     /// Persist the server's identity and epoch history, then tail.
     AdoptEpochThenTail,
     Bootstrap,
+    /// Repair the divergence from the upstream that answered (DESIGN.md §12.1); bootstrap
+    /// from it if that cannot be proven safe.
+    Repair,
     Halt(HaltReason),
     /// Back off, then handshake again; the message goes to `SlaveStatus::last_error`.
     Retry(String),
@@ -33,6 +36,7 @@ pub(crate) enum Action {
 fn diverged(p: &Policies) -> Action {
     match p.divergence {
         DivergencePolicy::Halt => Action::Halt(HaltReason::Diverged),
+        DivergencePolicy::Repair => Action::Repair,
         DivergencePolicy::Rebootstrap => Action::Bootstrap,
     }
 }
@@ -233,6 +237,32 @@ mod tests {
             act(Decision::Reject, Reason::Diverged, &OPPOSITE),
             Action::Bootstrap
         );
+        let repair = Policies {
+            divergence: DivergencePolicy::Repair,
+            ..DEFAULTS
+        };
+        assert_eq!(
+            act(Decision::Reject, Reason::Diverged, &repair),
+            Action::Repair
+        );
+        assert_eq!(
+            after_handshake(
+                &answer(Decision::Reject, Reason::Diverged),
+                &repair,
+                Force::Operator
+            ),
+            Action::Bootstrap,
+            "the operator's clear_halt(Rebootstrap) still bootstraps"
+        );
+        assert_eq!(
+            after_handshake(
+                &answer(Decision::Reject, Reason::Diverged),
+                &repair,
+                Force::Verify
+            ),
+            Action::Repair,
+            "a verify's request never overrides the divergence policy"
+        );
         assert_eq!(
             act(Decision::Reject, Reason::StaleEpoch, &DEFAULTS),
             Action::Retry("STALE_EPOCH: why".into())
@@ -373,6 +403,11 @@ mod tests {
             after_status(&s(Reason::Diverged), &OPPOSITE),
             Action::Bootstrap
         );
+        let repair = Policies {
+            divergence: DivergencePolicy::Repair,
+            ..DEFAULTS
+        };
+        assert_eq!(after_status(&s(Reason::Diverged), &repair), Action::Repair);
         for r in [
             Reason::LogGap,
             Reason::IdentityChanged,

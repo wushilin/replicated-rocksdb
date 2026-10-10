@@ -10,6 +10,7 @@ mod inner;
 mod maintenance;
 mod policy;
 mod promote;
+mod repair;
 mod repoint;
 mod source;
 mod state;
@@ -30,7 +31,7 @@ use crate::server::{ServerHandle, await_sole_owner};
 use crate::store::Store;
 use crate::store::meta::key;
 use crate::store::read::DbIter;
-use crate::types::{CfSpec, Direction, IterMode, Role, Seq, ValueMeta};
+use crate::types::{CfSpec, Direction, IterMode, LogEntry, Role, Seq, ValueMeta};
 use crate::verify::{VerifyMode, VerifyReport};
 use inner::Inner;
 use state::NodeState;
@@ -45,8 +46,8 @@ pub use state::{HaltAction, HaltReason, SlaveState, SlaveStatus};
 /// A read-only replica. It has no write methods: writing to a slave is a compile error.
 ///
 /// It replicates from its upstream in the background, serves reads from local data
-/// (except while bootstrapping, when reads return `Error::NotReady`), and keeps serving
-/// reads while halted.
+/// (except while bootstrapping, or while a repair replays up to its upstream's snapshot, when
+/// reads return `Error::NotReady`), and keeps serving reads while halted.
 pub struct Slave {
     inner: Arc<Inner>,
     driver: Option<JoinHandle<()>>,
@@ -158,15 +159,33 @@ impl Slave {
     /// Compares this slave's data with its upstream's now (DESIGN.md §12) and returns the
     /// report. The report is also stored in [`SlaveStatus::last_verify`] and passed to the
     /// listener's `on_verify_complete`; under `MismatchPolicy::Rebootstrap` a report with
-    /// mismatches makes the slave bootstrap. `cfg.verify` sets range sizes, the rate limit and
-    /// the policy; `mode` overrides `cfg.verify.mode`. One run at a time: a concurrent call
-    /// waits for the first.
+    /// mismatches makes the slave bootstrap, under `MismatchPolicy::Repair` it takes the
+    /// reported keys from the upstream (DESIGN.md §12.1). `cfg.verify` sets range sizes, the
+    /// rate limit and the policy; `mode` overrides `cfg.verify.mode`. One run at a time: a
+    /// concurrent call waits for the first.
     ///
-    /// Errors: `NotReady` without data; `VerifyAborted(_)` when no report could be made
+    /// Errors: `NotReady` without data, or while a repair replays; `VerifyAborted(_)` when no
+    /// report could be made
     /// (`Busy`, `SessionExpired`, `IdentityChanged`, `PassedSnapshot`, `CaptureTimeout`,
     /// `Upstream`); these leave `last_verify` unchanged.
     pub async fn verify_now(&self, mode: VerifyMode) -> Result<VerifyReport> {
         verifier::verify(&self.inner, mode).await
+    }
+
+    /// On a slave halted `Diverged`: its local entries past the fork point, for salvage
+    /// (DESIGN.md §12.1). The fork point is recorded when the slave halts, from the epoch
+    /// histories (or, for a slave ahead of its master, the master's `last_seq + 1`).
+    /// `Err(Config)` if the slave is not halted `Diverged`, or the fork point is not known
+    /// (neither shows it); `Err(Gap)` if local retention already removed part of the suffix.
+    /// Reads the whole suffix into memory.
+    pub fn diverged_entries(&self) -> Result<Vec<LogEntry>> {
+        if self.inner.state() != SlaveState::Halted(HaltReason::Diverged) {
+            return Err(Error::Config("the slave is not halted Diverged".into()));
+        }
+        let fork = self.inner.store.diverged_at()?.ok_or_else(|| {
+            Error::Config("the fork point is not known: the epoch histories do not show it".into())
+        })?;
+        self.inner.store.read_entries(fork, usize::MAX, usize::MAX)
     }
 
     pub fn watch_state(&self) -> watch::Receiver<SlaveState> {
@@ -203,7 +222,8 @@ impl Slave {
         Ok(())
     }
 
-    /// A consistent view at the current applied seq. `Err(NotReady)` while bootstrapping.
+    /// A consistent view at the current applied seq. `Err(NotReady)` while bootstrapping or
+    /// while a repair replays.
     pub fn snapshot(&self) -> Result<ReadSnapshot> {
         self.check_ready()?;
         self.inner.store.read_snapshot(self.inner.now_ms())

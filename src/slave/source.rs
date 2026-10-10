@@ -65,6 +65,8 @@ impl LogSource for Inner {
             SlaveState::Connecting | SlaveState::Streaming => {
                 if Inner::is_ready(self) {
                     "ready".into()
+                } else if let Some(seq) = self.repairing() {
+                    format!("repairing:{seq}")
                 } else {
                     "bootstrapping".into()
                 }

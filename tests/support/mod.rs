@@ -313,6 +313,7 @@ pub struct RecordingListener {
     pub bootstraps: AtomicUsize,
     pub states: Mutex<Vec<SlaveState>>,
     pub verifies: Mutex<Vec<VerifyReport>>,
+    pub rewinds: AtomicUsize,
     pub violations: Mutex<Vec<String>>,
     last: AtomicU64,
 }
@@ -320,6 +321,10 @@ pub struct RecordingListener {
 impl RecordingListener {
     pub fn bootstraps(&self) -> usize {
         self.bootstraps.load(Ordering::SeqCst)
+    }
+
+    pub fn rewinds(&self) -> usize {
+        self.rewinds.load(Ordering::SeqCst)
     }
 
     pub fn entries(&self) -> Vec<Seq> {
@@ -389,6 +394,11 @@ impl ReplicationListener for RecordingListener {
             .unwrap_or_else(PoisonError::into_inner)
             .push(report.clone());
     }
+
+    fn on_rewind(&self, last_seq: Seq) {
+        self.last.store(last_seq, Ordering::SeqCst);
+        self.rewinds.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// A **stopped** node's directory opened with plain RocksDB, bypassing the crate, to inject
@@ -436,6 +446,17 @@ impl RawDb {
             .unwrap_or_else(|| panic!("no physical CF for {name}"));
         assert!(found.next().is_none(), "{name} has several physical CFs");
         self.db.cf_handle(physical).unwrap()
+    }
+
+    /// `__meta.last_seq` as stored: the node's durable position.
+    pub fn last_seq(&self) -> u64 {
+        let meta = self.db.cf_handle("__meta").unwrap();
+        let raw = self
+            .db
+            .get_cf(&meta, b"last_seq")
+            .unwrap()
+            .unwrap_or_default();
+        raw.try_into().map(u64::from_be_bytes).unwrap_or(0)
     }
 
     /// The stored envelope.

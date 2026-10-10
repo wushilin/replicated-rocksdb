@@ -58,12 +58,21 @@ pub enum IdentityPolicy {
     Rebootstrap,
 }
 
-/// What to do when the upstream reports `DIVERGED`.
+/// What to do when the upstream reports `DIVERGED` on a reconnect (an explicit
+/// `Slave::repoint` uses `RepointOptions::on_divergence` instead). Both non-default choices
+/// are configured consent to discard the divergent entries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DivergencePolicy {
-    /// Halt with `Diverged` (persisted).
+    /// Halt with `Diverged` (persisted). The data stays readable; `Slave::diverged_entries`
+    /// returns the divergent suffix for salvage.
     #[default]
     Halt,
+    /// Discard only the divergent suffix (DESIGN.md §12.1): the keys it touched are taken
+    /// from the upstream, the suffix is dropped, and the slave replays the upstream's history
+    /// (reads answer `NotReady` until it has replayed up to the upstream's snapshot seq).
+    /// Falls back to a bootstrap from the same upstream when that cannot be proven safe.
+    Repair,
+    /// Discard all local data and bootstrap.
     Rebootstrap,
 }
 
@@ -165,6 +174,10 @@ pub struct SlaveConfig {
     pub reconnect: Backoff,
     /// Tail fetch batching. Default: real-time push.
     pub fetch: FetchConfig,
+    /// A repair (DESIGN.md §12.1) that would read, fetch or delete more than this many bytes
+    /// of entries, keys and envelopes falls back to a bootstrap. Default 64 MiB; must be
+    /// positive.
+    pub repair_max_bytes: u64,
     /// Fsync every applied entry before acknowledging it. Default `false`: an ack then means
     /// "in the replica's WAL", which survives a process crash but not a machine crash.
     pub sync_writes: bool,
@@ -196,6 +209,7 @@ impl SlaveConfig {
             on_log_gap: GapPolicy::default(),
             reconnect: Backoff::default(),
             fetch: FetchConfig::default(),
+            repair_max_bytes: 64 << 20,
             sync_writes: false,
             heartbeat: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(5),
@@ -223,6 +237,9 @@ impl SlaveConfig {
             return Err(Error::Config(
                 "fetch.max_batch_bytes must be positive".into(),
             ));
+        }
+        if self.repair_max_bytes == 0 {
+            return Err(Error::Config("repair_max_bytes must be positive".into()));
         }
         if self.heartbeat.is_zero()
             || self.connect_timeout.is_zero()
@@ -291,6 +308,13 @@ mod tests {
         let mut cfg = SlaveConfig::new("b", "/tmp/x", up.clone());
         cfg.reconnect.max = Duration::from_millis(1);
         assert!(cfg.validate().is_err());
+        let mut cfg = SlaveConfig::new("b", "/tmp/x", up.clone());
+        cfg.repair_max_bytes = 0;
+        assert!(matches!(cfg.validate(), Err(Error::Config(m)) if m.contains("repair_max_bytes")));
+        assert_eq!(
+            SlaveConfig::new("b", "/tmp/x", up.clone()).repair_max_bytes,
+            64 << 20
+        );
         // Serving: the heartbeat must be at most half of the in-sync window.
         let mut cfg = SlaveConfig::new("b", "/tmp/x", up);
         cfg.serve = Some(ServeConfig::new(

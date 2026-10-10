@@ -9,7 +9,11 @@
 //! `verify-before-finish` (a slave's verify run, after the comparison, before its report is acted on; `pause`),
 //! `server-verify-begin` (the server's VerifyBegin handler, before it answers; `pause`),
 //! `slave-before-apply` (a received entry, before its commit; `pause`),
-//! `slave-before-halt` (a session ended in a halt, before it is persisted; use `cfg_callback`).
+//! `slave-before-halt` (a session ended in a halt, before it is persisted; use `cfg_callback`),
+//! `slave-repair-before-fetch` (a repair's verify session is open, nothing fetched yet;
+//! `pause` or `cfg_callback`),
+//! `slave-repair-after-rewind` (a repair committed its rewind; `return` freezes the driver
+//! until the test kills the node, `pause` holds it until the point is removed).
 //!
 //! Configure with `fail::cfg(name, "1*return")` to make the point fire once, or
 //! `fail::cfg(name, "pause")` to block the thread there until `fail::remove(name)`.
@@ -48,3 +52,18 @@ pub(crate) async fn pause(name: &'static str) {
 #[cfg(not(feature = "failpoints"))]
 #[inline(always)]
 pub(crate) async fn pause(_name: &'static str) {}
+
+/// [`fire`] evaluated on a blocking thread, for async code: a `pause` action holds the caller
+/// without blocking an async worker, then this returns false; `return` makes it true.
+#[cfg(feature = "failpoints")]
+pub(crate) async fn fire_async(name: &'static str) -> bool {
+    tokio::task::spawn_blocking(move || fire(name))
+        .await
+        .unwrap_or(false)
+}
+
+#[cfg(not(feature = "failpoints"))]
+#[inline(always)]
+pub(crate) async fn fire_async(_name: &'static str) -> bool {
+    false
+}

@@ -114,6 +114,10 @@ pub(crate) async fn install(
     inner.verify_rebootstrap.clear();
     // A verify waiting for a seq of the old state can never be served now.
     inner.cancel_capture();
+    // A bootstrap replaces everything a repair would have fixed (the store removes the
+    // persisted `repair_until` and `diverged_at` with the rest of the state).
+    inner.clear_pending_repair();
+    inner.begin_repair(0);
     // The snapshot's last entry is not transferred: its ts_ms is unknown until the next entry.
     inner.last_applied_ts.store(0, Ordering::SeqCst);
     inner.pending_ts.store(0, Ordering::SeqCst);
