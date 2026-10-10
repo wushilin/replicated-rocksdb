@@ -145,6 +145,23 @@ pub enum Error {
     /// A verify run was abandoned before it produced a report.
     #[error("verify abandoned: {0:?}")]
     VerifyAborted(crate::verify::VerifyAbort),
+    /// A write (or `bump_epoch`, `reap_expired`, ...) on a `Node` that is not the master.
+    #[error("this node is not the master")]
+    NotMaster,
+    /// A slave-only call (`repoint`, `clear_halt`, `promote`, ...) on a `Node` that is not a
+    /// slave.
+    #[error("this node is not a slave")]
+    NotSlave,
+    /// The `Node` is a fenced stored master: nothing is served until `Node::unfence` clears
+    /// it or `Node::rejoin_as_slave` turns it into a slave.
+    #[error("the node is fenced: {reason}")]
+    Fenced { reason: crate::node::FenceReason },
+    /// The `Node` is switching roles (or a switch waits for the lock); retry shortly.
+    #[error("the node is switching roles; retry")]
+    Switching,
+    /// The `Node` lost its running handle (or was shut down); `Node::reopen` opens it again.
+    #[error("the node failed: {0}; call Node::reopen")]
+    NodeFailed(String),
     #[error(transparent)]
     RocksDb(#[from] rocksdb::Error),
     #[error(transparent)]
@@ -187,5 +204,20 @@ mod tests {
             }
             .is_transient_io()
         );
+    }
+
+    #[test]
+    fn node_errors_say_what_to_do() {
+        use crate::node::FenceReason;
+        let fenced = Error::Fenced {
+            reason: FenceReason::PeerIsMaster { peer: "b".into() },
+        };
+        assert_eq!(fenced.to_string(), "the node is fenced: peer b is a master");
+        assert_eq!(
+            Error::NodeFailed("boom".into()).to_string(),
+            "the node failed: boom; call Node::reopen"
+        );
+        assert!(Error::Switching.to_string().contains("retry"));
+        assert!(!Error::Switching.is_transient_io());
     }
 }

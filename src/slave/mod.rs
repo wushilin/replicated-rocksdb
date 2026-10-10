@@ -10,6 +10,7 @@ mod inner;
 mod maintenance;
 mod policy;
 mod promote;
+mod rejoin;
 mod repair;
 mod repoint;
 mod source;
@@ -39,6 +40,7 @@ pub use config::{
     Backoff, DivergencePolicy, FetchConfig, GapPolicy, IdentityPolicy, SlaveConfig, UpstreamConfig,
 };
 pub use promote::{PromoteRefused, PromotionCheck};
+pub use rejoin::RejoinOptions;
 pub use repoint::{AcceptDataLoss, RepointDivergence, RepointOptions, RepointOutcome};
 pub use state::{HaltAction, HaltReason, SlaveState, SlaveStatus};
 
