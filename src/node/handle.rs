@@ -80,7 +80,9 @@ struct Forward {
 pub struct Node {
     pub(super) cfg: NodeConfig,
     /// The slave role's upstream for later opens of that role: `cfg.slave.upstream` until a
-    /// `repoint` (or `rejoin_as_slave`) replaces it.
+    /// `repoint` (or `rejoin_as_slave`) replaces it. The running slave is the source of truth:
+    /// whenever a slave is taken out of service (`begin_switch`) or a repoint settles, the
+    /// upstream it actually follows is recorded here.
     pub(super) upstream: Mutex<UpstreamConfig>,
     pub(super) role: RwLock<Current>,
     state_tx: watch::Sender<NodeState>,
@@ -206,7 +208,9 @@ impl Node {
         node
     }
 
-    /// The exact current state.
+    /// The current state. While a switch waits for running slave-admin calls (for example a
+    /// `shutdown` behind a long `wait_for_seq`), this still shows the old role, but sync calls
+    /// already return `Error::Switching`; the state turns `Switching` once the switch begins.
     pub fn state(&self) -> NodeState {
         self.state_tx.borrow().clone()
     }
@@ -263,6 +267,11 @@ impl Node {
             state: status.state,
             upstream: status.upstream,
         });
+    }
+
+    /// Records the upstream `s` follows as the one later opens of the slave role use.
+    pub(super) fn record_upstream(&self, s: &Slave) {
+        *self.upstream.lock().unwrap_or_else(PoisonError::into_inner) = s.upstream();
     }
 
     /// `cfg.slave` with the current upstream.
@@ -436,8 +445,12 @@ impl Node {
     pub fn bump_epoch(&self) -> Result<DbIdentity> {
         self.with_master(|m| {
             let id = m.bump_epoch()?;
-            self.state_tx
-                .send_replace(NodeState::Master { identity: id });
+            // Concurrent bumps publish in order: each re-reads the master's identity under the
+            // forward mutex, so the last one published is the newest.
+            let _fwd = self.forward.lock().unwrap_or_else(PoisonError::into_inner);
+            self.state_tx.send_replace(NodeState::Master {
+                identity: m.identity(),
+            });
             Ok(id)
         })
     }
@@ -446,17 +459,21 @@ impl Node {
 
     /// [`Slave::repoint`]. The new upstream is also the one later reopens of the slave role
     /// use, unless the address is refused with `Err(Config)` (the slave then still follows the
-    /// old one).
+    /// old one). It is recorded once the address is accepted, before the handshake settles, so
+    /// dropping this future (to bound the wait) keeps it.
     pub async fn repoint(
         &self,
         upstream: UpstreamConfig,
         opts: RepointOptions,
     ) -> Result<RepointOutcome> {
         let s = self.slave().await?;
-        let result = s.repoint(upstream.clone(), opts).await;
-        // `Slave::repoint` answers `Config` only before it adopts the new upstream.
-        if !matches!(result, Err(Error::Config(_))) {
-            *self.upstream.lock().unwrap_or_else(PoisonError::into_inner) = upstream;
+        s.check_upstream(&upstream)?;
+        *self.upstream.lock().unwrap_or_else(PoisonError::into_inner) = upstream.clone();
+        let result = s.repoint(upstream, opts).await;
+        // A superseded repoint leaves the record to the call that superseded it; otherwise
+        // record what the slave follows now (the source of truth).
+        if !matches!(result, Err(Error::RepointSuperseded)) {
+            self.record_upstream(&s);
             self.refresh_slave(&s);
         }
         result

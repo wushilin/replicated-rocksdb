@@ -135,6 +135,11 @@ impl Slave {
         &self.inner.cfg.path
     }
 
+    /// The upstream this slave follows now (`cfg.upstream` until a `repoint` replaced it).
+    pub(crate) fn upstream(&self) -> UpstreamConfig {
+        self.inner.upstream()
+    }
+
     /// Reads this slave's current upstream address (`SlaveStatus::upstream`) without keeping
     /// the slave alive: `None` once it is gone. For the `Node` state forwarder.
     pub(crate) fn upstream_reader(&self) -> impl Fn() -> Option<String> + Send + 'static {

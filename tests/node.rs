@@ -301,3 +301,75 @@ async fn reopen_needs_a_stopped_node_and_checks_the_fence_again() {
     assert_eq!(a.state(), NodeState::Stopped);
     assert!(matches!(a.put("c", b"k", b"v"), Err(Error::NodeFailed(_))));
 }
+
+/// Review focus: a `repoint` future dropped before its handshake settles (the documented way
+/// to bound the wait) still sets the upstream later reopens use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_repoint_still_sets_the_upstream_for_reopen() {
+    let c = Cluster::new();
+    let a = Node::create_master(node_cfg(&c, "a", dead_addr(), &[]))
+        .await
+        .unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let a_addr = a.serve_addr().unwrap();
+    let b = Node::create_slave(node_cfg(&c, "b", dead_addr(), &[]))
+        .await
+        .unwrap();
+    // A zero timeout polls the repoint once: it adopts the new upstream, then is dropped
+    // while it waits for the handshake.
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::ZERO,
+            b.repoint(up(a_addr), RepointOptions::default())
+        )
+        .await
+        .is_err(),
+        "the repoint future was dropped before it settled"
+    );
+    b.shutdown().await.unwrap();
+    b.reopen().await.unwrap();
+    wait_node(&b, "b streams from a after reopen", streaming).await;
+    match b.state() {
+        NodeState::Slave { upstream, .. } => assert_eq!(upstream, format!("http://{a_addr}")),
+        s => panic!("expected Slave, got {s:?}"),
+    }
+}
+
+/// A fence check that cannot read the local store (here: a corrupt `__changelog` entry at the
+/// peer's position) fails the open; nothing opens, and `reopen` leaves the node `Stopped`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_fence_check_fails_the_open_and_keeps_the_node_stopped() {
+    let c = Cluster::new();
+    let s_addr = SocketAddr::from(([127, 0, 0, 1], reserved_port()));
+    let a_cfg = node_cfg(&c, "a", dead_addr(), &[s_addr]);
+    let a = Node::create_master(a_cfg.clone()).await.unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (mut s_cfg, _) = c.slave_config("s", a.serve_addr().unwrap());
+    s_cfg.serve.as_mut().unwrap().port = s_addr.port();
+    let s = Slave::open(s_cfg.clone()).await.unwrap();
+    let shared = a.put("c", b"k", b"1").unwrap();
+    s.wait_for_seq(shared, WAIT).await.unwrap();
+    s.shutdown().await.unwrap();
+    a.put("c", b"k2", b"2").unwrap();
+    a.shutdown().await.unwrap();
+    // The peer answers `Status` at `shared`, behind `a`: the check reads `a`'s entry there.
+    let s = Slave::open(s_cfg).await.unwrap();
+    assert_eq!(s.last_seq(), shared);
+    {
+        let path = c.path("a");
+        let names = rocksdb::DB::list_cf(&rocksdb::Options::default(), &path).unwrap();
+        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), &path, &names).unwrap();
+        let log = db.cf_handle("__changelog").unwrap();
+        db.put_cf(&log, shared.to_be_bytes(), b"not an entry")
+            .unwrap();
+    }
+
+    let err = a.reopen().await.unwrap_err();
+    assert!(matches!(err, Error::Corrupt(_)), "{err}");
+    assert_eq!(a.state(), NodeState::Stopped);
+    assert!(
+        matches!(Node::open(a_cfg).await, Err(Error::Corrupt(_))),
+        "nothing opens"
+    );
+    s.shutdown().await.unwrap();
+}

@@ -40,7 +40,8 @@ impl Drop for Switch<'_> {
 
 impl Node {
     /// Takes the write lock (waiting for running slave-admin calls), checks the role, and
-    /// moves it out, publishing `Switching`. A refused check changes nothing.
+    /// moves it out, publishing `Switching`. A refused check changes nothing. A slave moved out
+    /// has its upstream recorded first.
     async fn begin_switch(
         &self,
         check: impl FnOnce(&Current) -> Result<()>,
@@ -48,6 +49,11 @@ impl Node {
         let mut guard = self.role.write().await;
         check(&guard)?;
         let old = std::mem::replace(&mut *guard, Current::Switching);
+        if let Current::Slave(s) = &old {
+            // The slave leaves service: keep the upstream it actually follows (a dropped
+            // `repoint` future may have changed it) for later opens of the slave role.
+            self.record_upstream(s);
+        }
         self.publish(&guard);
         Ok((
             Switch {
