@@ -1732,3 +1732,50 @@ async fn a_gap_request_does_not_override_a_settled_repoints_refuse() {
     drop(a);
     scenario.teardown();
 }
+
+/// Final residual m3: a bootstrap that follows a handshake is pinned to the database that
+/// handshake answered for, on automatic paths too. The gap request converts the RESUME of
+/// the original master into a bootstrap; before the Bootstrap RPC starts, the address serves
+/// another database. The default `IdentityPolicy::Refuse` halts, nothing is installed and the
+/// local data stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_automatic_bootstrap_is_pinned_to_the_database_the_handshake_answered_for() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (d, ld, gate, port, _, last) = gap_then_upstream_lost(&c, |_| {}, false).await;
+    let _gate = gate.open_on_drop();
+    // The same database again: the next handshake answers RESUME, which the gap request
+    // converts into a bootstrap.
+    let mut mcfg = c.master_config("a");
+    mcfg.serve.as_mut().unwrap().port = port;
+    let a = Master::open(mcfg).await.unwrap();
+    let before_rpc = Gate::after(0);
+    before_rpc.install("slave-before-bootstrap-rpc");
+    let _before_rpc = before_rpc.open_on_drop();
+    gate.open();
+    fail::remove("slave-after-gap");
+    wait_until("the bootstrap was decided", || before_rpc.reached()).await;
+    // The address now serves another database.
+    a.shutdown().await.unwrap();
+    let mut zcfg = c.master_config("z");
+    zcfg.serve.as_mut().unwrap().port = port;
+    let z = Master::open(zcfg).await.unwrap();
+    z.create_cf(CfSpec::new("c")).unwrap();
+    z.put("c", b"foreign", b"y").unwrap();
+    before_rpc.open();
+    fail::remove("slave-before-bootstrap-rpc");
+
+    support::wait_state(&d, "IdentityChanged halt", |s| {
+        *s == SlaveState::Halted(HaltReason::IdentityChanged)
+    })
+    .await;
+    assert_eq!(ld.bootstraps(), 1, "the foreign database was not installed");
+    assert_eq!(d.last_seq(), last);
+    assert_eq!(d.get("c", b"foreign").unwrap(), None);
+    assert_eq!(
+        d.get("c", b"only-before-the-failover").unwrap(),
+        Some(b"x".to_vec())
+    );
+    drop(z);
+    scenario.teardown();
+}

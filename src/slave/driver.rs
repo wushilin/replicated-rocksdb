@@ -425,7 +425,22 @@ async fn session(
             }
             Err(end) => end,
         },
-        Action::Bootstrap => bootstrap_then_tail(inner, generation, &c, &hs, None, backoff).await,
+        Action::Bootstrap => {
+            // Every bootstrap after a handshake is pinned to the database and history that
+            // handshake answered for; the address may serve another one by the time the
+            // Bootstrap RPC runs. The operator's `clear_halt(Rebootstrap)` is the exception:
+            // its consent is broad by design and covers whatever the upstream serves.
+            let expected = if force == Force::Operator {
+                None
+            } else if let Some(u) = hs_uuid {
+                Some(u)
+            } else {
+                return SessionEnd::Retry("bootstrap: the handshake carried no identity".into());
+            };
+            // Test hook: the handshake decided to bootstrap; the Bootstrap RPC has not started.
+            failpoint::pause("slave-before-bootstrap-rpc").await;
+            bootstrap_then_tail(inner, generation, &c, &hs, expected, backoff).await
+        }
         Action::Repair => {
             let fetch = repair::prepare_divergence(inner, &c, &hs);
             match run_repair(inner, generation, fetch).await {
@@ -518,8 +533,9 @@ fn drop_repair(inner: &Inner, why: String) {
     inner.clear_pending_repair();
 }
 
-/// Bootstraps from the upstream that answered `hs`, then tails. With `expected`, only from
-/// that database (see `bootstrap::install`).
+/// Bootstraps from the upstream that answered `hs`, then tails. With `expected` (every path
+/// except the operator's `clear_halt(Rebootstrap)`), only from that database and a history
+/// no deeper-forking than `hs` showed (see `bootstrap::install`).
 async fn bootstrap_then_tail(
     inner: &Arc<Inner>,
     generation: u64,

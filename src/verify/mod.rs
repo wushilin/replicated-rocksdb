@@ -76,6 +76,14 @@ pub enum MismatchPolicy {
     /// (DESIGN.md §12.1), without a bootstrap: they are rewritten as of a fresh snapshot of the
     /// upstream, and reads answer `NotReady` until the slave has replayed up to it. A `CfSpec`
     /// mismatch, or a repair that cannot be done, re-bootstraps from that upstream instead.
+    ///
+    /// A failed probe never stops replication, and a repair that runs pauses tailing for at
+    /// most `REPAIR_TIMEOUT` per attempt. A repair that cannot run now (`BUSY`, a timeout, an
+    /// upstream behind the slave, a lost session) is postponed with backoff while replication
+    /// goes on, and `SlaveStatus::last_error` says so. One that can never run against this
+    /// upstream as things stand (permission or authentication refused, invalid arguments, an
+    /// invalid identity or history, an unregistered comparator) is dropped, with an error log
+    /// and `last_error`: fix the cause and verify again.
     Repair,
 }
 

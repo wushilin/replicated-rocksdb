@@ -106,12 +106,14 @@ async fn next(
 /// the following Tail. On any failure after the reset the slave stays in `bootstrapping`
 /// (persisted) and the next session starts over.
 ///
-/// The header is read before anything local changes. With `expected` (a repair's fallback:
-/// its consent covers only that database, and only the divergence `hs` showed), a header of
+/// The header is read before anything local changes. With `expected` (a repair's fallback, or
+/// any bootstrap an automatic request, a policy or a repoint's mode asked for: the consent
+/// covers only the database that answered `hs`, and only the divergence `hs` showed), a header of
 /// another database follows the identity policy instead (`Refuse` halts `IdentityChanged`),
 /// and a header of the same database whose history forks deeper than `hs` showed (any fork at
 /// or below `last_seq` after a RESUME, as for a verify repair) ends with `Retry`. Nothing is
-/// installed in either case.
+/// installed in either case. `None` is used only for the operator's `clear_halt(Rebootstrap)`,
+/// whose consent is broad by design: it installs whatever the upstream serves.
 pub(crate) async fn install(
     inner: &Arc<Inner>,
     generation: u64,
@@ -142,7 +144,7 @@ pub(crate) async fn install(
     let plan = Plan::from_header(header)?;
     if let Some(want) = expected {
         if plan.identity.db_uuid != want {
-            tracing::warn!(node = %inner.cfg.identifier, expected = %want, got = %plan.identity.db_uuid, "the fallback bootstrap is from another database");
+            tracing::warn!(node = %inner.cfg.identifier, expected = %want, got = %plan.identity.db_uuid, "the bootstrap is from another database than the handshake answered for");
             match inner.cfg.on_identity_change {
                 IdentityPolicy::Refuse => {
                     return Err(SessionEnd::Halt(HaltReason::IdentityChanged));
@@ -159,9 +161,9 @@ pub(crate) async fn install(
             // The same database, but its history now leaves this slave's earlier than the
             // answer the consent was given for: installing would discard entries the consent
             // never covered. Nothing changed locally; the next handshake decides afresh.
-            tracing::warn!(node = %inner.cfg.identifier, fork, "the fallback bootstrap's history forks deeper than consented");
+            tracing::warn!(node = %inner.cfg.identifier, fork, "the bootstrap's history forks deeper than consented");
             return Err(retry(format!(
-                "repair fallback refused: the upstream's history now forks deeper (at {fork}) than the repair was consented for"
+                "bootstrap refused: the upstream's history now forks deeper (at {fork}) than the consent was given for"
             )));
         }
     }
