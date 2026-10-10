@@ -425,6 +425,43 @@ fn fetch_batch_len(keys: &[Vec<u8>]) -> usize {
     n
 }
 
+/// Checks the records of a `FetchRange` as they arrive: each lies in the page that was asked
+/// for and sorts strictly after the one before (under the CF's own order), across pages. An
+/// upstream that breaks this is misbehaving; repair must not write what it sends.
+struct RangeCheck<'a> {
+    order: &'a KeyOrder,
+    prev: Option<Vec<u8>>,
+}
+
+impl RangeCheck<'_> {
+    fn accept(&mut self, page: &Bounds, key: &[u8]) -> Result<()> {
+        let protocol = |what: &str| abort(VerifyAbort::Upstream(format!("FetchRange: {what}")));
+        if !page.contains(self.order, key) {
+            return Err(protocol("a record outside the requested range"));
+        }
+        if let Some(prev) = &self.prev
+            && self.order.cmp(prev, key) != std::cmp::Ordering::Less
+        {
+            return Err(protocol("records are not strictly increasing"));
+        }
+        self.prev = Some(key.to_vec());
+        Ok(())
+    }
+}
+
+/// Checks that `records` answer the first keys of `ask`, in order (a prefix, never empty).
+fn check_fetched(ask: &[Vec<u8>], records: &[pb::FetchedRecord]) -> Result<()> {
+    let wrong = records.is_empty()
+        || records.len() > ask.len()
+        || records.iter().zip(ask).any(|(r, k)| r.key != *k);
+    if wrong {
+        return Err(abort(VerifyAbort::Upstream(
+            "FetchKeys answered other keys".into(),
+        )));
+    }
+    Ok(())
+}
+
 /// The upstream's half of a session, over one `VerifyRange` stream.
 pub(crate) struct Upstream {
     tx: mpsc::Sender<pb::VerifyRangeRequest>,
@@ -499,14 +536,7 @@ impl Upstream {
                     "unexpected answer to FetchKeys".into(),
                 )));
             };
-            let answered_others = f.records.is_empty()
-                || f.records.len() > ask.len()
-                || f.records.iter().zip(ask).any(|(r, k)| r.key != *k);
-            if answered_others {
-                return Err(abort(VerifyAbort::Upstream(
-                    "FetchKeys answered other keys".into(),
-                )));
-            }
+            check_fetched(ask, &f.records)?;
             rest = &rest[f.records.len()..];
             for r in f.records {
                 if !sink(r.key, r.envelope) {
@@ -518,16 +548,19 @@ impl Upstream {
     }
 
     /// Every key of `bounds` with its envelope at the session's snapshot, passed to `sink` in
-    /// key order, paging through truncated answers like a listing. Stops early, returning
-    /// `Ok(false)`, when `sink` returns `false`.
+    /// key order under `order` (the CF's comparator), paging through truncated answers like a
+    /// listing. Records outside the range or out of order are a protocol error. Stops early,
+    /// returning `Ok(false)`, when `sink` returns `false`.
     pub(crate) async fn fetch_range(
         &mut self,
         cf: &str,
         bounds: &Bounds,
+        order: &KeyOrder,
         sink: &mut (dyn FnMut(Vec<u8>, Option<Vec<u8>>) -> bool + Send),
     ) -> Result<bool> {
         let mut page = bounds.clone();
         let mut resume: Option<Vec<u8>> = None;
+        let mut check = RangeCheck { order, prev: None };
         loop {
             let req = pb::FetchRange {
                 range: Some(page.to_pb(cf)),
@@ -545,8 +578,9 @@ impl Upstream {
                 )));
             }
             let mut last = None;
-            for r in f.records {
-                if resume.as_deref() == Some(r.key.as_slice()) {
+            for (i, r) in f.records.into_iter().enumerate() {
+                // Only the first record may repeat the key the page resumes from.
+                if i == 0 && resume.as_deref() == Some(r.key.as_slice()) {
                     continue;
                 }
                 if r.envelope.is_none() {
@@ -554,6 +588,7 @@ impl Upstream {
                         "FetchRange record without envelope".into(),
                     )));
                 }
+                check.accept(&page, &r.key)?;
                 last = Some(r.key.clone());
                 if !sink(r.key, r.envelope) {
                     return Ok(false);
@@ -728,11 +763,17 @@ mod tests {
 
     /// An `Inner` that connects to `addr` (nothing runs: the tests only open sessions).
     fn inner_for(dir: &std::path::Path, addr: std::net::SocketAddr) -> Arc<Inner> {
+        inner_with(dir, addr, crate::tuning::RocksTuning::new())
+    }
+
+    fn inner_with(
+        dir: &std::path::Path,
+        addr: std::net::SocketAddr,
+        tuning: crate::tuning::RocksTuning,
+    ) -> Arc<Inner> {
         use crate::slave::config::{SlaveConfig, UpstreamConfig};
-        use crate::tuning::RocksTuning;
         use crate::types::Role;
-        let (store, meta) =
-            crate::store::Store::open(dir, Role::Slave, RocksTuning::new()).unwrap();
+        let (store, meta) = crate::store::Store::open(dir, Role::Slave, tuning).unwrap();
         let cfg = SlaveConfig::new("t", dir, UpstreamConfig::from_addr(addr));
         Arc::new(Inner::new(store, cfg, &meta).unwrap())
     }
@@ -808,16 +849,23 @@ mod tests {
         let mut seen = Vec::new();
         let done = session
             .upstream
-            .fetch_range("c", &Bounds::default(), &mut |k, e| {
-                assert!(e.is_some());
-                seen.push(k);
-                true
-            })
+            .fetch_range(
+                "c",
+                &Bounds::default(),
+                &KeyOrder::bytewise(),
+                &mut |k, e| {
+                    seen.push((k, e));
+                    true
+                },
+            )
             .await
             .unwrap();
         assert!(done);
         let all: Vec<Vec<u8>> = (0..2500u32).map(|i| i.to_be_bytes().to_vec()).collect();
-        assert_eq!(seen, all);
+        assert_eq!(seen.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), all);
+        // Values are the snapshot's, not the later write to key 0.
+        assert_eq!(seen[0].1.as_deref(), Some(old.as_slice()));
+        assert!(seen.iter().all(|(_, e)| e.is_some()));
         let sub = Bounds {
             lower: Some(10u32.to_be_bytes().to_vec()),
             upper: Some(20u32.to_be_bytes().to_vec()),
@@ -825,7 +873,7 @@ mod tests {
         let mut n = 0;
         session
             .upstream
-            .fetch_range("c", &sub, &mut |_, _| {
+            .fetch_range("c", &sub, &KeyOrder::bytewise(), &mut |_, _| {
                 n += 1;
                 true
             })
@@ -835,18 +883,213 @@ mod tests {
 
         // Entry CRCs: the entry at S, one before it, and none past the snapshot.
         let entries: Vec<_> = m.entries_since(0).unwrap().map(Result::unwrap).collect();
+        let mut checked = 0;
         for e in entries.iter().filter(|e| e.seq <= s) {
-            assert_eq!(
-                session.upstream.entry_crc(e.seq).await.unwrap(),
-                Some(e.crc32c)
-            );
+            let crc = session.upstream.entry_crc(e.seq).await.unwrap();
+            assert_eq!(crc, Some(e.crc32c));
+            checked += 1;
         }
+        assert_eq!(checked, 2, "the loop ran over entries 1 and 2");
         assert_eq!(session.upstream.entry_crc(s + 1).await.unwrap(), None);
         assert_eq!(session.upstream.entry_crc(0).await.unwrap(), None);
         // The session is still usable after those, and closes cleanly.
         session.close().await;
         drop(inner);
         m.shutdown().await.unwrap();
+    }
+
+    fn reverse_tuning() -> crate::tuning::RocksTuning {
+        let mut t = crate::tuning::RocksTuning::new();
+        t.comparators
+            .register("reverse", |a: &[u8], b: &[u8]| b.cmp(a));
+        t
+    }
+
+    /// Pages cut by the server's byte limit (not the client's key limits): every key arrives
+    /// exactly once and in the CF's order, with an empty key and NUL keys at page boundaries.
+    /// `keys` are in the CF's order.
+    async fn pages_cut_by_bytes(comparator: Option<&str>, keys: Vec<Vec<u8>>) {
+        use crate::server::test_client::serving_master;
+        use crate::types::{Batch, CfSpec};
+        let mdir = tempfile::tempdir().unwrap();
+        let sdir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(mdir.path(), |cfg| cfg.rocksdb = reverse_tuning()).await;
+        let mut spec = CfSpec::new("c");
+        if let Some(c) = comparator {
+            spec = spec.with_comparator(c);
+        }
+        m.create_cf(spec).unwrap();
+        let mut batch = Batch::new();
+        // 600 KiB values: the server cuts a page after two of them.
+        for (i, k) in keys.iter().enumerate() {
+            batch.put("c", k, &vec![i as u8; 600 << 10]);
+        }
+        let s = m.write(batch).unwrap();
+        let inner = inner_with(sdir.path(), m.serve_addr().unwrap(), reverse_tuning());
+        let order = KeyOrder::new(&reverse_tuning().comparators, comparator).unwrap();
+        let mut session = open_session(&inner).await;
+        let envelope_of =
+            |i: usize| crate::codec::envelope::encode(s, None, &vec![i as u8; 600 << 10]);
+
+        // A range, paged.
+        let mut got = Vec::new();
+        let before = session.upstream.next_id;
+        session
+            .upstream
+            .fetch_range("c", &Bounds::default(), &order, &mut |k, e| {
+                got.push((k, e));
+                true
+            })
+            .await
+            .unwrap();
+        assert!(
+            session.upstream.next_id - before >= 3,
+            "the range was paged"
+        );
+        let want: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.clone(), Some(envelope_of(i))))
+            .collect();
+        assert!(got == want, "every key once, in the CF's order");
+
+        // Keys, with an absent one among them, answered as prefixes and continued.
+        let mut ask: Vec<Vec<u8>> = keys.clone();
+        ask.insert(1, b"absent".to_vec());
+        let mut got = Vec::new();
+        let before = session.upstream.next_id;
+        session
+            .upstream
+            .fetch_keys("c", &ask, &mut |k, e| {
+                got.push((k, e));
+                true
+            })
+            .await
+            .unwrap();
+        assert!(
+            session.upstream.next_id - before >= 3,
+            "the keys were split"
+        );
+        let mut want = Vec::new();
+        for k in &ask {
+            let e = keys.iter().position(|x| x == k).map(envelope_of);
+            want.push((k.clone(), e));
+        }
+        assert!(got == want, "every key once, in the order asked");
+        session.close().await;
+        drop(inner);
+        m.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn byte_cut_pages_continue_in_bytewise_order() {
+        let keys = [&b""[..], b"\0", b"\0\0", b"a", b"b", b"c"];
+        pages_cut_by_bytes(None, keys.iter().map(|k| k.to_vec()).collect()).await;
+    }
+
+    #[tokio::test]
+    async fn byte_cut_pages_continue_in_a_reverse_comparator_order() {
+        let keys = [&b"c"[..], b"b", b"a", b"\0\0", b"\0", b""];
+        pages_cut_by_bytes(Some("reverse"), keys.iter().map(|k| k.to_vec()).collect()).await;
+    }
+
+    /// An empty key is a real bound, never "absent".
+    #[tokio::test]
+    async fn an_empty_key_is_a_real_bound_of_a_fetched_range() {
+        use crate::server::test_client::serving_master;
+        use crate::types::CfSpec;
+        let mdir = tempfile::tempdir().unwrap();
+        let sdir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(mdir.path(), |_| {}).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        for k in [&b""[..], b"a"] {
+            m.put("c", k, b"v").unwrap();
+        }
+        let inner = inner_for(sdir.path(), m.serve_addr().unwrap());
+        let mut session = open_session(&inner).await;
+        let o = KeyOrder::bytewise();
+        for (lower, upper, want) in [
+            (Some(&b""[..]), None, vec![b"".to_vec(), b"a".to_vec()]),
+            (None, Some(&b""[..]), vec![]),
+            (None, Some(&b"a"[..]), vec![b"".to_vec()]),
+        ] {
+            let b = Bounds {
+                lower: lower.map(<[u8]>::to_vec),
+                upper: upper.map(<[u8]>::to_vec),
+            };
+            let mut got = Vec::new();
+            session
+                .upstream
+                .fetch_range("c", &b, &o, &mut |k, _| {
+                    got.push(k);
+                    true
+                })
+                .await
+                .unwrap();
+            assert_eq!(got, want, "{lower:?}..{upper:?}");
+        }
+        session.close().await;
+        drop(inner);
+        m.shutdown().await.unwrap();
+    }
+
+    /// An upstream that sends records outside the range or out of order is refused.
+    #[test]
+    fn fetched_ranges_must_be_inside_and_strictly_increasing() {
+        let bytewise = KeyOrder::bytewise();
+        let page = Bounds {
+            lower: Some(b"b".to_vec()),
+            upper: Some(b"e".to_vec()),
+        };
+        let is_protocol_error =
+            |r: Result<()>| matches!(r, Err(Error::VerifyAborted(VerifyAbort::Upstream(_))));
+        let mut c = RangeCheck {
+            order: &bytewise,
+            prev: None,
+        };
+        assert!(c.accept(&page, b"b").is_ok());
+        assert!(c.accept(&page, b"c").is_ok());
+        assert!(is_protocol_error(c.accept(&page, b"c")), "a repeat");
+        assert!(is_protocol_error(c.accept(&page, b"b")), "going back");
+        assert!(is_protocol_error(c.accept(&page, b"e")), "the upper bound");
+        assert!(is_protocol_error(c.accept(&page, b"a")), "below the lower");
+        assert!(c.accept(&page, b"d").is_ok());
+        // Under a reverse comparator the same checks follow the CF's order.
+        let reverse = KeyOrder::new(&reverse_tuning().comparators, Some("reverse")).unwrap();
+        let page = Bounds {
+            lower: Some(b"e".to_vec()),
+            upper: Some(b"b".to_vec()),
+        };
+        let mut c = RangeCheck {
+            order: &reverse,
+            prev: None,
+        };
+        assert!(c.accept(&page, b"e").is_ok());
+        assert!(c.accept(&page, b"d").is_ok());
+        assert!(is_protocol_error(c.accept(&page, b"e")), "going back");
+        assert!(is_protocol_error(c.accept(&page, b"a")), "past the upper");
+    }
+
+    #[test]
+    fn fetched_keys_must_answer_a_prefix_of_the_request() {
+        let rec = |k: &[u8]| pb::FetchedRecord {
+            key: k.to_vec(),
+            envelope: None,
+        };
+        let ask = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+        let bad = |r: &[pb::FetchedRecord]| {
+            matches!(
+                check_fetched(&ask, r),
+                Err(Error::VerifyAborted(VerifyAbort::Upstream(_)))
+            )
+        };
+        assert!(check_fetched(&ask, &[rec(b"a")]).is_ok());
+        assert!(check_fetched(&ask, &[rec(b"a"), rec(b"b"), rec(b"c")]).is_ok());
+        assert!(bad(&[]), "nothing answered");
+        assert!(bad(&[rec(b"b")]), "a skipped key");
+        assert!(bad(&[rec(b"a"), rec(b"c")]), "a gap");
+        assert!(bad(&[rec(b"b"), rec(b"a")]), "swapped");
+        assert!(bad(&[rec(b"a"), rec(b"b"), rec(b"c"), rec(b"d")]), "extra");
     }
 
     #[tokio::test]

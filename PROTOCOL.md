@@ -114,7 +114,7 @@ A token MUST consist only of characters allowed by `b64token` in [RFC 6750] §2.
 - The server authenticates **each call** on its own. There is no session state, and a successful `Handshake` does not authorise later calls.
 - Token comparison MUST run in constant time. A server MAY accept several tokens at once so they can be rotated.
 - With mutual TLS, the peer's identity is taken from the client certificate. Otherwise `x-rrdb-node-id` is only a label for logs and status. It MUST NOT be used as the sole basis for authorisation.
-- A server SHOULD authorise per RPC. `Bootstrap` and `VerifyRange` with `ListRange` expose every key, and `Bootstrap` exposes every value. The method being called is available to the server's authenticator.
+- A server SHOULD authorise per RPC. `Bootstrap` and `VerifyRange` with `ListRange` expose every key, and `Bootstrap` and `VerifyRange` with `FetchKeys` or `FetchRange` expose every value. The method being called is available to the server's authenticator.
 - `Status` exposes node ids, positions and epoch histories, but no keys or values.
 - Failures: missing or invalid credentials → `UNAUTHENTICATED`. Valid credentials that are not allowed this RPC → `PERMISSION_DENIED`. The server MUST NOT say which part of the credentials was wrong.
 
@@ -597,7 +597,7 @@ message SeqCrc         { uint64 seq = 1; fixed32 crc32c = 2; }
 - When its state is replaced (it starts bootstrapping itself, or its identity changes), the server ends every `VerifyRange` stream with `UNAVAILABLE` / `UPSTREAM_RESET`, as it does for `Tail` (§7.3), and drops every session. A later request on a dropped session fails with `UPSTREAM_RESET` or `SESSION_NOT_FOUND`; a client MUST treat both as "start a new run".
 - `FetchKeys` (repair): the server returns, in the order asked, a `FetchedRecord` per key with its whole envelope as of the session's snapshot, or without `envelope` when the key does not exist. `keys` MUST NOT be empty and MUST NOT hold more than 1024 keys (`INVALID_ARGUMENT` otherwise). The server MAY answer only a prefix of the keys (setting `truncated`) to bound the answer (RECOMMENDED: stop once ~1 MiB of envelopes is reached), but answers at least one; the client asks again for the rest.
 - `FetchRange` (repair): like `ListRange`, but each record carries the whole envelope. The same limits, paging rule and two-record minimum apply.
-- `EntryCrcs` (repair): `from_seq ≤ to_seq ≤ snapshot_seq` is required (`INVALID_ARGUMENT` otherwise). The server returns `(seq, crc32c)` for every entry with `from_seq ≤ seq ≤ min(to_seq, from_seq + 1023)` that it held at the snapshot (entry `snapshot_seq` is always known). They are read through the session's snapshot, so they never change during the session; a client compares them with its own entries (repair checks the entry before the fork its epoch history shows).
+- `EntryCrcs` (repair): `from_seq ≤ to_seq ≤ snapshot_seq` is required (`INVALID_ARGUMENT` otherwise). The server returns `(seq, crc32c)` for every entry with `from_seq ≤ seq ≤ min(to_seq, from_seq + 1023)` that it held at the snapshot (entry `snapshot_seq` is known whenever the server knows its CRC: from the log, or from `last_entry_crc` after retention emptied the log or a bootstrap that carried one; it is not known for `snapshot_seq = 0`, nor after a bootstrap without a CRC, and is then omitted). They are read through the session's snapshot, so they never change during the session; a client compares them with its own entries (repair checks the entry before the fork its epoch history shows).
 - Envelopes expired but not yet reaped are returned like any other: repair copies what is stored.
 - The client MAY pipeline up to `verify_window` requests (RECOMMENDED: 16). The server answers in request order, and `request_id` echoes the request.
 
@@ -703,6 +703,10 @@ A failed bootstrap (bad footer, lost connection) also returns to `Connecting` th
 | `verify_window` | client | 16 |
 | `ListRange.limit` | client | ≤ 1024 |
 | `ListResult` size | server | stop after ~1 MiB of keys, but never fewer than 2 keys |
+| `FetchKeys.keys` | client | 1..=1024 keys, ≤ 1 MiB of keys per request (a single larger key alone) |
+| `FetchRange.limit` | client | 1..=1024 |
+| `FetchResult` size | server | stop after ~1 MiB of keys and envelopes, but never fewer than 1 record (`FetchKeys`) or 2 records (`FetchRange`) |
+| `EntryCrcs` span | server | at most 1024 entries per request |
 | HTTP/2 keepalive | client | 30 s interval, 10 s timeout |
 | Reconnect backoff | client | 100 ms → 30 s, ×2, full jitter |
 

@@ -59,7 +59,7 @@ impl Bounds {
             .is_none_or(|u| order.cmp(key, u) == Ordering::Less)
     }
 
-    #[cfg(test)] // the tests' in-memory upstream; the scans only need `below_upper`
+    /// True if `key` is in `[lower, upper)` under `order`.
     pub(crate) fn contains(&self, order: &KeyOrder, key: &[u8]) -> bool {
         self.lower
             .as_deref()

@@ -585,7 +585,7 @@ mod tests {
     use crate::pb;
     use crate::pb::verify_range_request::Kind as Req;
     use crate::pb::verify_range_response::Kind as Resp;
-    use crate::server::test_client::{Client, client, serving_master};
+    use crate::server::test_client::{Client, T0, client, serving_master};
     use crate::types::CfSpec;
     use crate::verify::VerifyMode;
     use crate::verify::range::RangeHasher;
@@ -769,6 +769,9 @@ mod tests {
             .unwrap()
             .session_id;
         m.put("c", b"a", b"later").unwrap(); // seq 5: after the snapshot
+        m.put("c", b"b", b"later").unwrap();
+        m.delete("c", b"c").unwrap();
+        m.put("c", b"d", b"new").unwrap();
         let keys = vec![b"a".to_vec(), b"zz".to_vec()];
         let (answers, err) = exchange(
             &mut c,
@@ -820,7 +823,17 @@ mod tests {
                     f.records.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
                     vec![b"b".to_vec(), b"c".to_vec()]
                 );
-                assert!(f.records.iter().all(|r| r.envelope.is_some()));
+                // The snapshot's values: b is not rewritten, c is not deleted, d is absent.
+                assert_eq!(
+                    f.records
+                        .iter()
+                        .map(|r| r.envelope.clone())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        Some(envelope::encode(3, None, b"v")),
+                        Some(envelope::encode(4, None, b"v"))
+                    ]
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -834,7 +847,7 @@ mod tests {
                 crc32c: e.crc32c,
             })
             .collect();
-        assert_eq!(expected.len(), 2);
+        assert_eq!(expected.len(), 2, "entries 3 and 4 were compared");
         match &answers[2].kind {
             Some(Resp::EntryCrcs(r)) => assert_eq!(r.entries, expected),
             other => panic!("{other:?}"),
@@ -932,6 +945,96 @@ mod tests {
                 }]
             ),
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// Entry `S` is known from `last_entry_crc` when retention has emptied the log; entries
+    /// before it are then not held.
+    #[tokio::test]
+    async fn the_entry_at_s_survives_an_emptied_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(dir.path(), |_| {}).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        m.put("c", b"a", b"v").unwrap(); // S = 2
+        let last = m.entries_since(1).unwrap().next().unwrap().unwrap();
+        assert_eq!(last.seq, 2);
+        let empty = crate::config::Retention {
+            max_age: None,
+            max_entries: Some(0),
+            check_interval: Duration::from_secs(1),
+        };
+        m.log_source().store().trim_changelog(0, &empty).unwrap();
+        assert_eq!(m.first_retained_seq(), 3, "the log is empty");
+        let mut c = client(m.serve_addr().unwrap(), "b");
+        let sid = begin(&mut c, pb::VerifyMode::Quick)
+            .await
+            .unwrap()
+            .session_id;
+        let req = Req::EntryCrcs(pb::EntryCrcs {
+            from_seq: 1,
+            to_seq: 2,
+        });
+        let (answers, err) = exchange(&mut c, vec![request(&sid, 1, req)]).await;
+        assert!(err.is_none(), "{err:?}");
+        match &answers[0].kind {
+            Some(Resp::EntryCrcs(r)) => assert_eq!(
+                r.entries,
+                vec![pb::SeqCrc {
+                    seq: 2,
+                    crc32c: last.crc32c
+                }],
+                "entry 1 is trimmed, entry S comes from last_entry_crc"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Values past their expiry that were not reaped are copied raw, by both fetches.
+    #[tokio::test]
+    async fn expired_but_unreaped_envelopes_are_fetched_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, clock) = serving_master(dir.path(), |_| {}).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        m.put_with_ttl("c", b"t", b"v", Duration::from_secs(10))
+            .unwrap();
+        clock.advance(Duration::from_secs(60));
+        assert!(m.get("c", b"t").unwrap().is_none(), "expired for readers");
+        let mut c = client(m.serve_addr().unwrap(), "b");
+        let sid = begin(&mut c, pb::VerifyMode::Quick)
+            .await
+            .unwrap()
+            .session_id;
+        let (answers, err) = exchange(
+            &mut c,
+            vec![
+                request(
+                    &sid,
+                    1,
+                    Req::FetchKeys(pb::FetchKeys {
+                        cf: "c".into(),
+                        keys: vec![b"t".to_vec()],
+                    }),
+                ),
+                request(
+                    &sid,
+                    2,
+                    Req::FetchRange(pb::FetchRange {
+                        range: Some(range(None, None)),
+                        limit: 10,
+                    }),
+                ),
+            ],
+        )
+        .await;
+        assert!(err.is_none(), "{err:?}");
+        for a in &answers {
+            let Some(Resp::Fetch(f)) = &a.kind else {
+                panic!("{a:?}")
+            };
+            assert_eq!(f.records.len(), 1);
+            let raw = f.records[0].envelope.as_deref().expect("the raw envelope");
+            let env = envelope::decode(raw).unwrap();
+            assert_eq!(env.meta.expire_at_ms, Some(T0 + 10_000));
         }
     }
 
