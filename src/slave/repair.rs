@@ -168,6 +168,27 @@ pub(crate) fn history_fork(
     fork_from(upstream, local).filter(|&f| f <= until)
 }
 
+/// Whether a fallback bootstrap may install an `offered` epoch history: `Some(fork)` when it
+/// leaves this slave's history (newest records `local`, log up to `last`) earlier than the
+/// `consented` history of the handshake whose answer the consent was given for.
+///
+/// - Divergence repair (`consented` shows a fork `F <= last`): the consent covers discarding
+///   `F..=last`; an offered history that forks below `F` would discard more.
+/// - Verify repair (`consented` answered RESUME: no fork at or below `last`): the consent
+///   covers no divergence at all; an offered history that forks at or below `last` would
+///   discard entries the default policy keeps (`DIVERGED` halts).
+///
+/// Records are compared with their nonces, as the handshake does (`fork_from`).
+pub(crate) fn deeper_fork(
+    local: &[EpochStart],
+    last: Seq,
+    consented: &[EpochStart],
+    offered: &[EpochStart],
+) -> Option<Seq> {
+    let bound = fork_from(consented, local).map_or(last + 1, |f| f.min(last + 1));
+    fork_from(offered, local).filter(|&f| f < bound)
+}
+
 /// Finds where the local divergent suffix starts and records it for `Slave::diverged_entries`
 /// (from the histories; for a slave ahead of its master on the same history, the master's
 /// `last_seq + 1`). `None` (recorded as unknown) when neither shows it.
@@ -661,6 +682,38 @@ mod tests {
             snapshot_history(&hs, &begin(&[])),
             Err(RepairError::Fallback(_))
         ));
+    }
+
+    /// Fix round 2: a fallback installs only a history that leaves this slave's no earlier
+    /// than the consented handshake's did.
+    #[test]
+    fn a_fallback_never_installs_a_history_that_forks_deeper_than_consented() {
+        let local = vec![rec(1, 1, 1), rec(2, 10, 2)];
+        let same = local.clone();
+        let later = vec![rec(1, 1, 1), rec(2, 10, 2), rec(3, 25, 3)];
+        let forked_at_20 = vec![rec(1, 1, 1), rec(2, 10, 2), rec(3, 20, 3)];
+        let forked_at_10 = vec![rec(1, 1, 1), rec(2, 10, 9)];
+        let forked_at_15 = vec![rec(1, 1, 1), rec(2, 10, 2), rec(3, 15, 4)];
+        // Verify repair at last_seq 22 (RESUME: the consented history shows no fork <= 22).
+        assert_eq!(deeper_fork(&local, 22, &same, &same), None);
+        assert_eq!(
+            deeper_fork(&local, 22, &same, &later),
+            None,
+            "a fork after last_seq"
+        );
+        assert_eq!(deeper_fork(&local, 22, &same, &forked_at_20), Some(20));
+        assert_eq!(deeper_fork(&local, 22, &same, &forked_at_10), Some(10));
+        // Divergence repair consented at fork 20 (the slave holds up to 22).
+        assert_eq!(deeper_fork(&local, 22, &forked_at_20, &forked_at_20), None);
+        assert_eq!(deeper_fork(&local, 22, &forked_at_20, &later), None);
+        assert_eq!(
+            deeper_fork(&local, 22, &forked_at_20, &forked_at_15),
+            Some(15)
+        );
+        assert_eq!(
+            deeper_fork(&local, 22, &forked_at_20, &forked_at_10),
+            Some(10)
+        );
     }
 
     #[test]

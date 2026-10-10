@@ -1235,3 +1235,144 @@ async fn a_snapshot_racing_a_rewind_is_refused() {
     assert!(d.snapshot().is_ok());
     scenario.teardown();
 }
+
+/// Fix round 2 (N-I1): a verify's consent never covers a divergence. The verify repair falls
+/// back, and by then its upstream (same database) is a failover to a node whose history
+/// leaves this slave's below its `last_seq`. The bootstrap is refused (`Retry`), nothing is
+/// installed, and the next handshake halts `Diverged` under the default policy, with the
+/// divergent entries kept for salvage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_verify_repair_fallback_never_discards_a_divergent_suffix() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    a.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..20u8 {
+        a.put("c", &[i], b"base").unwrap();
+    }
+    let (mut cfg, ld) = c.slave_config("d", a.serve_addr().unwrap());
+    cfg.verify.on_mismatch = MismatchPolicy::Repair;
+    cfg.repair_max_bytes = 4096;
+    let d = Slave::open(cfg.clone()).await.unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    let a = c.restart_master_after_backup(a, "a", "a-backup").await;
+    let fork = a.last_seq() + 1;
+    // Entries the failover target will not have; key 7 is larger than the repair budget.
+    a.put("c", &[7], &[7u8; 8192]).unwrap();
+    a.put("c", b"only-before-the-failover", b"x").unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    let last = d.last_seq();
+    d.shutdown().await.unwrap();
+    support::RawDb::open(&cfg.path).corrupt_value("c", &[7]);
+
+    let gate = Gate::after(0);
+    gate.install("slave-repair-before-fallback");
+    let _gate = gate.open_on_drop();
+    let d = Slave::open(cfg).await.unwrap();
+    d.wait_streaming(support::WAIT).await.unwrap();
+    assert!(!d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
+    wait_until("the verify repair fell back", || gate.reached()).await;
+    // Failover: the address now serves the same database on a history without those entries.
+    let port = a.serve_addr().unwrap().port();
+    a.shutdown().await.unwrap();
+    support::restore_dir(&c.path("a-backup"), &c.path("a"));
+    let mut mcfg = c.master_config("a");
+    mcfg.serve.as_mut().unwrap().port = port;
+    let a = Master::open(mcfg).await.unwrap();
+    gate.open();
+    fail::remove("slave-repair-before-fallback");
+
+    support::wait_state(&d, "Diverged halt", |s| {
+        *s == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
+    assert_eq!(ld.bootstraps(), 1, "nothing installed");
+    assert_eq!(d.last_seq(), last, "the divergent entries are kept");
+    assert_eq!(
+        d.diverged_entries()
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect::<Vec<_>>(),
+        (fork..=last).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        d.get("c", b"only-before-the-failover").unwrap(),
+        Some(b"x".to_vec())
+    );
+    drop(a);
+    scenario.teardown();
+}
+
+/// Fix round 2: a divergence repair's consent covers the suffix from the fork its handshake
+/// showed. If the fallback bootstrap is offered a history that forks deeper (the upstream was
+/// restored further back meanwhile), it is refused (`Retry`, nothing installed); the next
+/// handshake reports the deeper divergence, which the policy (`Repair`) then handles itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_divergence_repair_fallback_refuses_a_deeper_fork() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let a = c.master("a").await;
+    a.create_cf(CfSpec::new("c")).unwrap();
+    for i in 0..20u8 {
+        a.put("c", &[i], b"base").unwrap();
+    }
+    let (mut cfg, ld) = c.slave_config("d", a.serve_addr().unwrap());
+    cfg.on_divergence = replicated_rocksdb::DivergencePolicy::Repair;
+    cfg.repair_max_bytes = 4096;
+    let d = Slave::open(cfg.clone()).await.unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    let a = c.restart_master_after_backup(a, "a", "a-old").await;
+    a.put("c", &[2], b"between").unwrap();
+    let a = c.restart_master_after_backup(a, "a", "a-backup").await;
+    a.put("c", &[1], b"lost").unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    d.shutdown().await.unwrap();
+    let d_epoch = a.identity().epoch;
+    let port = a.serve_addr().unwrap().port();
+    // Restores a backup into "a" on the same port, opened until its epoch is above the
+    // slave's (an older epoch number would answer STALE_EPOCH, not DIVERGED); every open
+    // starts an epoch at the same seq.
+    let restore = |a: Master, backup: &'static str| {
+        let c = &c;
+        async move {
+            a.shutdown().await.unwrap();
+            support::restore_dir(&c.path(backup), &c.path("a"));
+            let mut mcfg = c.master_config("a");
+            mcfg.serve.as_mut().unwrap().port = port;
+            let mut a = Master::open(mcfg.clone()).await.unwrap();
+            while a.identity().epoch <= d_epoch {
+                a = c.restart_master(a, mcfg.clone()).await;
+            }
+            // Larger than the repair budget: every repair against it falls back.
+            a.put("c", &[1], &[9u8; 8192]).unwrap();
+            a
+        }
+    };
+    let a = restore(a, "a-backup").await;
+
+    let first = Gate::after(0);
+    first.install("slave-repair-before-fallback");
+    let _first = first.open_on_drop();
+    let d = Slave::open(cfg).await.unwrap();
+    wait_until("the repair fell back", || first.reached()).await;
+    // Restored further back: the fork is now below the one the repair was consented for.
+    let a = restore(a, "a-old").await;
+    let second = Gate::after(0);
+    second.install("slave-repair-before-fallback");
+    let _second = second.open_on_drop();
+    first.open();
+    wait_until("the next repair's fallback", || second.reached()).await;
+    assert_eq!(ld.bootstraps(), 1, "the deeper fork was not installed");
+    assert_eq!(d.get("c", &[1]).unwrap(), Some(b"lost".to_vec()));
+    assert!(
+        d.status().last_error.is_some_and(|m| m.contains("deeper")),
+        "{:?}",
+        d.status().last_error
+    );
+    second.open();
+    fail::remove("slave-repair-before-fallback");
+    wait_until("bootstrapped at the deeper fork", || ld.bootstraps() == 2).await;
+    assert_converged(&a, &[("d", &d)]).await;
+    scenario.teardown();
+}

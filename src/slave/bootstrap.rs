@@ -10,6 +10,7 @@ use super::client::Client;
 use super::config::IdentityPolicy;
 use super::driver::{SessionEnd, status_end, unless_repointed};
 use super::inner::Inner;
+use super::repair::deeper_fork;
 use super::state::{HaltReason, SlaveState};
 use crate::codec::digest::Digest;
 use crate::codec::{ENVELOPE_VERSION, envelope, validate_cf_name};
@@ -17,7 +18,7 @@ use crate::config::MAX_BOOTSTRAP_CHUNK_BYTES;
 use crate::error::{Error, Result};
 use crate::failpoint;
 use crate::net::DECODE_SLACK;
-use crate::net::convert::{cf_from_pb, checked_history, identity_from_pb};
+use crate::net::convert::{cf_from_pb, checked_history, epochs_from_pb, identity_from_pb};
 use crate::pb;
 use crate::pb::bootstrap_chunk::Kind;
 use crate::store::bootstrap::BootstrapFinish;
@@ -106,8 +107,11 @@ async fn next(
 /// (persisted) and the next session starts over.
 ///
 /// The header is read before anything local changes. With `expected` (a repair's fallback:
-/// its consent covers only that database), a header of another database follows the identity
-/// policy instead: `Refuse` halts `IdentityChanged`, nothing is installed.
+/// its consent covers only that database, and only the divergence `hs` showed), a header of
+/// another database follows the identity policy instead (`Refuse` halts `IdentityChanged`),
+/// and a header of the same database whose history forks deeper than `hs` showed (any fork at
+/// or below `last_seq` after a RESUME, as for a verify repair) ends with `Retry`. Nothing is
+/// installed in either case.
 pub(crate) async fn install(
     inner: &Arc<Inner>,
     generation: u64,
@@ -136,14 +140,29 @@ pub(crate) async fn install(
         return Err(retry("bootstrap stream did not start with a header"));
     };
     let plan = Plan::from_header(header)?;
-    if let Some(want) = expected
-        && plan.identity.db_uuid != want
-    {
-        tracing::warn!(node = %inner.cfg.identifier, expected = %want, got = %plan.identity.db_uuid, "the fallback bootstrap is from another database");
-        match inner.cfg.on_identity_change {
-            IdentityPolicy::Refuse => return Err(SessionEnd::Halt(HaltReason::IdentityChanged)),
-            // Configured consent to replace the data with another database.
-            IdentityPolicy::Rebootstrap => {}
+    if let Some(want) = expected {
+        if plan.identity.db_uuid != want {
+            tracing::warn!(node = %inner.cfg.identifier, expected = %want, got = %plan.identity.db_uuid, "the fallback bootstrap is from another database");
+            match inner.cfg.on_identity_change {
+                IdentityPolicy::Refuse => {
+                    return Err(SessionEnd::Halt(HaltReason::IdentityChanged));
+                }
+                // Configured consent to replace the data with another database.
+                IdentityPolicy::Rebootstrap => {}
+            }
+        } else if let Some(fork) = deeper_fork(
+            &inner.known_epochs(),
+            inner.store.position().last_seq,
+            &epochs_from_pb(&hs.epoch_history),
+            &plan.history,
+        ) {
+            // The same database, but its history now leaves this slave's earlier than the
+            // answer the consent was given for: installing would discard entries the consent
+            // never covered. Nothing changed locally; the next handshake decides afresh.
+            tracing::warn!(node = %inner.cfg.identifier, fork, "the fallback bootstrap's history forks deeper than consented");
+            return Err(retry(format!(
+                "repair fallback refused: the upstream's history now forks deeper (at {fork}) than the repair was consented for"
+            )));
         }
     }
     inner.force_bootstrap.clear(generation);

@@ -381,3 +381,26 @@ async fn concurrent_leader_writes_to_the_affected_keys_during_the_repair() {
     );
     ld.assert_no_violations();
 }
+
+/// Fix round 2: a verify repair that cannot be done (here: the upstream's value is larger
+/// than `repair_max_bytes`) re-bootstraps from the verified upstream when its history is
+/// still this slave's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_verify_repair_fallback_on_the_same_history_bootstraps() {
+    let c = Cluster::new();
+    let (a, d, cfg, ld) = setup(&c, |cfg| {
+        cfg.verify.on_mismatch = MismatchPolicy::Repair;
+        cfg.repair_max_bytes = 4096;
+    })
+    .await;
+    a.put("c", &key(7), &[7u8; 8192]).unwrap();
+    assert_converged(&a, &[("d", &d)]).await;
+    d.shutdown().await.unwrap();
+    RawDb::open(&cfg.path).corrupt_value("c", &key(7));
+    let d = Slave::open(cfg).await.unwrap();
+    assert!(!d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
+    wait_until("the fallback bootstrap", || ld.bootstraps() == 2).await;
+    assert_converged(&a, &[("d", &d)]).await;
+    assert!(d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
+    assert_eq!(ld.rewinds(), 0);
+}
