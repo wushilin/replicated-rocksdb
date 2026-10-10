@@ -429,15 +429,18 @@ impl Master {
     /// iterator borrowed from one) pins the database, and its directory LOCK, until it is
     /// dropped. Drop those first if the directory must be reopened at once.
     pub async fn shutdown(mut self) -> Result<()> {
-        if let Some(server) = self.server.take() {
-            server.shutdown().await;
-        }
+        // A server that could not stop its computations still lets the rest shut down, but
+        // the result is an error: the database may still be referenced.
+        let served = match self.server.take() {
+            Some(server) => server.shutdown().await,
+            None => Ok(()),
+        };
         self.inner.shutdown_tx.send_replace(true);
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
         if crate::server::await_sole_owner(&self.inner, Duration::from_secs(10)).await {
-            Ok(())
+            served
         } else {
             Err(crate::Error::Timeout)
         }

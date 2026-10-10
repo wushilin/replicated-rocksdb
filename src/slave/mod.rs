@@ -210,9 +210,12 @@ impl Slave {
     /// (`Err(Timeout)` after 10 s). It does not wait for `ReadSnapshot`s: each keeps the
     /// database open until it is dropped.
     pub async fn shutdown(mut self) -> Result<()> {
-        if let Some(server) = self.server.take() {
-            server.shutdown().await;
-        }
+        // A server that could not stop its computations still lets the rest shut down, but
+        // the result is an error: the database may still be referenced.
+        let served = match self.server.take() {
+            Some(server) => server.shutdown().await,
+            None => Ok(()),
+        };
         self.inner.shutdown_tx.send_replace(true);
         for task in [self.driver.take(), self.maintenance.take()]
             .into_iter()
@@ -221,7 +224,7 @@ impl Slave {
             let _ = task.await;
         }
         if await_sole_owner(&self.inner, Duration::from_secs(10)).await {
-            Ok(())
+            served
         } else {
             Err(Error::Timeout)
         }

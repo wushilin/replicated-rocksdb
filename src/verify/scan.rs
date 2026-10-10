@@ -1,6 +1,7 @@
 //! Range reads through a pinned snapshot, under the CF's comparator. Used by the server for
 //! `HashRange` and `ListRange`, and by the verifier for its own side.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::VerifyMode;
@@ -19,16 +20,32 @@ pub(crate) fn scan(
     cf: Arc<PhysCf>,
     order: &KeyOrder,
     bounds: &Bounds,
-    mut f: impl FnMut(&[u8], &[u8]) -> Result<bool>,
+    f: impl FnMut(&[u8], &[u8]) -> Result<bool>,
 ) -> Result<()> {
+    scan_until(snap, cf, order, bounds, None, f).map(|_| ())
+}
+
+/// Like [`scan`], but checks `cancel` before every key. Returns `false` if it was set (the
+/// scan then stopped early and its result must be discarded).
+pub(crate) fn scan_until(
+    snap: &ReadSnapshot,
+    cf: Arc<PhysCf>,
+    order: &KeyOrder,
+    bounds: &Bounds,
+    cancel: Option<&AtomicBool>,
+    mut f: impl FnMut(&[u8], &[u8]) -> Result<bool>,
+) -> Result<bool> {
     let ctx = snap.raw_ctx();
     for item in ctx.iter_raw_from(cf, bounds.lower.as_deref())? {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Ok(false);
+        }
         let (key, raw) = item?;
         if !bounds.below_upper(order, &key) || !f(&key, &raw)? {
             break;
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// `(count, hash)` of a range (PROTOCOL.md §5.4, §9.3).

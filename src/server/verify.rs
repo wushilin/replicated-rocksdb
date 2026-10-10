@@ -5,6 +5,7 @@
 //! server's shutdown, so it can never keep a closed node's database open.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -21,15 +22,20 @@ use crate::pb::verify_range_request::Kind as ReqKind;
 use crate::pb::verify_range_response::Kind as RespKind;
 use crate::read::ReadSnapshot;
 use crate::store::cfs::PhysCf;
-use crate::verify::range::{Bounds, KeyOrder};
+use crate::verify::range::{Bounds, KeyOrder, Lister, RangeHasher};
 use crate::verify::scan;
 use crate::verify::{LIST_SOFT_BYTES, MAX_LIST_LIMIT, VerifyMode};
+
+/// Computations running at once on one server (each holds a blocking thread and a scan).
+pub(crate) const MAX_COMPUTATIONS: usize = 8;
 
 /// Answers buffered per stream (the client pipelines at most `VERIFY_WINDOW` = 16 requests).
 const CHANNEL: usize = 16;
 
 /// One open session: a snapshot at `S` and what is needed to read it.
 pub(crate) struct Session {
+    #[cfg(test)]
+    id: [u8; 16],
     snap: ReadSnapshot,
     mode: VerifyMode,
     cfs: HashMap<String, (Arc<PhysCf>, KeyOrder)>,
@@ -206,6 +212,8 @@ pub(super) async fn begin(
     span.in_scope(|| tracing::info!(cfs = cfs.len(), "verify session opened"));
     let id = *uuid::Uuid::new_v4().as_bytes();
     let session = Session {
+        #[cfg(test)]
+        id,
         snap,
         mode,
         cfs,
@@ -297,6 +305,16 @@ async fn answer(
     req: pb::VerifyRangeRequest,
     reset_gen: u64,
 ) -> Result<pb::VerifyRangeResponse, Status> {
+    let shutting_down = || reason_status(pb::Reason::ShuttingDown, "server is shutting down");
+    // At most `MAX_COMPUTATIONS` scans run at once on this server. A request waits for a free
+    // slot rather than failing: the client already limits itself to `VERIFY_WINDOW` requests
+    // per session, so waiting is the natural backpressure (PROTOCOL.md §9.4). No session is
+    // held while waiting.
+    let mut shutdown = state.shutdown.clone();
+    let permit = tokio::select! {
+        p = state.compute_permits.clone().acquire_owned() => p.map_err(|_| shutting_down())?,
+        _ = super::stopped(&mut shutdown) => return Err(shutting_down()),
+    };
     let session = state.verify_sessions.get(&req.session_id)?;
     if session.reset_gen != reset_gen {
         state.verify_sessions.remove(&req.session_id);
@@ -308,12 +326,19 @@ async fn answer(
     let kind = req
         .kind
         .ok_or_else(|| net::invalid_argument("VerifyRangeRequest needs hash or list"))?;
-    let s = session.clone();
-    let kind = tokio::task::spawn_blocking(move || compute(&s, kind))
-        .await
-        .map_err(|e| internal_status(format!("verify task failed: {e}")))??;
-    // Idle time counts from the end of the last request.
-    session.touch();
+    let cancel = state.cancel.clone();
+    // The closure owns the session and the permit and drops the session first, so once
+    // `shutdown` holds every permit no computation references the database any more.
+    let kind = tokio::task::spawn_blocking(move || {
+        let r = compute(&session, kind, &cancel);
+        // Idle time counts from the end of the last request.
+        session.touch();
+        drop(session);
+        drop(permit);
+        r
+    })
+    .await
+    .map_err(|e| internal_status(format!("verify task failed: {e}")))??;
     Ok(pb::VerifyRangeResponse {
         request_id: req.request_id,
         kind: Some(kind),
@@ -334,14 +359,33 @@ fn target<'s>(
     Ok((phys, order, Bounds::from_pb(r)))
 }
 
-/// Runs on a blocking thread.
-fn compute(s: &Session, kind: ReqKind) -> Result<RespKind, Status> {
+/// Runs on a blocking thread. Checks `cancel` before every key and stops with
+/// `SHUTTING_DOWN` when it is set.
+fn compute(s: &Session, kind: ReqKind, cancel: &AtomicBool) -> Result<RespKind, Status> {
+    #[cfg(test)]
+    hooks::pause(&s.id, cancel);
     let _span = s.span.enter();
+    let stopped = || reason_status(pb::Reason::ShuttingDown, "server is shutting down");
+    if cancel.load(Ordering::Relaxed) {
+        return Err(stopped());
+    }
     match kind {
         ReqKind::Hash(h) => {
             let (phys, order, bounds) = target(s, h.range.as_ref())?;
-            let (count, hash) = scan::hash_range(&s.snap, phys.clone(), order, &bounds, s.mode)
-                .map_err(store_status)?;
+            let mut hasher = RangeHasher::new(s.mode);
+            let done = scan::scan_until(
+                &s.snap,
+                phys.clone(),
+                order,
+                &bounds,
+                Some(cancel),
+                |k, v| hasher.add(k, v).map(|()| true),
+            )
+            .map_err(store_status)?;
+            if !done {
+                return Err(stopped());
+            }
+            let (count, hash) = hasher.finish();
             let matched = count == h.count && hash.as_slice() == h.hash.as_slice();
             Ok(RespKind::Hash(pb::HashResult {
                 matched,
@@ -356,20 +400,70 @@ fn compute(s: &Session, kind: ReqKind) -> Result<RespKind, Status> {
                 )));
             }
             let (phys, order, bounds) = target(s, l.range.as_ref())?;
-            let (keys, truncated) = scan::list_range(
+            let mut lister = Lister::new(s.mode, l.limit as usize, LIST_SOFT_BYTES);
+            let done = scan::scan_until(
                 &s.snap,
                 phys.clone(),
                 order,
                 &bounds,
-                s.mode,
-                l.limit as usize,
-                LIST_SOFT_BYTES,
+                Some(cancel),
+                |k, v| lister.offer(k, v),
             )
             .map_err(store_status)?;
-            Ok(RespKind::List(pb::ListResult { keys, truncated }))
+            if !done {
+                return Err(stopped());
+            }
+            Ok(RespKind::List(pb::ListResult {
+                keys: lister.keys,
+                truncated: lister.truncated,
+            }))
         }
     }
 }
+/// Test hook: makes the computations of chosen sessions slow.
+#[cfg(test)]
+pub(crate) mod hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    pub(crate) struct Slow {
+        pub ignore_cancel: bool,
+        pub started: Arc<AtomicBool>,
+    }
+
+    pub(crate) static SLOW: Mutex<Vec<(Vec<u8>, Slow)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn slow(id: &[u8], ignore_cancel: bool) -> Arc<AtomicBool> {
+        let started = Arc::new(AtomicBool::new(false));
+        SLOW.lock().unwrap_or_else(PoisonError::into_inner).push((
+            id.to_vec(),
+            Slow {
+                ignore_cancel,
+                started: started.clone(),
+            },
+        ));
+        started
+    }
+
+    /// Blocks the computing thread for a while (6 s if it ignores cancellation, else up to 8 s
+    /// or until `cancel`).
+    pub(crate) fn pause(id: &[u8], cancel: &AtomicBool) {
+        let (ignore, started) = {
+            let slow = SLOW.lock().unwrap_or_else(PoisonError::into_inner);
+            match slow.iter().find(|(k, _)| k == id) {
+                Some((_, s)) => (s.ignore_cancel, s.started.clone()),
+                None => return,
+            }
+        };
+        started.store(true, Ordering::SeqCst);
+        let end = Instant::now() + Duration::from_secs(if ignore { 6 } else { 8 });
+        while Instant::now() < end && (ignore || !cancel.load(Ordering::SeqCst)) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -657,14 +751,48 @@ mod tests {
         assert!(err.is_none() && answers.len() == 1);
     }
 
-    /// A client that opens a session and walks away must not keep the database open.
+    /// A master that does not serve, plus a separately started server over it. Returns an extra
+    /// handle on the server state, so a leak through the state would be visible after shutdown.
+    async fn standalone_server(
+        dir: &std::path::Path,
+    ) -> (
+        crate::master::Master,
+        crate::server::ServerHandle,
+        std::sync::Arc<crate::server::ServerState>,
+    ) {
+        let (m, _) = serving_master(dir, |cfg| cfg.serve = None).await;
+        let cfg = crate::config::ServeConfig::new(
+            [127, 0, 0, 1].into(),
+            0,
+            std::sync::Arc::new(crate::auth::AllowAll),
+        );
+        let src = m.log_source();
+        let h = crate::server::start(
+            std::sync::Arc::downgrade(&src),
+            cfg,
+            std::sync::Arc::new(crate::server::replicas::ReplicaRegistry::default()),
+        )
+        .await
+        .unwrap();
+        let state = h.state.clone();
+        (m, h, state)
+    }
+
+    /// A client that opens a session and walks away must not keep the database open, even
+    /// while something else still holds the server's state.
     #[tokio::test]
     async fn open_sessions_do_not_keep_the_database_open() {
         let dir = tempfile::tempdir().unwrap();
-        let (m, _) = serving_master(dir.path(), |_| {}).await;
+        let (m, h, state) = standalone_server(dir.path()).await;
         m.create_cf(CfSpec::new("c")).unwrap();
-        let mut c = client(m.serve_addr().unwrap(), "b");
+        let db = m.log_source().store().db().clone();
+        let baseline = std::sync::Arc::strong_count(&db) - 1;
+        let mut c = client(h.addr(), "b");
         let s = begin(&mut c, pb::VerifyMode::Full).await.unwrap();
+        assert!(
+            std::sync::Arc::strong_count(&db) - 1 > baseline,
+            "the session holds it"
+        );
         // An open VerifyRange stream with an unanswered client, too.
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let _stream = c
@@ -674,9 +802,109 @@ mod tests {
         tx.send(hash(&s.session_id, 1, range(None, None), 0, vec![]))
             .await
             .unwrap();
-        m.shutdown()
+        h.shutdown().await.expect("shutdown succeeds");
+        assert_eq!(
+            std::sync::Arc::strong_count(&db) - 1,
+            baseline,
+            "shutdown released the session's snapshot although the state is still referenced"
+        );
+        drop(state);
+        drop(db);
+        m.shutdown().await.unwrap();
+    }
+
+    /// A long computation in flight must not outlive `shutdown`, and the directory must be
+    /// reopenable at once.
+    #[tokio::test]
+    async fn shutdown_aborts_a_computation_in_flight_and_releases_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, _) = serving_master(dir.path(), |_| {}).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        m.put("c", b"k", b"v").unwrap();
+        let mut c = client(m.serve_addr().unwrap(), "b");
+        let s = begin(&mut c, pb::VerifyMode::Full).await.unwrap();
+        let started = super::hooks::slow(&s.session_id, false);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut stream = c
+            .verify_range(tokio_stream::wrappers::ReceiverStream::new(rx))
             .await
-            .expect("shutdown releases the sessions' snapshots");
+            .unwrap()
+            .into_inner();
+        tx.send(hash(&s.session_id, 1, range(None, None), 0, vec![]))
+            .await
+            .unwrap();
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let t = std::time::Instant::now();
+        m.shutdown().await.expect("shutdown");
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+        let (m, _) = serving_master(dir.path(), |_| {}).await;
+        assert_eq!(m.last_seq(), 2);
+        drop(stream.message().await);
+    }
+
+    /// If a computation cannot be stopped, `shutdown` says so instead of returning `Ok`.
+    #[tokio::test]
+    async fn shutdown_fails_while_a_computation_cannot_be_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, h, _state) = standalone_server(dir.path()).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        let mut c = client(h.addr(), "b");
+        let s = begin(&mut c, pb::VerifyMode::Full).await.unwrap();
+        let started = super::hooks::slow(&s.session_id, true);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let _stream = c
+            .verify_range(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .unwrap();
+        tx.send(hash(&s.session_id, 1, range(None, None), 0, vec![]))
+            .await
+            .unwrap();
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(h.shutdown().await.is_err());
+    }
+
+    /// Computations are bounded by permits, which are returned when they end.
+    #[tokio::test]
+    async fn computations_hold_a_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, h, state) = standalone_server(dir.path()).await;
+        m.create_cf(CfSpec::new("c")).unwrap();
+        let mut c = client(h.addr(), "b");
+        let s = begin(&mut c, pb::VerifyMode::Full).await.unwrap();
+        let started = super::hooks::slow(&s.session_id, false);
+        assert_eq!(
+            state.compute_permits.available_permits(),
+            super::MAX_COMPUTATIONS
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut stream = c
+            .verify_range(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .unwrap()
+            .into_inner();
+        tx.send(hash(&s.session_id, 1, range(None, None), 0, vec![]))
+            .await
+            .unwrap();
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.compute_permits.available_permits(),
+            super::MAX_COMPUTATIONS - 1
+        );
+        h.shutdown().await.unwrap();
+        drop(stream.message().await);
+        assert_eq!(
+            state.compute_permits.available_permits(),
+            super::MAX_COMPUTATIONS,
+            "every permit is back after shutdown"
+        );
+        drop(state);
+        m.shutdown().await.unwrap();
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ mod tests;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -61,6 +62,10 @@ pub(crate) struct ServerState {
     pub(crate) replicas: Arc<ReplicaRegistry>,
     /// Open verify sessions; each owns a snapshot (PROTOCOL.md §9).
     pub(crate) verify_sessions: verify::Sessions,
+    /// Permits for running verify computations; `shutdown` takes them all.
+    pub(crate) compute_permits: Arc<Semaphore>,
+    /// Set on shutdown: running verify scans stop at their next key.
+    pub(crate) cancel: Arc<AtomicBool>,
 }
 
 impl ServerState {
@@ -376,8 +381,9 @@ impl ServerHandle {
     /// Ends every stream with `SHUTTING_DOWN`, stops accepting calls, and waits (up to 5 s
     /// each) until every bootstrap job has returned its permit (and dropped its snapshot)
     /// and the server task has finished.
-    pub(crate) async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(mut self) -> Result<()> {
         self.shutdown_tx.send_replace(true);
+        self.state.cancel.store(true, Ordering::SeqCst);
         let all =
             u32::try_from(self.state.cfg.limits.max_concurrent_bootstraps).unwrap_or(u32::MAX);
         if tokio::time::timeout(
@@ -389,6 +395,21 @@ impl ServerHandle {
         {
             tracing::warn!(addr = %self.addr, "bootstrap jobs did not stop in 5 s");
         }
+        // Verify computations stop at their next key; wait until none is left, because each
+        // one references the database through its session's snapshot.
+        let mut stuck = false;
+        let computations = u32::try_from(verify::MAX_COMPUTATIONS).unwrap_or(u32::MAX);
+        if tokio::time::timeout(
+            Duration::from_secs(5),
+            self.state.compute_permits.acquire_many(computations),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(addr = %self.addr, "verify computations did not stop in 5 s");
+            stuck = true;
+        }
+        self.state.compute_permits.close();
         // A Bootstrap that arrives later on an existing connection is refused.
         self.state.bootstraps.close();
         self.state.leases().clear();
@@ -405,12 +426,17 @@ impl ServerHandle {
                 task.abort();
             }
         }
+        if stuck {
+            return Err(Error::Timeout);
+        }
+        Ok(())
     }
 
     /// Stops immediately, without waiting for anything (emulates a crash).
     #[cfg_attr(not(feature = "failpoints"), allow(dead_code))] // used by Slave::kill
     pub(crate) fn abort(mut self) {
         self.shutdown_tx.send_replace(true);
+        self.state.cancel.store(true, Ordering::SeqCst);
         self.state.leases().clear();
         self.state.verify_sessions.clear();
         if let Some(t) = self.sweep.take() {
@@ -452,6 +478,8 @@ pub(crate) async fn start(
             cfg.limits.max_verify_sessions,
             cfg.limits.verify_session_timeout,
         ),
+        compute_permits: Arc::new(Semaphore::new(verify::MAX_COMPUTATIONS)),
+        cancel: Arc::new(AtomicBool::new(false)),
         cfg,
         replicas,
     });
@@ -486,13 +514,16 @@ pub(crate) async fn start(
 
 async fn sweep_leases(state: Arc<ServerState>, mut shutdown: watch::Receiver<bool>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    // Subscribe once and never upgrade the weak source here: this task must not become the
+    // last owner of a dropped node (closing RocksDB on an async worker).
+    let resets = state.source.upgrade().map(|s| s.resets());
     loop {
         tokio::select! {
             _ = tick.tick() => {
                 let now = Instant::now();
                 state.expire_leases(now);
                 // Sessions idle too long, or opened before a reset of this node's state.
-                let reset_gen = state.source.upgrade().map(|s| *s.resets().borrow());
+                let reset_gen = resets.as_ref().map(|r| *r.borrow());
                 state.verify_sessions.expire(now, reset_gen);
             }
             r = shutdown.changed() => if r.is_err() || *shutdown.borrow() { return },
