@@ -2078,7 +2078,7 @@ async fn a_promotion_refused_on_the_stopped_store_keeps_the_repointed_upstream()
 
 /// Group commit: the upstream batches entries (`min_batch_bytes`), so the slave receives
 /// several per Tail message. Sets the default group size explicitly, so these tests also group
-/// when the suite runs with `RRDB_TEST_MAX_GROUP_ENTRIES=1`.
+/// when the suite runs with `--features test-hooks` and `RRDB_TEST_MAX_GROUP_ENTRIES=1`.
 fn batched(cfg: &mut replicated_rocksdb::SlaveConfig) {
     cfg.max_group_entries = 256;
     cfg.fetch.min_batch_bytes = 1 << 20;
@@ -2131,19 +2131,27 @@ async fn a_burst_commits_in_groups_with_sync_writes() {
     scenario.teardown();
 }
 
+/// Opens slave `b` with [`batched`] fetching, lets it converge, and stops it: entries the
+/// master writes next all wait for it, and reach it in one Tail batch when it is reopened.
+async fn stopped_batched_slave(c: &Cluster, m: &Master) -> replicated_rocksdb::SlaveConfig {
+    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    batched(&mut cfg);
+    let b = Slave::open(cfg.clone()).await.unwrap();
+    assert_converged(m, &[("b", &b)]).await;
+    b.shutdown().await.unwrap();
+    cfg
+}
+
 /// D: a CF entry in the middle of a received batch commits alone; the entries around it are
-/// grouped, and the data is right.
+/// grouped, and the data is right. All entries are written while the slave is stopped, so they
+/// arrive in one Tail batch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cf_entry_in_a_burst_commits_alone() {
     let (_serial, scenario) = serial().await;
     let c = Cluster::new();
     let m = c.master("a").await;
     m.create_cf(CfSpec::new("c")).unwrap();
-    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
-    batched(&mut cfg);
-    let b = Slave::open(cfg).await.unwrap();
-    assert_converged(&m, &[("b", &b)]).await;
-    b.wait_streaming(support::WAIT).await.unwrap();
+    let cfg = stopped_batched_slave(&c, &m).await;
     for k in 0..3u8 {
         m.put("c", &[k], b"before").unwrap();
     }
@@ -2151,38 +2159,35 @@ async fn a_cf_entry_in_a_burst_commits_alone() {
     for k in 0..3u8 {
         m.put("d", &[k], b"after").unwrap();
     }
+    let b = Slave::open(cfg).await.unwrap();
     assert_converged(&m, &[("b", &b)]).await;
-    let sizes = b.commit_sizes();
-    assert_eq!(sizes.iter().sum::<usize>(), 7, "{sizes:?}");
-    let ends = group_ends(&sizes);
-    assert!(
-        ends.contains(&3) && ends.contains(&4),
-        "the CF entry (4th) is a commit of its own: {sizes:?}"
+    assert_eq!(
+        b.commit_sizes(),
+        vec![3, 1, 3],
+        "the CF entry (4th) is a commit of its own"
     );
-    assert!(sizes.iter().any(|n| *n > 1), "grouped: {sizes:?}");
     assert_eq!(b.get("d", &[2]).unwrap(), Some(b"after".to_vec()));
     assert_eq!(b.get("c", &[0]).unwrap(), Some(b"before".to_vec()));
     scenario.teardown();
 }
 
 /// D: a corrupt entry in the middle of a received batch: the entries before it are committed
-/// (as one group), then the slave halts `Corrupt` with `last_seq` on the entry before it.
+/// (as one group), then the slave halts `Corrupt` with `last_seq` on the entry before it. All
+/// entries are written while the slave is stopped, so they arrive in one Tail batch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_corrupt_entry_mid_batch_commits_the_entries_before_it_then_halts() {
     let (_serial, scenario) = serial().await;
     let c = Cluster::new();
     let m = c.master("a").await;
     m.create_cf(CfSpec::new("c")).unwrap();
-    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
-    batched(&mut cfg);
-    let b = Slave::open(cfg).await.unwrap();
-    assert_converged(&m, &[("b", &b)]).await;
-    b.wait_streaming(support::WAIT).await.unwrap();
+    let cfg = stopped_batched_slave(&c, &m).await;
     let before = m.last_seq();
-    fail::cfg("server-tail-corrupt-entry", "3*off->1*return").unwrap();
     for k in 0..6u8 {
         m.put("c", &[k], b"v").unwrap();
     }
+    // All six arrive in one Tail batch; the fourth is damaged in transit.
+    fail::cfg("server-tail-corrupt-entry", "3*off->1*return").unwrap();
+    let b = Slave::open(cfg).await.unwrap();
     support::wait_state(&b, "halted", |s| {
         *s == SlaveState::Halted(HaltReason::Corrupt)
     })

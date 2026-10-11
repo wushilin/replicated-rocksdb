@@ -688,9 +688,11 @@ impl Inner {
         }
     }
 
-    /// Pauses the applier before its next commit, until the hold sets a target or is dropped.
-    /// A verify takes it before asking the upstream for its snapshot, so this slave cannot pass
-    /// the snapshot's seq meanwhile.
+    /// Pauses the applier before it starts its next group, until the hold sets a target or is
+    /// dropped. A verify takes it before asking the upstream for its snapshot, so this slave
+    /// cannot pass the snapshot's seq meanwhile. A group already being committed when the hold
+    /// is taken still commits: its entries were received before the hold, so they are at or
+    /// below the snapshot's seq; nothing beyond it is applied.
     pub(crate) fn hold_applier(self: &Arc<Self>) -> CaptureHold {
         let id = self.capture_ids.fetch_add(1, Ordering::SeqCst) + 1;
         let mut slot = self.capture();

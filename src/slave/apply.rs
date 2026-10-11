@@ -326,7 +326,96 @@ fn commit_blocking(i: &Inner, group: &[Received]) -> (usize, Option<(Seq, Failur
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::EpochStart;
+    use crate::slave::config::{SlaveConfig, UpstreamConfig};
+    use crate::slave::inner::CaptureMiss;
+    use crate::store::Store;
+    use crate::tuning::RocksTuning;
+    use crate::types::{CfSpec, DbIdentity, EpochStart, Role};
+
+    /// A slave `Inner` over a fresh store, with an identity at epoch 1 and groups of up to 256.
+    fn inner(dir: &std::path::Path) -> Arc<Inner> {
+        let (store, meta) = Store::open(dir, Role::Slave, RocksTuning::new()).unwrap();
+        let mut cfg = SlaveConfig::new("t", dir, UpstreamConfig::new("127.0.0.1", 1));
+        cfg.max_group_entries = 256;
+        let i = Arc::new(Inner::new(store, cfg, &meta).unwrap());
+        i.set_ident(Some((
+            DbIdentity {
+                db_uuid: uuid::Uuid::new_v4(),
+                epoch: 1,
+            },
+            vec![EpochStart {
+                epoch: 1,
+                start_seq: 1,
+                nonce: 0,
+            }],
+        )));
+        i
+    }
+
+    fn entry(seq: Seq, ops: &[Op]) -> LogEntry {
+        LogEntry::new(seq, 1, 1_000 * seq, crate::codec::encode_ops(ops))
+    }
+
+    fn put(seq: Seq) -> LogEntry {
+        entry(
+            seq,
+            &[Op::Put {
+                cf: "c".into(),
+                key: seq.to_be_bytes().to_vec(),
+                value: b"v".to_vec(),
+                expire_at_ms: None,
+            }],
+        )
+    }
+
+    /// Applies a CF entry (seq 1, commits alone), then opens a group with puts `2..=last`.
+    async fn open_group(a: &mut Applier<'_>, last: Seq) {
+        a.push(entry(1, &[Op::CreateCf { spec: CfSpec::new("c") }]), 0)
+            .await
+            .unwrap();
+        for seq in 2..=last {
+            a.push(put(seq), 0).await.unwrap();
+        }
+    }
+
+    /// The `target_in_group` branch: a verify sets its capture seq while a group is open and
+    /// the seq is the group's last entry. The next entry commits the group first, so the
+    /// snapshot is taken right after that seq's commit, exactly at it.
+    #[tokio::test]
+    async fn a_capture_target_set_at_the_end_of_an_open_group_is_captured_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inner(dir.path());
+        let mut cleared = false;
+        let mut a = Applier::new(&i, 0, &mut cleared);
+        open_group(&mut a, 3).await;
+        assert_eq!(i.store.position().last_seq, 1, "2 and 3 wait in the open group");
+        let hold = i.hold_applier();
+        let rx = hold.target(3);
+        a.push(put(4), 0).await.unwrap();
+        assert_eq!(i.store.position().last_seq, 3, "the group ended at the target");
+        let snap = rx.await.unwrap().ok().expect("captured");
+        assert_eq!(snap.seq(), 3);
+        a.finish().await.unwrap();
+        assert_eq!(i.store.position().last_seq, 4);
+    }
+
+    /// A capture seq that lands strictly inside an open group (only possible when the slave is
+    /// ahead of its upstream, DESIGN.md §6) is refused as passed, never captured at another seq.
+    #[tokio::test]
+    async fn a_capture_target_inside_an_open_group_is_refused_never_misplaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inner(dir.path());
+        let mut cleared = false;
+        let mut a = Applier::new(&i, 0, &mut cleared);
+        open_group(&mut a, 4).await;
+        let hold = i.hold_applier();
+        let rx = hold.target(2);
+        a.push(put(5), 0).await.unwrap();
+        assert_eq!(i.store.position().last_seq, 4, "the group ended before the next entry");
+        assert!(matches!(rx.await.unwrap(), Err(CaptureMiss::Passed(4))));
+        a.finish().await.unwrap();
+        assert_eq!(i.store.position().last_seq, 5);
+    }
 
     /// C1: an entry whose epoch contradicts the history the session started with ends the
     /// session with a backed-off `Retry` and a `last_error`, never an immediate `Again` (which
