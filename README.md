@@ -133,7 +133,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `AllowAll` disables authentication; see the `secure_replication` example for TLS and tokens.
 More runnable programs are listed in [examples/README.md](examples/README.md)
-(`cargo run --example <name>`).
+(`cargo run --example <name>`). To get a feel for it, run the interactive web playground
+(`cargo run --example playground`, then open http://127.0.0.1:8080): four nodes in a chain,
+live replication status, and every role transition one click away.
 
 ## Documentation
 

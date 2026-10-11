@@ -62,9 +62,19 @@ async fn create_and_open_each_role() {
     assert!(matches!(b.bump_epoch(), Err(Error::NotMaster)));
     assert!(matches!(a.status(), Err(Error::NotSlave)));
     assert!(matches!(a.diverged_entries(), Err(Error::NotSlave)));
+    // Each role reports its direct downstream replicas.
+    wait_until("a sees b in sync", || {
+        a.replicas()
+            .unwrap()
+            .iter()
+            .any(|r| r.node_id == "b" && r.in_sync && r.applied_seq == a.last_seq().unwrap())
+    })
+    .await;
+    assert_eq!(b.replicas().unwrap(), vec![]);
 
     b.shutdown().await.unwrap();
     assert_eq!(b.state(), NodeState::Stopped);
+    assert!(matches!(b.replicas(), Err(Error::NodeFailed(_))));
     assert!(matches!(b.get("c", b"k"), Err(Error::NodeFailed(_))));
     let b = Node::open(node_cfg(&c, "b", a_addr, &[])).await.unwrap();
     wait_node(&b, "b streaming after open", streaming).await;

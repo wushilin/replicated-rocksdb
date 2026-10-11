@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Replication Playground</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #667085; --line: #e3e6eb;
+  --accent: #2f6fde; --ok: #1f9d55; --warn: #c98a00; --bad: #d64545; --chip: #eef1f5;
+  --code: #f1f3f6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12151b; --panel: #1b1f27; --text: #e6e9ef; --muted: #9aa3b2; --line: #2a303b;
+    --accent: #6c9cff; --ok: #3ccf7a; --warn: #f0b429; --bad: #ff6b6b; --chip: #252b35;
+    --code: #232833;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #12151b; --panel: #1b1f27; --text: #e6e9ef; --muted: #9aa3b2; --line: #2a303b;
+  --accent: #6c9cff; --ok: #3ccf7a; --warn: #f0b429; --bad: #ff6b6b; --chip: #252b35;
+  --code: #232833;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+  border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+header h1 { font-size: 17px; margin: 0; }
+#topology { font-family: ui-monospace, monospace; color: var(--muted); }
+#conn { margin-left: auto; font-size: 12px; color: var(--muted); }
+main { padding: 16px; max-width: 1400px; margin: 0 auto; display: grid; gap: 16px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+.panel h2 { font-size: 14px; margin: 0 0 10px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+input, select, button { font: inherit; color: var(--text); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+input[type=text] { min-width: 0; }
+button { cursor: pointer; background: var(--chip); }
+button:hover { border-color: var(--accent); }
+button.danger { color: var(--bad); }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+label.check { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; color: var(--muted); }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px;
+  display: grid; gap: 8px; align-content: start; }
+.card.master { border-color: var(--ok); }
+.card-head { display: flex; align-items: center; gap: 10px; }
+.card-head .id { font-size: 20px; font-weight: 700; }
+.badge { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; padding: 2px 8px;
+  border-radius: 999px; background: var(--chip); color: var(--muted); }
+.badge.master { background: var(--ok); color: #fff; }
+.badge.fenced, .badge.failed { background: var(--bad); color: #fff; }
+.badge.switching { background: var(--warn); color: #000; }
+.light { width: 14px; height: 14px; border-radius: 50%; background: var(--muted); flex: none; }
+.light.green { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.light.blink { background: var(--ok); animation: blink 0.8s ease-in-out infinite; }
+.light.red { background: var(--bad); box-shadow: 0 0 6px var(--bad); }
+.light.grey { background: var(--muted); }
+.light.amber { background: var(--warn); }
+@keyframes blink { 50% { opacity: .2; } }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 13px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+.bar { height: 8px; border-radius: 4px; background: var(--chip); overflow: hidden; }
+.bar > div { height: 100%; background: var(--ok); transition: width .3s; }
+.err { color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
+.muted { color: var(--muted); font-size: 12px; }
+.actions { display: grid; gap: 6px; border-top: 1px dashed var(--line); padding-top: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+td, th { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+#log { height: 300px; overflow: auto; font: 12px/1.5 ui-monospace, monospace; background: var(--code);
+  border-radius: 6px; padding: 6px 8px; }
+#log .error { color: var(--bad); }
+#log .ok, #log .write { color: var(--ok); }
+#log .role { color: var(--accent); }
+#log .entry { color: var(--muted); }
+#result { font-size: 12px; min-height: 1.4em; }
+#result.bad { color: var(--bad); }
+#banner { display: none; background: var(--bad); color: #fff; padding: 8px 16px; font-weight: 600; }
+@media (max-width: 760px) { .two { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Replication Playground</h1>
+  <span id="topology"></span>
+  <span id="conn">connecting…</span>
+</header>
+<div id="banner"></div>
+<main>
+  <div class="two">
+    <section class="panel">
+      <h2>Write (on a master)</h2>
+      <div class="row">
+        <select id="w-node" aria-label="Node to write on"></select>
+        <input id="w-key" type="text" placeholder="key" value="greeting" size="10">
+        <input id="w-value" type="text" placeholder="value" value="hello" size="12">
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label class="check">count <input id="w-count" type="number" value="1" min="1" max="5000" style="width:72px"></label>
+        <label class="check">min in-sync replicas <input id="w-insync" type="number" value="0" min="0" max="3" style="width:52px"></label>
+        <button class="primary" onclick="write_('put')">Put</button>
+        <button onclick="write_('delete')">Delete</button>
+      </div>
+      <div class="muted" style="margin-top:6px">count &gt; 1 writes key-0 … key-(count-1). Writing on a slave shows the refusal.</div>
+    </section>
+    <section class="panel">
+      <h2>Read a key on every node</h2>
+      <div class="row">
+        <input id="r-key" type="text" placeholder="key" value="greeting" size="14">
+        <button onclick="readKey()">Read</button>
+        <label class="check"><input id="r-auto" type="checkbox" checked> refresh live</label>
+      </div>
+      <table id="r-table" style="margin-top:8px"><tbody></tbody></table>
+    </section>
+  </div>
+  <div id="result"></div>
+  <section class="nodes" id="nodes"></section>
+  <div class="two">
+    <section class="panel">
+      <h2>Live events <span class="muted">(listener notifications, role changes, actions)</span></h2>
+      <div class="row" style="margin-bottom:6px">
+        <label class="check"><input id="l-entries" type="checkbox" checked> show applied entries</label>
+        <button onclick="document.getElementById('log').innerHTML=''">Clear</button>
+      </div>
+      <div id="log"></div>
+    </section>
+    <section class="panel">
+      <h2>Scan keys</h2>
+      <div class="row">
+        <select id="s-node" aria-label="Node to scan"></select>
+        <button onclick="scan()">Scan (first 200)</button>
+      </div>
+      <table id="s-table" style="margin-top:8px"><tbody></tbody></table>
+    </section>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let nodes = [];
+const ui = {};  // per node: selected target and consents survive re-renders
+
+function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function connect() {
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  ws.onopen = () => { $('conn').textContent = 'live'; };
+  ws.onclose = () => { $('conn').textContent = 'disconnected, retrying…'; setTimeout(connect, 1000); };
+  ws.onmessage = (m) => {
+    const msg = JSON.parse(m.data);
+    if (msg.type === 'snapshot') { nodes = msg.nodes; render(); }
+    else if (msg.type === 'event') { logEvent(msg); }
+    else if (msg.type === 'history') { $('log').innerHTML = ''; msg.events.forEach(logEvent); }
+  };
+}
+
+function logEvent(ev) {
+  if (ev.kind === 'entry' && !$('l-entries').checked) return;
+  const log = $('log');
+  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+  const t = new Date(ev.t).toLocaleTimeString();
+  const div = document.createElement('div');
+  div.className = ev.kind;
+  div.textContent = `${t}  ${ev.node}  ${ev.text}`;
+  log.appendChild(div);
+  while (log.childNodes.length > 600) log.removeChild(log.firstChild);
+  if (atBottom) log.scrollTop = log.scrollHeight;
+  if (ev.kind === 'entry' || ev.kind === 'write') scheduleRead();
+}
+
+let readTimer = null;
+function scheduleRead() {
+  if (!$('r-auto').checked || readTimer) return;
+  readTimer = setTimeout(() => { readTimer = null; readKey(); }, 250);
+}
+
+// The view of the whole cluster: who is master, its seq and epoch.
+function cluster() {
+  const masters = nodes.filter(n => n.kind === 'master');
+  const m = masters[0];
+  return {
+    masters,
+    masterSeq: m ? m.last_seq : null,
+    masterEpoch: m ? Number((m.detail.match(/epoch (\d+)/) || [])[1]) : null,
+  };
+}
+
+// Status light: green = up to date, blinking green = replicating/catching up, red = error.
+function light(n, c) {
+  if (n.kind === 'master') return ['green', 'master: accepting writes'];
+  if (n.kind === 'fenced') return ['red', 'fenced: ' + n.detail];
+  if (n.kind === 'failed') return ['red', 'failed: ' + n.detail];
+  if (n.kind === 'stopped') return ['grey', 'stopped'];
+  if (n.kind === 'switching') return ['amber', 'switching role'];
+  const s = n.slave;
+  if (!s) return ['grey', n.kind];
+  if (s.state.startsWith('Halted')) return ['red', s.state];
+  if (s.state !== 'Streaming' && s.last_error) return ['red', `error: ${s.last_error_kind}`];
+  const behind = behindOf(n, c);
+  if (s.state === 'Streaming' && behind.entries === 0 && !behind.epochs) return ['green', 'up to date'];
+  return ['blink', s.state === 'Streaming' ? 'replicating' : s.state];
+}
+
+function behindOf(n, c) {
+  const s = n.slave;
+  if (!s) return { entries: 0, epochs: 0 };
+  // Ground truth from the current master when there is exactly one; else the slave's own view.
+  const head = c.masters.length === 1 ? c.masterSeq : s.origin_last_seq;
+  const entries = Math.max(0, (head ?? 0) - s.applied_seq);
+  const epochs = (c.masterEpoch && s.epoch) ? Math.max(0, c.masterEpoch - s.epoch) : 0;
+  return { entries, epochs, head };
+}
+
+function topology() {
+  const up = {};
+  nodes.forEach(n => { if (n.slave && n.slave.upstream_id) up[n.id] = n.slave.upstream_id; });
+  const roots = nodes.filter(n => !up[n.id]);
+  const down = (id) => nodes.filter(n => up[n.id] === id).map(n => n.id);
+  const walk = (id) => { const d = down(id); return id + (d.length ? ' → ' + (d.length > 1 ? '{' + d.map(walk).join(', ') + '}' : walk(d[0])) : ''); };
+  return roots.map(r => walk(r.id).replace(r.id, `${r.id} (${r.kind})`)).join('  |  ');
+}
+
+function render() {
+  const c = cluster();
+  $('topology').textContent = topology();
+  const banner = $('banner');
+  if (c.masters.length > 1) {
+    banner.style.display = 'block';
+    banner.textContent = `Split brain: ${c.masters.map(m => m.id).join(' and ')} are both masters`;
+  } else if (c.masters.length === 0) {
+    banner.style.display = 'block';
+    banner.textContent = 'No master: writes are refused everywhere. Promote a slave or unfence the old master.';
+  } else banner.style.display = 'none';
+
+  for (const sel of [$('w-node'), $('s-node')]) {
+    const keep = sel.value;
+    sel.innerHTML = nodes.map(n => `<option value="${n.id}">${n.id} (${n.kind})</option>`).join('');
+    sel.value = keep || (sel === $('w-node') && c.masters[0] ? c.masters[0].id : nodes[0]?.id);
+  }
+
+  const root = $('nodes');
+  // Keep focus and open selects stable: only rebuild a card when its content changed.
+  nodes.forEach(n => {
+    let card = $('card-' + n.id);
+    if (!card) { card = document.createElement('div'); card.id = 'card-' + n.id; root.appendChild(card); }
+    const html = cardHtml(n, c);
+    if (card.dataset.html !== html && !card.contains(document.activeElement)) {
+      card.dataset.html = html;
+      card.className = 'card' + (n.kind === 'master' ? ' master' : '');
+      card.innerHTML = html;
+    } else if (card.dataset.html !== html) {
+      card.dataset.stale = '1';  // re-render once focus leaves
+    }
+  });
+}
+document.addEventListener('focusout', () => setTimeout(render, 0));
+
+function cardHtml(n, c) {
+  const [cls, why] = light(n, c);
+  const s = n.slave;
+  const b = behindOf(n, c);
+  let rows = '';
+  const row = (k, v) => { rows += `<dt>${k}</dt><dd>${v}</dd>`; };
+  row('address', esc(n.addr));
+  if (n.kind === 'master') {
+    row('epoch', esc(c.masters.length ? (n.detail.match(/epoch (\d+)/) || [])[1] : ''));
+    row('last seq', esc(n.last_seq));
+  } else if (s) {
+    row('state', esc(s.state));
+    row('upstream', esc(s.upstream_id ? `${s.upstream_id} (${s.upstream})` : s.upstream));
+    row('chain', esc((s.upstream_chain || []).join(' → ') || '—'));
+    row('epoch', esc(s.epoch ?? '—') + (b.epochs ? ` <span class="err">(${b.epochs} behind master)</span>` : ''));
+    row('applied', `${esc(s.applied_seq)} / ${esc(b.head ?? '?')}`);
+    row('behind', b.entries ? `${b.entries} entries` : 'nothing');
+    row('lag', s.lag_ms == null ? '—' : `${s.lag_ms} ms`);
+    row('last contact', s.last_contact_ago_ms == null ? 'never' : `${(s.last_contact_ago_ms / 1000).toFixed(1)} s ago`);
+    if (s.last_verify) row('last verify', esc(s.last_verify));
+  } else {
+    row('detail', esc(n.detail || '—'));
+  }
+  const pct = s && b.head ? Math.min(100, Math.round(100 * s.applied_seq / Math.max(1, b.head))) : (n.kind === 'master' ? 100 : 0);
+  const halted = s && s.state.startsWith('Halted');
+  // A halt is the state itself; an older retry error is shown as such, not as the cause.
+  const err = !s ? '' : halted
+    ? `<div class="err">${esc(s.state)}: replication stopped; see the transitions below</div>`
+      + (s.last_error ? `<div class="muted">before the halt: ${esc(s.last_error_kind)}: ${esc(s.last_error)}</div>` : '')
+    : s.last_error ? `<div class="err">${esc(s.last_error_kind)}: ${esc(s.last_error)}</div>` : '';
+  const reps = (n.replicas || []).map(r =>
+    `<span class="badge" title="acked seq ${r.applied_seq}, lag ${r.lag_ms ?? '?'} ms">${esc(r.node_id)} ${r.in_sync ? '✓ in sync' : `✗ ${r.lag_entries} behind`}</span>`).join(' ');
+  if (n.kind === 'master' || n.kind === 'slave') row('downstream', reps || '<span class="muted">none</span>');
+  const detailErr = (n.kind === 'fenced' || n.kind === 'failed') ? `<div class="err">${esc(n.detail)}</div>` : '';
+  return `
+    <div class="card-head">
+      <span class="light ${cls}" title="${esc(why)}"></span>
+      <span class="id">${n.id}</span>
+      <span class="badge ${n.kind}">${n.kind}</span>
+      <span class="muted" style="margin-left:auto;text-align:right">${esc(why.length > 48 ? why.slice(0, 47) + '…' : why)}</span>
+    </div>
+    <div class="bar" title="replication progress"><div style="width:${pct}%"></div></div>
+    <dl class="kv">${rows}</dl>
+    ${err}${detailErr}
+    <div class="actions">${actionsHtml(n)}</div>`;
+}
+
+// The transitions this node offers in its current state.
+function actionsHtml(n) {
+  const u = ui[n.id] || (ui[n.id] = { target: '', loss: false, brain: false });
+  const others = nodes.filter(o => o.id !== n.id);
+  if (!u.target || !others.some(o => o.id === u.target)) {
+    u.target = (others.find(o => o.kind === 'master') || others[0] || {}).id || '';
+  }
+  const btn = (action, label, cls = '') => `<button class="${cls}" onclick="act('${n.id}','${action}')">${label}</button>`;
+  const target = `<select onchange="ui['${n.id}'].target=this.value" aria-label="Target node">${others.map(o => `<option value="${o.id}" ${o.id === u.target ? 'selected' : ''}>${o.id} (${o.kind})</option>`).join('')}</select>`;
+  const loss = `<label class="check"><input type="checkbox" ${u.loss ? 'checked' : ''} onchange="ui['${n.id}'].loss=this.checked"> accept data loss</label>`;
+  const brain = `<label class="check"><input type="checkbox" ${u.brain ? 'checked' : ''} onchange="ui['${n.id}'].brain=this.checked"> accept split-brain risk</label>`;
+  const halted = n.slave && n.slave.state.startsWith('Halted');
+  switch (n.kind) {
+    case 'master': return `
+      <div class="row">${btn('demote', 'Demote (undo unused promotion)')}${btn('stop', 'Stop (simulate crash)', 'danger')}</div>
+      <div class="row">${target}${btn('rejoin', 'Rejoin as slave of')}${loss}</div>`;
+    case 'slave': return `
+      <div class="row">${btn('promote_checked', 'Promote (checked)', 'primary')}${btn('promote', 'Promote unchecked', 'danger')}</div>
+      <div class="row">${target}${btn('repoint', 'Repoint to')}${loss}</div>
+      <div class="row">${btn('verify', 'Verify (full)')}${halted ? btn('clear_halt', 'Clear halt (retry)') + btn('diverged', 'Show divergent entries') + btn('rebootstrap', 'Rebootstrap', 'danger') : ''}${btn('stop', 'Stop', 'danger')}</div>`;
+    case 'fenced': return `
+      <div class="row">${btn('unfence', 'Unfence (peer check)', 'primary')}${brain}</div>
+      <div class="row">${target}${btn('rejoin', 'Rejoin as slave of')}${loss}</div>
+      <div class="row">${btn('stop', 'Stop', 'danger')}</div>`;
+    case 'stopped': case 'failed': return `<div class="row">${btn('start', 'Start (reopen)', 'primary')}</div>`;
+    default: return '<div class="muted">no transition while switching</div>';
+  }
+}
+
+function showResult(r) {
+  const el = $('result');
+  el.className = r.ok ? '' : 'bad';
+  el.textContent = (r.ok ? '✓ ' : '✗ ') + r.message;
+}
+
+async function post(url, body) {
+  const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const r = await res.json();
+  showResult(r);
+  return r;
+}
+
+function act(node, action) {
+  const u = ui[node];
+  $('result').textContent = `${action} on ${node}…`;
+  post('/api/action', { node, action, target: u.target, accept_loss: u.loss, accept_split_brain: u.brain });
+}
+
+function write_(op) {
+  post('/api/write', {
+    node: $('w-node').value, op, key: $('w-key').value, value: $('w-value').value,
+    count: Number($('w-count').value) || 1, min_insync: Number($('w-insync').value) || 0,
+  });
+}
+
+async function readKey() {
+  const key = $('r-key').value;
+  if (!key) return;
+  const r = await (await fetch('/api/key?key=' + encodeURIComponent(key))).json();
+  $('r-table').querySelector('tbody').innerHTML = r.values.map(v => `<tr><th>${v.node}</th><td>${
+    v.error ? `<span class="err">${esc(v.error)}</span>` : v.absent ? '<span class="muted">(absent)</span>' : esc(v.value) + ` <span class="muted">@ seq ${v.write_seq}</span>`
+  }</td></tr>`).join('');
+}
+
+async function scan() {
+  const r = await (await fetch('/api/scan?node=' + $('s-node').value)).json();
+  if (!r.ok) return showResult(r);
+  $('s-table').querySelector('tbody').innerHTML = r.rows.length
+    ? r.rows.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join('')
+    : '<tr><td class="muted">(empty)</td></tr>';
+}
+
+$('r-key').addEventListener('keydown', e => { if (e.key === 'Enter') readKey(); });
+connect();
+setTimeout(readKey, 500);
+</script>
+</body>
+</html>
