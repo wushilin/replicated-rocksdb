@@ -114,6 +114,9 @@ impl Store {
             ColumnFamilyDescriptor::new(CF_CHANGELOG, tuning.cf_options(CfKind::Changelog)?),
             ColumnFamilyDescriptor::new(CF_TTL_INDEX, tuning.cf_options(CfKind::TtlIndex)?),
         ];
+        if let Some(opts) = tuning.default_cf_options() {
+            descriptors.push(ColumnFamilyDescriptor::new("default", opts));
+        }
         let known: HashMap<String, CfEntry> = prior
             .iter()
             .flat_map(|m| {

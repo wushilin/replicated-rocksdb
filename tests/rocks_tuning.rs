@@ -2,7 +2,7 @@
 
 mod support;
 
-use replicated_rocksdb::{CfSpec, Error, Node, NodeState};
+use replicated_rocksdb::{CfSpec, Error, Node, NodeState, RocksTuning};
 use std::net::SocketAddr;
 use support::{Cluster, WAIT, node_cfg, reserved_port};
 
@@ -87,4 +87,30 @@ async fn properties_through_node() {
         b.property(None, "rocksdb.estimate-num-keys"),
         Err(Error::NodeFailed(_))
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn block_cache_is_shared_by_every_cf() {
+    let c = Cluster::new();
+    let mut cfg = c.master_config("a");
+    cfg.rocksdb = RocksTuning::new().with_block_cache(8 << 20);
+    let m = replicated_rocksdb::Master::open(cfg).await.unwrap();
+    m.create_cf(CfSpec::new("x")).unwrap();
+    m.create_cf(CfSpec::new("y")).unwrap();
+    for cf in ["x", "y"] {
+        m.put(cf, b"k", b"v").unwrap();
+        assert_eq!(m.get(cf, b"k").unwrap(), Some(b"v".to_vec()));
+    }
+    assert_eq!(
+        m.property_int(None, "rocksdb.block-cache-capacity")
+            .unwrap(),
+        Some(8 << 20)
+    );
+    for cf in ["x", "y"] {
+        assert_eq!(
+            m.property_int(Some(cf), "rocksdb.block-cache-capacity")
+                .unwrap(),
+            Some(8 << 20)
+        );
+    }
 }

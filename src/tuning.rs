@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use rocksdb::{BlockBasedOptions, DBCompactionStyle, DBCompressionType, Options};
+use rocksdb::{BlockBasedOptions, Cache, DBCompactionStyle, DBCompressionType, Options};
 
 use crate::error::{Error, Result};
 use crate::types::CfSpec;
@@ -218,6 +218,9 @@ type OptionsFn = dyn Fn(CfKind<'_>, &mut Tunable<'_>) + Send + Sync;
 pub struct RocksTuning {
     pub comparators: ComparatorRegistry,
     options: Option<Arc<OptionsFn>>,
+    /// One LRU cache for every CF of the node; clones share it.
+    block_cache: Option<Cache>,
+    rate_limit: Option<i64>,
 }
 
 impl fmt::Debug for RocksTuning {
@@ -225,6 +228,8 @@ impl fmt::Debug for RocksTuning {
         f.debug_struct("RocksTuning")
             .field("comparators", &self.comparators)
             .field("options", &self.options.is_some())
+            .field("block_cache", &self.block_cache.is_some())
+            .field("rate_limit", &self.rate_limit)
             .finish()
     }
 }
@@ -242,6 +247,43 @@ impl RocksTuning {
         self
     }
 
+    /// One LRU block cache of `bytes` capacity, shared by every column family of the node
+    /// (internal ones included). The cache is created here, so clones of this value and every
+    /// store opened with it share the same cache. Without it, each CF uses RocksDB's default.
+    pub fn with_block_cache(mut self, bytes: usize) -> Self {
+        self.block_cache = Some(Cache::new_lru_cache(bytes));
+        self
+    }
+
+    /// Limits flush and compaction writes DB-wide to `bytes_per_sec`. A value of zero or
+    /// less means no limit.
+    pub fn with_rate_limit(mut self, bytes_per_sec: i64) -> Self {
+        self.rate_limit = (bytes_per_sec > 0).then_some(bytes_per_sec);
+        self
+    }
+
+    /// Runs the options callback for `kind`, then installs the block-based table if a table
+    /// setter ran or a shared cache is configured. Otherwise the default table stays.
+    fn apply_callback(&self, kind: CfKind<'_>, opts: &mut Options) {
+        let mut table = None;
+        if let Some(cb) = &self.options {
+            let mut t = Tunable {
+                opts: &mut *opts,
+                table: None,
+            };
+            cb(kind, &mut t);
+            table = t.table;
+        }
+        if let Some(cache) = &self.block_cache {
+            table
+                .get_or_insert_with(BlockBasedOptions::default)
+                .set_block_cache(cache);
+        }
+        if let Some(t) = &table {
+            opts.set_block_based_table_factory(t);
+        }
+    }
+
     pub(crate) fn db_options(&self) -> Options {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -255,7 +297,22 @@ impl RocksTuning {
                 },
             );
         }
+        if let Some(rate) = self.rate_limit {
+            opts.set_ratelimiter(rate, 100_000, 10);
+        }
         opts
+    }
+
+    /// Options for RocksDB's `default` CF, which this crate never uses. `Some` only when a
+    /// shared block cache is configured, so the unused CF does not keep a private default
+    /// cache beside it; otherwise RocksDB's own defaults stay untouched.
+    pub(crate) fn default_cf_options(&self) -> Option<Options> {
+        let cache = self.block_cache.as_ref()?;
+        let mut opts = Options::default();
+        let mut table = BlockBasedOptions::default();
+        table.set_block_cache(cache);
+        opts.set_block_based_table_factory(&table);
+        Some(opts)
     }
 
     pub(crate) fn cf_options(&self, kind: CfKind<'_>) -> Result<Options> {
@@ -269,18 +326,7 @@ impl RocksTuning {
                 opts.set_comparator(name.as_str(), Box::new(move |a: &[u8], b: &[u8]| f(a, b)));
             }
         }
-        let mut table = None;
-        if let Some(cb) = &self.options {
-            let mut t = Tunable {
-                opts: &mut opts,
-                table: None,
-            };
-            cb(kind, &mut t);
-            table = t.table;
-        }
-        if let Some(t) = &table {
-            opts.set_block_based_table_factory(t);
-        }
+        self.apply_callback(kind, &mut opts);
         Ok(opts)
     }
 }
@@ -303,6 +349,57 @@ mod tests {
         t.set_bytes_per_sync(1 << 20);
         t.set_wal_bytes_per_sync(1 << 20);
         t.set_max_total_wal_size(256 << 20);
+    }
+
+    #[test]
+    fn block_cache_is_shared_by_clones_and_default_is_untouched() {
+        use crate::read::ReadApi;
+        use crate::store::test_support::{apply, open_store_with};
+        use crate::types::Op;
+        let t = RocksTuning::new()
+            .with_block_cache(8 << 20)
+            .with_rate_limit(64 << 20);
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store_with(dir.path(), t.clone());
+        for name in ["x", "y"] {
+            apply(
+                &store,
+                vec![Op::CreateCf {
+                    spec: CfSpec::new(name),
+                }],
+            )
+            .unwrap();
+            apply(
+                &store,
+                vec![Op::Put {
+                    cf: name.into(),
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                    expire_at_ms: None,
+                }],
+            )
+            .unwrap();
+        }
+        let snap = store.read_snapshot(0).unwrap();
+        for name in ["x", "y"] {
+            assert_eq!(snap.get(name, b"k").unwrap().unwrap(), b"v");
+            for cf in [None, Some(name)] {
+                assert_eq!(
+                    store
+                        .property(cf, "rocksdb.block-cache-capacity", true)
+                        .unwrap()
+                        .map(|p| match p {
+                            crate::store::Prop::Int(n) => n,
+                            crate::store::Prop::Text(_) => 0,
+                        }),
+                    Some(8 << 20)
+                );
+            }
+        }
+        // Without the setters, nothing is installed.
+        assert!(RocksTuning::new().block_cache.is_none());
+        assert!(RocksTuning::new().rate_limit.is_none());
+        assert!(format!("{t:?}").contains("block_cache: true"));
     }
 
     #[test]
