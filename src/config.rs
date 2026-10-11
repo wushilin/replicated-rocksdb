@@ -385,6 +385,18 @@ mod serve_tests {
     }
 
     #[test]
+    fn wrapped_token_auth_on_plaintext_is_refused() {
+        let inner: Arc<dyn crate::auth::Authenticator> =
+            Arc::new(crate::auth::TokenAuthenticator::new(["s3cret"]));
+        let auth = Arc::new(crate::auth::AllowMethods::new(
+            inner,
+            &[crate::auth::Method::Status],
+        ));
+        let cfg = ServeConfig::new("10.0.0.1".parse().unwrap(), 0, auth);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn limits_are_validated() {
         let mut cfg = ServeConfig::new(
             std::net::IpAddr::from([127, 0, 0, 1]),

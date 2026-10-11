@@ -556,8 +556,9 @@ pub struct PeerInfo {
 pub trait Authenticator: Send + Sync + 'static {
     async fn authenticate(&self, peer: &PeerInfo, method: Method, token: Option<&[u8]>)
         -> Result<(), AuthError>;     // AuthError::{Unauthenticated, PermissionDenied}
-    /// True for token-based authenticators: refused on plaintext unless allow_plaintext_token.
-    fn uses_tokens(&self) -> bool { false }
+    /// Required (no default). True for token-based authenticators: refused on plaintext unless
+    /// allow_plaintext_token. Wrappers must delegate to the inner authenticator.
+    fn uses_tokens(&self) -> bool;
 }
 pub trait CredentialsProvider: Send + Sync + 'static {
     fn token(&self) -> Option<Vec<u8>>;

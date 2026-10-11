@@ -425,6 +425,10 @@ impl Authenticator for VerifyAllowedFor {
         }
         Ok(())
     }
+
+    fn uses_tokens(&self) -> bool {
+        false
+    }
 }
 
 /// Final fix wave, I1 / A-M6: a queued verify repair that the upstream refuses for good
