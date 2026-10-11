@@ -216,10 +216,16 @@ async fn status_and_wait_for_seq() {
     assert!(s.last_contact.is_some());
     assert_eq!(s.last_error, None);
     assert!(!s.listener_failed);
-    assert!(matches!(
-        b.wait_for_seq(3, Duration::from_millis(100)).await,
-        Err(Error::Timeout)
-    ));
+    // An idle master: the wait gives up, and says the slave is healthy but has nothing to do.
+    match b.wait_for_seq(3, Duration::from_millis(100)).await {
+        Err(Error::WaitTimeout(p)) => {
+            assert_eq!(p.target_seq, Some(3));
+            assert!(!p.progressed);
+            assert_eq!(p.status.state, SlaveState::Streaming);
+            assert_eq!((p.status.applied_seq, p.status.last_error_kind), (2, None));
+        }
+        other => panic!("{other:?}"),
+    }
     // The master sees B's acknowledgements (addendum §1).
     wait_until("b acknowledged 2", || {
         m.replicas().iter().any(|r| r.applied_seq == 2 && r.in_sync)
@@ -258,7 +264,7 @@ async fn a_slave_without_data_is_not_ready_and_reports_the_connection_error() {
     assert!(matches!(b.snapshot(), Err(Error::NotReady)));
     assert!(matches!(
         b.wait_for_seq(1, Duration::from_millis(200)).await,
-        Err(Error::Timeout)
+        Err(Error::WaitTimeout(_))
     ));
     wait_until("a connection error", || b.status().last_error.is_some()).await;
     assert_eq!(b.status().state, SlaveState::Connecting);

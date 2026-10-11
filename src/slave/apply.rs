@@ -7,7 +7,7 @@ use super::config::GapPolicy;
 use super::driver::SessionEnd;
 use super::inner::Inner;
 use super::policy::AutoCause;
-use super::state::HaltReason;
+use super::state::{HaltReason, Problem};
 use crate::error::Error;
 use crate::failpoint;
 use crate::types::{LogEntry, epoch_for};
@@ -33,10 +33,10 @@ pub(crate) const EPOCH_CONTRADICTION: &str =
 /// is not the epoch of `entry.seq` in `history`.
 fn epoch_mismatch(history: &[crate::types::EpochStart], entry: &LogEntry) -> Option<SessionEnd> {
     (epoch_for(history, entry.seq) != Some(entry.epoch)).then(|| {
-        SessionEnd::Retry(format!(
+        SessionEnd::Retry(Problem::upstream(format!(
             "{EPOCH_CONTRADICTION} (entry {} has epoch {})",
             entry.seq, entry.epoch
-        ))
+        )))
     })
 }
 
@@ -126,7 +126,7 @@ pub(crate) async fn apply(
         // same physical name): retriable, never a halt. The next session applies it again.
         Ok(Err(Failure::Commit(e @ Error::CfInUse { .. }))) => {
             tracing::warn!(node = %inner.cfg.identifier, seq, error = %e, "column family still in use by a snapshot; will retry");
-            return Applied::End(SessionEnd::Retry(e.to_string()));
+            return Applied::End(SessionEnd::Retry(Problem::local(e.to_string())));
         }
         // A storage I/O failure (disk full, a device error) says nothing about the data: back
         // off and retry, reported in `last_error`. Nothing was committed (`last_seq` did not
@@ -134,9 +134,9 @@ pub(crate) async fn apply(
         // the store refuses to reuse it for an entry with another spec (`Corrupt`, below).
         Ok(Err(Failure::Commit(e))) if e.is_transient_io() => {
             tracing::warn!(node = %inner.cfg.identifier, seq, error = %e, "commit failed with an I/O error; will retry");
-            return Applied::End(SessionEnd::Retry(format!(
+            return Applied::End(SessionEnd::Retry(Problem::local(format!(
                 "could not commit entry {seq}: {e}"
-            )));
+            ))));
         }
         // Integrity failures (corruption, a commit that contradicts local state) halt.
         Ok(Err(Failure::Commit(e))) => {
@@ -191,7 +191,9 @@ mod tests {
         assert!(epoch_mismatch(&history, &entry(11, 2)).is_none());
         for (seq, epoch) in [(11, 1), (10, 2), (12, 3)] {
             match epoch_mismatch(&history, &entry(seq, epoch)) {
-                Some(SessionEnd::Retry(m)) => assert!(m.starts_with(EPOCH_CONTRADICTION), "{m}"),
+                Some(SessionEnd::Retry(m)) => {
+                    assert!(m.message.starts_with(EPOCH_CONTRADICTION), "{m}")
+                }
                 other => panic!("entry {seq}@{epoch}: expected Retry, got {other:?}"),
             }
         }

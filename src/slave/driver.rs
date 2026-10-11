@@ -23,7 +23,7 @@ use super::inner::Inner;
 use super::policy::{self, Action, AutoCause, Force};
 use super::repair::{self, RepairError};
 use super::repoint::{self, RepointDivergence, RepointOutcome};
-use super::state::{HaltReason, NodeState, SlaveState};
+use super::state::{HaltReason, NodeState, Problem, SlaveState, UpstreamErrorKind};
 use crate::background::blocking;
 use crate::codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 use crate::failpoint;
@@ -40,7 +40,7 @@ use crate::store::meta::key;
 #[derive(Debug)]
 pub(crate) enum SessionEnd {
     /// Back off, then handshake again.
-    Retry(String),
+    Retry(Problem),
     /// Handshake again after a short pause.
     Again,
     Halt(HaltReason),
@@ -93,9 +93,9 @@ fn repair_failed(inner: &Inner, e: RepairError) -> RepairEnd {
             tracing::warn!(node = %inner.cfg.identifier, reason = %why, "repair not possible; bootstrapping instead");
             RepairEnd::Fallback
         }
-        RepairError::Retry(why) => {
-            RepairEnd::End(SessionEnd::Retry(format!("repair failed: {why}")))
-        }
+        RepairError::Retry(why) => RepairEnd::End(SessionEnd::Retry(Problem::upstream(format!(
+            "repair failed: {why}"
+        )))),
         RepairError::Refused(why) => RepairEnd::Refused(format!("repair refused: {why}")),
     }
 }
@@ -156,7 +156,10 @@ pub(crate) fn status_end(inner: &Inner, generation: u64, s: &Status) -> SessionE
             None => {}
         }
     }
-    let action = policy::after_status(s, &inner.policies());
+    let action = match policy::after_status(s, &inner.policies()) {
+        Action::Retry(p) if !inner.upstream_answered() => Action::Retry(p.unanswered(s)),
+        action => action,
+    };
     if action == Action::Repair {
         // Under the configured `DivergencePolicy::Repair` too: a RESUME on the next handshake
         // contradicts this stream and is retried with backoff (`contradicting_resume`).
@@ -244,7 +247,11 @@ async fn run(
             SessionEnd::Again => AGAIN_PAUSE,
             SessionEnd::Retry(msg) => {
                 tracing::warn!(node = %inner.cfg.identifier, upstream = %inner.upstream_uri(), error = %msg, "replication retry");
-                inner.set_last_error(Some(msg));
+                // A session a repoint replaced must not report its upstream's problem over
+                // the new one (the repoint cleared `last_error`; its session reports anew).
+                if *repoints.borrow() == generation {
+                    inner.set_last_error(Some(msg));
+                }
                 inner.set_state(SlaveState::Connecting);
                 backoff.next_delay()
             }
@@ -313,7 +320,9 @@ async fn session(
         Some((_, c)) => c.clone(),
         None => match client::connect(inner) {
             Ok(c) => client.insert((generation, c)).1.clone(),
-            Err(e) => return SessionEnd::Retry(e.to_string()),
+            Err(e) => {
+                return SessionEnd::Retry(Problem::new(UpstreamErrorKind::Config, e.to_string()));
+            }
         },
     };
     let req = handshake_request(inner);
@@ -435,7 +444,9 @@ async fn session(
             } else if let Some(u) = hs_uuid {
                 Some(u)
             } else {
-                return SessionEnd::Retry("bootstrap: the handshake carried no identity".into());
+                return SessionEnd::Retry(Problem::upstream(
+                    "bootstrap: the handshake carried no identity",
+                ));
             };
             // Test hook: the handshake decided to bootstrap; the Bootstrap RPC has not started.
             failpoint::pause("slave-before-bootstrap-rpc").await;
@@ -519,17 +530,22 @@ async fn queued_repair(
 }
 
 /// A queued repair cannot run now: it stays queued, and the next probe waits for a backoff.
-fn postpone_repair(inner: &Inner, msg: String) {
+fn postpone_repair(inner: &Inner, why: Problem) {
     let delay = inner.defer_repair();
-    tracing::warn!(node = %inner.cfg.identifier, upstream = %inner.upstream_uri(), error = %msg, retry_in = ?delay, "verify repair postponed; replication goes on");
-    inner.set_last_error(Some(format!("verify repair postponed: {msg}")));
+    tracing::warn!(node = %inner.cfg.identifier, upstream = %inner.upstream_uri(), error = %why, retry_in = ?delay, "verify repair postponed; replication goes on");
+    inner.set_last_error(Some(Problem::new(
+        why.kind,
+        format!("verify repair postponed: {why}"),
+    )));
 }
 
 /// A queued repair can never run against this upstream as things stand: dropped. The operator
 /// fixes the cause and verifies again.
 fn drop_repair(inner: &Inner, why: String) {
     tracing::error!(node = %inner.cfg.identifier, upstream = %inner.upstream_uri(), error = %why, "verify repair dropped: it cannot run against this upstream; fix the cause and verify again");
-    inner.set_last_error(Some(format!("verify repair dropped: {why}")));
+    inner.set_last_error(Some(Problem::upstream(format!(
+        "verify repair dropped: {why}"
+    ))));
     inner.clear_pending_repair();
 }
 
@@ -581,7 +597,9 @@ async fn fallback_bootstrap(
     // Test hook: the repair fell back; the bootstrap has not started.
     failpoint::pause("slave-repair-before-fallback").await;
     let Some(expected) = hs_uuid else {
-        return SessionEnd::Retry("repair fallback: the handshake carried no identity".into());
+        return SessionEnd::Retry(Problem::upstream(
+            "repair fallback: the handshake carried no identity",
+        ));
     };
     bootstrap_then_tail(inner, generation, c, hs, Some(expected), backoff).await
 }
@@ -601,9 +619,9 @@ async fn run_repair(
         Ok(Ok(Ok(p))) => p,
         Ok(Ok(Err(e))) => return Err(repair_failed(inner, e)),
         Ok(Err(_)) => {
-            return Err(RepairEnd::End(SessionEnd::Retry(format!(
-                "repair: no answer within {:?}",
-                repair::REPAIR_TIMEOUT
+            return Err(RepairEnd::End(SessionEnd::Retry(Problem::new(
+                UpstreamErrorKind::Unreachable,
+                format!("repair: no answer within {:?}", repair::REPAIR_TIMEOUT),
             ))));
         }
     };
@@ -644,7 +662,7 @@ const CONTRADICTION: &str = "upstream reported DIVERGED on the stream but not in
 /// `resumes` is about the handshake answer itself (RESUME, not forced by the operator), not the
 /// action: a pending verify rebootstrap must not turn the contradiction into a bootstrap.
 fn contradicting_resume(after_stream_diverged: bool, resumes: bool) -> Option<SessionEnd> {
-    (after_stream_diverged && resumes).then(|| SessionEnd::Retry(CONTRADICTION.to_string()))
+    (after_stream_diverged && resumes).then(|| SessionEnd::Retry(Problem::upstream(CONTRADICTION)))
 }
 
 /// Which pending request, if any, applies to this handshake: the operator's consent first,
@@ -684,7 +702,7 @@ async fn adopt_epoch(inner: &Arc<Inner>, hs: &pb::HandshakeResponse) -> Result<(
     let (i, h) = (inner.clone(), history.clone());
     blocking(move || i.store.adopt_identity(&id, &h))
         .await
-        .map_err(|e| SessionEnd::Retry(e.to_string()))?;
+        .map_err(|e| SessionEnd::Retry(Problem::local(e.to_string())))?;
     tracing::info!(node = %inner.cfg.identifier, epoch = id.epoch, "adopted new epoch from upstream");
     inner.set_ident(Some((id, history)));
     inner.reset_downstream();
@@ -777,7 +795,7 @@ async fn tail(
                         inner.repair_probed(generation);
                         return SessionEnd::Again;
                     }
-                    Err(RepairError::Retry(msg)) => postpone_repair(inner, msg),
+                    Err(RepairError::Retry(msg)) => postpone_repair(inner, Problem::upstream(msg)),
                     Err(RepairError::Refused(why)) => drop_repair(inner, why),
                 }
                 continue;
@@ -788,9 +806,16 @@ async fn tail(
             Err(end) => return end,
         };
         let msg = match next {
-            Err(_) => return SessionEnd::Retry(format!("no message from upstream for {idle:?}")),
+            Err(_) => {
+                return SessionEnd::Retry(Problem::new(
+                    UpstreamErrorKind::Unreachable,
+                    format!("no message from upstream for {idle:?}"),
+                ));
+            }
             Ok(Err(s)) => return status_end(inner, generation, &s),
-            Ok(Ok(None)) => return SessionEnd::Retry("upstream ended the tail stream".into()),
+            Ok(Ok(None)) => {
+                return SessionEnd::Retry(Problem::upstream("upstream ended the tail stream"));
+            }
             Ok(Ok(Some(m))) => m,
         };
         inner.note_contact();
@@ -809,7 +834,7 @@ async fn tail(
             }
             Some(Kind::Batch(batch)) => {
                 if batch.entries.is_empty() {
-                    return SessionEnd::Retry("empty entry batch from upstream".into());
+                    return SessionEnd::Retry(Problem::upstream("empty entry batch from upstream"));
                 }
                 // Received entries prove the origin is at least this far, and the oldest
                 // unapplied one gives the lag.
@@ -835,7 +860,7 @@ async fn tail(
                 }
                 acks.send_replace(inner.store.position().last_seq);
             }
-            None => return SessionEnd::Retry("tail message without content".into()),
+            None => return SessionEnd::Retry(Problem::upstream("tail message without content")),
         }
     }
 }
@@ -867,7 +892,7 @@ mod tests {
     #[test]
     fn resume_after_a_stream_diverged_is_retried_with_backoff() {
         assert!(
-            matches!(contradicting_resume(true, true), Some(SessionEnd::Retry(m)) if m == CONTRADICTION)
+            matches!(contradicting_resume(true, true), Some(SessionEnd::Retry(m)) if m.message == CONTRADICTION)
         );
         assert!(contradicting_resume(false, true).is_none());
         assert!(contradicting_resume(true, false).is_none());

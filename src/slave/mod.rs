@@ -42,7 +42,7 @@ pub use config::{
 pub use promote::{PromoteRefused, PromotionCheck};
 pub use rejoin::RejoinOptions;
 pub use repoint::{AcceptDataLoss, RepointDivergence, RepointOptions, RepointOutcome};
-pub use state::{HaltAction, HaltReason, SlaveState, SlaveStatus};
+pub use state::{HaltAction, HaltReason, SlaveState, SlaveStatus, UpstreamErrorKind, WaitProgress};
 
 /// A read-only replica. It has no write methods: writing to a slave is a compile error.
 ///
@@ -159,8 +159,14 @@ impl Slave {
     }
 
     /// Waits until the slave is `Streaming` (connected and tailing its upstream).
-    /// `Err(Halted(reason))` if it halts first, `Err(Timeout)` after `timeout`.
+    ///
+    /// - `Ok(())` once it streams (at that moment; it may reconnect later).
+    /// - `Err(Halted(reason))` at once if it is or becomes halted.
+    /// - `Err(WaitTimeout(progress))` after `timeout`: not a failure by itself. The slave goes
+    ///   on retrying; [`WaitProgress`] tells a long bootstrap (`progressed`) from a slave stuck
+    ///   on a wrong address or a down upstream (`status.last_error_kind`).
     pub async fn wait_streaming(&self, timeout: Duration) -> Result<()> {
+        let start = WaitProgress::marker(&self.status());
         let mut states = self.inner.state_tx.subscribe();
         let wait = async {
             loop {
@@ -174,14 +180,20 @@ impl Slave {
                 }
             }
         };
-        tokio::time::timeout(timeout, wait)
-            .await
-            .map_err(|_| Error::Timeout)?
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(r) => r,
+            Err(_) => Err(self.wait_timeout(None, start)),
+        }
     }
 
-    /// Waits until `applied_seq() >= seq`. `Err(Halted(reason))` if the slave halts first,
-    /// `Err(Timeout)` after `timeout`.
+    /// Waits until `applied_seq() >= seq` (read-your-writes: pass the seq a master write
+    /// returned). Once `Ok`, the entry is committed and the listener has seen it.
+    ///
+    /// - `Ok(())` when the seq is reached, even if the slave halted after reaching it.
+    /// - `Err(Halted(reason))` at once if it halts before reaching it.
+    /// - `Err(WaitTimeout(progress))` after `timeout`: see [`wait_streaming`](Self::wait_streaming).
     pub async fn wait_for_seq(&self, seq: Seq, timeout: Duration) -> Result<()> {
+        let start = WaitProgress::marker(&self.status());
         let mut seqs = self.inner.seq_tx.subscribe();
         let mut states = self.inner.state_tx.subscribe();
         let wait = async {
@@ -198,9 +210,19 @@ impl Slave {
                 }
             }
         };
-        tokio::time::timeout(timeout, wait)
-            .await
-            .map_err(|_| Error::Timeout)?
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(r) => r,
+            Err(_) => Err(self.wait_timeout(Some(seq), start)),
+        }
+    }
+
+    fn wait_timeout(&self, target_seq: Option<Seq>, start: (Seq, u64)) -> Error {
+        let status = self.status();
+        Error::WaitTimeout(Box::new(WaitProgress {
+            target_seq,
+            progressed: WaitProgress::marker(&status) != start,
+            status,
+        }))
     }
 
     /// Compares this slave's data with its upstream's now (DESIGN.md §12) and returns the

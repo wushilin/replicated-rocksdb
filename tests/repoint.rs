@@ -5,7 +5,7 @@ mod support;
 use replicated_rocksdb::admin;
 use replicated_rocksdb::{
     AcceptDataLoss, CfSpec, Error, HaltAction, HaltReason, Master, ReadApi, RepointDivergence,
-    RepointOptions, RepointOutcome, Slave, SlaveState, UpstreamConfig,
+    RepointOptions, RepointOutcome, Slave, SlaveState, UpstreamConfig, UpstreamErrorKind,
 };
 use support::{Cluster, assert_converged, wait_state, wait_until};
 
@@ -238,7 +238,8 @@ async fn repoint_to_a_stale_master_keeps_retrying() {
         .await
         .unwrap()
     {
-        RepointOutcome::Retrying { last_error } => {
+        RepointOutcome::Retrying { last_error, kind } => {
+            assert_eq!(kind, UpstreamErrorKind::Upstream);
             assert!(last_error.contains("STALE_EPOCH"), "{last_error}")
         }
         o => panic!("expected Retrying, got {o:?}"),

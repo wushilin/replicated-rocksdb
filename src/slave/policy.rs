@@ -4,7 +4,7 @@
 use tonic::{Code, Status};
 
 use super::config::{DivergencePolicy, GapPolicy, IdentityPolicy};
-use super::state::HaltReason;
+use super::state::{HaltReason, Problem};
 use crate::net::reason_of;
 use crate::pb;
 use crate::pb::{Decision, Reason};
@@ -27,8 +27,8 @@ pub(crate) enum Action {
     /// from it if that cannot be proven safe.
     Repair,
     Halt(HaltReason),
-    /// Back off, then handshake again; the message goes to `SlaveStatus::last_error`.
-    Retry(String),
+    /// Back off, then handshake again; the problem goes to `SlaveStatus::last_error`.
+    Retry(Problem),
     /// Handshake again at once.
     Again,
 }
@@ -97,11 +97,11 @@ pub(crate) fn after_handshake(r: &pb::HandshakeResponse, p: &Policies, force: Fo
         return Action::Bootstrap;
     }
     let unexpected = || {
-        Action::Retry(format!(
+        Action::Retry(Problem::upstream(format!(
             "unexpected handshake answer {}/{}",
             decision.as_str_name(),
             reason.as_str_name()
-        ))
+        )))
     };
     match decision {
         // Any reason on RESUME is informational, except an advanced epoch.
@@ -135,9 +135,11 @@ pub(crate) fn after_handshake(r: &pb::HandshakeResponse, p: &Policies, force: Fo
         },
         Decision::Reject => match reason {
             Reason::Diverged => diverged(p),
-            Reason::StaleEpoch | Reason::NotReady => {
-                Action::Retry(format!("{}: {}", reason.as_str_name(), r.detail))
-            }
+            Reason::StaleEpoch | Reason::NotReady => Action::Retry(Problem::upstream(format!(
+                "{}: {}",
+                reason.as_str_name(),
+                r.detail
+            ))),
             Reason::ProtocolMismatch => Action::Halt(HaltReason::ProtocolMismatch),
             Reason::EnvelopeMismatch => Action::Halt(HaltReason::EnvelopeMismatch),
             Reason::LoopDetected => Action::Halt(HaltReason::LoopDetected),
@@ -179,7 +181,7 @@ pub(crate) fn after_status(s: &Status, p: &Policies) -> Action {
             | Reason::EpochAdvanced
             | Reason::StaleEpoch,
         )
-        | None => Action::Retry(format!("{:?}: {}", s.code(), s.message())),
+        | None => Action::Retry(Problem::from_status(s)),
     }
 }
 
@@ -286,11 +288,11 @@ mod tests {
         );
         assert_eq!(
             act(Decision::Reject, Reason::StaleEpoch, &DEFAULTS),
-            Action::Retry("STALE_EPOCH: why".into())
+            Action::Retry(Problem::upstream("STALE_EPOCH: why"))
         );
         assert_eq!(
             act(Decision::Reject, Reason::NotReady, &DEFAULTS),
-            Action::Retry("NOT_READY: why".into())
+            Action::Retry(Problem::upstream("NOT_READY: why"))
         );
         assert_eq!(
             act(Decision::Reject, Reason::ProtocolMismatch, &DEFAULTS),

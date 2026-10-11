@@ -50,6 +50,11 @@ pub enum Error {
     /// An operation did not finish within its deadline.
     #[error("timed out")]
     Timeout,
+    /// `Slave::wait_streaming` or `Slave::wait_for_seq` gave up after its timeout. The slave
+    /// keeps replicating; [`WaitProgress`](crate::WaitProgress) says whether it was still
+    /// moving or stuck, and on what.
+    #[error("{0}")]
+    WaitTimeout(Box<crate::slave::WaitProgress>),
     /// A bootstrap or a replicated `CreateCf` needs a physical column family that a reader's
     /// snapshot still references with a different spec. Nothing was written. Retriable: the
     /// slave driver retries with backoff and shows it in `SlaveStatus::last_error`.
