@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use rocksdb::{DBCompressionType, Options};
+use rocksdb::{BlockBasedOptions, DBCompactionStyle, DBCompressionType, Options};
 
 use crate::error::{Error, Result};
 use crate::types::CfSpec;
@@ -72,19 +72,114 @@ pub enum Compression {
     Zstd,
 }
 
-/// The tuning knobs this crate allows. There is deliberately no way to set a merge
-/// operator, compaction filter or TTL:
+/// RocksDB compaction style. Performance only; the log and the data are the same either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionStyle {
+    /// Leveled compaction (the RocksDB default).
+    Level,
+    /// Universal (size-tiered) compaction.
+    Universal,
+}
+
+/// The tuning knobs this crate allows. They affect performance only, never semantics.
+/// There is deliberately no way to set a merge operator, compaction filter, native TTL or
+/// prefix extractor:
+///
+/// - Merge operators are relative ops, which the log forbids.
+/// - Compaction filters and native TTL would drop data on one node without a logged
+///   `Delete`, so replicas would diverge silently. TTL is master-driven here.
+/// - A prefix extractor lets RocksDB iterators skip keys outside the seek prefix unless
+///   `total_order_seek` is on. Bootstrap, verify and `prefix_iter` assume total-order scans
+///   and would silently skip keys.
 ///
 /// ```compile_fail
 /// fn f(t: &mut replicated_rocksdb::tuning::Tunable<'_>) {
 ///     t.set_merge_operator_associative("m", |_, _, _| None);
 /// }
 /// ```
+///
+/// ```compile_fail
+/// fn f(t: &mut replicated_rocksdb::tuning::Tunable<'_>) {
+///     t.set_compaction_filter("f", |_, _, _| rocksdb::compaction_filter::Decision::Keep);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn f(t: &mut replicated_rocksdb::tuning::Tunable<'_>) {
+///     t.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(3));
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn f(t: &mut replicated_rocksdb::tuning::Tunable<'_>) {
+///     t.set_ttl(60);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn f(t: &mut replicated_rocksdb::tuning::Tunable<'_>) {
+///     t.set_periodic_compaction_seconds(60);
+/// }
+/// ```
 pub struct Tunable<'a> {
     opts: &'a mut Options,
+    /// Created on the first table setter, so untouched CFs keep RocksDB's default table.
+    table: Option<BlockBasedOptions>,
 }
 
 impl Tunable<'_> {
+    fn table(&mut self) -> &mut BlockBasedOptions {
+        self.table.get_or_insert_with(BlockBasedOptions::default)
+    }
+
+    /// Block-based table: data block size in bytes.
+    pub fn set_block_size(&mut self, bytes: usize) {
+        self.table().set_block_size(bytes);
+    }
+    /// Block-based table: bloom filter with `bits_per_key` bits per key.
+    pub fn set_bloom_filter(&mut self, bits_per_key: f64) {
+        self.table().set_bloom_filter(bits_per_key, false);
+    }
+    /// Block-based table: keep index and filter blocks in the block cache.
+    pub fn set_cache_index_and_filter_blocks(&mut self, v: bool) {
+        self.table().set_cache_index_and_filter_blocks(v);
+    }
+    /// Compaction style.
+    pub fn set_compaction_style(&mut self, style: CompactionStyle) {
+        self.opts.set_compaction_style(match style {
+            CompactionStyle::Level => DBCompactionStyle::Level,
+            CompactionStyle::Universal => DBCompactionStyle::Universal,
+        });
+    }
+    /// Number of L0 files that triggers a compaction.
+    pub fn set_level_zero_file_num_compaction_trigger(&mut self, n: i32) {
+        self.opts.set_level_zero_file_num_compaction_trigger(n);
+    }
+    /// Target size of the base level, in bytes.
+    pub fn set_max_bytes_for_level_base(&mut self, bytes: u64) {
+        self.opts.set_max_bytes_for_level_base(bytes);
+    }
+    /// Size levels dynamically from the last level.
+    pub fn set_level_compaction_dynamic_level_bytes(&mut self, v: bool) {
+        self.opts.set_level_compaction_dynamic_level_bytes(v);
+    }
+    /// Compression of the bottommost level.
+    pub fn set_bottommost_compression(&mut self, c: Compression) {
+        self.opts
+            .set_bottommost_compression_type(compression_type(c));
+    }
+    /// Incrementally sync SST files every `bytes` written (0 disables).
+    pub fn set_bytes_per_sync(&mut self, bytes: u64) {
+        self.opts.set_bytes_per_sync(bytes);
+    }
+    /// Incrementally sync WAL files every `bytes` written (0 disables).
+    pub fn set_wal_bytes_per_sync(&mut self, bytes: u64) {
+        self.opts.set_wal_bytes_per_sync(bytes);
+    }
+    /// Total WAL size that forces memtable flushes (0 lets RocksDB choose).
+    pub fn set_max_total_wal_size(&mut self, bytes: u64) {
+        self.opts.set_max_total_wal_size(bytes);
+    }
     pub fn set_write_buffer_size(&mut self, bytes: usize) {
         self.opts.set_write_buffer_size(bytes);
     }
@@ -95,11 +190,7 @@ impl Tunable<'_> {
         self.opts.set_target_file_size_base(bytes);
     }
     pub fn set_compression(&mut self, c: Compression) {
-        self.opts.set_compression_type(match c {
-            Compression::None => DBCompressionType::None,
-            Compression::Lz4 => DBCompressionType::Lz4,
-            Compression::Zstd => DBCompressionType::Zstd,
-        });
+        self.opts.set_compression_type(compression_type(c));
     }
     pub fn set_max_background_jobs(&mut self, n: i32) {
         self.opts.set_max_background_jobs(n);
@@ -109,6 +200,14 @@ impl Tunable<'_> {
     }
     pub fn increase_parallelism(&mut self, threads: i32) {
         self.opts.increase_parallelism(threads);
+    }
+}
+
+fn compression_type(c: Compression) -> DBCompressionType {
+    match c {
+        Compression::None => DBCompressionType::None,
+        Compression::Lz4 => DBCompressionType::Lz4,
+        Compression::Zstd => DBCompressionType::Zstd,
     }
 }
 
@@ -148,7 +247,13 @@ impl RocksTuning {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
         if let Some(cb) = &self.options {
-            cb(CfKind::Db, &mut Tunable { opts: &mut opts });
+            cb(
+                CfKind::Db,
+                &mut Tunable {
+                    opts: &mut opts,
+                    table: None,
+                },
+            );
         }
         opts
     }
@@ -164,8 +269,17 @@ impl RocksTuning {
                 opts.set_comparator(name.as_str(), Box::new(move |a: &[u8], b: &[u8]| f(a, b)));
             }
         }
+        let mut table = None;
         if let Some(cb) = &self.options {
-            cb(kind, &mut Tunable { opts: &mut opts });
+            let mut t = Tunable {
+                opts: &mut opts,
+                table: None,
+            };
+            cb(kind, &mut t);
+            table = t.table;
+        }
+        if let Some(t) = &table {
+            opts.set_block_based_table_factory(t);
         }
         Ok(opts)
     }
@@ -176,6 +290,59 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn every_knob(t: &mut Tunable<'_>, style: CompactionStyle) {
+        t.set_block_size(8 << 10);
+        t.set_bloom_filter(10.0);
+        t.set_cache_index_and_filter_blocks(true);
+        t.set_compaction_style(style);
+        t.set_level_zero_file_num_compaction_trigger(8);
+        t.set_max_bytes_for_level_base(64 << 20);
+        t.set_level_compaction_dynamic_level_bytes(true);
+        t.set_bottommost_compression(Compression::Zstd);
+        t.set_bytes_per_sync(1 << 20);
+        t.set_wal_bytes_per_sync(1 << 20);
+        t.set_max_total_wal_size(256 << 20);
+    }
+
+    #[test]
+    fn every_knob_opens_and_round_trips() {
+        use crate::read::ReadApi;
+        use crate::store::test_support::{apply, open_store_with};
+        use crate::types::Op;
+        for style in [CompactionStyle::Level, CompactionStyle::Universal] {
+            let t = RocksTuning::new().with_options(move |kind, t| {
+                // Universal only on user CFs and the DB level; both kinds see every knob.
+                let style = if matches!(kind, CfKind::User(_) | CfKind::Db) {
+                    style
+                } else {
+                    CompactionStyle::Level
+                };
+                every_knob(t, style);
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let store = open_store_with(dir.path(), t);
+            apply(
+                &store,
+                vec![Op::CreateCf {
+                    spec: CfSpec::new("c"),
+                }],
+            )
+            .unwrap();
+            apply(
+                &store,
+                vec![Op::Put {
+                    cf: "c".into(),
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                    expire_at_ms: None,
+                }],
+            )
+            .unwrap();
+            let snap = store.read_snapshot(0).unwrap();
+            assert_eq!(snap.get("c", b"k").unwrap().unwrap(), b"v");
+        }
+    }
 
     #[test]
     fn compare_uses_registered_comparator_or_bytewise() {
