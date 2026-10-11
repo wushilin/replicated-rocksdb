@@ -158,9 +158,9 @@ impl Inner {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         let (mut id, mut history) = guard.clone();
-        // `max_burned_epoch` needs no check here: a number is burned only by `demote`, which
-        // turns the node into a slave, and a slave becomes a master again only through a
-        // promotion, which does honour it (`Store::promote_to_master`).
+        // `max_burned_epoch` needs no check here: a number is burned only by `demote` or
+        // `Slave::rejoin`, which turn the node into a slave, and a slave becomes a master again
+        // only through a promotion, which does honour it (`Store::promote_to_master`).
         id.epoch = history
             .iter()
             .map(|e| e.epoch)

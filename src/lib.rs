@@ -24,6 +24,27 @@
 //!
 //! Every writer of those keys must take the same lock. Because there is exactly one master
 //! process, an in-process lock is enough.
+//!
+//! # One handle for either role: `Node`
+//!
+//! [`Node`] holds a database directory as master or slave and changes role only through
+//! explicit calls (`promote_checked`, `demote`, `rejoin_as_slave`, ...), so an `Arc<Node>`
+//! shared by the application always points at the current role. A directory whose stored role
+//! is `master` opens **fenced** (no epoch, no port, no reads or writes) until a peer check
+//! proves no other master exists ([`NodeConfig::peers`]) or the caller passes
+//! [`AcceptSplitBrainRisk`]. A former master rejoins as a slave of the new master without a
+//! wipe ([`Slave::rejoin`]); entries only it holds are discarded only with [`AcceptDataLoss`].
+//!
+//! ```no_run
+//! # use replicated_rocksdb::{Node, NodeConfig, NodeState, RejoinOptions, Result};
+//! # async fn f(cfg: NodeConfig) -> Result<()> {
+//! let node = std::sync::Arc::new(Node::open(cfg).await?);
+//! if let NodeState::Fenced { reason } = node.state() {
+//!     eprintln!("not serving: {reason}");
+//!     node.rejoin_as_slave(None, RejoinOptions::default()).await?; // refuses divergence
+//! }
+//! # Ok(()) }
+//! ```
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -40,6 +61,7 @@ pub mod config;
 pub mod error;
 pub mod log;
 mod master;
+mod node;
 pub mod read;
 pub mod tuning;
 pub mod types;
@@ -78,10 +100,11 @@ pub mod listener;
 mod slave;
 
 pub use listener::ReplicationListener;
+pub use node::{AcceptSplitBrainRisk, FenceReason, Node, NodeConfig, NodeState, UnfenceOptions};
 pub use slave::{
     AcceptDataLoss, Backoff, DivergencePolicy, FetchConfig, GapPolicy, HaltAction, HaltReason,
-    IdentityPolicy, PromoteRefused, PromotionCheck, RepointDivergence, RepointOptions,
-    RepointOutcome, Slave, SlaveConfig, SlaveState, SlaveStatus, UpstreamConfig,
+    IdentityPolicy, PromoteRefused, PromotionCheck, RejoinOptions, RepointDivergence,
+    RepointOptions, RepointOutcome, Slave, SlaveConfig, SlaveState, SlaveStatus, UpstreamConfig,
 };
 pub(crate) mod failpoint;
 pub(crate) mod server;

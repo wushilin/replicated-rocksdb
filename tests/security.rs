@@ -272,3 +272,28 @@ async fn an_auth_failure_flood_throttles_but_never_halts_a_good_replica_on_the_s
         listener.states()
     );
 }
+
+/// A rejected TLS handshake (here: the peer's certificate is signed by another CA) means the
+/// peer was reached and is misconfigured, not unreachable: `Status` reports it as an error
+/// answer, so a promotion check refuses as unverifiable and consent to skip unreachable peers
+/// can never skip it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_tls_handshake_is_an_error_answer_not_unreachable() {
+    let c = Cluster::new();
+    let pki = Pki::new();
+    let other = Pki::new();
+    let m = tls_master(&c, &pki, false, Arc::new(replicated_rocksdb::AllowAll)).await;
+    let mut wrong = replicated_rocksdb::UpstreamConfig::from_addr(m.serve_addr().unwrap());
+    wrong.tls = Some(other.client(None));
+    let err = replicated_rocksdb::admin::node_status(&wrong, "probe")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Config(_)), "{err:?}");
+    let s = tls_slave(&c, &m, "b", pki.client(None), None).await;
+    assert_converged(&m, &[("b", &s)]).await;
+    let refused = s.check_promotion(&[wrong]).await.unwrap_err();
+    assert!(
+        matches!(refused, Error::PromotionUnverifiable { .. }),
+        "{refused:?}"
+    );
+}

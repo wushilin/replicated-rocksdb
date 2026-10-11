@@ -316,6 +316,10 @@ pub(crate) async fn install(
         .max_entry_bytes
         .store(plan.max_entry_bytes, Ordering::SeqCst);
     inner.set_ident(Some((plan.identity, plan.history)));
+    // The bootstrap is over and the data ready: the slave is about to tail, as after a resumed
+    // handshake (`Streaming` once the Tail opens). Set before `seq_tx`, so nothing woken by
+    // the new seq (`wait_for_seq`) still sees `Bootstrapping`.
+    inner.set_state(SlaveState::Connecting);
     tracing::info!(node = %inner.cfg.identifier, snapshot_seq = s, records = count, "bootstrap complete");
     inner.notify(|l| l.on_bootstrap_complete(s));
     inner.seq_tx.send_replace(s);

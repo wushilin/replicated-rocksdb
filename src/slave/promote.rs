@@ -87,7 +87,10 @@ impl Slave {
         crate::failpoint::pause("slave-promote-before-shutdown").await;
         let path = cfg.path.clone();
         let tuning = cfg.rocksdb.clone();
-        let slave_cfg = self.inner.cfg.clone();
+        // A refused promotion reopens the slave following the upstream it follows now (a
+        // `repoint` may have replaced the configured one).
+        let mut slave_cfg = self.inner.cfg.clone();
+        slave_cfg.upstream = self.inner.upstream();
         // Snapshots share the database handle; one that outlives the slave keeps the DB open.
         let db = Arc::downgrade(self.inner.store.db());
         self.inner.reset_downstream();
@@ -177,8 +180,11 @@ impl Slave {
     /// `admin::STATUS_TIMEOUT`) and foreign peers are reported too: the operator decides.
     /// A peer that is reachable but answered `Status` with an error (permission denied, another
     /// protocol, ...) blocks as `PromotionUnverifiable` (`seq` 0, the error in `peer`): its state
-    /// is unknown. A peer that reports `role == Master` blocks with `Error::MasterReachable`:
-    /// fence it, or `Master::demote` it if it was promoted by mistake.
+    /// is unknown. So does a peer whose TLS handshake is rejected (its certificate does not
+    /// verify) and a peer entry that cannot be used at all (an invalid address or TLS
+    /// configuration): these are misconfigurations, not unreachable peers. A peer that reports
+    /// `role == Master` blocks with `Error::MasterReachable`: fence it, or `Master::demote` it
+    /// if it was promoted by mistake.
     ///
     /// A later peer that is replaying a repair (`node_state = repairing:<seq>`) still blocks
     /// with `NotMostAdvanced` naming it, although it refuses promotion itself until its replay
@@ -283,9 +289,9 @@ impl Slave {
     /// check runs on the stopped store: a repair that committed its rewind meanwhile (it is
     /// replaying, DESIGN.md §12.1) or a bootstrap that began meanwhile (no data to promote)
     /// refuses with `Error::Config`, the directory unchanged, and the slave is reopened and
-    /// handed back. It is reopened with the configured `cfg.upstream`: an upstream set by
-    /// `repoint` is not kept (repoint it again). If that reopen fails, the handle is lost
-    /// (`slave` is `None`) and the application reopens the directory.
+    /// handed back, following the upstream it followed before (an upstream set by `repoint`
+    /// is kept). If that reopen fails, the handle is lost (`slave` is `None`) and the
+    /// application reopens the directory.
     pub async fn promote_checked(
         self,
         cfg: MasterConfig,
@@ -315,6 +321,23 @@ impl Slave {
                 slave: Some(Box::new(self)),
             }),
         }
+    }
+}
+
+impl Slave {
+    /// [`promote`](Self::promote) that hands the slave back, still running, on every refusal
+    /// before it changes anything (the checks of `promote_refusal`), like
+    /// [`promote_checked`](Self::promote_checked) without the peer check; the final check on
+    /// the stopped store reopens and hands it back too. Used by `Node::promote`, which must
+    /// never shut a refused slave down.
+    pub(crate) async fn promote_keeping(self, cfg: MasterConfig) -> Result<Master, PromoteRefused> {
+        if let Some(msg) = self.promote_refusal(&cfg) {
+            return Err(PromoteRefused {
+                error: Error::Config(msg),
+                slave: Some(Box::new(self)),
+            });
+        }
+        self.promote_now(cfg, 0, true).await
     }
 }
 

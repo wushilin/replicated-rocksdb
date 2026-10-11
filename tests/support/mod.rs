@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use replicated_rocksdb::{
     AllowAll, Backoff, CfSpec, IterMode, LogApi, LogEntry, ManualClock, Master, MasterConfig,
-    ReadApi, ReplicationListener, Seq, ServeConfig, Slave, SlaveConfig, SlaveState, UpstreamConfig,
-    ValueMeta, VerifyReport,
+    NodeConfig, ReadApi, ReplicationListener, Seq, ServeConfig, Slave, SlaveConfig, SlaveState,
+    UpstreamConfig, ValueMeta, VerifyReport,
 };
 
 pub const T0: u64 = 1_700_000_000_000;
@@ -159,6 +159,44 @@ impl Cluster {
         }
         Slave::open(cfg).await.unwrap()
     }
+}
+
+/// A (master) → B (slave), in sync. With `a_ahead`, B stops first and A takes two entries B
+/// never sees. A stops; B reopens and is promoted (plain `promote`: A is down). Returns A's
+/// master config, B as the new master, and the first seq B does not share with A.
+pub async fn failover(c: &Cluster, a_ahead: bool) -> (MasterConfig, Master, Seq) {
+    let a_cfg = c.master_config("a");
+    let a = Master::open(a_cfg.clone()).await.unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let (b_cfg, _) = c.slave_config("b", a.serve_addr().unwrap());
+    let b = Slave::open(b_cfg.clone()).await.unwrap();
+    a.put("c", b"k", b"1").unwrap();
+    assert_converged(&a, &[("b", &b)]).await;
+    b.shutdown().await.unwrap();
+    if a_ahead {
+        a.put("c", b"only on a", b"2").unwrap();
+        a.put("c", b"also only on a", b"3").unwrap();
+    }
+    a.shutdown().await.unwrap();
+    let b = Slave::open(b_cfg).await.unwrap();
+    let fork = b.last_seq() + 1;
+    let b = b.promote(c.master_config("b")).await.unwrap();
+    (a_cfg, b, fork)
+}
+
+/// `NodeConfig` of node `name`: master and slave share path, identifier and serve port, so the
+/// node keeps its address in both roles. `upstream` is the slave role's default upstream.
+pub fn node_cfg(c: &Cluster, name: &str, upstream: SocketAddr, peers: &[SocketAddr]) -> NodeConfig {
+    let master = c.master_config(name);
+    let (mut slave, _) = c.slave_config(name, upstream);
+    slave.serve = master.serve.clone();
+    let mut cfg = NodeConfig::new(master, slave);
+    cfg.peers = peers
+        .iter()
+        .copied()
+        .map(UpstreamConfig::from_addr)
+        .collect();
+    cfg
 }
 
 /// Polls `f` every 20 ms; panics after 30 s.

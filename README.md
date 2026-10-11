@@ -38,6 +38,13 @@ Master(A) ──► Slave(B) ──► Slave(C)
 ## Features
 
 - **Master / slave roles** persisted on disk; opening a directory in the wrong role is refused.
+- **`Node` handle** (`Arc<Node>`): one object that holds either role and switches explicitly
+  (`promote_checked`, `demote`, `rejoin_as_slave`, `unfence`), with an exact `state()` /
+  `watch_state()` API. Callers keep their reference across role changes.
+- **Fenced restart of a former master**: a stored master reopened through `Node` takes no
+  reads or writes until its peers confirm no other master exists and nobody is ahead.
+- **Rejoin**: a former master becomes a replica of the new one without wiping its directory;
+  it resumes if its log is a prefix, and halts `DIVERGED` otherwise.
 - **Chained replication**: any slave can serve other slaves (fan-out trees, cross-region relays),
   with loop detection. Entries are forwarded verbatim; identity always refers to the origin master.
 - **Automatic bootstrap**: a new or far-behind replica pulls a consistent RocksDB snapshot,

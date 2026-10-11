@@ -8,6 +8,7 @@
 //! `slave-after-gap` (a slave saw a gap mid-stream and requested a bootstrap under
 //! `GapPolicy::Rebootstrap`, before the session ends; `pause` or `cfg_callback`),
 //! `slave-before-bootstrap-rpc` (a handshake decided to bootstrap, before the Bootstrap RPC; `pause`),
+//! `slave-before-tail-rpc` (a slave is about to open its Tail stream; `pause`),
 //! `master-bump-epoch-write` (the synced write of `bump_epoch` fails),
 //! `slave-commit-io` (a slave's commit of a received entry fails with an I/O error),
 //! `verify-before-finish` (a slave's verify run, after the comparison, before its report is acted on; `pause`),
@@ -25,6 +26,8 @@
 //! `cfg_callback`),
 //! `slave-promote-before-shutdown` (a promotion passed its checks, the slave still runs;
 //! `pause` or `cfg_callback`),
+//! `rejoin-after-rewrite` (`Slave::rejoin` committed its rewrite batch, before the slave
+//! opens; `return` makes it fail with `Err(Io)`, as a crash there would),
 //! `slave-snapshot-after-check` (`Slave::snapshot` checked readiness, before the snapshot;
 //! `cfg_callback`).
 //!

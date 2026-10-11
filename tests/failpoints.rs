@@ -8,8 +8,9 @@ use std::time::Duration;
 use tokio::sync::{Mutex, MutexGuard};
 
 use replicated_rocksdb::{
-    CfSpec, Error, HaltReason, LogApi, Master, MismatchPolicy, ReadApi, RepointOptions,
-    RepointOutcome, Slave, SlaveState, UpstreamConfig, VerifyAbort, VerifyMode, WriteConcern,
+    CfSpec, Error, HaltReason, LogApi, Master, MismatchPolicy, NodeState, ReadApi, RejoinOptions,
+    RepointOptions, RepointOutcome, Slave, SlaveState, UpstreamConfig, VerifyAbort, VerifyMode,
+    WriteConcern,
 };
 use support::{Cluster, assert_converged, wait_until};
 
@@ -1777,5 +1778,300 @@ async fn an_automatic_bootstrap_is_pinned_to_the_database_the_handshake_answered
         Some(b"x".to_vec())
     );
     drop(z);
+    scenario.teardown();
+}
+
+/// A crash right after the rejoin rewrite batch (before the slave opens) leaves a slave
+/// directory that reopens as a slave and still refuses the divergence (consent is never
+/// persisted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_after_the_rejoin_rewrite_reopens_as_a_halting_slave() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (_, b, _) = support::failover(&c, true).await;
+
+    fail::cfg("rejoin-after-rewrite", "1*return").unwrap();
+    let (cfg, _) = c.slave_config("a", b.serve_addr().unwrap());
+    let err = Slave::rejoin(
+        cfg.clone(),
+        RejoinOptions {
+            on_divergence: replicated_rocksdb::RepointDivergence::Repair {
+                accept_loss: replicated_rocksdb::AcceptDataLoss,
+            },
+        },
+    )
+    .await
+    .err()
+    .expect("the crash");
+    assert!(matches!(err, Error::Io(_)), "{err}");
+    fail::remove("rejoin-after-rewrite");
+    assert_eq!(
+        support::RawDb::open(&c.path("a")).meta(b"role"),
+        Some(b"slave".to_vec())
+    );
+    let a = Slave::open(cfg).await.unwrap();
+    wait_until("a halts Diverged", || {
+        a.status().state == SlaveState::Halted(HaltReason::Diverged)
+    })
+    .await;
+    assert_eq!(a.get("c", b"only on a").unwrap(), Some(b"2".to_vec()));
+    scenario.teardown();
+}
+
+/// `watch_state` shows Slave → Switching → Master, and calls fail fast with `Switching`
+/// while the switch runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_state_sees_the_switch() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let a = Master::open(c.master_config("a")).await.unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let a_addr = a.serve_addr().unwrap();
+    let b = std::sync::Arc::new(
+        replicated_rocksdb::Node::create_slave(support::node_cfg(&c, "b", a_addr, &[]))
+            .await
+            .unwrap(),
+    );
+    wait_until("b streaming", || {
+        matches!(
+            b.state(),
+            NodeState::Slave {
+                state: SlaveState::Streaming,
+                ..
+            }
+        )
+    })
+    .await;
+    a.shutdown().await.unwrap();
+    let mut rx = b.watch_state();
+    let seen = tokio::spawn(async move {
+        // The state at subscription comes first.
+        let mut seen = vec![rx.borrow_and_update().clone()];
+        while rx.changed().await.is_ok() {
+            let s = rx.borrow_and_update().clone();
+            let done = matches!(s, NodeState::Master { .. });
+            seen.push(s);
+            if done {
+                break;
+            }
+        }
+        seen
+    });
+    fail::cfg("slave-promote-before-shutdown", "pause").unwrap();
+    let promoting = tokio::spawn({
+        let b = b.clone();
+        async move { b.promote().await }
+    });
+    wait_until("switching", || b.state() == NodeState::Switching).await;
+    assert!(matches!(b.put("c", b"k", b"v"), Err(Error::Switching)));
+    assert!(matches!(b.get("c", b"k"), Err(Error::Switching)));
+    fail::remove("slave-promote-before-shutdown");
+    promoting.await.unwrap().unwrap();
+    let seen = seen.await.unwrap();
+    let switching = seen
+        .iter()
+        .position(|s| *s == NodeState::Switching)
+        .expect("Switching seen");
+    assert!(switching > 0, "a Slave state comes first: {seen:?}");
+    assert!(
+        seen[..switching]
+            .iter()
+            .all(|s| matches!(s, NodeState::Slave { .. })),
+        "{seen:?}"
+    );
+    assert!(matches!(seen.last(), Some(NodeState::Master { .. })));
+    assert!(
+        seen[switching..seen.len() - 1]
+            .iter()
+            .all(|s| *s == NodeState::Switching),
+        "only Switching between the roles: {seen:?}"
+    );
+    b.put("c", b"k", b"v").unwrap();
+    scenario.teardown();
+}
+
+/// Review focus: a switch future dropped mid-way leaves the node `Failed`, never `Switching`,
+/// and `reopen` restores it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_switch_leaves_the_node_failed_and_reopenable() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let a = Master::open(c.master_config("a")).await.unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    let a_addr = a.serve_addr().unwrap();
+    let b = replicated_rocksdb::Node::create_slave(support::node_cfg(&c, "b", a_addr, &[]))
+        .await
+        .unwrap();
+    wait_until("b streaming", || {
+        matches!(
+            b.state(),
+            NodeState::Slave {
+                state: SlaveState::Streaming,
+                ..
+            }
+        )
+    })
+    .await;
+    fail::cfg("slave-promote-before-shutdown", "pause").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), b.promote())
+            .await
+            .is_err(),
+        "the promotion is held at the pause point"
+    );
+    assert!(
+        matches!(b.state(), NodeState::Failed { .. }),
+        "{:?}",
+        b.state()
+    );
+    assert!(matches!(b.get("c", b"k"), Err(Error::NodeFailed(_))));
+    fail::remove("slave-promote-before-shutdown");
+    // The dropped slave winds down asynchronously; its LOCK is released shortly.
+    let deadline = tokio::time::Instant::now() + support::WAIT;
+    loop {
+        match b.reopen().await {
+            Ok(()) => break,
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                tracing::debug!(error = %e, "reopen not yet possible");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("reopen failed: {e}"),
+        }
+    }
+    wait_until("b streaming again", || {
+        matches!(
+            b.state(),
+            NodeState::Slave {
+                state: SlaveState::Streaming,
+                ..
+            }
+        )
+    })
+    .await;
+    scenario.teardown();
+}
+
+/// A rejoin that fails after the rewrite (a crash before the slave opens) leaves a fenced
+/// node `Failed`, not fenced: the directory is a slave now, and `reopen` opens it as one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejoin_failing_after_the_rewrite_fails_the_node() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (_, b, _) = support::failover(&c, false).await;
+    let b_addr = b.serve_addr().unwrap();
+    let a = replicated_rocksdb::Node::open(support::node_cfg(&c, "a", b_addr, &[b_addr]))
+        .await
+        .unwrap();
+    assert!(
+        matches!(a.state(), NodeState::Fenced { .. }),
+        "{:?}",
+        a.state()
+    );
+    fail::cfg("rejoin-after-rewrite", "1*return").unwrap();
+    let err = a
+        .rejoin_as_slave(None, RejoinOptions::default())
+        .await
+        .unwrap_err();
+    fail::remove("rejoin-after-rewrite");
+    assert!(matches!(err, Error::Io(_)), "{err}");
+    assert!(
+        matches!(a.state(), NodeState::Failed { .. }),
+        "{:?}",
+        a.state()
+    );
+    a.reopen().await.unwrap();
+    wait_until("a streams from b", || {
+        matches!(
+            a.state(),
+            NodeState::Slave {
+                state: SlaveState::Streaming,
+                ..
+            }
+        )
+    })
+    .await;
+    scenario.teardown();
+}
+
+/// Fix round 1 of Task 6: a finished bootstrap leaves `Bootstrapping` when it commits, before
+/// the first Tail answer (here held back), so `wait_for_seq` never returns into a slave that
+/// still reports a bootstrap (and would refuse promotion).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_bootstrap_no_longer_reports_bootstrapping() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let a = Master::open(c.master_config("a")).await.unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    a.put("c", b"k", b"v").unwrap();
+    fail::cfg("slave-before-tail-rpc", "pause").unwrap();
+    let (cfg, ld) = c.slave_config("b", a.serve_addr().unwrap());
+    let b = Slave::open(cfg).await.unwrap();
+    b.wait_for_seq(a.last_seq(), support::WAIT).await.unwrap();
+    assert_eq!(ld.bootstraps(), 1);
+    assert_eq!(b.status().state, SlaveState::Connecting);
+    assert_eq!(b.get("c", b"k").unwrap(), Some(b"v".to_vec()));
+    fail::remove("slave-before-tail-rpc");
+    wait_until("b streaming", || b.status().state == SlaveState::Streaming).await;
+    scenario.teardown();
+}
+
+/// Fix round 1 of Task 6: a promotion refused on the stopped store hands the slave back
+/// following the upstream it was repointed to, not the configured one (here a dead address):
+/// it finishes its replay from that upstream and converges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_promotion_refused_on_the_stopped_store_keeps_the_repointed_upstream() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (a, mut cfg, ld, fork, _) = diverged_slave_and_restored_master(&c).await;
+    for i in 0..3u8 {
+        a.put("c", &[100 + i], b"new").unwrap();
+    }
+    let s = a.last_seq();
+    let a_up = UpstreamConfig::from_addr(a.serve_addr().unwrap());
+    let a_uri = format!("http://{}", a.serve_addr().unwrap());
+    let dead = std::net::SocketAddr::from(([127, 0, 0, 1], support::reserved_port()));
+    cfg.upstream = UpstreamConfig::from_addr(dead);
+    let fetch = Gate::after(0);
+    fetch.install("slave-repair-before-fetch");
+    let _fetch = fetch.open_on_drop();
+    let promoting = Gate::after(0);
+    promoting.install("slave-promote-before-shutdown");
+    let _promoting = promoting.open_on_drop();
+    let d = Slave::open(cfg).await.unwrap();
+    // Polled once: the repoint adopts `a` (repairing with consent), then is dropped.
+    let repair = RepointOptions {
+        on_divergence: replicated_rocksdb::RepointDivergence::Repair {
+            accept_loss: replicated_rocksdb::AcceptDataLoss,
+        },
+    };
+    assert!(
+        tokio::time::timeout(Duration::ZERO, d.repoint(a_up.clone(), repair))
+            .await
+            .is_err()
+    );
+    assert_eq!(d.status().upstream, a_uri);
+    wait_until("the repair's network phase", || fetch.reached()).await;
+    let promotion = tokio::spawn(d.promote_checked(c.master_config("d"), &[]));
+    wait_until("the promotion passed its checks", || promoting.reached()).await;
+    fail::cfg("slave-repair-after-rewind", "1*return").unwrap();
+    fetch.open();
+    fail::remove("slave-repair-before-fetch");
+    wait_until("rewound", || ld.rewinds() == 1).await;
+    promoting.open();
+    fail::remove("slave-promote-before-shutdown");
+    let refused = match promotion.await.unwrap() {
+        Ok(_) => panic!("a mixed state was promoted"),
+        Err(r) => r,
+    };
+    assert!(
+        matches!(refused.error, Error::Config(ref m) if m.contains("repair")),
+        "{:?}",
+        refused.error
+    );
+    fail::remove("slave-repair-after-rewind");
+    let d = refused.into_slave().expect("reopened and handed back");
+    assert_eq!(d.status().upstream, a_uri, "still the repointed upstream");
+    assert!(d.last_seq() >= fork - 1 && d.last_seq() <= s);
+    assert_converged(&a, &[("d", &d)]).await;
     scenario.teardown();
 }

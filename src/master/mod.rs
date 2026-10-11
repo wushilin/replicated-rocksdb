@@ -332,6 +332,11 @@ impl Master {
         self.inner.bump_epoch()
     }
 
+    /// The directory this master runs on.
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.inner.cfg.path
+    }
+
     /// The master as a replication source, for server tests.
     #[cfg(test)]
     pub(crate) fn log_source(&self) -> Arc<dyn crate::source::LogSource> {
@@ -423,6 +428,20 @@ impl Master {
         .await
         .map_err(lost)?;
         crate::slave::Slave::open(cfg).await.map_err(lost)
+    }
+
+    /// [`shutdown`](Self::shutdown), then `Err(Config)` if a `ReadSnapshot` still holds the
+    /// database (a role switch could not reopen the directory). Used by
+    /// `Node::rejoin_as_slave`.
+    pub(crate) async fn shutdown_released(self) -> Result<()> {
+        let db = Arc::downgrade(self.inner.store.db());
+        self.shutdown().await?;
+        if db.strong_count() > 0 {
+            return Err(crate::Error::Config(
+                "a ReadSnapshot of this master is still open and keeps the database open; drop it first".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Ends every replication stream with `SHUTTING_DOWN`, stops background work, and waits

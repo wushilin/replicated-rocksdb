@@ -194,6 +194,22 @@ pub(crate) fn divergence(
 }
 
 impl Slave {
+    /// The checks `repoint` runs before it adopts `upstream`: `Err(Config)` for an address
+    /// (or TLS configuration) it would refuse. Nothing else answers `Config`.
+    pub(crate) fn check_upstream(&self, upstream: &UpstreamConfig) -> Result<()> {
+        if upstream.server.is_empty() || upstream.port == 0 {
+            return Err(Error::Config(
+                "upstream server and port are required".into(),
+            ));
+        }
+        connect_upstream(
+            upstream,
+            &self.inner.cfg.identifier,
+            self.inner.cfg.connect_timeout,
+        )?;
+        Ok(())
+    }
+
     /// Switches this slave to another upstream at runtime, without reopening; reads keep
     /// being served throughout. The new upstream is not persisted: after a restart, open
     /// the slave with it. Likewise a halt is cleared in memory only, and `ready` is persisted
@@ -233,16 +249,7 @@ impl Slave {
         upstream: UpstreamConfig,
         opts: RepointOptions,
     ) -> Result<RepointOutcome> {
-        if upstream.server.is_empty() || upstream.port == 0 {
-            return Err(Error::Config(
-                "upstream server and port are required".into(),
-            ));
-        }
-        connect_upstream(
-            &upstream,
-            &self.inner.cfg.identifier,
-            self.inner.cfg.connect_timeout,
-        )?;
+        self.check_upstream(&upstream)?;
         let (reply, settled) = oneshot::channel();
         {
             let mut pending = self.inner.pending_repoint();

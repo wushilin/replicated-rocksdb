@@ -703,6 +703,8 @@ async fn tail(
     let Some((identity, _)) = inner.ident() else {
         return SessionEnd::Again;
     };
+    // Test hook: about to open the Tail stream (after a handshake or a bootstrap).
+    failpoint::pause("slave-before-tail-rpc").await;
     let pos = inner.store.position();
     let fetch = &inner.cfg.fetch;
     let limit = tail_decode_limit(hs.max_entry_bytes, fetch.max_batch_bytes);

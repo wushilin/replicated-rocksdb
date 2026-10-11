@@ -47,8 +47,8 @@ pub struct NodeInfo {
     /// entry there, `None` if it does not hold that entry. [`compare`] uses the longer node's
     /// probe at the shorter node's `last_seq`; [`gather`] and `Slave::check_promotion` fill it.
     pub probes: BTreeMap<Seq, Option<u32>>,
-    /// The highest epoch number this node started as a master and gave up with
-    /// `Master::demote` (0 if none). Replicas that followed that promotion may hold it, so a
+    /// The highest epoch number this node started as a master and gave up (`Master::demote`,
+    /// or the empty trailing epochs `Slave::rejoin` dropped; 0 if none). Replicas that followed that promotion may hold it, so a
     /// promotion never reuses it (`Slave::promote_checked` chooses a higher epoch).
     pub max_burned_epoch: u64,
 }
@@ -343,7 +343,10 @@ pub async fn node_status(upstream: &UpstreamConfig, client_id: &str) -> Result<N
 ///
 /// `Err(PeerUnreachable { peer, reason, source })` when no answer could be had (connect error, the
 /// [`STATUS_TIMEOUT`], a transport failure); `Err(Config)` with the status text when the peer
-/// answered with an error (permission denied, another protocol, ...) or an undecodable answer.
+/// answered with an error (permission denied, another protocol, ...) or an undecodable answer,
+/// when the call could not be made because of a local configuration error (an invalid
+/// address, a TLS configuration that does not build, an invalid `client_id`), or when the TLS
+/// handshake was rejected (the peer's certificate does not verify, or it does not speak TLS).
 pub async fn node_status_probed(
     upstream: &UpstreamConfig,
     client_id: &str,
@@ -363,12 +366,19 @@ pub async fn node_status_probed(
 
 /// Why a `Status` call failed: the peer could not be reached, or it was reached and answered
 /// with an error (or an undecodable answer), so its state is unknown but it is alive.
+///
+/// Only a failure that says nothing about the peer is `Unreachable`. A local configuration
+/// error (the peer was never contacted) and a rejected TLS handshake are `Answered`, so a
+/// consent to skip unreachable peers can never skip a peer that is misconfigured.
 pub(crate) enum StatusFailure {
-    /// `reason` is one short line; `source` keeps the whole error.
+    /// No answer: connect errors, the timeout, a transport failure. `reason` is one short
+    /// line; `source` keeps the whole error.
     Unreachable {
         reason: String,
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
+    /// An error answer, an undecodable answer, a local configuration error or a rejected TLS
+    /// handshake: the text says which.
     Answered(String),
 }
 
@@ -403,15 +413,19 @@ fn short_reason(e: &(dyn std::error::Error + 'static)) -> String {
 }
 
 /// Unreachable: connect errors, the timeout, and statuses `Unavailable`, `DeadlineExceeded`,
-/// `Cancelled` and `Unknown` with a transport error as its source. Every other status (`PermissionDenied`, `Unimplemented`, `FailedPrecondition`, ...) is `Answered`.
+/// `Cancelled` and `Unknown` with a transport error as its source, unless that error is a
+/// rejected TLS handshake. Every other status (`PermissionDenied`, `Unimplemented`,
+/// `FailedPrecondition`, ...), a TLS rejection and a local configuration error (invalid
+/// address or TLS configuration, see [`StatusFailure`]) are `Answered`.
 pub(crate) async fn status_classified(
     upstream: &UpstreamConfig,
     client_id: &str,
     probe_seq: Option<Seq>,
 ) -> std::result::Result<NodeInfo, StatusFailure> {
     let uri = upstream.uri();
+    // A local configuration error: the peer was never contacted, so it is not unreachable.
     let mut c = crate::slave::connect_upstream(upstream, client_id, STATUS_TIMEOUT)
-        .map_err(StatusFailure::unreachable)?;
+        .map_err(|e| StatusFailure::Answered(format!("Status to {uri} not sent: {e}")))?;
     let call = c.status(pb::StatusRequest {
         client_id: client_id.to_string(),
         probe_seq,
@@ -423,7 +437,12 @@ pub(crate) async fn status_classified(
             source: None,
         })?
         .map_err(|s| {
-            if is_transport_failure(&s) {
+            if is_tls_rejection(&s) {
+                StatusFailure::Answered(format!(
+                    "Status from {uri}: TLS handshake rejected: {}",
+                    short_reason(&s)
+                ))
+            } else if is_transport_failure(&s) {
                 StatusFailure::unreachable(s)
             } else {
                 StatusFailure::Answered(format!("Status from {uri}: {}: {}", s.code(), s.message()))
@@ -431,6 +450,25 @@ pub(crate) async fn status_classified(
         })?;
     NodeInfo::from_pb(r.into_inner(), probe_seq)
         .map_err(|e| StatusFailure::Answered(format!("Status from {uri}: {e}")))
+}
+
+/// A TLS handshake the client rejected: rustls reports it as an `io::Error` of kind
+/// `InvalidData` (a certificate that does not verify, a peer that does not speak TLS). A
+/// server rejecting the client's certificate after a TLS 1.3 handshake shows up only as a
+/// broken connection, which cannot be told apart from a network failure, so it stays
+/// unreachable.
+fn is_tls_rejection(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::InvalidData)
+        {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
 }
 
 fn is_transport_failure(s: &tonic::Status) -> bool {
@@ -499,6 +537,55 @@ mod tests {
         assert!(is_transport_failure(&tonic::Status::unavailable(
             "connection refused"
         )));
+    }
+
+    fn is_answered(r: &std::result::Result<NodeInfo, StatusFailure>) -> bool {
+        matches!(r, Err(StatusFailure::Answered(_)))
+    }
+
+    /// A peer that was never contacted because of a local configuration error is not
+    /// unreachable: consent to skip unreachable peers must not skip it.
+    #[tokio::test]
+    async fn local_configuration_errors_are_answered_not_unreachable() {
+        let bad_address = UpstreamConfig::new("not a host", 1);
+        assert!(is_answered(
+            &status_classified(&bad_address, "me", None).await
+        ));
+        let mut bad_tls = UpstreamConfig::new("127.0.0.1", 1);
+        bad_tls.tls = Some(crate::config::TlsClientConfig {
+            ca_pem: b"not a certificate".to_vec(),
+            domain_name: None,
+            identity: Some(crate::config::TlsIdentity {
+                cert_pem: b"not a certificate".to_vec(),
+                key_pem: b"not a key".to_vec(),
+            }),
+        });
+        assert!(is_answered(&status_classified(&bad_tls, "me", None).await));
+        // Control: a refused connection (nothing listens on port 1) is unreachable.
+        let refused = UpstreamConfig::new("127.0.0.1", 1);
+        assert!(matches!(
+            status_classified(&refused, "me", None).await,
+            Err(StatusFailure::Unreachable { .. })
+        ));
+    }
+
+    /// A rejected TLS handshake (rustls: `io::Error` of kind `InvalidData`) is an answer, not
+    /// a transport failure; a broken connection stays unreachable.
+    #[test]
+    fn a_tls_rejection_is_not_unreachable() {
+        let mut rejected = tonic::Status::unavailable("invalid peer certificate: BadSignature");
+        rejected.set_source(std::sync::Arc::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid peer certificate: BadSignature",
+        )));
+        assert!(is_tls_rejection(&rejected));
+        let mut broken = tonic::Status::unknown("transport error");
+        broken.set_source(std::sync::Arc::new(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        )));
+        assert!(!is_tls_rejection(&broken));
+        assert!(is_transport_failure(&broken));
     }
 
     fn node(id: &str, uuid: u128, history: &[(u64, Seq)], last: Seq, crc: Option<u32>) -> NodeInfo {
