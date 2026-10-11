@@ -26,20 +26,130 @@ pub(crate) struct Prepared {
     cf_change: Option<CfChange>,
 }
 
+impl Prepared {
+    /// The position the store has once this entry is committed.
+    pub(crate) fn position(&self) -> Position {
+        Position {
+            last_seq: self.seq,
+            last_entry_crc: Some(self.crc),
+        }
+    }
+}
+
+/// Consecutive entries without CF ops, prepared into one `WriteBatch` (slave group commit,
+/// DESIGN.md §6). Every entry is whole in it: its ops, `__changelog[seq]` and the position keys
+/// (later entries overwrite `__meta.last_seq` / `last_entry_crc` inside the batch, so the batch
+/// ends on the last entry's). Building one has no side effects.
+pub(crate) struct PreparedGroup {
+    batch: WriteBatch,
+    /// The position the group starts after.
+    base: Position,
+    /// The position once the group is committed.
+    last: Position,
+    len: usize,
+}
+
+impl PreparedGroup {
+    /// An empty group that starts right after `base`.
+    pub(crate) fn after(base: Position) -> Self {
+        PreparedGroup {
+            batch: WriteBatch::default(),
+            base,
+            last: base,
+            len: 0,
+        }
+    }
+
+    /// Number of entries in the group.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The position the store has once the group is committed.
+    pub(crate) fn position(&self) -> Position {
+        self.last
+    }
+}
+
+/// True when `ops` change the CF registry (such entries never share a batch).
+pub(crate) fn is_cf_entry(ops: &[Op]) -> bool {
+    ops.iter()
+        .any(|op| matches!(op, Op::CreateCf { .. } | Op::DropCf { .. }))
+}
+
 impl Store {
+    /// Prepares `entry` as the next entry after the stored position.
     pub(crate) fn prepare(&self, entry: &LogEntry, ops: &[Op]) -> Result<Prepared> {
-        let last = self.position().last_seq;
-        if entry.seq != last + 1 {
+        self.prepare_after(self.position(), entry, ops)
+    }
+
+    /// Prepares `entry` on top of `prev` (the previous entry of the same group) instead of the
+    /// stored position. Everything else it reads is the CF registry and the comparators, which
+    /// only a CF entry changes, and CF entries are never grouped.
+    pub(crate) fn prepare_after(
+        &self,
+        prev: Position,
+        entry: &LogEntry,
+        ops: &[Op],
+    ) -> Result<Prepared> {
+        let mut batch = WriteBatch::default();
+        let cf_change = self.prepare_into(prev.last_seq, &mut batch, entry, ops)?;
+        Ok(Prepared {
+            batch,
+            seq: entry.seq,
+            crc: entry.crc32c,
+            cf_change,
+        })
+    }
+
+    /// Adds `entry` to `group` as its next entry. On error the group is unchanged (nothing of
+    /// `entry` is in it), so the entries before it can still be committed. A CF entry is
+    /// refused (`Corrupt`): it commits alone, holding the registry lock.
+    pub(crate) fn prepare_in_group(
+        &self,
+        group: &mut PreparedGroup,
+        entry: &LogEntry,
+        ops: &[Op],
+    ) -> Result<()> {
+        if is_cf_entry(ops) {
             return Err(Error::corrupt(format!(
-                "entry {} does not follow last_seq {last}",
+                "entry {} changes a column family and cannot join a group",
+                entry.seq
+            )));
+        }
+        let cf_change = self.prepare_into(group.last.last_seq, &mut group.batch, entry, ops)?;
+        debug_assert!(cf_change.is_none());
+        group.last = Position {
+            last_seq: entry.seq,
+            last_entry_crc: Some(entry.crc32c),
+        };
+        group.len += 1;
+        Ok(())
+    }
+
+    /// Validates `entry` as the entry after `prev_seq`, then writes it into `batch`: its ops,
+    /// `__changelog[seq]`, `__meta.last_seq` and `last_entry_crc`. All checks run before the
+    /// first write, so an error leaves `batch` untouched.
+    fn prepare_into(
+        &self,
+        prev_seq: Seq,
+        batch: &mut WriteBatch,
+        entry: &LogEntry,
+        ops: &[Op],
+    ) -> Result<Option<CfChange>> {
+        if entry.seq != prev_seq + 1 {
+            return Err(Error::corrupt(format!(
+                "entry {} does not follow last_seq {prev_seq}",
                 entry.seq
             )));
         }
         check_structure(ops)?;
 
         let meta_cf = self.cf(CF_META);
-        let mut batch = WriteBatch::default();
-        let mut cf_change = None;
         let live = self.cfs.read();
         let lookup = |name: &str| {
             live.get(name)
@@ -47,24 +157,15 @@ impl Store {
                 .ok_or_else(|| Error::NoSuchCf(name.to_string()))
         };
 
+        // Validate every op and resolve its column family; nothing is written yet.
+        let mut handles = Vec::with_capacity(ops.len());
+        let mut cf_change = None;
+        let mut specs = None;
         for op in ops {
             match op {
-                Op::Put {
-                    cf,
-                    key,
-                    value,
-                    expire_at_ms,
-                } => {
+                Op::Put { cf, .. } | Op::Delete { cf, .. } => {
                     let phys = lookup(cf)?;
-                    batch.put_cf(
-                        &self.handle(&phys)?,
-                        key,
-                        envelope::encode(entry.seq, *expire_at_ms, value),
-                    );
-                }
-                Op::Delete { cf, key } => {
-                    let phys = lookup(cf)?;
-                    batch.delete_cf(&self.handle(&phys)?, key);
+                    handles.push(Some(self.handle(&phys)?));
                 }
                 Op::DeleteRange { cf, start, end } => {
                     let phys = lookup(cf)?;
@@ -76,7 +177,7 @@ impl Store {
                     if cmp != Ordering::Less {
                         return Err(Error::InvalidRange);
                     }
-                    batch.delete_range_cf(&self.handle(&phys)?, start, end);
+                    handles.push(Some(self.handle(&phys)?));
                 }
                 Op::CreateCf { spec } => {
                     if live.contains_key(&spec.name) {
@@ -91,26 +192,55 @@ impl Store {
                         spec: spec.clone(),
                         create_seq: entry.seq,
                     };
-                    let mut specs: Vec<CfEntry> = live.values().map(|p| p.entry.clone()).collect();
-                    specs.push(new.clone());
-                    specs.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
-                    batch.put_cf(&meta_cf, key::CF_SPECS, meta::encode_cf_list(&specs));
-                    batch.delete_cf(&meta_cf, key::CF_CREATE_INTENT);
+                    let mut list: Vec<CfEntry> = live.values().map(|p| p.entry.clone()).collect();
+                    list.push(new.clone());
+                    list.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
+                    specs = Some(list);
                     cf_change = Some(CfChange::Create(new));
+                    handles.push(None);
                 }
                 Op::DropCf { name } => {
                     let phys = lookup(name)?;
-                    let specs: Vec<CfEntry> = live
+                    let list: Vec<CfEntry> = live
                         .values()
                         .filter(|p| p.entry.spec.name != *name)
                         .map(|p| p.entry.clone())
                         .collect();
-                    batch.put_cf(&meta_cf, key::CF_SPECS, meta::encode_cf_list(&specs));
+                    specs = Some(list);
                     cf_change = Some(CfChange::Drop(phys));
+                    handles.push(None);
                 }
             }
         }
         drop(live);
+
+        for (op, handle) in ops.iter().zip(&handles) {
+            match (op, handle) {
+                (
+                    Op::Put {
+                        key,
+                        value,
+                        expire_at_ms,
+                        ..
+                    },
+                    Some(h),
+                ) => batch.put_cf(h, key, envelope::encode(entry.seq, *expire_at_ms, value)),
+                (Op::Delete { key, .. }, Some(h)) => batch.delete_cf(h, key),
+                (Op::DeleteRange { start, end, .. }, Some(h)) => {
+                    batch.delete_range_cf(h, start, end)
+                }
+                (Op::CreateCf { .. }, None) => {
+                    let list = specs.as_deref().unwrap_or_default();
+                    batch.put_cf(&meta_cf, key::CF_SPECS, meta::encode_cf_list(list));
+                    batch.delete_cf(&meta_cf, key::CF_CREATE_INTENT);
+                }
+                (Op::DropCf { .. }, None) => {
+                    let list = specs.as_deref().unwrap_or_default();
+                    batch.put_cf(&meta_cf, key::CF_SPECS, meta::encode_cf_list(list));
+                }
+                _ => unreachable!("every data op was resolved to a handle above"),
+            }
+        }
 
         batch.put_cf(
             &self.cf(CF_CHANGELOG),
@@ -119,12 +249,29 @@ impl Store {
         );
         batch.put_cf(&meta_cf, key::LAST_SEQ, entry.seq.to_be_bytes());
         batch.put_cf(&meta_cf, key::LAST_ENTRY_CRC, entry.crc32c.to_be_bytes());
-        Ok(Prepared {
-            batch,
-            seq: entry.seq,
-            crc: entry.crc32c,
-            cf_change,
-        })
+        Ok(cf_change)
+    }
+
+    /// Commits a group of consecutive non-CF entries in one `WriteBatch` (one fsync with
+    /// `sync`). All or nothing: on error nothing of the group is committed and the position
+    /// does not move. An empty group does nothing.
+    pub(crate) fn commit_group(&self, group: PreparedGroup, sync: bool) -> Result<()> {
+        if group.is_empty() {
+            return Ok(());
+        }
+        let last = self.position();
+        if group.base.last_seq != last.last_seq {
+            return Err(Error::corrupt(format!(
+                "commit of a group after {} does not follow last_seq {}",
+                group.base.last_seq, last.last_seq
+            )));
+        }
+        let mut wo = WriteOptions::default();
+        wo.set_sync(sync);
+        let pos = group.position();
+        self.db().write_opt(group.batch, &wo)?;
+        self.set_position(pos);
+        Ok(())
     }
 
     /// Writes a prepared entry. CF changes hold the registry write lock across the write,
@@ -137,6 +284,7 @@ impl Store {
                 p.seq
             )));
         }
+        let pos = p.position();
         let mut wo = WriteOptions::default();
         wo.set_sync(sync);
         let mut p = p;
@@ -247,10 +395,7 @@ impl Store {
             }
             None => self.db().write_opt(p.batch, &wo)?,
         }
-        self.set_position(Position {
-            last_seq: p.seq,
-            last_entry_crc: Some(p.crc),
-        });
+        self.set_position(pos);
         Ok(())
     }
 }
@@ -655,6 +800,132 @@ mod tests {
         store.commit(a, false).unwrap();
         assert!(matches!(store.commit(b, false), Err(Error::Corrupt(_))));
         assert_eq!(store.position().last_seq, 1);
+    }
+
+    fn entry(seq: u64, ops: &[Op]) -> LogEntry {
+        LogEntry::new(seq, 1, 1_000 * seq, crate::codec::encode_ops(ops))
+    }
+
+    /// Group commit (DESIGN.md §6): three entries in one batch end on the third's position,
+    /// with every changelog row and every value.
+    #[test]
+    fn a_group_commits_several_entries_in_one_batch() {
+        use crate::store::apply::PreparedGroup;
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        apply(&store, vec![create("c")]).unwrap();
+        let mut group = PreparedGroup::after(store.position());
+        let entries: Vec<LogEntry> = (2..=4u64)
+            .map(|seq| entry(seq, &[put("c", &[seq as u8], b"v")]))
+            .collect();
+        for e in &entries {
+            let ops = e.decode_ops().unwrap();
+            store.prepare_in_group(&mut group, e, &ops).unwrap();
+        }
+        assert_eq!(group.len(), 3);
+        assert_eq!(store.position().last_seq, 1, "nothing written before the commit");
+        store.commit_group(group, true).unwrap();
+
+        let last = entries.last().unwrap();
+        assert_eq!(store.position().last_seq, 4);
+        assert_eq!(store.position().last_entry_crc, Some(last.crc32c));
+        let meta = store.load_meta().unwrap().unwrap();
+        assert_eq!(meta.last_seq, 4);
+        assert_eq!(meta.last_entry_crc, Some(last.crc32c));
+        for e in &entries {
+            let row = store
+                .db()
+                .get_cf(&store.cf(CF_CHANGELOG), e.seq.to_be_bytes())
+                .unwrap()
+                .unwrap();
+            assert_eq!(LogEntry::decode(&row).unwrap(), *e);
+            let env = raw(&store, "c", &[e.seq as u8]).unwrap();
+            let decoded = envelope::decode(&env).unwrap();
+            assert_eq!(decoded.meta.write_seq, e.seq);
+            assert_eq!(decoded.value, b"v");
+        }
+    }
+
+    /// CF entries commit alone; an entry that fails to prepare leaves the group as it was, so
+    /// the entries before it still commit.
+    #[test]
+    fn a_group_refuses_cf_entries_and_keeps_earlier_entries_on_error() {
+        use crate::store::apply::PreparedGroup;
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        apply(&store, vec![create("c")]).unwrap();
+        let mut group = PreparedGroup::after(store.position());
+        let e2 = entry(2, &[put("c", b"a", b"1")]);
+        store
+            .prepare_in_group(&mut group, &e2, &e2.decode_ops().unwrap())
+            .unwrap();
+        let cf = entry(3, &[create("d")]);
+        assert!(matches!(
+            store.prepare_in_group(&mut group, &cf, &cf.decode_ops().unwrap()),
+            Err(Error::Corrupt(_))
+        ));
+        let bad = entry(3, &[put("c", b"b", b"2"), put("missing", b"x", b"y")]);
+        assert!(matches!(
+            store.prepare_in_group(&mut group, &bad, &bad.decode_ops().unwrap()),
+            Err(Error::NoSuchCf(_))
+        ));
+        assert_eq!(group.len(), 1);
+        assert_eq!(group.position().last_seq, 2);
+        store.commit_group(group, false).unwrap();
+        assert_eq!(store.position().last_seq, 2);
+        assert!(raw(&store, "c", b"a").is_some());
+        assert!(raw(&store, "c", b"b").is_none(), "nothing of the failed entry");
+        assert!(
+            store
+                .db()
+                .get_cf(&store.cf(CF_CHANGELOG), 3u64.to_be_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn prepare_after_needs_the_next_seq() {
+        use crate::store::Position;
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        apply(&store, vec![create("c")]).unwrap();
+        let prev = Position {
+            last_seq: 7,
+            last_entry_crc: None,
+        };
+        let e = entry(9, &[put("c", b"k", b"v")]);
+        assert!(matches!(
+            store.prepare_after(prev, &e, &e.decode_ops().unwrap()),
+            Err(Error::Corrupt(_))
+        ));
+        let e = entry(8, &[put("c", b"k", b"v")]);
+        let p = store
+            .prepare_after(prev, &e, &e.decode_ops().unwrap())
+            .unwrap();
+        assert_eq!(p.position().last_seq, 8);
+        assert_eq!(p.position().last_entry_crc, Some(e.crc32c));
+    }
+
+    /// A group prepared on a position that moved since is refused whole.
+    #[test]
+    fn commit_group_rechecks_the_position() {
+        use crate::store::apply::PreparedGroup;
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        apply(&store, vec![create("c")]).unwrap();
+        let mut group = PreparedGroup::after(store.position());
+        let e = entry(2, &[put("c", b"a", b"1")]);
+        store
+            .prepare_in_group(&mut group, &e, &e.decode_ops().unwrap())
+            .unwrap();
+        apply(&store, vec![put("c", b"z", b"1")]).unwrap();
+        assert!(matches!(
+            store.commit_group(group, false),
+            Err(Error::Corrupt(_))
+        ));
+        assert_eq!(store.position().last_seq, 2);
+        assert!(raw(&store, "c", b"a").is_none());
     }
 
     /// A failed create left `u:a:1` and its intent; the next create at the same seq is for
