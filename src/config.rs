@@ -290,6 +290,30 @@ impl Default for ServeLimits {
     }
 }
 
+/// gRPC message compression this side sends (PROTOCOL.md §3.4). Every node always accepts
+/// zstd, so the settings of two peers never need to match.
+///
+/// gRPC does not negotiate request compression: a client that sends zstd to a server that
+/// does not accept it fails. Upgrade every node to a build that accepts zstd before
+/// configuring any node to send it. Leaving the setting at `None` is always safe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WireCompression {
+    /// Send uncompressed messages (the default).
+    #[default]
+    None,
+    /// Compress sent messages with zstd.
+    Zstd,
+}
+
+impl WireCompression {
+    pub(crate) fn encoding(self) -> Option<tonic::codec::CompressionEncoding> {
+        match self {
+            WireCompression::None => None,
+            WireCompression::Zstd => Some(tonic::codec::CompressionEncoding::Zstd),
+        }
+    }
+}
+
 /// Where and how a node serves replication to downstream replicas.
 #[derive(Clone)]
 pub struct ServeConfig {
@@ -301,6 +325,9 @@ pub struct ServeConfig {
     /// Allows token authentication without TLS. Loopback and tests only.
     pub allow_plaintext_token: bool,
     pub limits: ServeLimits,
+    /// What the server compresses its responses with. Default `None`; see [`WireCompression`]
+    /// for the upgrade-order rule.
+    pub compression: WireCompression,
 }
 
 impl ServeConfig {
@@ -316,6 +343,7 @@ impl ServeConfig {
             authenticator,
             allow_plaintext_token: false,
             limits: ServeLimits::default(),
+            compression: WireCompression::None,
         }
     }
 
@@ -371,6 +399,15 @@ impl ServeConfig {
 mod serve_tests {
     use super::*;
     use crate::auth::{AllowAll, TokenAuthenticator};
+
+    #[test]
+    fn wire_compression_defaults_to_none() {
+        let localhost = std::net::IpAddr::from([127, 0, 0, 1]);
+        let cfg = ServeConfig::new(localhost, 0, Arc::new(AllowAll));
+        assert_eq!(cfg.compression, WireCompression::None);
+        let up = crate::slave::UpstreamConfig::new("h", 1);
+        assert_eq!(up.compression, WireCompression::None);
+    }
 
     #[test]
     fn token_auth_on_plaintext_is_refused_unless_allowed() {

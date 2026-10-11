@@ -17,7 +17,7 @@ blake3 = "1.8"
 crc32c = "0.6.8"
 thiserror = "2.0"
 tracing = "0.1.44"
-tonic = { version = "0.14.6", features = ["tls-ring"] }
+tonic = { version = "0.14.6", features = ["tls-ring", "zstd"] }
 tonic-prost = "0.14.6"
 tonic-types = "0.14.6"
 tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
