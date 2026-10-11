@@ -92,6 +92,18 @@ pub enum CompactionStyle {
 ///   `total_order_seek` is on. Bootstrap, verify and `prefix_iter` assume total-order scans
 ///   and would silently skip keys.
 ///
+/// # Which kind each knob applies to
+///
+/// The callback runs once per [`CfKind`]. Some knobs are DB-wide and RocksDB reads them only
+/// from the DB options, so they take effect only when called for `CfKind::Db`; for any other
+/// kind they are ignored. Table knobs and the rest are per column family.
+///
+/// | Knob | Scope |
+/// |---|---|
+/// | `set_bytes_per_sync`, `set_wal_bytes_per_sync`, `set_max_total_wal_size`, `set_max_background_jobs`, `set_max_open_files`, `increase_parallelism` | DB-wide: only for `CfKind::Db` |
+/// | `set_block_size`, `set_bloom_filter`, `set_cache_index_and_filter_blocks` | per CF (block-based table): ignored for `CfKind::Db` |
+/// | `set_write_buffer_size`, `set_max_write_buffer_number`, `set_target_file_size_base`, `set_compression`, `set_bottommost_compression`, `set_compaction_style`, `set_level_zero_file_num_compaction_trigger`, `set_max_bytes_for_level_base`, `set_level_compaction_dynamic_level_bytes` | per CF: `Meta`, `Changelog`, `TtlIndex` and `User` |
+///
 /// ```compile_fail
 /// fn f(t: &mut replicated_rocksdb::tuning::Tunable<'_>) {
 ///     t.set_merge_operator_associative("m", |_, _, _| None);
