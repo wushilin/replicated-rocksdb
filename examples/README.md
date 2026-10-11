@@ -16,6 +16,8 @@ seconds, prints what it is doing and exits 0. Run one with `cargo run --example 
 
 ## Interactive playground
 
+Screenshots and a guided tour are in the [main README](../README.md#playground).
+
 `cargo run --example playground`, then open <http://127.0.0.1:8080>. Unlike the examples
 above it keeps running (Ctrl-C to stop).
 
