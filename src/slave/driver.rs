@@ -345,16 +345,7 @@ async fn session(
         Err(end) => return end,
     };
     if hs.decision() != pb::Decision::Reject {
-        if let Some(max) = inner.note_upstream(&hs) {
-            let i = inner.clone();
-            let persisted = blocking(move || {
-                i.store
-                    .write_meta(&[(key::MAX_ENTRY_BYTES, &max.to_be_bytes())], false)
-            });
-            if let Err(e) = persisted.await {
-                tracing::warn!(error = %e, "could not persist max_entry_bytes");
-            }
-        }
+        adopt_upstream(inner, &hs).await;
     } else {
         inner.note_contact();
     }
@@ -372,9 +363,37 @@ async fn session(
         after_stream_diverged,
     );
     let mut action = policy::after_handshake(&hs, &inner.policies(), force);
+    if let Action::Retry(p) = &mut action
+        && hs.reason() == pb::Reason::StaleEpoch
+    {
+        p.message.push_str(if hs.upstream_chain.is_empty() {
+            " (the upstream is a master: it never reaches this epoch; repoint elsewhere, or \
+             repoint to it with AcceptDataLoss to discard this node's newer entries)"
+        } else {
+            " (the upstream replica may still learn this epoch; if its master never will, \
+             repoint to it with AcceptDataLoss to discard this node's newer entries)"
+        });
+    }
     // An explicit repoint never resolves divergence by the configured policy.
     if let Some(mode) = inner.repoint_mode() {
-        let diverged = hs.decision() == pb::Decision::Reject && hs.reason() == pb::Reason::Diverged;
+        let rejected = |hs: &pb::HandshakeResponse, r| {
+            hs.decision() == pb::Decision::Reject && hs.reason() == r
+        };
+        // STALE_EPOCH: this node holds a newer epoch than the upstream. A master never reaches
+        // it; a replica may (it has not learned it yet) or may not (its master is older). With
+        // the repoint's consent to lose data the operator chose the upstream's history: the
+        // newer epoch's entries are the divergence they are, and the consented repair rewinds
+        // them (if the upstream later learns that epoch, they come back from it). Without
+        // consent it stays a retry, as for any client (PROTOCOL.md §6.3 rule 7).
+        let consented = !matches!(mode, RepointDivergence::Refuse);
+        if rejected(&hs, pb::Reason::StaleEpoch) && consented && force != Force::Operator {
+            hs.set_reason(pb::Reason::Diverged);
+            hs.detail = format!(
+                "{}; following the upstream's older epoch, as consented",
+                hs.detail
+            );
+        }
+        let diverged = rejected(&hs, pb::Reason::Diverged);
         if diverged && force != Force::Operator {
             action = match mode {
                 RepointDivergence::Rebootstrap { .. } => Action::Bootstrap,
@@ -391,6 +410,13 @@ async fn session(
                 }
             };
         }
+    }
+    // A rejected answer that the session goes on from (a consented or configured repair or
+    // bootstrap from this upstream) makes it this slave's upstream like an accepted one: its
+    // chain is what this slave serves downstream (loop detection, "is my upstream a master").
+    if hs.decision() == pb::Decision::Reject && matches!(action, Action::Repair | Action::Bootstrap)
+    {
+        adopt_upstream(inner, &hs).await;
     }
     // The retry arm of the driver loop logs the warning and sets `last_error`.
     let resumes = hs.decision() == pb::Decision::Resume && force != Force::Operator;
@@ -707,6 +733,21 @@ async fn adopt_epoch(inner: &Arc<Inner>, hs: &pb::HandshakeResponse) -> Result<(
     inner.set_ident(Some((id, history)));
     inner.reset_downstream();
     Ok(())
+}
+
+/// Records what an upstream this session goes on with said about itself (chain, positions,
+/// contact) and persists a changed `max_entry_bytes`.
+async fn adopt_upstream(inner: &Arc<Inner>, hs: &pb::HandshakeResponse) {
+    if let Some(max) = inner.note_upstream(hs) {
+        let i = inner.clone();
+        let persisted = blocking(move || {
+            i.store
+                .write_meta(&[(key::MAX_ENTRY_BYTES, &max.to_be_bytes())], false)
+        });
+        if let Err(e) = persisted.await {
+            tracing::warn!(error = %e, "could not persist max_entry_bytes");
+        }
+    }
 }
 
 /// Tails from `last_seq + 1` and applies entries until the stream ends.

@@ -133,9 +133,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `AllowAll` disables authentication; see the `secure_replication` example for TLS and tokens.
 More runnable programs are listed in [examples/README.md](examples/README.md)
-(`cargo run --example <name>`). To get a feel for it, run the interactive web playground
-(`cargo run --example playground`, then open http://127.0.0.1:8080): four nodes in a chain,
-live replication status, and every role transition one click away.
+(`cargo run --example <name>`).
+
+## Playground
+
+The quickest way to get a feel for the model is the interactive web playground:
+
+```sh
+cargo run --example playground          # then open http://127.0.0.1:8080
+```
+
+It runs four `Node`s in one process as a daisy chain **A → B → C → D**. From the browser you
+write on the master, read a key on every node side by side, and drive every role transition by
+hand, while each node's state is pushed live over a WebSocket (fed by the slaves'
+`ReplicationListener` and each `Node::watch_state`).
+
+![Healthy chain: A is the master; B, C and D are up to date](docs/images/playground-healthy.png)
+
+**What each card shows.** A status light (green: up to date, blinking: replicating or catching
+up, red: fenced, halted or retrying with an error, grey: stopped), replication progress against
+the current master, the epoch and how many epochs it is behind, entries behind, lag, its
+upstream and chain, its direct downstream replicas (in sync or not: what a write concern
+counts), and the last error with its kind. Below that, only the transitions valid in its current
+state: promote (checked or unchecked), demote, repoint, rejoin, unfence, stop / start, clear
+halt, rebootstrap, verify, show divergent entries. Steps that can lose data or create a second
+writer need an explicit tick (`AcceptDataLoss`, `AcceptSplitBrainRisk`), exactly as in the API.
+
+**Failover.** Stop A, promote B (checked), start A again: A's stored role is master, so it comes
+back **fenced** (no reads, no writes, no epoch) because its peer check finds B is the master.
+"Rejoin as slave" of B turns it into a replica without wiping it.
+
+![After a failover: B is the master, the old master A is fenced by it](docs/images/playground-failover.png)
+
+**Divergence, never silent.** Stop D, write on B, stop B, start D and promote it *unchecked*
+(the checked promotion refuses: C is more advanced), then write on D. A and C now hold an entry
+D never had: pointed at D they halt `Diverged`, keep their data readable, and list the entry
+under "Divergent entries". Nothing is discarded until you tick "accept data loss" and repoint.
+
+![D was promoted unchecked: A and C halt Diverged instead of silently following it](docs/images/playground-diverged.png)
+
+After the consented repairs every node converges on D's history:
+
+![Repaired: D is the master and A, B and C are back in sync](docs/images/playground-repaired.png)
+
+Other things to try: a burst of writes (`count` 4000) to watch the replicas blink while they
+catch up; the same keys as **one atomic batch** (one seq, all-or-nothing on every replica) or
+from the bulk editor (`key=value` and `-key` lines); a write concern of 2 on a chain (refused: only direct replicas count); repointing a
+node at its own downstream (the UI marks it "would loop"; the slave halts `LoopDetected`).
+Options: `--http ADDR`, `--port-base N`, `--dir PATH` (see [examples/README.md](examples/README.md)).
+The page has no authentication: keep `--http` on localhost unless the network is trusted.
 
 ## Documentation
 

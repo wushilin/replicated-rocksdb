@@ -21,9 +21,20 @@ use crate::types::{EpochStart, Seq};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AcceptDataLoss;
 
-/// What a repoint does when the new upstream answers `DIVERGED`. The slave's configured
-/// `on_divergence` policy is not used after an explicit repoint: the repoint's mode decides
-/// every `DIVERGED` answer until the next repoint or a restart.
+/// What a repoint does when the new upstream answers `DIVERGED`, or `STALE_EPOCH` under
+/// consent. The slave's configured `on_divergence` policy is not used after an explicit
+/// repoint: the repoint's mode decides every `DIVERGED` answer until the next repoint or a
+/// restart.
+///
+/// **`STALE_EPOCH` under consent.** `STALE_EPOCH` means this slave holds a newer epoch than
+/// the upstream (typically it followed, or was, a node promoted without checks while the
+/// upstream's master kept running). Under `Refuse` it is retried (`Retrying`), never
+/// discarded: an upstream replica may still learn that epoch. Under `Repair` or `Rebootstrap`
+/// the operator has chosen the upstream's history, so the answer is resolved as the divergence
+/// it is: **the newer epoch's entries this slave holds are discarded** (repaired away, or the
+/// whole database rebootstrapped), and the slave follows the upstream's older epoch. If that
+/// upstream later learns the newer epoch, the entries come back from it; entries no other node
+/// holds are lost, which is what the consent accepts.
 ///
 /// **Consent to lose data is single-use: it lasts until its own repoint settles.**
 /// `Rebootstrap` and `Repair` apply only while their repoint is in progress. A repoint settles
@@ -40,7 +51,8 @@ pub enum RepointDivergence {
     /// and readable.
     #[default]
     Refuse,
-    /// Discard only the divergent suffix (DESIGN.md §12.1): the keys it touched are taken from
+    /// Discard only the divergent suffix (DESIGN.md §12.1), including entries of a newer epoch
+    /// the upstream answered `STALE_EPOCH` for: the keys it touched are taken from
     /// the new upstream, the suffix is dropped, and the slave replays the upstream's history
     /// (`Repaired { discarded }`; reads answer `NotReady` until replay reaches the upstream's
     /// snapshot seq). When repair cannot be proven safe (a CF operation in the suffix, entries
@@ -48,7 +60,7 @@ pub enum RepointDivergence {
     /// instead (`Bootstrapped`).
     Repair { accept_loss: AcceptDataLoss },
     /// Discard all local data and bootstrap from the new upstream, if this repoint's upstream
-    /// answers `DIVERGED` before the repoint settles.
+    /// answers `DIVERGED` (or `STALE_EPOCH`) before the repoint settles.
     Rebootstrap { accept_loss: AcceptDataLoss },
 }
 
@@ -229,7 +241,9 @@ impl Slave {
     /// - `Ok(Resumed | EpochAdvanced | Bootstrapped | Repaired { .. })`: replicating from the
     ///   new upstream.
     /// - `Ok(Retrying { .. })`: the new upstream cannot be used yet (unreachable,
-    ///   `STALE_EPOCH`, `NOT_READY`); the slave keeps retrying it.
+    ///   `NOT_READY`, or `STALE_EPOCH` under `Refuse`); the slave keeps retrying it.
+    ///   `STALE_EPOCH` means this slave holds a newer epoch than the upstream; the message says
+    ///   whether the upstream is a master (it never catches up) or a replica (it may).
     /// - `Err(Diverged { .. })` (with `RepointDivergence::Refuse`, the default): the local log
     ///   holds entries the new upstream does not. **Divergence is never resolved
     ///   implicitly:** the slave halts `Diverged`, its data intact and readable. Discarding
@@ -238,8 +252,11 @@ impl Slave {
     ///   `RepointDivergence::Repair { accept_loss: AcceptDataLoss }` discards only the
     ///   divergent suffix and returns `Ok(Repaired { discarded })` (or `Ok(Bootstrapped)` when
     ///   repair is not possible, `Ok(Retrying)` when it failed for a transient reason).
-    ///   The consent is single-use: it covers `DIVERGED` answers until this repoint settles
-    ///   (this call returns), then the mode reverts to `Refuse` (see [`RepointDivergence`]).
+    ///   The same consent also resolves a `STALE_EPOCH` answer: **the slave's newer-epoch
+    ///   entries are discarded** to follow the upstream's older epoch (see
+    ///   [`RepointDivergence`]).
+    ///   The consent is single-use: it covers `DIVERGED` (and `STALE_EPOCH`) answers until this
+    ///   repoint settles (this call returns), then the mode reverts to `Refuse`.
     /// - `Err(Halted(LoopDetected))`: the new upstream is this slave or replicates from it;
     ///   the slave halts until it is repointed again.
     /// - `Err(RepointSuperseded)`: a later repoint replaced this one (or the slave shut down)

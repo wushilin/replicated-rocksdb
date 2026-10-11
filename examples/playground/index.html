@@ -6,378 +6,709 @@
 <title>Replication Playground</title>
 <style>
 :root {
-  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #667085; --line: #e3e6eb;
-  --accent: #2f6fde; --ok: #1f9d55; --warn: #c98a00; --bad: #d64545; --chip: #eef1f5;
-  --code: #f1f3f6;
+  --bg: #f4f6fa; --panel: #ffffff; --panel-2: #f8f9fc; --text: #172033; --muted: #66708a;
+  --line: #e2e6ef; --accent: #3b6ef5; --accent-soft: #e8eefe; --ok: #18a058; --ok-soft: #e3f6ec;
+  --warn: #d48806; --warn-soft: #fdf3e1; --bad: #d93f3f; --bad-soft: #fde8e8; --grey: #9aa3b5;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 1px 3px rgba(16, 24, 40, .06);
+  --n-A: #3b6ef5; --n-B: #8b5cf6; --n-C: #0e9f9a; --n-D: #e8710a;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #12151b; --panel: #1b1f27; --text: #e6e9ef; --muted: #9aa3b2; --line: #2a303b;
-    --accent: #6c9cff; --ok: #3ccf7a; --warn: #f0b429; --bad: #ff6b6b; --chip: #252b35;
-    --code: #232833;
+    --bg: #0f131a; --panel: #171c25; --panel-2: #1c222d; --text: #e5e9f2; --muted: #8f99ad;
+    --line: #283041; --accent: #6d95ff; --accent-soft: #1f2a44; --ok: #3ccf7a; --ok-soft: #15301f;
+    --warn: #f0b429; --warn-soft: #33290f; --bad: #ff6b6b; --bad-soft: #3a1c1c; --grey: #5d677a;
+    --shadow: none; --n-A: #6d95ff; --n-B: #a78bfa; --n-C: #2dd4bf; --n-D: #fb923c;
   }
 }
 :root[data-theme="dark"] {
-  --bg: #12151b; --panel: #1b1f27; --text: #e6e9ef; --muted: #9aa3b2; --line: #2a303b;
-  --accent: #6c9cff; --ok: #3ccf7a; --warn: #f0b429; --bad: #ff6b6b; --chip: #252b35;
-  --code: #232833;
+  --bg: #0f131a; --panel: #171c25; --panel-2: #1c222d; --text: #e5e9f2; --muted: #8f99ad;
+  --line: #283041; --accent: #6d95ff; --accent-soft: #1f2a44; --ok: #3ccf7a; --ok-soft: #15301f;
+  --warn: #f0b429; --warn-soft: #33290f; --bad: #ff6b6b; --bad-soft: #3a1c1c; --grey: #5d677a;
+  --shadow: none; --n-A: #6d95ff; --n-B: #a78bfa; --n-C: #2dd4bf; --n-D: #fb923c;
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text);
-  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-header { display: flex; align-items: center; gap: 12px; padding: 12px 16px;
-  border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
-header h1 { font-size: 17px; margin: 0; }
-#topology { font-family: ui-monospace, monospace; color: var(--muted); }
-#conn { margin-left: auto; font-size: 12px; color: var(--muted); }
-main { padding: 16px; max-width: 1400px; margin: 0 auto; display: grid; gap: 16px; }
-.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
-.panel h2 { font-size: 14px; margin: 0 0 10px; }
-.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-input, select, button { font: inherit; color: var(--text); background: var(--panel);
-  border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
-input[type=text] { min-width: 0; }
-button { cursor: pointer; background: var(--chip); }
-button:hover { border-color: var(--accent); }
-button.danger { color: var(--bad); }
-button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-label.check { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; color: var(--muted); }
-.two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-.nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px;
-  display: grid; gap: 8px; align-content: start; }
-.card.master { border-color: var(--ok); }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--text);
+  font: 14px/1.45 Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+button, input, select { font: inherit; color: inherit; }
+
+/* ---- header ---- */
+header { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 14px;
+  padding: 10px 20px; background: color-mix(in srgb, var(--panel) 92%, transparent);
+  backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+.logo { width: 28px; height: 28px; border-radius: 8px; background: var(--accent); color: #fff;
+  display: grid; place-items: center; font-weight: 700; font-size: 14px; flex: none; }
+header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+header .sub { color: var(--muted); font-size: 12px; }
+.spacer { flex: 1; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 10px;
+  border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line); color: var(--muted); }
+.pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--grey); }
+.pill.live .dot { background: var(--ok); }
+.icon-btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 4px 9px;
+  cursor: pointer; color: var(--muted); }
+
+#banner { display: none; padding: 9px 20px; font-weight: 600; color: #fff; background: var(--bad); }
+#banner.warn { background: var(--warn); color: #1d1500; }
+
+main { max-width: 1440px; margin: 0 auto; padding: 18px 20px 40px; display: grid; gap: 18px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); min-width: 0; }
+.panel-h { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.panel-h h2 { margin: 0; font-size: 13px; font-weight: 650; letter-spacing: .01em; }
+.panel-h .hint { color: var(--muted); font-size: 12px; }
+.panel-b { padding: 14px 16px; }
+
+/* ---- topology ---- */
+#topo-wrap { padding: 8px 12px 4px; overflow-x: auto; }
+#topo { display: block; margin: 0 auto; }
+#topo .node-box { stroke-width: 2; }
+#topo text { font-family: inherit; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); padding: 0 16px 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+
+/* ---- controls ---- */
+.controls { display: grid; grid-template-columns: 1.1fr 1fr; gap: 18px; }
+.field { display: grid; gap: 4px; min-width: 0; }
+.field > span { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+.form { display: grid; grid-template-columns: 120px 1fr 1fr; gap: 10px; }
+.form2 { display: grid; grid-template-columns: 120px 1fr auto; gap: 10px; margin-top: 10px; align-items: end; }
+input[type=text], input[type=number], select { width: 100%; padding: 7px 10px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--panel-2); outline: none; min-width: 0; }
+input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.btn { border: 1px solid var(--line); background: var(--panel-2); border-radius: 8px; padding: 7px 12px;
+  cursor: pointer; font-weight: 550; white-space: nowrap; }
+.btn:hover { border-color: var(--accent); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); background: var(--bad-soft); }
+.btn.sm { padding: 5px 10px; font-size: 13px; }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btns { display: flex; gap: 8px; flex-wrap: wrap; }
+.reads { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+.reads td { padding: 6px 4px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.reads td:first-child { width: 44px; }
+.reads tr:last-child td { border-bottom: 0; }
+.mono { font-family: var(--mono); font-size: 12.5px; }
+.bulk-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+.bulk-row .addr { flex: 1; min-width: 200px; font-family: inherit; font-size: 12px; }
+.bulk { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
+.bulk summary { cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+.bulk textarea { width: 100%; margin-top: 8px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--panel-2); color: var(--text); font-family: var(--mono); font-size: 12.5px; resize: vertical; outline: none; }
+.bulk textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.bulk-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+
+/* ---- node cards ---- */
+.nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); gap: 18px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow);
+  display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+.card.is-master { border-color: color-mix(in srgb, var(--ok) 55%, var(--line)); }
+.card.is-red { border-color: color-mix(in srgb, var(--bad) 55%, var(--line)); }
+.card-top { padding: 14px 16px 10px; display: grid; gap: 10px; }
 .card-head { display: flex; align-items: center; gap: 10px; }
-.card-head .id { font-size: 20px; font-weight: 700; }
-.badge { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; padding: 2px 8px;
-  border-radius: 999px; background: var(--chip); color: var(--muted); }
-.badge.master { background: var(--ok); color: #fff; }
-.badge.fenced, .badge.failed { background: var(--bad); color: #fff; }
-.badge.switching { background: var(--warn); color: #000; }
-.light { width: 14px; height: 14px; border-radius: 50%; background: var(--muted); flex: none; }
-.light.green { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
-.light.blink { background: var(--ok); animation: blink 0.8s ease-in-out infinite; }
-.light.red { background: var(--bad); box-shadow: 0 0 6px var(--bad); }
-.light.grey { background: var(--muted); }
-.light.amber { background: var(--warn); }
-@keyframes blink { 50% { opacity: .2; } }
-.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 13px; }
-.kv dt { color: var(--muted); }
-.kv dd { margin: 0; overflow-wrap: anywhere; }
-.bar { height: 8px; border-radius: 4px; background: var(--chip); overflow: hidden; }
-.bar > div { height: 100%; background: var(--ok); transition: width .3s; }
-.err { color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
-.muted { color: var(--muted); font-size: 12px; }
-.actions { display: grid; gap: 6px; border-top: 1px dashed var(--line); padding-top: 8px; }
-table { border-collapse: collapse; width: 100%; font-size: 13px; }
-td, th { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); }
-#log { height: 300px; overflow: auto; font: 12px/1.5 ui-monospace, monospace; background: var(--code);
-  border-radius: 6px; padding: 6px 8px; }
-#log .error { color: var(--bad); }
-#log .ok, #log .write { color: var(--ok); }
-#log .role { color: var(--accent); }
-#log .entry { color: var(--muted); }
-#result { font-size: 12px; min-height: 1.4em; }
-#result.bad { color: var(--bad); }
-#banner { display: none; background: var(--bad); color: #fff; padding: 8px 16px; font-weight: 600; }
-@media (max-width: 760px) { .two { grid-template-columns: 1fr; } }
+.avatar { width: 34px; height: 34px; border-radius: 10px; color: #fff; display: grid; place-items: center;
+  font-weight: 700; font-size: 16px; flex: none; }
+.role { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; padding: 2px 8px;
+  border-radius: 6px; background: var(--panel-2); color: var(--muted); border: 1px solid var(--line); }
+.role.master { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+.role.fenced, .role.failed { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
+.role.switching { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.addr { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+.status { margin-left: auto; display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted);
+  max-width: 55%; text-align: right; }
+.light { width: 11px; height: 11px; border-radius: 50%; background: var(--grey); flex: none; display: inline-block; }
+.light.green { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+.light.blink { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); animation: blink .9s ease-in-out infinite; }
+.light.red { background: var(--bad); box-shadow: 0 0 0 3px var(--bad-soft); }
+.light.amber { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+@keyframes blink { 50% { opacity: .25; } }
+.progress { height: 6px; border-radius: 3px; background: var(--panel-2); border: 1px solid var(--line); overflow: hidden; }
+.progress > div { height: 100%; background: var(--ok); transition: width .3s ease; }
+.progress.red > div { background: var(--bad); }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.stat { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 7px 9px; min-width: 0; }
+.stat .k { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+.stat .v { font-size: 16px; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.stat .v small { font-size: 11px; font-weight: 500; color: var(--muted); }
+.stat.bad .v { color: var(--bad); }
+.facts { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12.5px; margin: 0; }
+.facts dt { color: var(--muted); }
+.facts dd { margin: 0; overflow-wrap: anywhere; }
+.chip { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; padding: 1px 7px;
+  border-radius: 6px; background: var(--panel-2); border: 1px solid var(--line); margin: 0 4px 2px 0; }
+.chip.ok { color: var(--ok); }
+.chip.bad { color: var(--bad); }
+.nid { font-weight: 700; }
+.alert { border-radius: 10px; padding: 8px 10px; font-size: 12.5px; background: var(--bad-soft); color: var(--bad);
+  overflow-wrap: anywhere; }
+.alert .why { color: var(--muted); display: block; margin-top: 3px; font-size: 12px; }
+.card-actions { margin-top: auto; border-top: 1px solid var(--line); background: var(--panel-2);
+  padding: 10px 16px 12px; display: grid; gap: 8px; }
+.act-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.act-row select { width: auto; flex: 1; min-width: 110px; padding: 5px 8px; }
+.act-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
+  font-weight: 600; width: 100%; }
+.consent { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--warn); cursor: pointer; }
+.consent input { accent-color: var(--bad); }
+
+/* ---- bottom ---- */
+.bottom { display: grid; grid-template-columns: 1.6fr 1fr; gap: 18px; }
+#log { height: 340px; overflow: auto; font-family: var(--mono); font-size: 12px; padding: 8px 12px; }
+.ev { display: grid; grid-template-columns: 64px 22px 1fr; gap: 8px; padding: 2px 0; }
+.ev .t { color: var(--muted); }
+.ev .n { font-weight: 700; }
+.ev .x { overflow-wrap: anywhere; }
+.ev.k-error .x { color: var(--bad); }
+.ev.k-ok .x, .ev.k-write .x { color: var(--ok); }
+.ev.k-role .x { color: var(--accent); }
+.ev.k-entry .x { color: var(--muted); }
+.filters { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
+.toggle { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); cursor: pointer;
+  background: var(--panel-2); color: var(--muted); user-select: none; }
+.toggle.on { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+#scan-out { max-height: 300px; overflow: auto; }
+
+/* ---- toasts ---- */
+#toasts { position: fixed; right: 18px; bottom: 18px; display: grid; gap: 8px; z-index: 20; width: min(420px, calc(100vw - 36px)); }
+.toast { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--ok); border-radius: 10px;
+  padding: 9px 12px; box-shadow: 0 8px 24px rgba(0,0,0,.15); font-size: 13px; overflow-wrap: anywhere;
+  animation: slide .2s ease; }
+.toast.bad { border-left-color: var(--bad); }
+.toast.info { border-left-color: var(--accent); }
+@keyframes slide { from { transform: translateY(8px); opacity: 0; } }
+
+@media (max-width: 980px) { .controls, .bottom { grid-template-columns: 1fr; } }
+@media (max-width: 520px) {
+  main { padding: 12px 16px 30px; } header { padding: 10px 16px; }
+  .form, .form2 { grid-template-columns: 1fr; } .stats { grid-template-columns: repeat(2, 1fr); }
+  header .sub { display: none; }
+}
 </style>
 </head>
 <body>
 <header>
-  <h1>Replication Playground</h1>
-  <span id="topology"></span>
-  <span id="conn">connecting…</span>
+  <div class="logo">R</div>
+  <div>
+    <h1>Replication Playground</h1>
+    <div class="sub">replicated-rocksdb · four nodes in one process · every switch is explicit</div>
+  </div>
+  <div class="spacer"></div>
+  <span class="pill" id="conn"><span class="dot"></span><span>connecting</span></span>
+  <button class="icon-btn" id="theme" title="Toggle light / dark">◐</button>
 </header>
 <div id="banner"></div>
 <main>
-  <div class="two">
+  <section class="panel">
+    <div class="panel-h"><h2>Topology</h2><span class="hint">arrows show the direction data flows: upstream → downstream</span></div>
+    <div id="topo-wrap"><svg id="topo" height="150"></svg></div>
+    <div class="legend">
+      <span><span class="light green"></span>up to date</span>
+      <span><span class="light blink"></span>replicating / catching up</span>
+      <span><span class="light red"></span>error, halted or fenced</span>
+      <span><span class="light amber"></span>switching role</span>
+      <span><span class="light"></span>stopped</span>
+    </div>
+  </section>
+
+  <div class="controls">
     <section class="panel">
-      <h2>Write (on a master)</h2>
-      <div class="row">
-        <select id="w-node" aria-label="Node to write on"></select>
-        <input id="w-key" type="text" placeholder="key" value="greeting" size="10">
-        <input id="w-value" type="text" placeholder="value" value="hello" size="12">
+      <div class="panel-h"><h2>Write</h2><span class="hint">only a master accepts; try a slave to see the refusal</span></div>
+      <div class="panel-b">
+        <div class="form">
+          <label class="field"><span>Node</span><select id="w-node"></select></label>
+          <label class="field"><span>Key</span><input id="w-key" type="text" value="greeting"></label>
+          <label class="field"><span>Value</span><input id="w-value" type="text" value="hello"></label>
+        </div>
+        <div class="form2">
+          <label class="field"><span>Count</span><input id="w-count" type="number" value="1" min="1" max="5000" title="&gt; 1 writes key-0 … key-(count-1)"></label>
+          <label class="field"><span>Min in-sync replicas (write concern)</span><input id="w-insync" type="number" value="0" min="0" max="3"></label>
+          <div class="btns"><button class="btn primary" onclick="write_('put')" title="One log entry per key">Put</button><button class="btn" onclick="write_('delete')" title="One log entry per key">Delete</button></div>
+        </div>
+        <div class="bulk-row">
+          <span class="addr">Count &gt; 1 writes key-0 … key-(count−1). <b>Put / Delete</b>: one log entry per key. <b>Bulk</b>: all of them in one atomic batch (one entry, one seq, all-or-nothing on every replica).</span>
+          <div class="btns"><button class="btn primary" onclick="write_('put', true)">Bulk put</button><button class="btn" onclick="write_('delete', true)">Bulk delete</button></div>
+        </div>
+        <details class="bulk" id="bulk" open>
+          <summary>Bulk editor</summary>
+          <textarea id="b-text" rows="7" spellcheck="false" placeholder="one operation per line:&#10;user:1=alice&#10;user:2=bob&#10;-user:3        (a leading - deletes)&#10;# comments and blank lines are ignored"></textarea>
+          <div class="bulk-bar">
+            <span class="addr" id="b-count">0 operations</span>
+            <div class="btns">
+              <button class="btn primary" onclick="bulk(true)" title="One Batch: one seq, all-or-nothing on every node">Write as one atomic batch</button>
+              <button class="btn" onclick="bulk(false)" title="One log entry per line">Write as separate entries</button>
+            </div>
+          </div>
+        </details>
       </div>
-      <div class="row" style="margin-top:8px">
-        <label class="check">count <input id="w-count" type="number" value="1" min="1" max="5000" style="width:72px"></label>
-        <label class="check">min in-sync replicas <input id="w-insync" type="number" value="0" min="0" max="3" style="width:52px"></label>
-        <button class="primary" onclick="write_('put')">Put</button>
-        <button onclick="write_('delete')">Delete</button>
-      </div>
-      <div class="muted" style="margin-top:6px">count &gt; 1 writes key-0 … key-(count-1). Writing on a slave shows the refusal.</div>
     </section>
     <section class="panel">
-      <h2>Read a key on every node</h2>
-      <div class="row">
-        <input id="r-key" type="text" placeholder="key" value="greeting" size="14">
-        <button onclick="readKey()">Read</button>
-        <label class="check"><input id="r-auto" type="checkbox" checked> refresh live</label>
+      <div class="panel-h"><h2>Read a key everywhere</h2><span class="hint">value and the seq that wrote it, per node</span></div>
+      <div class="panel-b">
+        <div class="form2" style="margin-top:0;grid-template-columns:1fr auto auto">
+          <label class="field"><span>Key</span><input id="r-key" type="text" value="greeting"></label>
+          <button class="btn" onclick="readKey()">Read</button>
+          <span class="toggle on" id="r-auto" onclick="this.classList.toggle('on')" title="re-read after every write and applied entry">live</span>
+        </div>
+        <table class="reads"><tbody id="r-table"></tbody></table>
       </div>
-      <table id="r-table" style="margin-top:8px"><tbody></tbody></table>
     </section>
   </div>
-  <div id="result"></div>
+
   <section class="nodes" id="nodes"></section>
-  <div class="two">
+
+  <div class="bottom">
     <section class="panel">
-      <h2>Live events <span class="muted">(listener notifications, role changes, actions)</span></h2>
-      <div class="row" style="margin-bottom:6px">
-        <label class="check"><input id="l-entries" type="checkbox" checked> show applied entries</label>
-        <button onclick="document.getElementById('log').innerHTML=''">Clear</button>
+      <div class="panel-h"><h2>Live events</h2>
+        <div class="filters" id="filters"></div>
       </div>
       <div id="log"></div>
     </section>
     <section class="panel">
-      <h2>Scan keys</h2>
-      <div class="row">
-        <select id="s-node" aria-label="Node to scan"></select>
-        <button onclick="scan()">Scan (first 200)</button>
+      <div class="panel-h"><h2>Scan keys</h2><span class="hint">first 200 of one node</span></div>
+      <div class="panel-b">
+        <div class="form2" style="margin-top:0;grid-template-columns:1fr auto">
+          <label class="field"><span>Node</span><select id="s-node"></select></label>
+          <button class="btn" onclick="scan()">Scan</button>
+        </div>
+        <div id="scan-out"><table class="reads"><tbody id="s-table"></tbody></table></div>
       </div>
-      <table id="s-table" style="margin-top:8px"><tbody></tbody></table>
     </section>
   </div>
 </main>
+<div id="toasts"></div>
 <script>
 const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 let nodes = [];
-const ui = {};  // per node: selected target and consents survive re-renders
+const ui = {};                                   // per node: target and consents survive re-renders
+const filters = { entries: true, nodes: { A: true, B: true, C: true, D: true } };
+const eventsSeen = [];
 
-function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+// ---------------------------------------------------------------- theme
+(() => {
+  let saved = null;
+  try { saved = localStorage.getItem('rrdb-theme'); } catch (e) {}
+  if (saved) document.documentElement.dataset.theme = saved;
+  $('theme').onclick = () => {
+    const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+    const cur = document.documentElement.dataset.theme || (dark ? 'dark' : 'light');
+    const next = cur === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem('rrdb-theme', next); } catch (e) {}
+    document.querySelectorAll('.card').forEach(c => { c.dataset.html = ''; });
+    render();
+  };
+})();
 
+// ---------------------------------------------------------------- connection
 function connect() {
   const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
-  ws.onopen = () => { $('conn').textContent = 'live'; };
-  ws.onclose = () => { $('conn').textContent = 'disconnected, retrying…'; setTimeout(connect, 1000); };
+  const setConn = (on, text) => { $('conn').className = 'pill' + (on ? ' live' : ''); $('conn').lastChild.textContent = text; };
+  ws.onopen = () => setConn(true, 'live');
+  ws.onclose = () => { setConn(false, 'reconnecting…'); setTimeout(connect, 1000); };
   ws.onmessage = (m) => {
     const msg = JSON.parse(m.data);
     if (msg.type === 'snapshot') { nodes = msg.nodes; render(); }
-    else if (msg.type === 'event') { logEvent(msg); }
-    else if (msg.type === 'history') { $('log').innerHTML = ''; msg.events.forEach(logEvent); }
+    else if (msg.type === 'event') addEvent(msg);
+    else if (msg.type === 'history') { eventsSeen.length = 0; $('log').innerHTML = ''; msg.events.forEach(addEvent); }
   };
 }
 
-function logEvent(ev) {
-  if (ev.kind === 'entry' && !$('l-entries').checked) return;
-  const log = $('log');
-  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
-  const t = new Date(ev.t).toLocaleTimeString();
-  const div = document.createElement('div');
-  div.className = ev.kind;
-  div.textContent = `${t}  ${ev.node}  ${ev.text}`;
-  log.appendChild(div);
-  while (log.childNodes.length > 600) log.removeChild(log.firstChild);
-  if (atBottom) log.scrollTop = log.scrollHeight;
-  if (ev.kind === 'entry' || ev.kind === 'write') scheduleRead();
+// ---------------------------------------------------------------- cluster model
+function upstreamOf() {
+  const up = {};
+  nodes.forEach(n => { if (n.slave && n.slave.upstream_id) up[n.id] = n.slave.upstream_id; });
+  return up;
 }
-
-let readTimer = null;
-function scheduleRead() {
-  if (!$('r-auto').checked || readTimer) return;
-  readTimer = setTimeout(() => { readTimer = null; readKey(); }, 250);
-}
-
-// The view of the whole cluster: who is master, its seq and epoch.
 function cluster() {
   const masters = nodes.filter(n => n.kind === 'master');
   const m = masters[0];
   return {
-    masters,
+    masters, up: upstreamOf(),
     masterSeq: m ? m.last_seq : null,
     masterEpoch: m ? Number((m.detail.match(/epoch (\d+)/) || [])[1]) : null,
   };
 }
-
-// Status light: green = up to date, blinking green = replicating/catching up, red = error.
-function light(n, c) {
-  if (n.kind === 'master') return ['green', 'master: accepting writes'];
-  if (n.kind === 'fenced') return ['red', 'fenced: ' + n.detail];
-  if (n.kind === 'failed') return ['red', 'failed: ' + n.detail];
-  if (n.kind === 'stopped') return ['grey', 'stopped'];
-  if (n.kind === 'switching') return ['amber', 'switching role'];
-  const s = n.slave;
-  if (!s) return ['grey', n.kind];
-  if (s.state.startsWith('Halted')) return ['red', s.state];
-  if (s.state !== 'Streaming' && s.last_error) return ['red', `error: ${s.last_error_kind}`];
-  const behind = behindOf(n, c);
-  if (s.state === 'Streaming' && behind.entries === 0 && !behind.epochs) return ['green', 'up to date'];
-  return ['blink', s.state === 'Streaming' ? 'replicating' : s.state];
+function epochOf(n) {
+  if (n.kind === 'master') return Number((n.detail.match(/epoch (\d+)/) || [])[1]);
+  return n.slave ? n.slave.epoch : null;
 }
-
 function behindOf(n, c) {
   const s = n.slave;
-  if (!s) return { entries: 0, epochs: 0 };
+  if (!s) return { entries: 0, epochs: 0, head: null };
   // Ground truth from the current master when there is exactly one; else the slave's own view.
   const head = c.masters.length === 1 ? c.masterSeq : s.origin_last_seq;
-  const entries = Math.max(0, (head ?? 0) - s.applied_seq);
-  const epochs = (c.masterEpoch && s.epoch) ? Math.max(0, c.masterEpoch - s.epoch) : 0;
-  return { entries, epochs, head };
+  return {
+    entries: Math.max(0, (head ?? 0) - s.applied_seq),
+    epochs: (c.masterEpoch && s.epoch) ? Math.max(0, c.masterEpoch - s.epoch) : 0,
+    head,
+  };
 }
-
-function topology() {
-  const up = {};
-  nodes.forEach(n => { if (n.slave && n.slave.upstream_id) up[n.id] = n.slave.upstream_id; });
-  const roots = nodes.filter(n => !up[n.id]);
-  const down = (id) => nodes.filter(n => up[n.id] === id).map(n => n.id);
-  const walk = (id) => { const d = down(id); return id + (d.length ? ' → ' + (d.length > 1 ? '{' + d.map(walk).join(', ') + '}' : walk(d[0])) : ''); };
-  return roots.map(r => walk(r.id).replace(r.id, `${r.id} (${r.kind})`)).join('  |  ');
+// Would `node` replicating from `target` close a cycle? Walk target's upstream chain.
+function wouldLoop(node, target, up) {
+  const seen = new Set();
+  for (let cur = target; cur && !seen.has(cur); cur = up[cur]) {
+    if (cur === node) return true;
+    seen.add(cur);
+  }
+  return false;
 }
+// Status light: green = up to date, blinking = replicating, red = error.
+function light(n, c) {
+  if (n.kind === 'master') return ['green', c.masters.length > 1 ? 'split brain!' : 'accepting writes'];
+  if (n.kind === 'fenced') return ['red', 'fenced'];
+  if (n.kind === 'failed') return ['red', 'failed'];
+  if (n.kind === 'stopped') return ['', 'stopped'];
+  if (n.kind === 'switching') return ['amber', 'switching role'];
+  const s = n.slave;
+  if (!s) return ['', n.kind];
+  if (s.state.startsWith('Halted')) return ['red', s.state.replace(/[()]/g, ' ').trim()];
+  if (s.state !== 'Streaming' && s.last_error) return ['red', 'error · ' + s.last_error_kind];
+  const b = behindOf(n, c);
+  if (s.state === 'Streaming' && b.entries === 0 && !b.epochs) return ['green', 'up to date'];
+  if (s.state.startsWith('Bootstrapping')) return ['blink', 'bootstrapping'];
+  return ['blink', s.state === 'Streaming' ? `replicating · ${b.entries} behind` : s.state.toLowerCase()];
+}
+const colorOf = (id) => `var(--n-${id})`;
 
+// ---------------------------------------------------------------- render
 function render() {
   const c = cluster();
-  $('topology').textContent = topology();
-  const banner = $('banner');
-  if (c.masters.length > 1) {
-    banner.style.display = 'block';
-    banner.textContent = `Split brain: ${c.masters.map(m => m.id).join(' and ')} are both masters`;
-  } else if (c.masters.length === 0) {
-    banner.style.display = 'block';
-    banner.textContent = 'No master: writes are refused everywhere. Promote a slave or unfence the old master.';
-  } else banner.style.display = 'none';
-
+  renderBanner(c);
+  renderTopology(c);
   for (const sel of [$('w-node'), $('s-node')]) {
+    if (sel === document.activeElement) continue;
     const keep = sel.value;
-    sel.innerHTML = nodes.map(n => `<option value="${n.id}">${n.id} (${n.kind})</option>`).join('');
-    sel.value = keep || (sel === $('w-node') && c.masters[0] ? c.masters[0].id : nodes[0]?.id);
+    sel.innerHTML = nodes.map(n => `<option value="${n.id}">${n.id} · ${n.kind}</option>`).join('');
+    const fallback = sel.id === 'w-node' && c.masters[0] ? c.masters[0].id : nodes[0]?.id;
+    sel.value = (sel.id === 'w-node' && !sel.dataset.touched) ? fallback : (keep || fallback);
   }
-
   const root = $('nodes');
-  // Keep focus and open selects stable: only rebuild a card when its content changed.
   nodes.forEach(n => {
     let card = $('card-' + n.id);
-    if (!card) { card = document.createElement('div'); card.id = 'card-' + n.id; root.appendChild(card); }
+    if (!card) { card = document.createElement('article'); card.id = 'card-' + n.id; root.appendChild(card); }
+    const [cls] = light(n, c);
     const html = cardHtml(n, c);
+    // Do not rebuild a card while the user is in one of its controls.
     if (card.dataset.html !== html && !card.contains(document.activeElement)) {
       card.dataset.html = html;
-      card.className = 'card' + (n.kind === 'master' ? ' master' : '');
+      card.className = 'card' + (n.kind === 'master' ? ' is-master' : '') + (cls === 'red' ? ' is-red' : '');
       card.innerHTML = html;
-    } else if (card.dataset.html !== html) {
-      card.dataset.stale = '1';  // re-render once focus leaves
     }
   });
 }
 document.addEventListener('focusout', () => setTimeout(render, 0));
+$('w-node').addEventListener('change', e => { e.target.dataset.touched = '1'; });
+
+function renderBanner(c) {
+  const b = $('banner');
+  if (c.masters.length > 1) {
+    b.className = ''; b.style.display = 'block';
+    b.textContent = `Split brain: ${c.masters.map(m => m.id).join(' and ')} are both masters and both accept writes.`;
+  } else if (!nodes.length || c.masters.length === 1) {
+    b.style.display = 'none';
+  } else {
+    b.className = 'warn'; b.style.display = 'block';
+    b.textContent = 'No master: every write is refused. Promote a slave, or unfence a former master.';
+  }
+}
+
+function renderTopology(c) {
+  const svg = $('topo');
+  if (!nodes.length) return;
+  const up = c.up;
+  // Depth = hops from a root (a node without an upstream). Nodes in a cycle have no root.
+  const depth = {};
+  const visit = (id, d, seen) => {
+    if (seen.has(id)) return; seen.add(id);
+    depth[id] = Math.max(depth[id] ?? 0, d);
+    nodes.filter(n => up[n.id] === id).forEach(n => visit(n.id, d + 1, seen));
+  };
+  nodes.filter(n => !up[n.id]).forEach(n => visit(n.id, 0, new Set()));
+  let maxD = Math.max(0, ...Object.values(depth));
+  const cyclic = nodes.filter(n => depth[n.id] === undefined);
+  cyclic.forEach(n => { depth[n.id] = maxD + 1; });
+  maxD = Math.max(0, ...Object.values(depth));
+  const cols = {};
+  nodes.forEach(n => (cols[depth[n.id]] = cols[depth[n.id]] || []).push(n));
+  const W = 150, H = 66, GX = 70, GY = 18;
+  const rows = Math.max(...Object.values(cols).map(a => a.length));
+  const width = (maxD + 1) * W + maxD * GX + 20, height = rows * H + (rows - 1) * GY + 24;
+  svg.setAttribute('width', width); svg.setAttribute('height', height);
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  const pos = {};
+  Object.entries(cols).forEach(([d, list]) => {
+    const total = list.length * H + (list.length - 1) * GY;
+    list.forEach((n, i) => { pos[n.id] = { x: 10 + d * (W + GX), y: (height - total) / 2 + i * (H + GY) }; });
+  });
+  const css = getComputedStyle(document.documentElement);
+  const v = (name) => css.getPropertyValue(name).trim();
+  let out = `<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="${v('--muted')}"/></marker>
+    <marker id="arrbad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="${v('--bad')}"/></marker></defs>`;
+  nodes.forEach(n => {
+    const u = up[n.id];
+    if (!u || !pos[u]) return;
+    const a = pos[u], b = pos[n.id];
+    const loop = cyclic.includes(n);
+    const stroke = loop ? v('--bad') : v('--muted');
+    let d;
+    if (b.x > a.x) d = `M${a.x + W},${a.y + H / 2} C${a.x + W + GX / 2},${a.y + H / 2} ${b.x - GX / 2},${b.y + H / 2} ${b.x},${b.y + H / 2}`;
+    else {
+      // Same column (a loop): bow out to the right.
+      const ax = a.x + W, ay = a.y + H / 2, bx = b.x + W, by = b.y + H / 2, bow = 46 + Math.abs(ay - by) / 4;
+      d = `M${ax},${ay} C${ax + bow},${ay} ${bx + bow},${by} ${bx},${by}`;
+    }
+    out += `<path d="${d}" fill="none" stroke="${stroke}" stroke-width="1.6" ${loop ? 'stroke-dasharray="5 4"' : ''} marker-end="url(#${loop ? 'arrbad' : 'arr'})"/>`;
+  });
+  nodes.forEach(n => {
+    const p = pos[n.id];
+    const [cls, why] = light(n, c);
+    const dot = { green: v('--ok'), blink: v('--ok'), red: v('--bad'), amber: v('--warn') }[cls] || v('--grey');
+    const border = n.kind === 'master' ? v('--ok') : cls === 'red' ? v('--bad') : v('--line');
+    const sub = n.kind === 'master' ? `epoch ${epochOf(n)} · seq ${n.last_seq}`
+      : n.slave ? `seq ${n.slave.applied_seq} · epoch ${n.slave.epoch ?? '–'}` : n.kind;
+    out += `<g transform="translate(${p.x},${p.y})">
+      <rect class="node-box" width="${W}" height="${H}" rx="12" fill="${v('--panel-2')}" stroke="${border}"/>
+      <rect x="10" y="12" width="26" height="26" rx="7" fill="${v('--n-' + n.id)}"/>
+      <text x="23" y="30" text-anchor="middle" fill="#fff" font-weight="700" font-size="14">${n.id}</text>
+      <text x="44" y="24" fill="${v('--text')}" font-size="12.5" font-weight="650">${n.kind}</text>
+      <circle cx="${W - 14}" cy="20" r="5" fill="${dot}">${cls === 'blink' ? '<animate attributeName="opacity" values="1;.2;1" dur=".9s" repeatCount="indefinite"/>' : ''}</circle>
+      <text x="44" y="39" fill="${v('--muted')}" font-size="11">${esc(sub)}</text>
+      <text x="10" y="56" fill="${cls === 'red' ? v('--bad') : v('--muted')}" font-size="10.5">${esc(why.length > 26 ? why.slice(0, 25) + '…' : why)}</text>
+    </g>`;
+  });
+  if (cyclic.length) {
+    out += `<text x="${width - 10}" y="${height - 4}" text-anchor="end" fill="${v('--bad')}" font-size="11">dashed red: replication loop</text>`;
+  }
+  svg.innerHTML = out;
+}
+
+function stat(k, v, bad = false) { return `<div class="stat${bad ? ' bad' : ''}"><div class="k">${k}</div><div class="v">${v}</div></div>`; }
 
 function cardHtml(n, c) {
   const [cls, why] = light(n, c);
   const s = n.slave;
   const b = behindOf(n, c);
-  let rows = '';
-  const row = (k, v) => { rows += `<dt>${k}</dt><dd>${v}</dd>`; };
-  row('address', esc(n.addr));
-  if (n.kind === 'master') {
-    row('epoch', esc(c.masters.length ? (n.detail.match(/epoch (\d+)/) || [])[1] : ''));
-    row('last seq', esc(n.last_seq));
-  } else if (s) {
-    row('state', esc(s.state));
-    row('upstream', esc(s.upstream_id ? `${s.upstream_id} (${s.upstream})` : s.upstream));
-    row('chain', esc((s.upstream_chain || []).join(' → ') || '—'));
-    row('epoch', esc(s.epoch ?? '—') + (b.epochs ? ` <span class="err">(${b.epochs} behind master)</span>` : ''));
-    row('applied', `${esc(s.applied_seq)} / ${esc(b.head ?? '?')}`);
-    row('behind', b.entries ? `${b.entries} entries` : 'nothing');
-    row('lag', s.lag_ms == null ? '—' : `${s.lag_ms} ms`);
-    row('last contact', s.last_contact_ago_ms == null ? 'never' : `${(s.last_contact_ago_ms / 1000).toFixed(1)} s ago`);
-    if (s.last_verify) row('last verify', esc(s.last_verify));
-  } else {
-    row('detail', esc(n.detail || '—'));
-  }
-  const pct = s && b.head ? Math.min(100, Math.round(100 * s.applied_seq / Math.max(1, b.head))) : (n.kind === 'master' ? 100 : 0);
-  const halted = s && s.state.startsWith('Halted');
-  // A halt is the state itself; an older retry error is shown as such, not as the cause.
-  const err = !s ? '' : halted
-    ? `<div class="err">${esc(s.state)}: replication stopped; see the transitions below</div>`
-      + (s.last_error ? `<div class="muted">before the halt: ${esc(s.last_error_kind)}: ${esc(s.last_error)}</div>` : '')
-    : s.last_error ? `<div class="err">${esc(s.last_error_kind)}: ${esc(s.last_error)}</div>` : '';
-  const reps = (n.replicas || []).map(r =>
-    `<span class="badge" title="acked seq ${r.applied_seq}, lag ${r.lag_ms ?? '?'} ms">${esc(r.node_id)} ${r.in_sync ? '✓ in sync' : `✗ ${r.lag_entries} behind`}</span>`).join(' ');
-  if (n.kind === 'master' || n.kind === 'slave') row('downstream', reps || '<span class="muted">none</span>');
-  const detailErr = (n.kind === 'fenced' || n.kind === 'failed') ? `<div class="err">${esc(n.detail)}</div>` : '';
-  return `
+  const head = `
     <div class="card-head">
-      <span class="light ${cls}" title="${esc(why)}"></span>
-      <span class="id">${n.id}</span>
-      <span class="badge ${n.kind}">${n.kind}</span>
-      <span class="muted" style="margin-left:auto;text-align:right">${esc(why.length > 48 ? why.slice(0, 47) + '…' : why)}</span>
-    </div>
-    <div class="bar" title="replication progress"><div style="width:${pct}%"></div></div>
-    <dl class="kv">${rows}</dl>
-    ${err}${detailErr}
-    <div class="actions">${actionsHtml(n)}</div>`;
+      <div class="avatar" style="background:${colorOf(n.id)}">${n.id}</div>
+      <div><span class="role ${n.kind}">${n.kind}</span><div class="addr">${esc(n.addr)}</div></div>
+      <div class="status"><span>${esc(why)}</span><span class="light ${cls}"></span></div>
+    </div>`;
+  let body = '';
+  const reps = (n.replicas || []).map(r =>
+    `<span class="chip ${r.in_sync ? 'ok' : 'bad'}" title="acked seq ${r.applied_seq}, lag ${r.lag_ms ?? '?'} ms"><span class="nid">${esc(r.node_id)}</span>${r.in_sync ? '✓ in sync' : `${r.lag_entries} behind`}</span>`).join('');
+  if (n.kind === 'master') {
+    body = `
+      <div class="progress"><div style="width:100%"></div></div>
+      <div class="stats">${stat('Epoch', epochOf(n))}${stat('Seq', n.last_seq)}${stat('Replicas', (n.replicas || []).length)}${stat('In sync', (n.replicas || []).filter(r => r.in_sync).length)}</div>
+      <dl class="facts"><dt>downstream</dt><dd>${reps || '<span class="addr">none</span>'}</dd>
+        <dt>note</dt><dd class="addr">only direct replicas count toward a write concern</dd></dl>`;
+  } else if (s) {
+    const halted = s.state.startsWith('Halted');
+    const pct = b.head ? Math.min(100, Math.round(100 * s.applied_seq / Math.max(1, b.head))) : 0;
+    const upId = s.upstream_id;
+    body = `
+      <div class="progress${cls === 'red' ? ' red' : ''}" title="applied ${s.applied_seq} of ${b.head ?? '?'}"><div style="width:${pct}%"></div></div>
+      <div class="stats">
+        ${stat('Applied', `${s.applied_seq}<small> / ${b.head ?? '?'}</small>`)}
+        ${stat('Behind', b.entries, b.entries > 0 && cls === 'red')}
+        ${stat('Epoch', `${s.epoch ?? '–'}${b.epochs ? `<small> (−${b.epochs})</small>` : ''}`, b.epochs > 0)}
+        ${stat('Lag', s.lag_ms == null ? '–' : s.lag_ms < 1000 ? `${s.lag_ms}<small>ms</small>` : `${(s.lag_ms / 1000).toFixed(1)}<small>s</small>`)}
+      </div>
+      <dl class="facts">
+        <dt>state</dt><dd>${esc(s.state)}</dd>
+        <dt>upstream</dt><dd>${upId ? `<span class="chip"><span class="nid" style="color:${colorOf(upId)}">${upId}</span>${esc(s.upstream.replace('http://', ''))}</span>` : esc(s.upstream)}</dd>
+        <dt>chain</dt><dd>${esc((s.upstream_chain || []).join(' → ') || '–')}</dd>
+        <dt>last contact</dt><dd>${s.last_contact_ago_ms == null ? 'never' : `${(s.last_contact_ago_ms / 1000).toFixed(1)} s ago`}</dd>
+        <dt>downstream</dt><dd>${reps || '<span class="addr">none</span>'}</dd>
+        ${s.last_verify ? `<dt>last verify</dt><dd>${esc(s.last_verify)}</dd>` : ''}
+      </dl>
+      ${halted ? `<div class="alert">${esc(s.state)}: replication stopped. ${haltHelp(s.state)}${s.last_error ? `<span class="why">before the halt: ${esc(s.last_error_kind)}: ${esc(s.last_error)}</span>` : ''}</div>`
+        : s.last_error ? `<div class="alert">${esc(s.last_error_kind)}: ${esc(s.last_error)}</div>` : ''}`;
+  } else if (n.kind === 'fenced') {
+    body = `<div class="alert">No reads, no writes, no epoch, no port: ${esc(n.detail)}.<span class="why">Unfence runs the peer check again; rejoin turns it into a slave.</span></div>`;
+  } else if (n.kind === 'failed') {
+    body = `<div class="alert">${esc(n.detail)}<span class="why">Start reopens the stored role (a stored master is fence-checked again).</span></div>`;
+  } else if (n.kind === 'stopped') {
+    body = `<div class="addr">Shut down. Start reopens it with its stored role; a stored master comes back fenced until its peers clear it.</div>`;
+  }
+  return `<div class="card-top">${head}${body}</div><div class="card-actions">${actionsHtml(n, c)}</div>`;
+}
+
+function haltHelp(state) {
+  if (state.includes('LoopDetected')) return 'Its upstream chain leads back to itself: repoint it at a node outside the loop (e.g. the master).';
+  if (state.includes('Diverged')) return 'Its log has entries its upstream lacks: inspect them, then repoint or rebootstrap with "accept data loss".';
+  if (state.includes('IdentityChanged')) return 'The upstream serves another database: repoint, or rebootstrap with consent.';
+  if (state.includes('LogGap')) return 'The upstream no longer holds the entries it needs: rebootstrap.';
+  return 'Fix the cause, then clear the halt or repoint.';
 }
 
 // The transitions this node offers in its current state.
-function actionsHtml(n) {
+function actionsHtml(n, c) {
   const u = ui[n.id] || (ui[n.id] = { target: '', loss: false, brain: false });
   const others = nodes.filter(o => o.id !== n.id);
-  if (!u.target || !others.some(o => o.id === u.target)) {
-    u.target = (others.find(o => o.kind === 'master') || others[0] || {}).id || '';
+  const ok = (t) => !wouldLoop(n.id, t, c.up);
+  if (!u.target || !others.some(o => o.id === u.target && ok(o.id))) {
+    const rank = (o) => ['master', 'slave', 'fenced'].indexOf(o.kind) + 1 || 9;
+    u.target = (others.filter(o => ok(o.id)).sort((a, b) => rank(a) - rank(b))[0] || {}).id || '';
   }
-  const btn = (action, label, cls = '') => `<button class="${cls}" onclick="act('${n.id}','${action}')">${label}</button>`;
-  const target = `<select onchange="ui['${n.id}'].target=this.value" aria-label="Target node">${others.map(o => `<option value="${o.id}" ${o.id === u.target ? 'selected' : ''}>${o.id} (${o.kind})</option>`).join('')}</select>`;
-  const loss = `<label class="check"><input type="checkbox" ${u.loss ? 'checked' : ''} onchange="ui['${n.id}'].loss=this.checked"> accept data loss</label>`;
-  const brain = `<label class="check"><input type="checkbox" ${u.brain ? 'checked' : ''} onchange="ui['${n.id}'].brain=this.checked"> accept split-brain risk</label>`;
+  const btn = (action, label, cls = 'btn sm', off = false) => `<button class="${cls}" ${off ? 'disabled' : ''} onclick="act('${n.id}','${action}')">${label}</button>`;
+  const needsTarget = !others.some(o => ok(o.id));
+  const valid = others.filter(o => ok(o.id));
+  if (!valid.length) u.target = '';
+  const target = !valid.length
+    ? `<span class="addr" style="flex:1">no valid target: every other node replicates from ${n.id}</span>`
+    : `<select onchange="ui['${n.id}'].target=this.value" aria-label="Target node">${others.map(o => {
+    const loop = !ok(o.id);
+    return `<option value="${o.id}" ${o.id === u.target ? 'selected' : ''} ${loop ? 'disabled' : ''}>${o.id} · ${o.kind}${loop ? ' (would loop)' : ''}</option>`;
+  }).join('')}</select>`;
+  const loss = `<label class="consent" title="AcceptDataLoss: allow discarding this node's divergent entries"><input type="checkbox" ${u.loss ? 'checked' : ''} onchange="ui['${n.id}'].loss=this.checked">accept data loss</label>`;
+  const brain = `<label class="consent" title="AcceptSplitBrainRisk: ignore peers that do not answer"><input type="checkbox" ${u.brain ? 'checked' : ''} onchange="ui['${n.id}'].brain=this.checked">accept split-brain risk</label>`;
   const halted = n.slave && n.slave.state.startsWith('Halted');
+  const diverged = n.slave && n.slave.state.includes('Diverged');
   switch (n.kind) {
     case 'master': return `
-      <div class="row">${btn('demote', 'Demote (undo unused promotion)')}${btn('stop', 'Stop (simulate crash)', 'danger')}</div>
-      <div class="row">${target}${btn('rejoin', 'Rejoin as slave of')}${loss}</div>`;
+      <div class="act-row"><span class="act-label">Step down</span>${target}${btn('rejoin', 'Rejoin as slave', 'btn sm', needsTarget)}${loss}</div>
+      <div class="act-row">${btn('demote', 'Demote')}<span class="addr">undoes an unused promotion only</span></div>
+      <div class="act-row">${btn('stop', 'Stop (simulate crash)', 'btn sm danger')}</div>`;
     case 'slave': return `
-      <div class="row">${btn('promote_checked', 'Promote (checked)', 'primary')}${btn('promote', 'Promote unchecked', 'danger')}</div>
-      <div class="row">${target}${btn('repoint', 'Repoint to')}${loss}</div>
-      <div class="row">${btn('verify', 'Verify (full)')}${halted ? btn('clear_halt', 'Clear halt (retry)') + btn('diverged', 'Show divergent entries') + btn('rebootstrap', 'Rebootstrap', 'danger') : ''}${btn('stop', 'Stop', 'danger')}</div>`;
+      <div class="act-row"><span class="act-label">Become master</span>${btn('promote_checked', 'Promote (checked)', 'btn sm primary')}${btn('promote', 'Promote unchecked', 'btn sm danger')}</div>
+      <div class="act-row"><span class="act-label">Follow another node</span>${target}${btn('repoint', 'Repoint', 'btn sm', needsTarget)}${loss}</div>
+      <div class="act-row"><span class="act-label">Maintenance</span>${btn('verify', 'Verify')}${halted ? btn('clear_halt', 'Clear halt') : ''}${diverged ? btn('diverged', 'Divergent entries') : ''}${halted ? btn('rebootstrap', 'Rebootstrap', 'btn sm danger') : ''}${btn('stop', 'Stop', 'btn sm danger')}</div>`;
     case 'fenced': return `
-      <div class="row">${btn('unfence', 'Unfence (peer check)', 'primary')}${brain}</div>
-      <div class="row">${target}${btn('rejoin', 'Rejoin as slave of')}${loss}</div>
-      <div class="row">${btn('stop', 'Stop', 'danger')}</div>`;
-    case 'stopped': case 'failed': return `<div class="row">${btn('start', 'Start (reopen)', 'primary')}</div>`;
-    default: return '<div class="muted">no transition while switching</div>';
+      <div class="act-row"><span class="act-label">Prove it is safe</span>${btn('unfence', 'Unfence (peer check)', 'btn sm primary')}${brain}</div>
+      <div class="act-row"><span class="act-label">Or step down</span>${target}${btn('rejoin', 'Rejoin as slave', 'btn sm', needsTarget)}${loss}</div>
+      <div class="act-row">${btn('stop', 'Stop', 'btn sm danger')}</div>`;
+    case 'stopped': case 'failed': return `<div class="act-row">${btn('start', 'Start (reopen)', 'btn sm primary')}</div>`;
+    default: return '<div class="addr">no transition while a switch is running</div>';
   }
 }
 
-function showResult(r) {
-  const el = $('result');
-  el.className = r.ok ? '' : 'bad';
-  el.textContent = (r.ok ? '✓ ' : '✗ ') + r.message;
+// ---------------------------------------------------------------- events
+function renderFilters() {
+  const f = $('filters');
+  f.innerHTML = `<span class="toggle ${filters.entries ? 'on' : ''}" data-k="entries">applied entries</span>` +
+    ['A', 'B', 'C', 'D'].map(id => `<span class="toggle ${filters.nodes[id] ? 'on' : ''}" data-n="${id}" style="${filters.nodes[id] ? `color:${colorOf(id)}` : ''}">${id}</span>`).join('') +
+    `<span class="toggle" data-clear="1">clear</span>`;
+  f.querySelectorAll('.toggle').forEach(t => t.onclick = () => {
+    if (t.dataset.clear) { eventsSeen.length = 0; $('log').innerHTML = ''; return; }
+    if (t.dataset.k) filters.entries = !filters.entries; else filters.nodes[t.dataset.n] = !filters.nodes[t.dataset.n];
+    renderFilters(); redrawLog();
+  });
+}
+const visible = (ev) => (ev.kind !== 'entry' || filters.entries) && filters.nodes[ev.node] !== false;
+function evEl(ev) {
+  const d = document.createElement('div');
+  d.className = 'ev k-' + ev.kind;
+  d.innerHTML = `<span class="t">${new Date(ev.t).toLocaleTimeString([], { hour12: false })}</span><span class="n" style="color:${colorOf(ev.node)}">${esc(ev.node)}</span><span class="x">${esc(ev.text)}</span>`;
+  return d;
+}
+function redrawLog() {
+  const log = $('log'); log.innerHTML = '';
+  eventsSeen.filter(visible).slice(-600).forEach(ev => log.appendChild(evEl(ev)));
+  log.scrollTop = log.scrollHeight;
+}
+function addEvent(ev) {
+  eventsSeen.push(ev);
+  if (eventsSeen.length > 2000) eventsSeen.splice(0, eventsSeen.length - 2000);
+  if (ev.kind === 'entry' || ev.kind === 'write') scheduleRead();
+  if (!visible(ev)) return;
+  const log = $('log');
+  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 6;
+  log.appendChild(evEl(ev));
+  while (log.childNodes.length > 600) log.removeChild(log.firstChild);
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+let readTimer = null;
+function scheduleRead() {
+  if (!$('r-auto').classList.contains('on') || readTimer) return;
+  readTimer = setTimeout(() => { readTimer = null; readKey(); }, 250);
 }
 
+// ---------------------------------------------------------------- actions
+function toast(text, kind = 'ok') {
+  const t = document.createElement('div');
+  t.className = 'toast ' + kind;
+  t.textContent = text;
+  $('toasts').appendChild(t);
+  setTimeout(() => t.remove(), kind === 'bad' ? 9000 : 5000);
+  while ($('toasts').childNodes.length > 4) $('toasts').firstChild.remove();
+}
 async function post(url, body) {
-  const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-  const r = await res.json();
-  showResult(r);
-  return r;
+  try {
+    const r = await (await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })).json();
+    toast((r.ok ? '✓ ' : '✗ ') + r.message, r.ok ? 'ok' : 'bad');
+    return r;
+  } catch (e) { toast('✗ ' + e, 'bad'); }
 }
-
 function act(node, action) {
   const u = ui[node];
-  $('result').textContent = `${action} on ${node}…`;
+  toast(`${action.replace('_', ' ')} on ${node}…`, 'info');
   post('/api/action', { node, action, target: u.target, accept_loss: u.loss, accept_split_brain: u.brain });
 }
-
-function write_(op) {
+function write_(op, atomic = false) {
   post('/api/write', {
     node: $('w-node').value, op, key: $('w-key').value, value: $('w-value').value,
     count: Number($('w-count').value) || 1, min_insync: Number($('w-insync').value) || 0,
+    atomic,
   });
 }
-
+// Bulk editor: `key=value` puts, `-key` deletes; blank lines and `#` comments are skipped.
+function parseBulk() {
+  const items = [], errors = [];
+  $('b-text').value.split('\n').forEach((raw, i) => {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) return;
+    if (line.startsWith('-')) {
+      const key = line.slice(1).trim();
+      key ? items.push({ op: 'delete', key }) : errors.push(`line ${i + 1}: no key after -`);
+      return;
+    }
+    const eq = line.indexOf('=');
+    if (eq <= 0) { errors.push(`line ${i + 1}: expected key=value or -key`); return; }
+    items.push({ op: 'put', key: line.slice(0, eq).trim(), value: line.slice(eq + 1) });
+  });
+  return { items, errors };
+}
+function updateBulkCount() {
+  const { items, errors } = parseBulk();
+  const puts = items.filter(i => i.op === 'put').length;
+  $('b-count').textContent = errors.length ? errors[0]
+    : `${items.length} operation${items.length === 1 ? '' : 's'} (${puts} put, ${items.length - puts} delete)`;
+  $('b-count').style.color = errors.length ? 'var(--bad)' : '';
+}
+function bulk(atomic) {
+  const { items, errors } = parseBulk();
+  if (errors.length) return toast('✗ ' + errors[0], 'bad');
+  if (!items.length) return toast('✗ the bulk editor is empty', 'bad');
+  post('/api/write', { node: $('w-node').value, items, atomic, min_insync: Number($('w-insync').value) || 0 });
+}
+$('b-text').addEventListener('input', updateBulkCount);
+$('b-text').value = 'user:1=alice\nuser:2=bob\nuser:3=carol\n-user:4';
+updateBulkCount();
 async function readKey() {
   const key = $('r-key').value;
   if (!key) return;
-  const r = await (await fetch('/api/key?key=' + encodeURIComponent(key))).json();
-  $('r-table').querySelector('tbody').innerHTML = r.values.map(v => `<tr><th>${v.node}</th><td>${
-    v.error ? `<span class="err">${esc(v.error)}</span>` : v.absent ? '<span class="muted">(absent)</span>' : esc(v.value) + ` <span class="muted">@ seq ${v.write_seq}</span>`
-  }</td></tr>`).join('');
+  try {
+    const r = await (await fetch('/api/key?key=' + encodeURIComponent(key))).json();
+    $('r-table').innerHTML = r.values.map(v => `<tr><td><span class="nid" style="color:${colorOf(v.node)}">${v.node}</span></td><td>${
+      v.error ? `<span style="color:var(--bad)">${esc(v.error)}</span>`
+      : v.absent ? '<span class="addr">(absent)</span>'
+      : `<span class="mono">${esc(v.value)}</span> <span class="addr">@ seq ${v.write_seq}</span>`}</td></tr>`).join('');
+  } catch (e) {}
 }
-
 async function scan() {
   const r = await (await fetch('/api/scan?node=' + $('s-node').value)).json();
-  if (!r.ok) return showResult(r);
-  $('s-table').querySelector('tbody').innerHTML = r.rows.length
-    ? r.rows.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join('')
-    : '<tr><td class="muted">(empty)</td></tr>';
+  if (!r.ok) return toast('✗ ' + r.message, 'bad');
+  $('s-table').innerHTML = r.rows.length
+    ? r.rows.map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="mono">${esc(v)}</td></tr>`).join('')
+    : '<tr><td class="addr">(empty)</td></tr>';
 }
-
 $('r-key').addEventListener('keydown', e => { if (e.key === 'Enter') readKey(); });
+$('w-value').addEventListener('keydown', e => { if (e.key === 'Enter') write_('put'); });
+renderFilters();
 connect();
 setTimeout(readKey, 500);
 </script>

@@ -24,7 +24,7 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use replicated_rocksdb::{
-    AcceptDataLoss, AcceptSplitBrainRisk, AllowAll, Backoff, CfSpec, HaltAction, IterMode,
+    AcceptDataLoss, AcceptSplitBrainRisk, AllowAll, Backoff, Batch, CfSpec, HaltAction, IterMode,
     LogEntry, MasterConfig, Node, NodeConfig, NodeState, Op, ReadApi, RejoinOptions,
     ReplicationListener, RepointDivergence, RepointOptions, Seq, ServeConfig, SlaveConfig,
     SlaveState, UnfenceOptions, UpstreamConfig, VerifyMode, VerifyReport, WriteConcern,
@@ -448,56 +448,147 @@ async fn scan(State(app): AppState, Query(q): Query<ScanQuery>) -> Json<Value> {
     }
 }
 
+/// One operation of a write request: `{"op": "put", "key": .., "value": ..}` or
+/// `{"op": "delete", "key": ..}`.
 #[derive(Deserialize)]
-struct WriteReq {
-    node: String,
+struct WriteItem {
     op: String,
     key: String,
     #[serde(default)]
     value: String,
-    /// > 1: write `key-0` .. `key-{count-1}`.
+}
+
+#[derive(Deserialize)]
+struct WriteReq {
+    node: String,
+    /// Either `items`, or `op` / `key` / `value` / `count` (keys `key-0` .. `key-{count-1}`
+    /// when `count` > 1).
+    #[serde(default)]
+    items: Vec<WriteItem>,
+    #[serde(default)]
+    op: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    value: String,
     #[serde(default)]
     count: Option<u32>,
+    /// All operations in one `Batch`: one atomic log entry (every replica applies all of
+    /// them or none). Otherwise one entry per operation.
+    #[serde(default)]
+    atomic: bool,
     /// Write concern: wait for this many in-sync replicas (0 = asynchronous).
     #[serde(default)]
     min_insync: usize,
+}
+
+const MAX_OPS: usize = 5000;
+
+impl WriteReq {
+    fn items(&self) -> Result<Vec<WriteItem>, String> {
+        let items: Vec<WriteItem> = if self.items.is_empty() {
+            let count = self.count.unwrap_or(1).max(1) as usize;
+            (0..count)
+                .map(|i| WriteItem {
+                    op: self.op.clone(),
+                    key: if count == 1 {
+                        self.key.clone()
+                    } else {
+                        format!("{}-{i}", self.key)
+                    },
+                    value: self.value.clone(),
+                })
+                .collect()
+        } else {
+            self.items
+                .iter()
+                .map(|i| WriteItem {
+                    op: i.op.clone(),
+                    key: i.key.clone(),
+                    value: i.value.clone(),
+                })
+                .collect()
+        };
+        if items.len() > MAX_OPS {
+            return Err(format!("at most {MAX_OPS} operations per request"));
+        }
+        if let Some(bad) = items.iter().find(|i| i.key.is_empty()) {
+            return Err(format!("an empty key (op {:?})", bad.op));
+        }
+        Ok(items)
+    }
+}
+
+fn add(batch: &mut Batch, item: &WriteItem) -> Result<(), String> {
+    match item.op.as_str() {
+        "put" => batch.put(CF, item.key.as_bytes(), item.value.as_bytes()),
+        "delete" => batch.delete(CF, item.key.as_bytes()),
+        other => return Err(format!("unknown op {other:?}")),
+    };
+    Ok(())
+}
+
+fn summary(items: &[WriteItem]) -> String {
+    let puts = items.iter().filter(|i| i.op == "put").count();
+    let dels = items.len() - puts;
+    match items {
+        [one] => format!("{} {}", one.op, show(one.key.as_bytes())),
+        _ => format!(
+            "{} ops ({puts} put, {dels} delete; {} .. {})",
+            items.len(),
+            show(items[0].key.as_bytes()),
+            show(items[items.len() - 1].key.as_bytes())
+        ),
+    }
 }
 
 async fn write(State(app): AppState, Json(req): Json<WriteReq>) -> Json<Value> {
     let app2 = app.clone();
     let res = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let m = app2.member(&req.node)?;
+        let items = req.items()?;
         let concern = WriteConcern {
             min_insync_replicas: req.min_insync,
             ack_timeout: Duration::from_secs(3),
         };
-        let count = req.count.unwrap_or(1).clamp(1, 5000);
-        let mut last = 0;
-        for i in 0..count {
-            let key = if count == 1 {
-                req.key.clone()
-            } else {
-                format!("{}-{i}", req.key)
-            };
-            let r = match req.op.as_str() {
-                "put" => m
-                    .node
-                    .put_with(CF, key.as_bytes(), req.value.as_bytes(), concern),
-                "delete" => m.node.delete(CF, key.as_bytes()),
-                other => return Err(format!("unknown op {other:?}")),
-            };
-            last = r.map_err(|e| {
-                let msg = format!("{} {key} on {} failed: {e}", req.op, m.id);
-                app2.bus.emit(m.id, "error", msg.clone());
-                msg
-            })?;
-        }
-        let what = if count == 1 {
-            format!("{} {}", req.op, req.key)
-        } else {
-            format!("{} {}-0..{}", req.op, req.key, count - 1)
+        let fail = |what: &str, e: replicated_rocksdb::Error| {
+            let msg = format!("{what} on {} failed: {e}", m.id);
+            app2.bus.emit(m.id, "error", msg.clone());
+            msg
         };
-        let msg = format!("{what} committed at seq {last}");
+        let what = summary(&items);
+        let msg = if req.atomic || items.len() == 1 {
+            let mut batch = Batch::new();
+            for item in &items {
+                add(&mut batch, item)?;
+            }
+            let seq = m
+                .node
+                .write_with(batch, concern)
+                .map_err(|e| fail(&what, e))?;
+            if items.len() == 1 {
+                format!("{what} committed at seq {seq}")
+            } else {
+                format!("{what} committed atomically as ONE entry, seq {seq}")
+            }
+        } else {
+            let mut first = None;
+            let mut last = 0;
+            for item in &items {
+                let mut batch = Batch::new();
+                add(&mut batch, item)?;
+                last = m
+                    .node
+                    .write_with(batch, concern)
+                    .map_err(|e| fail(&format!("{} {}", item.op, item.key), e))?;
+                first.get_or_insert(last);
+            }
+            format!(
+                "{what} committed as {} separate entries, seq {}..={last}",
+                items.len(),
+                first.unwrap_or(last)
+            )
+        };
         app2.bus.emit(m.id, "write", msg.clone());
         Ok(msg)
     })
