@@ -946,3 +946,153 @@ async fn an_unfence_whose_open_fails_fails_the_node() {
     a.reopen().await.unwrap();
     assert_eq!(a.state(), fenced, "the consent was not reused");
 }
+
+/// A slave promoted unchecked while its master still runs holds a newer epoch than that master
+/// (split brain). Rejoining the old master: without consent it keeps retrying `STALE_EPOCH`
+/// (a master never reaches another node's epoch) with a hint, never discarding; with
+/// `AcceptDataLoss` the newer epoch's entries are the divergence they are, and are repaired
+/// away (both by `rejoin_as_slave` and by a later `repoint`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_split_brain_master_rejoins_the_older_master_only_with_consent() {
+    let c = Cluster::new();
+    let a = Node::create_master(node_cfg(&c, "a", dead_addr(), &[]))
+        .await
+        .unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    a.put("c", b"k", b"1").unwrap();
+    let a_addr = a.serve_addr().unwrap();
+    let repair = || RepointDivergence::Repair {
+        accept_loss: AcceptDataLoss,
+    };
+    for (name, consent_at_rejoin) in [("b", false), ("d", true)] {
+        let n = Node::create_slave(node_cfg(&c, name, a_addr, &[]))
+            .await
+            .unwrap();
+        n.wait_for_seq(a.last_seq().unwrap(), WAIT).await.unwrap();
+        n.promote().await.unwrap(); // unchecked, while A runs: a second master
+        let NodeState::Master { identity } = n.state() else {
+            panic!("{:?}", n.state())
+        };
+        assert!(identity.epoch > 1);
+        n.put("c", b"k", b"split").unwrap();
+
+        if consent_at_rejoin {
+            let out = n
+                .rejoin_as_slave(
+                    Some(up(a_addr)),
+                    RejoinOptions {
+                        on_divergence: repair(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(out, RepointOutcome::Repaired { .. }), "{out:?}");
+        } else {
+            match n
+                .rejoin_as_slave(Some(up(a_addr)), RejoinOptions::default())
+                .await
+                .unwrap()
+            {
+                RepointOutcome::Retrying { last_error, .. } => {
+                    assert!(last_error.contains("STALE_EPOCH"), "{last_error}");
+                    assert!(
+                        last_error.contains("AcceptDataLoss"),
+                        "a hint: {last_error}"
+                    );
+                }
+                o => panic!("expected Retrying, got {o:?}"),
+            }
+            assert_eq!(n.get("c", b"k").unwrap(), Some(b"split".to_vec()), "kept");
+            let out = n
+                .repoint(
+                    up(a_addr),
+                    RepointOptions {
+                        on_divergence: repair(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(out, RepointOutcome::Repaired { .. }), "{out:?}");
+        }
+        a.put("c", b"after", name.as_bytes()).unwrap();
+        n.wait_for_seq(a.last_seq().unwrap(), WAIT).await.unwrap();
+        assert_eq!(n.get("c", b"k").unwrap(), Some(b"1".to_vec()), "{name}");
+        assert_eq!(
+            n.get("c", b"after").unwrap(),
+            Some(name.as_bytes().to_vec())
+        );
+        let s = n.status().unwrap();
+        assert_eq!(
+            s.origin_identity.unwrap().epoch,
+            1,
+            "{name} follows A's epoch"
+        );
+        assert_eq!(s.last_error, None);
+    }
+}
+
+/// A replica of the split-brain master keeps that master's newer epoch after the master itself
+/// rejoined the older history. Repointed at its old upstream (now a replica on the older
+/// epoch), it retries `STALE_EPOCH` without consent and repairs with `AcceptDataLoss`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replica_of_the_split_brain_master_follows_it_back_only_with_consent() {
+    let c = Cluster::new();
+    let a = Node::create_master(node_cfg(&c, "a", dead_addr(), &[]))
+        .await
+        .unwrap();
+    a.create_cf(CfSpec::new("c")).unwrap();
+    a.put("c", b"k", b"1").unwrap();
+    let a_addr = a.serve_addr().unwrap();
+    let b = Node::create_slave(node_cfg(&c, "b", a_addr, &[]))
+        .await
+        .unwrap();
+    let b_addr = b.serve_addr().unwrap();
+    let d = Node::create_slave(node_cfg(&c, "d", b_addr, &[]))
+        .await
+        .unwrap();
+    d.wait_for_seq(a.last_seq().unwrap(), WAIT).await.unwrap();
+    b.promote().await.unwrap(); // unchecked, while A runs
+    let seq = b.put("c", b"k", b"split").unwrap();
+    d.wait_for_seq(seq, WAIT).await.unwrap(); // D now holds B's newer epoch
+    let repair = || RepointOptions {
+        on_divergence: RepointDivergence::Repair {
+            accept_loss: AcceptDataLoss,
+        },
+    };
+    let out = b
+        .rejoin_as_slave(
+            Some(up(a_addr)),
+            RejoinOptions {
+                on_divergence: RepointDivergence::Repair {
+                    accept_loss: AcceptDataLoss,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(out, RepointOutcome::Repaired { .. }), "{out:?}");
+    b.wait_for_seq(a.last_seq().unwrap(), WAIT).await.unwrap();
+    // The repair went on from a rejected handshake: A is still recorded as B's upstream, so
+    // B serves its chain downstream (it does not look like a master to D).
+    assert_eq!(b.status().unwrap().upstream_chain, vec!["a".to_string()]);
+
+    match d
+        .repoint(up(b_addr), RepointOptions::default())
+        .await
+        .unwrap()
+    {
+        RepointOutcome::Retrying { last_error, .. } => {
+            assert!(last_error.contains("STALE_EPOCH"), "{last_error}");
+            assert!(last_error.contains("replica"), "a hint: {last_error}");
+        }
+        o => panic!("expected Retrying, got {o:?}"),
+    }
+    assert_eq!(d.get("c", b"k").unwrap(), Some(b"split".to_vec()), "kept");
+    let out = d.repoint(up(b_addr), repair()).await.unwrap();
+    assert!(matches!(out, RepointOutcome::Repaired { .. }), "{out:?}");
+    a.put("c", b"after", b"x").unwrap();
+    d.wait_for_seq(a.last_seq().unwrap(), WAIT).await.unwrap();
+    assert_eq!(d.get("c", b"k").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(d.get("c", b"after").unwrap(), Some(b"x".to_vec()));
+    assert_eq!(d.status().unwrap().origin_identity.unwrap().epoch, 1);
+}

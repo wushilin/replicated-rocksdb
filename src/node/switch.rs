@@ -219,8 +219,12 @@ impl Node {
     /// after a failover), `Resumed`, ... when its log is a prefix of the upstream's;
     /// `Err(Diverged)` under the default `RepointDivergence::Refuse`, with the node then a
     /// slave halted `Diverged` (data intact, [`diverged_entries`](Self::diverged_entries);
-    /// resolve with [`repoint`](Self::repoint) and `AcceptDataLoss`). `opts.on_divergence` is
-    /// the only consent it uses, single-use as for `repoint`.
+    /// resolve with [`repoint`](Self::repoint) and `AcceptDataLoss`); `Ok(Retrying)` with
+    /// `STALE_EPOCH` when this node holds a newer epoch than the upstream (it was promoted
+    /// while the upstream's master ran). `opts.on_divergence` is the only consent it uses,
+    /// single-use as for `repoint`: under `Repair` / `Rebootstrap` it resolves `DIVERGED` and
+    /// also `STALE_EPOCH`, discarding this node's newer-epoch entries to follow the upstream
+    /// (see [`RepointDivergence`](crate::RepointDivergence)).
     ///
     /// A running master is shut down first (a live `ReadSnapshot` fails the call and leaves
     /// the node `Failed`). A refusal before the directory is rewritten (it cannot be opened,

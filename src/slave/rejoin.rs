@@ -11,8 +11,10 @@ use crate::types::Role;
 /// slave halts `Diverged` with its data intact.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RejoinOptions {
-    /// Decides a `DIVERGED` answer to the first handshake, exactly like
-    /// `RepointOptions::on_divergence` (single-use consent).
+    /// Decides a `DIVERGED` answer to the first handshake, and under `Repair` / `Rebootstrap`
+    /// also a `STALE_EPOCH` one (this node's newer-epoch entries are discarded to follow the
+    /// upstream's older epoch), exactly like `RepointOptions::on_divergence` (single-use
+    /// consent). Under `Refuse`, `STALE_EPOCH` settles as `Retrying`.
     pub on_divergence: RepointDivergence,
 }
 
@@ -38,7 +40,9 @@ impl Slave {
     ///    [`Slave::repoint`]: `Ok(EpochAdvanced)` when the old master's log is a prefix of the
     ///    new master's (after a failover the new master always runs a newer epoch, so this is
     ///    the usual "resumed" answer), `Resumed`, `Bootstrapped`, `Repaired { discarded }`,
-    ///    `Retrying { .. }`, or `Err(Diverged { .. })` under `RepointDivergence::Refuse` (the
+    ///    `Retrying { .. }` (also `STALE_EPOCH` under `Refuse`: a former master promoted while
+    ///    the target's master ran holds a newer epoch; consent repairs it away instead), or
+    ///    `Err(Diverged { .. })` under `RepointDivergence::Refuse` (the
     ///    default) with the slave halted `Diverged`, its data intact and
     ///    [`diverged_entries`](Self::diverged_entries) available. The consent in `opts` is
     ///    single-use, as for `repoint`. As after a repoint, the returned slave keeps the
