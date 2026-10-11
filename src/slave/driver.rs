@@ -15,7 +15,7 @@ use tracing::Instrument;
 
 use tonic::Status;
 
-use super::apply::{self, Applied};
+use super::apply::Applier;
 use super::bootstrap;
 use super::client::{self, Client};
 use super::config::BackoffState;
@@ -885,19 +885,17 @@ async fn tail(
                 let ts: Vec<u64> = batch.entries.iter().map(|e| e.ts_ms).collect();
                 inner.pending_ts.store(ts[0], Ordering::SeqCst);
                 let _clear = ClearPending(inner);
-                // Each entry is its own atomic write, so a crash mid-batch leaves a clean boundary.
+                // Consecutive entries share one atomic write (group commit, DESIGN.md §6); an
+                // entry is never split, so a crash mid-batch leaves a clean boundary.
+                let mut applier = Applier::new(inner, generation, &mut cleared);
                 for (i, e) in batch.entries.into_iter().enumerate() {
                     let next_ts = ts.get(i + 1).copied().unwrap_or(0);
-                    match apply::apply(inner, generation, entry_from_pb(e), next_ts).await {
-                        Applied::Committed => {
-                            if !cleared {
-                                inner.set_last_error(None);
-                                cleared = true;
-                            }
-                        }
-                        Applied::Skipped => {}
-                        Applied::End(end) => return end,
+                    if let Err(end) = applier.push(entry_from_pb(e), next_ts).await {
+                        return end;
                     }
+                }
+                if let Err(end) = applier.finish().await {
+                    return end;
                 }
                 acks.send_replace(inner.store.position().last_seq);
             }

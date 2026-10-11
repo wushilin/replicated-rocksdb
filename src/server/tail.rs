@@ -507,7 +507,12 @@ async fn produce(
             next = entry.seq + 1;
             pending.since.get_or_insert_with(Instant::now);
             pending.bytes += size;
-            pending.entries.push(entry_to_pb(entry));
+            let mut pb = entry_to_pb(entry);
+            // Test hook: an entry damaged in transit (its CRC no longer matches).
+            if failpoint::fire("server-tail-corrupt-entry") {
+                pb.crc32c ^= 1;
+            }
+            pending.entries.push(pb);
             if failpoint::fire("server-tail-after-entry") {
                 send_pending!();
                 return out

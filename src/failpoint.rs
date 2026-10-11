@@ -5,6 +5,7 @@
 //! `slave-bootstrap-after-chunk` (after a bootstrap records message is written),
 //! `server-tail-after-entry` (the server ends the Tail stream after sending an entry),
 //! `server-tail-skip-entry` (the server leaves the next entry out of the Tail stream: a gap),
+//! `server-tail-corrupt-entry` (the server sends the next entry with a wrong CRC),
 //! `slave-after-gap` (a slave saw a gap mid-stream and requested a bootstrap under
 //! `GapPolicy::Rebootstrap`, before the session ends; `pause` or `cfg_callback`),
 //! `slave-before-bootstrap-rpc` (a handshake decided to bootstrap, before the Bootstrap RPC; `pause`),
@@ -14,7 +15,7 @@
 //! `verify-before-finish` (a slave's verify run, after the comparison, before its report is acted on; `pause`),
 //! `server-verify-begin` (the server's VerifyBegin handler, before it answers; `pause`),
 //! `server-verify-begin-busy` (the server's VerifyBegin handler answers `BUSY`; `return`),
-//! `slave-before-apply` (a received entry, before its commit; `pause`),
+//! `slave-before-apply` (before the commit of a group of received entries; `pause`),
 //! `slave-before-halt` (a session ended in a halt, before it is persisted; use `cfg_callback`),
 //! `slave-repair-before-fetch` (a repair's verify session is open, nothing fetched yet;
 //! `pause` or `cfg_callback`),

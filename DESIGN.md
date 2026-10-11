@@ -197,18 +197,32 @@ Write methods stay synchronous; async callers use `spawn_blocking`. Concurrent w
 ## 6. Slave apply path
 
 ```
-for each LogEntry received (in order):
+for each received batch, for each LogEntry in it (in order):
+  (checks: any failure first commits the open group, then is handled as shown)
   verify crc                                          → Halted(Corrupt)
   verify entry.epoch == epoch_for(entry.seq)            → end stream, back off, handshake again
                                                        (last_error set: it contradicts the shared history)
-  if entry.seq <= last_seq: skip                       (exactly-once)
-  if entry.seq != last_seq + 1:                        → GapPolicy
+  if entry.seq <= tail: skip                           (exactly-once; tail = last entry of the open
+                                                        group, or last_seq)
+  if entry.seq != tail + 1:                            → GapPolicy
   ops = decode + validate (PROTOCOL.md §5.2)           → Halted(Corrupt / SpecMismatch)
-  wb = WriteBatch:
+  commit the open group first if: entry is a CF op, or adding it passes 4 MiB of ops, or a
+    verify capture seq is inside the group, or a verify holds the applier (never wait holding
+    an uncommitted group); with no open group, wait while a verify holds the applier
+  add entry to the open group
+  commit the group if: entry is a CF op (it commits alone), entry.seq is a verify capture seq,
+    entry.seq reaches repair_until, the group has SlaveConfig::max_group_entries (default 256)
+    entries or 4 MiB of ops
+at the end of the batch: commit the open group
+
+commit a group (one spawn_blocking):
+  wb = one WriteBatch, for every entry of the group:
          ops with envelopes (write_seq = entry.seq)
          __changelog[seq] = entry (unchanged)
-         __meta.last_seq = seq, last_entry_crc = entry.crc32c
-  db.write(wb)          (sync = SlaveConfig::sync_writes, default false)
+         __meta.last_seq = seq, last_entry_crc = entry.crc32c   (the last entry's values win)
+       an entry that fails to prepare ends the group before it: the entries before it commit,
+       then it halts as above (Corrupt / SpecMismatch)
+  db.write(wb)          (sync = SlaveConfig::sync_writes, default false: one fsync per group)
                                                        integrity failure → Halted(Corrupt);
                                                        storage I/O failure (std::io, RocksDB IOError/Busy/TimedOut/
                                                        TryAgain; nothing committed) → back off, retry, report in
@@ -217,16 +231,19 @@ for each LogEntry received (in order):
                                                        nothing was written). A physical CF left by a failed create is
                                                        reused only by the same create (persisted create intent);
                                                        another spec at that name → Halted(Corrupt)
-  if a verify capture is requested at this seq: take the snapshot now (§12)
-  listener.on_entry(&entry)
-  publish seq to wait_for_seq and downstream tail subscribers
+  per entry of the group, in order:
+    if it reaches repair_until: clear the target (§12.1)
+    if a verify capture is requested at this seq: take the snapshot now (§12)
+  then per entry, in order:
+    listener.on_entry(&entry)
+    publish seq to wait_for_seq and downstream tail subscribers
 after each batch (coalesced), and at least once per heartbeat:
   ack applied_seq = last_seq to the upstream (PROTOCOL.md §7.6)
 ```
 
-- **One entry is one WriteBatch, and an entry is never split.** That makes every RocksDB snapshot on a slave a consistent state at some seq.
+- **An entry is never split; consecutive entries may share one WriteBatch** (group commit). Every RocksDB snapshot on a slave is still a consistent state at some seq: a batch holds whole entries, and `__meta.last_seq` in it is the last of them. A group commit is all or nothing (a failed write commits none of its entries and is retried like a single entry: I/O errors back off and retry, anything else halts). Group boundaries are exact where they matter: a verify capture seq and a repair target always end a group, so the capture snapshot and the end of a repair happen right after that seq's commit, before any later entry commits. `max_group_entries = 1` applies every entry in its own batch, as before group commit.
 - **Upstream epoch histories are validated** (in an `EPOCH_ADVANCED` handshake and in a bootstrap header): non-empty, first record `{1, 1}`, epochs strictly increasing, start seqs non-decreasing, last epoch equal to the identity's epoch. An invalid history halts the slave with `Corrupt`.
-- Writes are not synced on slaves by default (`SlaveConfig::sync_writes = false`). A slave that crashes resumes from its durable `last_seq` and fetches the rest again from upstream. Its acks (§11) then promise that an entry is in its write-ahead log, which survives a process crash but not a power loss. With `sync_writes = true` every applied entry is fsynced, so an acknowledged entry survives a power loss of the replica too.
+- Writes are not synced on slaves by default (`SlaveConfig::sync_writes = false`). A slave that crashes resumes from its durable `last_seq` and fetches the rest again from upstream. Its acks (§11) then promise that an entry is in its write-ahead log, which survives a process crash but not a power loss. With `sync_writes = true` every applied entry is fsynced (once per group), so an acknowledged entry survives a power loss of the replica too.
 - **A downstream replica can be ahead of its upstream slave.** If upstream B crashes unsynced after forwarding to C, C's `last_seq` can exceed B's. On handshake B replies `RESUME`, and the Tail stream sends only heartbeats until B passes C's seq. The content is identical because seqs come from the same origin log. This is allowed only when the upstream is a slave. The master rejects it (§13).
 - **Divergence check on connect.** The slave sends `last_entry_crc` in the handshake and `prev_crc32c` in `Tail`. If the upstream still holds that entry and its CRC differs, the upstream answers `DIVERGED` and the slave follows `on_divergence` (halt by default, §12.1 repair, or bootstrap) instead of applying a different history.
 
@@ -402,7 +419,7 @@ Nothing has to be recorded at write time, and the divergent entries only need to
 
 **Why the state at `S` is consistent.** The upstream's verify session pins one RocksDB snapshot (PROTOCOL.md §9.2). `S` (`__meta.last_seq`), the identity, the epoch history, `cf_specs` and every fetched envelope are read through it. The rewind stores that epoch history; if it differs from the handshake's (the upstream moved to another history with the same identity in between), the repair falls back.
 
-- Every entry is one `WriteBatch` together with `__meta.last_seq`, on the master and on slaves (§5, §6). A snapshot therefore holds exactly the effects of entries `1..=S`: never part of an entry, never a later one.
+- Every entry is committed whole, in one `WriteBatch` together with `__meta.last_seq`, on the master and on slaves (§5, §6; a slave's batch may hold several consecutive entries, and its `last_seq` is the last of them). A snapshot therefore holds exactly the effects of entries `1..=S`: never part of an entry, never a later one.
 - Writes the upstream commits while the slave fetches are invisible to the fetch. They are entries after `S`, which the slave replays after `S`.
 - A local CF must exist on the upstream at `S` with the same `create_seq` and comparator. Otherwise repair is not possible.
 
@@ -420,7 +437,7 @@ Nothing has to be recorded at write time, and the divergent entries only need to
    It is serialized with retention (both hold the retention lock, and a trim reads its positions under it), so a trim never decides from a position the rewind replaced.
 
    It is **all or nothing**. Before it, the old state stands (the divergent suffix is still readable and is retried); after it, the rewound state stands with its target. The batch is refused if the position moved since the fetch. Readers are refused before the batch becomes visible. Downstream streams and sessions are reset before and after it (they end with `UPSTREAM_RESET`, so no downstream bootstrap or verify completes on a mixed snapshot). A verify capture waiting on the old state is cancelled. In memory, identity and position follow on the same blocking thread.
-3. **Replay** (the ordinary apply path, §6). Reads, iterators and `Slave::snapshot` re-check readiness after they took their view, so a view that could hold the rewind is practically never returned. The re-check is not atomic: a view taken just before a rewind whose whole replay then completes before the re-check (an ABA) would pass it. That residual needs an entire replay to finish between two steps of one read. Each entry is its own atomic commit, together with `__changelog[seq]` and `last_seq`. A crash resumes from the durable `last_seq + 1`, since the handshake sends it. The mixed state is **hidden behind `repair_until`**. Until `last_seq` reaches it, the slave answers `NotReady` to reads, snapshots, `verify_now`, verify captures, promotion and downstream handshakes, bootstraps and verify sessions. `Status` reports `repairing:<S>`. All of this holds in every state, also after a restart and after a halt during the replay, because a halt rewrites `node_state` and not `repair_until`. The commit that reaches `S` removes `repair_until` (synced) before the slave reports ready. A crash in between leaves a target at or below `last_seq`, which the next open removes (the node is ready at once).
+3. **Replay** (the ordinary apply path, §6). Reads, iterators and `Slave::snapshot` re-check readiness after they took their view, so a view that could hold the rewind is practically never returned. The re-check is not atomic: a view taken just before a rewind whose whole replay then completes before the re-check (an ABA) would pass it. That residual needs an entire replay to finish between two steps of one read. Each entry is committed atomically, together with `__changelog[seq]` and `last_seq` (consecutive entries may share one commit, §6, and a commit always ends at `S`). A crash resumes from the durable `last_seq + 1`, since the handshake sends it. The mixed state is **hidden behind `repair_until`**. Until `last_seq` reaches it, the slave answers `NotReady` to reads, snapshots, `verify_now`, verify captures, promotion and downstream handshakes, bootstraps and verify sessions. `Status` reports `repairing:<S>`. All of this holds in every state, also after a restart and after a halt during the replay, because a halt rewrites `node_state` and not `repair_until`. The commit that reaches `S` removes `repair_until` (synced) before the slave reports ready. A crash in between leaves a target at or below `last_seq`, which the next open removes (the node is ready at once).
 
 **Guards**
 
@@ -740,7 +757,8 @@ pub struct SlaveConfig {
                                              // 0 = real-time push; larger = batch like Kafka fetch.min.bytes
     pub heartbeat: Duration,                 // when serving downstream; default 5 s
     pub connect_timeout: Duration,           // default 5 s
-    pub sync_writes: bool,                   // fsync each applied entry; default false
+    pub sync_writes: bool,                   // fsync each applied entry (once per group); default false
+    pub max_group_entries: usize,            // group commit: entries per WriteBatch; default 256, >= 1
     pub rocksdb: RocksTuning,
     pub clock: Arc<dyn Clock>,               // TTL read filtering and retention
 }
@@ -936,6 +954,7 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 | Master fsync | always (not configurable) |
 | Write concern | `min_insync_replicas` 0 (asynchronous), `ack_timeout` 5 s |
 | Slave fsync | off (`SlaveConfig::sync_writes`) |
+| Slave group commit | up to 256 entries (`SlaveConfig::max_group_entries`) or 4 MiB of ops per `WriteBatch` |
 | Heartbeat / idle timeout | 5 s / 15 s |
 | Reconnect backoff | 100 ms → 30 s, ×2, full jitter |
 | Identity change policy | Refuse |
@@ -996,6 +1015,7 @@ Dependencies: `rocksdb`, `tokio`, `tonic` (tls), `prost`, `tonic-types` (ErrorIn
 - A→B→C chain, with C bootstrapping from B while A writes and creates/drops CFs. Checksums for A, B and C must be identical.
 - Slave crash and restart at random points: no gaps, no duplicates, listener order preserved.
 - C ahead of B after B crashes unsynced: C waits and then converges.
+- **Group commit:** a 1 000-entry burst with `sync_writes` commits in fewer batches than entries (and in 1 000 with `max_group_entries = 1`); a CF entry in a burst commits alone; a corrupt entry mid-batch commits the entries before it, then halts; verify captures during a burst land exactly at `S`; a repair target inside a received batch ends a group there. The whole suite also passes with `RRDB_TEST_MAX_GROUP_ENTRIES=1` (debug builds read it as the default).
 - Retention trims the log past a stopped slave; the slave bootstraps again on restart.
 - **Bootstrap lease:** aggressive retention (`max_entries = 1`) during a slow bootstrap; the slave still tails from `S + 1` without bootstrapping again.
 - **Acks and write concern:** `replicas()` follows a replica's acknowledged seq and lag; an ack that goes backwards or past what was sent ends the stream. `min_insync_replicas = 1` without a replica → `NotEnoughReplicas` (no seq consumed); with one → returns after its ack; a replica that stops acknowledging → `AckTimeout`, the entry still replicates; master lost after an acknowledged write → `promote_checked` on the in-sync replica → the write is there.

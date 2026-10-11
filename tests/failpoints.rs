@@ -2075,3 +2075,213 @@ async fn a_promotion_refused_on_the_stopped_store_keeps_the_repointed_upstream()
     assert_converged(&a, &[("d", &d)]).await;
     scenario.teardown();
 }
+
+/// Group commit: the upstream batches entries (`min_batch_bytes`), so the slave receives
+/// several per Tail message. Sets the default group size explicitly, so these tests also group
+/// when the suite runs with `RRDB_TEST_MAX_GROUP_ENTRIES=1`.
+fn batched(cfg: &mut replicated_rocksdb::SlaveConfig) {
+    cfg.max_group_entries = 256;
+    cfg.fetch.min_batch_bytes = 1 << 20;
+    cfg.fetch.max_wait = Duration::from_millis(400);
+}
+
+/// Seqs (relative to the first applied entry) after which a commit ended.
+fn group_ends(sizes: &[usize]) -> Vec<usize> {
+    sizes
+        .iter()
+        .scan(0, |sum, n| {
+            *sum += n;
+            Some(*sum)
+        })
+        .collect()
+}
+
+/// D: with `sync_writes`, a burst of 1 000 entries commits in fewer batches than entries, and
+/// the slave matches the master. With `max_group_entries = 1` every entry is its own commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_commits_in_groups_with_sync_writes() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    cfg.sync_writes = true;
+    batched(&mut cfg);
+    let b = Slave::open(cfg).await.unwrap();
+    let (mut cfg, _) = c.slave_config("one", m.serve_addr().unwrap());
+    cfg.sync_writes = true;
+    batched(&mut cfg);
+    cfg.max_group_entries = 1;
+    let one = Slave::open(cfg).await.unwrap();
+    assert_converged(&m, &[("b", &b), ("one", &one)]).await;
+    b.wait_streaming(support::WAIT).await.unwrap();
+    one.wait_streaming(support::WAIT).await.unwrap();
+    let before = m.last_seq();
+    for i in 0..1_000u32 {
+        m.put("c", &i.to_be_bytes(), b"v").unwrap();
+    }
+    assert_converged(&m, &[("b", &b), ("one", &one)]).await;
+    let sizes = b.commit_sizes();
+    assert_eq!(sizes.iter().sum::<usize>() as u64, m.last_seq() - before);
+    assert!(sizes.len() < 1_000, "{} commits", sizes.len());
+    assert!(sizes.iter().all(|n| *n <= 256));
+    let sizes = one.commit_sizes();
+    assert_eq!(sizes.len(), 1_000);
+    assert!(sizes.iter().all(|n| *n == 1));
+    scenario.teardown();
+}
+
+/// D: a CF entry in the middle of a received batch commits alone; the entries around it are
+/// grouped, and the data is right.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cf_entry_in_a_burst_commits_alone() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    batched(&mut cfg);
+    let b = Slave::open(cfg).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    b.wait_streaming(support::WAIT).await.unwrap();
+    for k in 0..3u8 {
+        m.put("c", &[k], b"before").unwrap();
+    }
+    m.create_cf(CfSpec::new("d")).unwrap();
+    for k in 0..3u8 {
+        m.put("d", &[k], b"after").unwrap();
+    }
+    assert_converged(&m, &[("b", &b)]).await;
+    let sizes = b.commit_sizes();
+    assert_eq!(sizes.iter().sum::<usize>(), 7, "{sizes:?}");
+    let ends = group_ends(&sizes);
+    assert!(
+        ends.contains(&3) && ends.contains(&4),
+        "the CF entry (4th) is a commit of its own: {sizes:?}"
+    );
+    assert!(sizes.iter().any(|n| *n > 1), "grouped: {sizes:?}");
+    assert_eq!(b.get("d", &[2]).unwrap(), Some(b"after".to_vec()));
+    assert_eq!(b.get("c", &[0]).unwrap(), Some(b"before".to_vec()));
+    scenario.teardown();
+}
+
+/// D: a corrupt entry in the middle of a received batch: the entries before it are committed
+/// (as one group), then the slave halts `Corrupt` with `last_seq` on the entry before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_corrupt_entry_mid_batch_commits_the_entries_before_it_then_halts() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let m = c.master("a").await;
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    batched(&mut cfg);
+    let b = Slave::open(cfg).await.unwrap();
+    assert_converged(&m, &[("b", &b)]).await;
+    b.wait_streaming(support::WAIT).await.unwrap();
+    let before = m.last_seq();
+    fail::cfg("server-tail-corrupt-entry", "3*off->1*return").unwrap();
+    for k in 0..6u8 {
+        m.put("c", &[k], b"v").unwrap();
+    }
+    support::wait_state(&b, "halted", |s| {
+        *s == SlaveState::Halted(HaltReason::Corrupt)
+    })
+    .await;
+    fail::remove("server-tail-corrupt-entry");
+    assert_eq!(b.last_seq(), before + 3, "the three entries before it");
+    assert_eq!(b.commit_sizes(), vec![3], "committed as one group");
+    for k in 0..3u8 {
+        assert_eq!(b.get("c", &[k]).unwrap(), Some(b"v".to_vec()));
+    }
+    assert_eq!(b.get("c", &[3]).unwrap(), None);
+    scenario.teardown();
+}
+
+/// D: verifies started while a burst streams in large batches: each capture lands exactly at
+/// the upstream's snapshot seq (a capture at any other seq is refused as `PassedSnapshot` or
+/// would report differences), so every report is clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_verify_capture_mid_burst_lands_exactly_at_the_snapshot() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let m = std::sync::Arc::new(c.master("a").await);
+    m.create_cf(CfSpec::new("c")).unwrap();
+    let (mut cfg, _) = c.slave_config("b", m.serve_addr().unwrap());
+    batched(&mut cfg);
+    cfg.fetch.max_wait = Duration::from_millis(50);
+    let b = Slave::open(cfg).await.unwrap();
+    assert_converged(&*m, &[("b", &b)]).await;
+    b.wait_streaming(support::WAIT).await.unwrap();
+    let before = m.last_seq();
+    let writer = {
+        let m = m.clone();
+        tokio::task::spawn_blocking(move || {
+            for i in 0..3_000u32 {
+                m.put("c", &(i % 500).to_be_bytes(), &i.to_be_bytes())
+                    .unwrap();
+            }
+        })
+    };
+    let mut reports = Vec::new();
+    while !writer.is_finished() {
+        let r = b.verify_now(VerifyMode::Full).await.unwrap();
+        assert!(r.is_clean(), "{r:?}");
+        reports.push(r.seq);
+    }
+    writer.await.unwrap();
+    assert!(!reports.is_empty());
+    assert_converged(&*m, &[("b", &b)]).await;
+    let sizes = b.commit_sizes();
+    assert!(sizes.iter().any(|n| *n > 1), "grouped: {sizes:?}");
+    // Each capture was taken right after a commit that ended exactly at its `S`.
+    let ends = group_ends(&sizes);
+    for s in reports.into_iter().filter(|s| *s > before) {
+        let at = usize::try_from(s - before).unwrap();
+        assert!(ends.contains(&at), "a commit ends at S = {s}: {sizes:?}");
+    }
+    scenario.teardown();
+}
+
+/// D: a repair whose target `S` lies inside a received batch: the replay's group ends exactly
+/// at `S` (the commit that reaches it clears the target), then continues grouped; the slave
+/// ends equal to the leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repair_target_mid_batch_ends_the_group_there() {
+    let (_serial, scenario) = serial().await;
+    let c = Cluster::new();
+    let (a, mut cfg, ld, fork, _) = diverged_slave_and_restored_master(&c).await;
+    cfg.fetch.max_batch_bytes = 1 << 20;
+    batched(&mut cfg);
+    for i in 0..3u8 {
+        a.put("c", &[100 + i], b"new").unwrap();
+    }
+    let gate = Gate::after(0);
+    gate.install("slave-repair-before-fetch");
+    let _gate = gate.open_on_drop();
+    let d = Slave::open(cfg).await.unwrap();
+    wait_until("the session is open, nothing fetched yet", || {
+        gate.reached()
+    })
+    .await;
+    let s = a.last_seq();
+    for i in 0..6u8 {
+        a.put("c", &[i], b"after-s").unwrap();
+    }
+    gate.open();
+    fail::remove("slave-repair-before-fetch");
+    assert_converged(&a, &[("d", &d)]).await;
+    assert_eq!(ld.rewinds(), 1);
+    assert_eq!(ld.bootstraps(), 1, "only the initial bootstrap");
+    assert_eq!(d.promotion_info().node_state, "ready");
+    let sizes = d.commit_sizes();
+    let t = fork - 1;
+    assert_eq!(sizes.iter().sum::<usize>() as u64, a.last_seq() - t);
+    let ends = group_ends(&sizes);
+    assert!(
+        ends.contains(&usize::try_from(s - t).unwrap()),
+        "a group ends at S: {sizes:?}"
+    );
+    assert!(sizes.iter().any(|n| *n > 1), "grouped: {sizes:?}");
+    assert!(d.verify_now(VerifyMode::Full).await.unwrap().is_clean());
+    scenario.teardown();
+}
