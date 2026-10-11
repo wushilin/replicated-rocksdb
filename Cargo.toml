@@ -34,6 +34,10 @@ tonic-prost-build = "0.14.6"
 [dev-dependencies]
 tempfile = "3.27"
 rcgen = "0.14.10"
+axum = { version = "0.8.4", features = ["ws"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tokio = { version = "1.53", features = ["signal", "rt-multi-thread", "macros"] }
 
 [[test]]
 name = "failpoints"

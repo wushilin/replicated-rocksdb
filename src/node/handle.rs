@@ -16,6 +16,7 @@ use crate::config::WriteConcern;
 use crate::error::{Error, Result};
 use crate::master::{Master, ReapStats};
 use crate::read::{ReadApi, ReadSnapshot};
+use crate::server::replicas::ReplicaStatus;
 use crate::slave::{
     HaltAction, RepointOptions, RepointOutcome, Slave, SlaveConfig, SlaveState, SlaveStatus,
     UpstreamConfig,
@@ -347,6 +348,19 @@ impl Node {
             Current::Master(m) => m.serve_addr(),
             Current::Slave(s) => s.serve_addr(),
             _ => None,
+        }
+    }
+
+    /// Direct downstream replicas of the running role ([`Master::replicas`],
+    /// [`Slave::replicas`]): what each was sent and acknowledged, and whether it is in sync
+    /// (what a write concern counts on a master). Empty when the role does not serve;
+    /// `Err` when fenced, failed, stopped or switching.
+    pub fn replicas(&self) -> Result<Vec<ReplicaStatus>> {
+        let g = self.current()?;
+        match &*g {
+            Current::Master(m) => Ok(m.replicas()),
+            Current::Slave(s) => Ok(s.replicas()),
+            other => Err(other.unavailable()),
         }
     }
 
