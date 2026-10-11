@@ -630,6 +630,7 @@ pub struct ServeConfig {
     pub tls: Option<TlsServerConfig>,
     pub authenticator: Arc<dyn Authenticator>,
     pub allow_plaintext_token: bool,
+    pub compression: WireCompression, // None (default) | Zstd: what the server sends
     pub limits: ServeLimits,   // #[non_exhaustive]; start from ServeLimits::default()
                                // { max_concurrent_bootstraps: 2, max_verify_sessions: 4,
                                //   bootstrap_chunk_bytes: 1 MiB (at most 16 MiB),
@@ -719,6 +720,7 @@ pub struct UpstreamConfig {
     pub port: u16,
     pub tls: Option<TlsClientConfig>,
     pub credentials: Arc<dyn CredentialsProvider>,
+    pub compression: WireCompression,   // None (default) | Zstd: what the slave sends
 }
 
 pub struct SlaveConfig {
@@ -945,6 +947,7 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 | Bootstrap chunk size | 1 MiB |
 | Tail fetch batching (slave) | `min_batch_bytes` 0 (real-time), `max_wait` 100 ms, `max_batch_bytes` 1 MiB; server cap 4 MiB |
 | In-sync window (`ServeLimits::replica_lag_time_max`) | 10 s |
+| Wire compression (`ServeConfig::compression`, `UpstreamConfig::compression`) | `None`; every node always accepts zstd (PROTOCOL.md §3.4) |
 | Verify | off by default; `Quick` when enabled; ranges of 1 000 keys or 4 MiB, listed at ≤ 16 keys; capture timeout 60 s; at most 10 000 key mismatches per report |
 | Verify session timeout | 5 min |
 | Repair (`repair_max_bytes`, network phase) | 64 MiB, 120 s; a larger repair bootstraps |

@@ -132,6 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `AllowAll` disables authentication; see the `secure_replication` example for TLS and tokens.
+Optional zstd compression of replication traffic is `ServeConfig::compression` /
+`UpstreamConfig::compression` (`WireCompression`, off by default). Every node accepts zstd, but
+upgrade all nodes before enabling it on any: gRPC does not negotiate request compression.
 More runnable programs are listed in [examples/README.md](examples/README.md)
 (`cargo run --example <name>`).
 

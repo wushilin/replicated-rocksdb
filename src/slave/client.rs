@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tonic::codec::CompressionEncoding;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
@@ -14,6 +15,7 @@ use super::config::UpstreamConfig;
 use super::inner::Inner;
 use crate::auth::CredentialsProvider;
 use crate::codec::PROTOCOL_VERSION;
+use crate::config::WireCompression;
 use crate::error::{Error, Result};
 use crate::net::{MD_AUTHORIZATION, MD_NODE_ID, MD_PROTOCOL_VERSION};
 use crate::pb::replication_client::ReplicationClient;
@@ -65,16 +67,13 @@ pub(crate) fn connect(inner: &Inner) -> Result<Client> {
 /// A client for the current upstream whose connection is already established (bounded by
 /// `connect_timeout`). A verify connects this way before it holds the applier.
 pub(crate) async fn connect_now(inner: &Inner) -> Result<Client> {
-    let (endpoint, meta) = endpoint_for(
-        &inner.upstream(),
-        &inner.cfg.identifier,
-        inner.cfg.connect_timeout,
-    )?;
+    let up = inner.upstream();
+    let (endpoint, meta) = endpoint_for(&up, &inner.cfg.identifier, inner.cfg.connect_timeout)?;
     let channel = endpoint
         .connect()
         .await
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-    Ok(ReplicationClient::with_interceptor(channel, meta))
+    Ok(new_client(channel, meta, up.compression))
 }
 
 /// A client for `up`, identifying itself as `identifier`.
@@ -84,10 +83,17 @@ pub(crate) fn connect_upstream(
     connect_timeout: Duration,
 ) -> Result<Client> {
     let (endpoint, meta) = endpoint_for(up, identifier, connect_timeout)?;
-    Ok(ReplicationClient::with_interceptor(
-        endpoint.connect_lazy(),
-        meta,
-    ))
+    Ok(new_client(endpoint.connect_lazy(), meta, up.compression))
+}
+
+/// The one place a `ReplicationClient` is built: always accepts zstd, sends it when configured.
+fn new_client(channel: Channel, meta: CallMeta, compression: WireCompression) -> Client {
+    let mut client = ReplicationClient::with_interceptor(channel, meta)
+        .accept_compressed(CompressionEncoding::Zstd);
+    if let Some(e) = compression.encoding() {
+        client = client.send_compressed(e);
+    }
+    client
 }
 
 fn endpoint_for(

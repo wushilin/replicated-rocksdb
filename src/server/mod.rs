@@ -26,6 +26,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tonic::codec::CompressionEncoding;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
@@ -533,8 +534,12 @@ pub(crate) async fn start(
             .tls_config(tls.to_tonic())
             .map_err(|e| Error::Config(format!("server TLS: {e}")))?;
     }
-    let service = ReplicationServer::new(Svc(state.clone()))
-        .max_decoding_message_size(net::MAX_REQUEST_BYTES);
+    let mut service = ReplicationServer::new(Svc(state.clone()))
+        .max_decoding_message_size(net::MAX_REQUEST_BYTES)
+        .accept_compressed(CompressionEncoding::Zstd);
+    if let Some(e) = state.cfg.compression.encoding() {
+        service = service.send_compressed(e);
+    }
     let mut signal = shutdown_rx.clone();
     let task = tokio::spawn(
         builder
