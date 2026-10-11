@@ -47,7 +47,7 @@ async fn wait_streaming_resolves_or_reports_the_halt() {
     let (lonely, _) = c.slave("lonely", unreachable).await;
     assert!(matches!(
         lonely.wait_streaming(Duration::from_millis(100)).await,
-        Err(Error::Timeout)
+        Err(Error::WaitTimeout(p)) if p.target_seq.is_none() && !p.progressed
     ));
 }
 

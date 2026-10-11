@@ -115,3 +115,116 @@ fn endpoint_for(
     };
     Ok((endpoint, meta))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TlsClientConfig;
+    use crate::slave::UpstreamErrorKind as Kind;
+    use crate::slave::state::Problem;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The problem a handshake with `up` ends in.
+    async fn problem(up: UpstreamConfig) -> Problem {
+        let mut c = connect_upstream(&up, "probe", Duration::from_secs(2)).unwrap();
+        let r = tokio::time::timeout(
+            Duration::from_secs(10),
+            c.handshake(crate::pb::HandshakeRequest::default()),
+        )
+        .await
+        .expect("an answer within 10 s");
+        Problem::from_status(&r.expect_err("not a replication server"))
+    }
+
+    /// A TCP server that reads once, writes `reply` and closes.
+    async fn raw_server(reply: &'static [u8]) -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut b = [0u8; 1024];
+                    let _ = s.read(&mut b).await;
+                    let _ = s.write_all(reply).await;
+                    // Closing at once races the client's parse of the reply (it may see only the
+                    // close); servers usually linger a moment.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let _ = s.shutdown().await;
+                });
+            }
+        });
+        port
+    }
+
+    fn tls(port: u16) -> UpstreamConfig {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let mut up = UpstreamConfig::new("127.0.0.1", port);
+        up.tls = Some(TlsClientConfig {
+            ca_pem: p.self_signed(&key).unwrap().pem().into_bytes(),
+            domain_name: Some("localhost".into()),
+            identity: None,
+        });
+        up
+    }
+
+    #[tokio::test]
+    async fn failed_connections_are_classified() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let p = problem(UpstreamConfig::new("127.0.0.1", closed_port)).await;
+        assert_eq!(p.kind, Kind::Unreachable, "{p}");
+        assert!(p.message.contains("refused"), "the root cause is kept: {p}");
+
+        let hung_up = raw_server(b"").await;
+        let p = problem(UpstreamConfig::new("127.0.0.1", hung_up)).await;
+        assert_eq!(p.kind, Kind::Unreachable, "{p}");
+
+        let http1 = raw_server(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n").await;
+        let p = problem(UpstreamConfig::new("127.0.0.1", http1)).await;
+        assert_eq!(p.kind, Kind::NotReplicationService, "{p}");
+        let other = raw_server(b"-ERR unknown command\r\n").await;
+        let p = problem(UpstreamConfig::new("127.0.0.1", other)).await;
+        assert_eq!(p.kind, Kind::NotReplicationService, "{p}");
+        // A plaintext client at a TLS port: the server answers with a TLS alert.
+        let tls_port = raw_server(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x46]).await;
+        let p = problem(UpstreamConfig::new("127.0.0.1", tls_port)).await;
+        assert_eq!(p.kind, Kind::NotReplicationService, "{p}");
+
+        // A gRPC server without the replication service.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let grpc = l.local_addr().unwrap().port();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(l)),
+        );
+        let p = problem(UpstreamConfig::new("127.0.0.1", grpc)).await;
+        assert_eq!(p.kind, Kind::NotReplicationService, "{p}");
+
+        // A TLS client at a plaintext port.
+        let p = problem(tls(grpc)).await;
+        assert_eq!(p.kind, Kind::Tls, "{p}");
+        let p = problem(tls(http1)).await;
+        assert_eq!(p.kind, Kind::Tls, "{p}");
+    }
+
+    #[test]
+    fn replication_answers_are_upstream_problems() {
+        let p = Problem::from_status(&Status::unavailable("x").clone());
+        assert_eq!(p.kind, Kind::Unreachable);
+        for s in [
+            Status::failed_precondition("STALE_EPOCH"),
+            Status::resource_exhausted("busy"),
+            Status::internal("oops"),
+        ] {
+            assert_eq!(Problem::from_status(&s).kind, Kind::Upstream, "{s:?}");
+        }
+        assert_eq!(
+            Problem::from_status(&Status::internal("oops")).message,
+            "Internal: oops"
+        );
+    }
+}

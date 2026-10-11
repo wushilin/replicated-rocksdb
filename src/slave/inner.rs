@@ -12,7 +12,7 @@ use super::config::{BackoffState, SlaveConfig, UpstreamConfig};
 use super::policy::{AutoCause, Policies};
 use super::repair::AffectedSet;
 use super::repoint::PendingRepoint;
-use super::state::{HaltReason, NodeState, SlaveState, SlaveStatus, lag_ms};
+use super::state::{HaltReason, NodeState, Problem, SlaveState, SlaveStatus, lag_ms};
 use crate::error::{Error, Result};
 use crate::listener::ReplicationListener;
 use crate::read::ReadSnapshot;
@@ -206,7 +206,9 @@ pub(crate) struct Inner {
     upstream_chain: RwLock<Vec<String>>,
     pub max_entry_bytes: AtomicU64,
     last_contact: Mutex<Option<SystemTime>>,
-    last_error: Mutex<Option<String>>,
+    /// 1 + the repoint generation whose upstream last answered; 0 before any answer.
+    answered_generation: AtomicU64,
+    last_error: Mutex<Option<Problem>>,
     /// Set by `clear_halt(Rebootstrap)` only: the operator's consent. Scoped to the repoint
     /// generation that requested it.
     pub force_bootstrap: ForcedBootstrap,
@@ -321,6 +323,7 @@ impl Inner {
             upstream_chain: RwLock::new(Vec::new()),
             max_entry_bytes: AtomicU64::new(meta.max_entry_bytes.unwrap_or(0)),
             last_contact: Mutex::new(None),
+            answered_generation: AtomicU64::new(0),
             last_error: Mutex::new(None),
             force_bootstrap: ForcedBootstrap::default(),
             auto_rebootstrap: AutoRebootstrap::default(),
@@ -506,13 +509,20 @@ impl Inner {
     }
 
     pub(crate) fn note_contact(&self) {
+        self.answered_generation
+            .store(*self.repoint_tx.borrow() + 1, Ordering::SeqCst);
         *self
             .last_contact
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(SystemTime::now());
     }
 
-    pub(crate) fn set_last_error(&self, e: Option<String>) {
+    /// The current upstream (since the latest repoint) answered at least once.
+    pub(crate) fn upstream_answered(&self) -> bool {
+        self.answered_generation.load(Ordering::SeqCst) == *self.repoint_tx.borrow() + 1
+    }
+
+    pub(crate) fn set_last_error(&self, e: Option<Problem>) {
         *self
             .last_error
             .lock()
@@ -532,6 +542,11 @@ impl Inner {
     }
 
     pub(crate) fn status(&self) -> SlaveStatus {
+        let last_error = self
+            .last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let pos = self.store.position();
         let origin_last_seq = self
             .origin_last_seq
@@ -557,11 +572,8 @@ impl Inner {
                 .last_contact
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
-            last_error: self
-                .last_error
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone(),
+            last_error: last_error.as_ref().map(|p| p.message.clone()),
+            last_error_kind: last_error.as_ref().map(|p| p.kind),
             listener_failed: self.listener_failed.load(Ordering::SeqCst),
             last_verify: self.last_verify(),
         }

@@ -190,7 +190,7 @@ With `min_insync_replicas = N > 0`:
 1. Under the writer lock, after the entry is built and validated (a fenced writer, an unknown CF, an oversized entry or an invalid range report their own error first) and just before the commit: if fewer than N replicas are in sync → `Error::NotEnoughReplicas { required, in_sync }`. Nothing is written and no seq is consumed.
 2. Commit and fsync as usual (§5), then release the writer lock.
 3. Wait, without the writer lock, until N in-sync replicas have acknowledged `seq` → `Ok(seq)`.
-4. After `ack_timeout` → `Error::AckTimeout { seq, acked, required }`. **The entry is committed on the master and keeps replicating**; the error only says that N acknowledgements were not seen in time (Kafka semantics). Retrying the write would write it twice.
+4. After `ack_timeout` → `Error::AckTimeout { seq, acked, required }`. **The entry is committed on the master and keeps replicating**; the error only says that N acknowledgements were not seen in time (Kafka semantics). Retrying the write appends a second entry (a new seq) and waits again; since operations are absolute, retrying the same value leaves the same state, but recomputing it from a read (read-modify-write) may apply the change twice.
 
 Write methods stay synchronous; async callers use `spawn_blocking`. Concurrent writers pipeline: each waits for its own acknowledgements while the next commits. With `N ≥ 1`, the most advanced in-sync replica holds every acknowledged write, which is what the failover runbook (§13.1) relies on.
 
@@ -509,7 +509,7 @@ One caveat applies to verify repair. A replica that was in sync until a verify f
 - After `Master::demote`, replicas that had already followed the wrongly promoted master are refused by it with `STALE_EPOCH` until they are repointed at the real master.
 - `promote_checked` and `demote` refuse by default and **hand the untouched, still-running node back**: `Err(PromoteRefused { error, slave })` / `Err(DemoteRefused { error, master })`, with `into_slave()` / `into_master()`, or `into_parts()` → `(Error, Option<node>)` to keep the node while propagating the error with `?`. Only a failure after the node has started shutting down for the change (an I/O error during shutdown, a `ReadSnapshot` that still holds the database, a failure while rewriting `__meta`) loses the handle (`None`); the directory is then reopened by the application. Plain `promote` keeps its behaviour: a refusal shuts the slave down with its directory unchanged.
 
-**Repoint.** `Slave::repoint(upstream, RepointOptions) -> Result<RepointOutcome>` switches a running slave to another upstream; reads keep being served. It closes the current upstream stream (a bootstrap in progress is abandoned and starts from scratch against the new upstream), clears a halt (in memory: `node_state = ready` is persisted only once the new upstream is accepted, so a restart before that reopens the slave still halted and the operator repoints again), forgets the old upstream chain, and handshakes the new upstream under all the normal rules (loop detection, `STALE_EPOCH`, epoch continuity). It returns once that handshake settles: `Resumed`, `EpochAdvanced`, `Bootstrapped`, or `Retrying { last_error }` when the new upstream cannot be used yet (unreachable, `STALE_EPOCH`, `NOT_READY`; the slave keeps retrying it). The new upstream is not persisted: after a restart, open the slave with it. A repoint replaced by a later one, or by a shutdown, before it settles returns `Error::RepointSuperseded`. `SlaveStatus.upstream` is the current target.
+**Repoint.** `Slave::repoint(upstream, RepointOptions) -> Result<RepointOutcome>` switches a running slave to another upstream; reads keep being served. It closes the current upstream stream (a bootstrap in progress is abandoned and starts from scratch against the new upstream), clears a halt (in memory: `node_state = ready` is persisted only once the new upstream is accepted, so a restart before that reopens the slave still halted and the operator repoints again), forgets the old upstream chain, and handshakes the new upstream under all the normal rules (loop detection, `STALE_EPOCH`, epoch continuity). It returns once that handshake settles: `Resumed`, `EpochAdvanced`, `Bootstrapped`, or `Retrying { last_error, kind }` when the new upstream cannot be used yet (unreachable, a wrong endpoint, `STALE_EPOCH`, `NOT_READY`; `kind` tells them apart; the slave keeps retrying it). The new upstream is not persisted: after a restart, open the slave with it. A repoint replaced by a later one, or by a shutdown, before it settles returns `Error::RepointSuperseded`. `SlaveStatus.upstream` is the current target.
 
 **Divergence is never resolved implicitly by a repoint.** The configured `on_divergence` is not used after a repoint; the repoint's mode decides every `DIVERGED` answer (a handshake of any later session, or a Tail or Bootstrap ending `DIVERGED`) until the next repoint. **Consent is single-use:** `Rebootstrap` and `Repair` apply only to their own repoint until it settles (`repoint` returns, with any outcome including `Retrying` or an error; with `Repair`, when the repair the first answer started committed, failed, or fell back to a bootstrap); from then on the mode is `Refuse`, so a later, unrelated `DIVERGED` halts the slave with its data intact instead of discarding data again. `Refuse` stays in force until the next repoint. A bootstrap requested before the repoint (the operator's `clear_halt(Rebootstrap)`, or one the slave requested itself after a gap or a `DIVERGED` stream, §13) is bound to the generation that requested it and never applies to a later repoint; only `clear_halt(Rebootstrap)` issued after the repoint applies. The slave's own requests never skip the repoint's mode either: a settled repoint's `Refuse` halts a later `DIVERGED`. The modes:
 - `Refuse` (default): `Error::Diverged { fork_seq, local_last_seq, divergent_entries }`; the slave halts `Diverged` with its data intact and readable.
@@ -766,7 +766,7 @@ pub struct AcceptDataLoss;                   // written out by the caller to acc
 pub struct RepointOptions { pub on_divergence: RepointDivergence }   // Default: Refuse
 pub enum RepointDivergence { Refuse, Repair { accept_loss: AcceptDataLoss }, Rebootstrap { accept_loss: AcceptDataLoss } }
 pub enum RepointOutcome { Resumed, EpochAdvanced, Bootstrapped, Repaired { discarded: RangeInclusive<Seq> },
-                          Retrying { last_error: String } }
+                          Retrying { last_error: String, kind: UpstreamErrorKind } }
 
 pub struct SlaveStatus {
     pub state: SlaveState,
@@ -784,9 +784,29 @@ pub struct SlaveStatus {
     pub last_contact: Option<SystemTime>,
     pub last_verify: Option<VerifyReport>,
     pub last_error: Option<String>,          // last connection/handshake problem, e.g. STALE_EPOCH
+    pub last_error_kind: Option<UpstreamErrorKind>, // Some exactly when last_error is; see below
     pub listener_failed: bool,               // the listener panicked; disabled until restart
     // `SlaveStatus` is #[non_exhaustive].
 }
+
+// What kind of problem last_error is. Every kind is retried with backoff; none halts.
+#[non_exhaustive]
+pub enum UpstreamErrorKind {
+    Config,                 // the upstream address or TLS settings do not parse
+    Unreachable,            // refused, DNS, connect timeout, reset, idle timeout
+    Tls,                    // handshake or certificate error, TLS client at a plaintext port
+    NotReplicationService,  // not HTTP/2 (HTTP/1, another protocol, plaintext at a TLS port),
+                            // or a gRPC server without this service (UNIMPLEMENTED)
+    Upstream,               // the replication server answered: NOT_READY, BUSY, STALE_EPOCH, ...
+    Local,                  // the local store failed
+}
+
+// Error::WaitTimeout(Box<WaitProgress>) from wait_for_seq / wait_streaming. Not a failure by
+// itself: the slave keeps replicating. `progressed` (applied seq or bootstrap records moved
+// during the wait) tells a long bootstrap or catch-up from a stuck slave; a stuck one shows
+// why in status.last_error_kind (status.last_contact == None: it never reached anything).
+#[non_exhaustive]
+pub struct WaitProgress { pub target_seq: Option<Seq>, pub progressed: bool, pub status: SlaveStatus }
 
 impl Slave {
     pub async fn open(cfg: SlaveConfig) -> Result<Self>;   // serves local data immediately unless Bootstrapping
@@ -794,8 +814,9 @@ impl Slave {
     pub fn applied_seq(&self) -> Seq;
     pub fn last_seq(&self) -> Seq;                       // = applied_seq; also via LogApi
     pub fn serve_addr(&self) -> Option<SocketAddr>;     // when serve is configured
-    pub async fn wait_for_seq(&self, seq: Seq, timeout: Duration) -> Result<()>;
-    pub async fn wait_streaming(&self, timeout: Duration) -> Result<()>;   // Err(Halted(r)) | Err(Timeout)
+    pub async fn wait_for_seq(&self, seq: Seq, timeout: Duration) -> Result<()>;   // Ok once applied (even if
+                                                         // halted after); Err(Halted(r)) | Err(WaitTimeout(p))
+    pub async fn wait_streaming(&self, timeout: Duration) -> Result<()>;   // Err(Halted(r)) | Err(WaitTimeout(p))
     pub fn watch_state(&self) -> watch::Receiver<SlaveState>;
     pub async fn verify_now(&self, mode: VerifyMode) -> Result<VerifyReport>;
     pub fn diverged_entries(&self) -> Result<Vec<LogEntry>>;   // halted Diverged: the local suffix (§12.1)
@@ -874,7 +895,7 @@ See §5.1. `Master::get`, `Master::put`, `Master::write` and the crate-level doc
 
 ### 16.2 Errors
 
-`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping, or replaying a repair), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }`, `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), `Diverged { fork_seq, local_last_seq, divergent_entries }` (a refused `repoint`), `RepointSuperseded`, `PeerUnreachable { peer, reason, source }` (`admin::node_status*` got no answer; `reason` is one line), `VerifyAborted(VerifyAbort)` (`verify_now` could not produce a report), `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
+`Error` is a `thiserror` enum. The variants applications match on: `NotReady` (slave bootstrapping, or replaying a repair), `NoSuchCf`, `AlreadyExists`, `EmptyBatch`, `InvalidRange`, `EntryTooLarge`, `UnknownComparator`, `Gap { requested, first_retained }`, `Corrupt`, `Halted(HaltReason)` (from `wait_for_seq`), `Timeout`, `WaitTimeout(Box<WaitProgress>)` (`wait_for_seq` / `wait_streaming`: where the slave stood), `NotMostAdvanced { leader, seq, diverged }`, `PromotionUnverifiable { peer, seq, diverged }`, `MasterReachable { peer }` and `PromotionWouldDiscard { peer, fork, peer_last_seq }` (`promote_checked`), `NotEnoughReplicas { required, in_sync }` (nothing written) and `AckTimeout { seq, acked, required }` (written, not acknowledged in time; §5.2), `Diverged { fork_seq, local_last_seq, divergent_entries }` (a refused `repoint`), `RepointSuperseded`, `PeerUnreachable { peer, reason, source }` (`admin::node_status*` got no answer; `reason` is one line), `VerifyAborted(VerifyAbort)` (`verify_now` could not produce a report), `Io`, `RocksDb`. Reads on a halted slave succeed. Halting stops the slave from advancing; it does not stop reads.
 
 ### 16.3 Persisted vs runtime slave state
 

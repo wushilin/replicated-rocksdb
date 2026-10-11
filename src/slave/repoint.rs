@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 use super::client::connect_upstream;
 use super::driver::SessionEnd;
 use super::inner::Inner;
-use super::state::SlaveState;
+use super::state::{SlaveState, UpstreamErrorKind};
 use super::{Slave, UpstreamConfig};
 use crate::admin::fork_between;
 use crate::error::{Error, Result};
@@ -75,8 +75,12 @@ pub enum RepointOutcome {
     /// slave has replayed up to the upstream's snapshot seq.
     Repaired { discarded: RangeInclusive<Seq> },
     /// The new upstream could not be used yet (unreachable, `STALE_EPOCH`, `NOT_READY`, …).
-    /// The slave keeps retrying it with backoff; `last_error` says why.
-    Retrying { last_error: String },
+    /// The slave keeps retrying it with backoff; `last_error` says why and `kind` what kind of
+    /// problem it is (a wrong address shows as `Unreachable` or `NotReplicationService`).
+    Retrying {
+        last_error: String,
+        kind: UpstreamErrorKind,
+    },
 }
 
 pub(crate) struct PendingRepoint {
@@ -152,7 +156,8 @@ impl Inner {
             SessionEnd::Retry(m) => self.settle_repoint(
                 generation,
                 Ok(RepointOutcome::Retrying {
-                    last_error: m.clone(),
+                    last_error: m.message.clone(),
+                    kind: m.kind,
                 }),
             ),
             SessionEnd::Again => {}

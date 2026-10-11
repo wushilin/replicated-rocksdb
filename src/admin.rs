@@ -457,7 +457,7 @@ pub(crate) async fn status_classified(
 /// server rejecting the client's certificate after a TLS 1.3 handshake shows up only as a
 /// broken connection, which cannot be told apart from a network failure, so it stays
 /// unreachable.
-fn is_tls_rejection(e: &(dyn std::error::Error + 'static)) -> bool {
+pub(crate) fn is_tls_rejection(e: &(dyn std::error::Error + 'static)) -> bool {
     let mut cur = Some(e);
     while let Some(err) = cur {
         if err

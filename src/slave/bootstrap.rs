@@ -11,7 +11,7 @@ use super::config::IdentityPolicy;
 use super::driver::{SessionEnd, status_end, unless_repointed};
 use super::inner::Inner;
 use super::repair::deeper_fork;
-use super::state::{HaltReason, SlaveState};
+use super::state::{HaltReason, Problem, SlaveState};
 use crate::codec::digest::Digest;
 use crate::codec::{ENVELOPE_VERSION, envelope, validate_cf_name};
 use crate::config::MAX_BOOTSTRAP_CHUNK_BYTES;
@@ -34,7 +34,7 @@ async fn blocking<T: Send + 'static>(
 }
 
 fn retry(msg: impl Into<String>) -> SessionEnd {
-    SessionEnd::Retry(msg.into())
+    SessionEnd::Retry(Problem::upstream(msg))
 }
 
 /// The header, validated.

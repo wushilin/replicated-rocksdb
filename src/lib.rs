@@ -105,6 +105,7 @@ pub use slave::{
     AcceptDataLoss, Backoff, DivergencePolicy, FetchConfig, GapPolicy, HaltAction, HaltReason,
     IdentityPolicy, PromoteRefused, PromotionCheck, RejoinOptions, RepointDivergence,
     RepointOptions, RepointOutcome, Slave, SlaveConfig, SlaveState, SlaveStatus, UpstreamConfig,
+    UpstreamErrorKind, WaitProgress,
 };
 pub(crate) mod failpoint;
 pub(crate) mod server;
