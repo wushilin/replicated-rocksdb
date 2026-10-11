@@ -54,6 +54,7 @@ Master(A) ──► Slave(B) ──► Slave(C)
 - **Write concern**: optionally make writes wait for acknowledgement from N in-sync replicas
   (`WriteConcern`), with Kafka-like `NotEnoughReplicas` / `AckTimeout` semantics.
 - **Read-your-writes on replicas**: `wait_for_seq(seq)` blocks until a replica has applied a write.
+- **RocksDB tuning** through a restricted `Tunable` (buffers, compression, compaction style, block size, bloom filter, sync sizes; no merge operator, compaction filter, native TTL or prefix extractor), plus a shared block cache and rate limiter on `RocksTuning`. `property` / `property_int` on `Master`, `Slave` and `Node` read RocksDB properties.
 - **Column families** created and dropped through the log, with custom comparators via a registry.
 - **Master-driven TTL**: per-value expiry computed on the master, filtered on every read, and
   reaped by the master as logged deletes, so all nodes agree.

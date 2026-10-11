@@ -131,7 +131,7 @@ Rules:
 - `CreateCf` and `DropCf` are always the **only op** in their entry. A data batch never contains CF ops.
 - A data entry may touch several CFs.
 - `Put` carries the user value. Each node builds the envelope (`write_seq = entry.seq`, plus `expire_at_ms`) when it applies the op.
-- There is no merge. `RocksTuning`'s callback receives a restricted `Tunable`, not raw `rocksdb::Options`, so a merge operator, compaction filter or native TTL cannot be set at all.
+- There is no merge. `RocksTuning`'s callback receives a restricted `Tunable`, not raw `rocksdb::Options`, so a merge operator, compaction filter, native TTL or prefix extractor cannot be set at all (a prefix extractor would let iterators skip keys, breaking bootstrap, verify and `prefix_iter`). `Tunable` offers performance knobs only: write buffers, compression (also bottommost), compaction style and triggers, block size, bloom filter, IO sync sizes and WAL size.
 
 ## 5. Master write path
 
@@ -619,6 +619,11 @@ pub trait LogApi {
     fn entries_since(&self, seq: Seq) -> Result<EntryIter<'_>>;   // Err(Gap{..}) when trimmed
     fn subscribe(&self) -> watch::Receiver<Seq>;
 }
+
+// On Master, Slave and Node (read-only; cf = None is DB-wide, Some(name) a live user CF;
+// internal and unknown CFs are NoSuchCf; Ok(None) for a property RocksDB does not know)
+fn property(&self, cf: Option<&str>, name: &str) -> Result<Option<String>>;
+fn property_int(&self, cf: Option<&str>, name: &str) -> Result<Option<u64>>;
 
 pub struct ReadSnapshot { .. }       // impl ReadApi; fn seq(&self) -> Seq; `now` fixed at creation;
                                      // owns an Arc of the DB, so it can be moved into tasks

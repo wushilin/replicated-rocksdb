@@ -39,6 +39,12 @@ pub(crate) struct Position {
     pub last_entry_crc: Option<u32>,
 }
 
+/// Result of [`Store::property`].
+pub(crate) enum Prop {
+    Text(String),
+    Int(u64),
+}
+
 pub(crate) struct Store {
     db: Arc<DbCore>,
     role: Role,
@@ -295,6 +301,27 @@ impl Store {
         self.cfs
             .get(name)
             .ok_or_else(|| Error::NoSuchCf(name.to_string()))
+    }
+
+    /// A RocksDB property, DB-wide (`cf = None`) or of a live user CF. Internal CFs (`__`
+    /// prefix) and unknown or dropped CFs are `NoSuchCf`; they are never addressed.
+    pub(crate) fn property(&self, cf: Option<&str>, name: &str, int: bool) -> Result<Option<Prop>> {
+        let handle = match cf {
+            None => None,
+            Some(n) => {
+                if n.starts_with("__") {
+                    return Err(Error::NoSuchCf(n.to_string()));
+                }
+                let phys = self.live_cf(n)?;
+                Some(self.handle(&phys)?)
+            }
+        };
+        Ok(match (handle, int) {
+            (None, false) => self.db.property_value(name)?.map(Prop::Text),
+            (None, true) => self.db.property_int_value(name)?.map(Prop::Int),
+            (Some(h), false) => self.db.property_value_cf(&h, name)?.map(Prop::Text),
+            (Some(h), true) => self.db.property_int_value_cf(&h, name)?.map(Prop::Int),
+        })
     }
 
     pub(crate) fn write_meta(&self, kvs: &[(&[u8], &[u8])], sync: bool) -> Result<()> {

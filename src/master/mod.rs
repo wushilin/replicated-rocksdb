@@ -321,6 +321,25 @@ impl Master {
         ReadApi::get(self, cf, key)
     }
 
+    /// A RocksDB property (for example `rocksdb.estimate-num-keys`). `cf = None` is
+    /// DB-wide; `Some(name)` is a user column family. `Ok(None)` when RocksDB does not know
+    /// the property. Internal column families (`__` prefix) and unknown or dropped ones are
+    /// [`crate::Error::NoSuchCf`]. Read-only; never affects replication.
+    pub fn property(&self, cf: Option<&str>, name: &str) -> Result<Option<String>> {
+        Ok(match self.inner.store.property(cf, name, false)? {
+            Some(crate::store::Prop::Text(s)) => Some(s),
+            _ => None,
+        })
+    }
+
+    /// Like [`property`](Self::property) for integer-valued properties.
+    pub fn property_int(&self, cf: Option<&str>, name: &str) -> Result<Option<u64>> {
+        Ok(match self.inner.store.property(cf, name, true)? {
+            Some(crate::store::Prop::Int(n)) => Some(n),
+            _ => None,
+        })
+    }
+
     /// A consistent point-in-time view; "now" for TTL is fixed when it is taken. Holding it
     /// keeps dropped column families on disk and the database open (see [`Master`] docs).
     pub fn snapshot(&self) -> Result<ReadSnapshot> {
