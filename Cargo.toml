@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Single-master, async log-shipping replication for RocksDB"
+license = "Apache-2.0"
+repository = "https://github.com/wushilin/replicated-rocksdb"
 
 [dependencies]
 rocksdb = { version = "0.25.0", default-features = false, features = ["lz4", "zstd", "bindgen-runtime", "multi-threaded-cf"] }
