@@ -328,6 +328,11 @@ pub struct ServeConfig {
     /// What the server compresses its responses with. Default `None`; see [`WireCompression`]
     /// for the upgrade-order rule.
     pub compression: WireCompression,
+    /// Also serves the read-only HTTP endpoints `/v1/status`, `/v1/health`, `/v1/ready` and
+    /// `/metrics` on this port (DESIGN.md §15, §19), behind the same TLS and the same
+    /// `authenticator` as replication (`authorization: Bearer <token>`, checked as the
+    /// `Status` method, with the same failure limiter). Default `false`: gRPC only.
+    pub http_status: bool,
 }
 
 impl ServeConfig {
@@ -344,6 +349,7 @@ impl ServeConfig {
             allow_plaintext_token: false,
             limits: ServeLimits::default(),
             compression: WireCompression::None,
+            http_status: false,
         }
     }
 

@@ -23,6 +23,8 @@ tonic-types = "0.14.6"
 tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
 subtle = "2.6.1"
 async-trait = "0.1.92"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
 fail = { version = "0.5.1", optional = true }
 
 [features]
@@ -35,9 +37,12 @@ tonic-prost-build = "0.14.6"
 tempfile = "3.27"
 rcgen = "0.14.10"
 axum = { version = "0.8.4", features = ["ws"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
 tokio = { version = "1.53", features = ["signal", "rt-multi-thread", "macros"] }
+# HTTP client for tests/http_status.rs: crates already in tonic's dependency tree.
+hyper = { version = "1.12", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+http-body-util = "0.1.5"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 
 [[test]]
 name = "failpoints"

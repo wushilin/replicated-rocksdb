@@ -361,6 +361,12 @@ impl Master {
         self.server.as_ref().map(ServerHandle::addr)
     }
 
+    /// The running replication server's state (unit tests of its surfaces).
+    #[cfg(test)]
+    pub(crate) fn server_state(&self) -> &Arc<crate::server::ServerState> {
+        self.server.as_ref().expect("serving").state()
+    }
+
     /// Whether [`demote`](Self::demote) would be allowed now: no entry was written since the
     /// promotion started (`last_seq <` the start of the first epoch the promotion added) and
     /// there is an earlier epoch to return to. Epochs that restarts of this master added after
