@@ -177,7 +177,8 @@ After the consented repairs every node converges on D's history:
 ![Repaired: D is the master and A, B and C are back in sync](docs/images/playground-repaired.png)
 
 Other things to try: a burst of writes (`count` 4000) to watch the replicas blink while they
-catch up; a write concern of 2 on a chain (refused: only direct replicas count); repointing a
+catch up; the same keys as **one atomic batch** (one seq, all-or-nothing on every replica) or
+from the bulk editor (`key=value` and `-key` lines); a write concern of 2 on a chain (refused: only direct replicas count); repointing a
 node at its own downstream (the UI marks it "would loop"; the slave halts `LoopDetected`).
 Options: `--http ADDR`, `--port-base N`, `--dir PATH` (see [examples/README.md](examples/README.md)).
 The page has no authentication: keep `--http` on localhost unless the network is trusted.

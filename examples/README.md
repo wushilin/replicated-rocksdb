@@ -24,8 +24,9 @@ above it keeps running (Ctrl-C to stop).
 Four `Node`s run in one process as a daisy chain A → B → C → D on 127.0.0.1:7101..7104. From
 the browser you can:
 
-- **Write** on any node (a slave refuses), single keys or bursts, with an optional write concern
-  (`min in-sync replicas`). **Read** one key on all four nodes side by side, or scan a node.
+- **Write** on any node (a slave refuses): single keys, generated bursts (one entry per key, or
+  all keys in **one atomic `Batch`**), or a bulk editor of `key=value` / `-key` lines written as
+  one batch or as separate entries, with an optional write concern (`min in-sync replicas`). **Read** one key on all four nodes side by side, or scan a node.
 - **Transitions** offered per state: promote (checked / unchecked), demote, repoint, rejoin as
   slave, unfence (optionally accepting split-brain risk), stop / start, clear halt, rebootstrap,
   verify, show divergent entries. Data-loss steps need the "accept data loss" tick

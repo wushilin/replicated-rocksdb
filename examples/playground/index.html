@@ -89,6 +89,14 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
 .reads td:first-child { width: 44px; }
 .reads tr:last-child td { border-bottom: 0; }
 .mono { font-family: var(--mono); font-size: 12.5px; }
+.switch { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12.5px; color: var(--muted); cursor: pointer; }
+.switch input { accent-color: var(--accent); }
+.bulk { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
+.bulk summary { cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+.bulk textarea { width: 100%; margin-top: 8px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--panel-2); color: var(--text); font-family: var(--mono); font-size: 12.5px; resize: vertical; outline: none; }
+.bulk textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.bulk-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 
 /* ---- node cards ---- */
 .nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); gap: 18px; }
@@ -217,6 +225,18 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
           <label class="field"><span>Min in-sync replicas (write concern)</span><input id="w-insync" type="number" value="0" min="0" max="3"></label>
           <div class="btns"><button class="btn primary" onclick="write_('put')">Put</button><button class="btn" onclick="write_('delete')">Delete</button></div>
         </div>
+        <label class="switch" title="Count &gt; 1: all keys in one Batch, one log entry, applied all-or-nothing on every replica"><input type="checkbox" id="w-atomic"> <span>count &gt; 1 as <b>one atomic batch</b> (one log entry) instead of one entry per key</span></label>
+        <details class="bulk" id="bulk" open>
+          <summary>Bulk editor</summary>
+          <textarea id="b-text" rows="7" spellcheck="false" placeholder="one operation per line:&#10;user:1=alice&#10;user:2=bob&#10;-user:3        (a leading - deletes)&#10;# comments and blank lines are ignored"></textarea>
+          <div class="bulk-bar">
+            <span class="addr" id="b-count">0 operations</span>
+            <div class="btns">
+              <button class="btn primary" onclick="bulk(true)" title="One Batch: one seq, all-or-nothing on every node">Write as one atomic batch</button>
+              <button class="btn" onclick="bulk(false)" title="One log entry per line">Write as separate entries</button>
+            </div>
+          </div>
+        </details>
       </div>
     </section>
     <section class="panel">
@@ -629,8 +649,42 @@ function write_(op) {
   post('/api/write', {
     node: $('w-node').value, op, key: $('w-key').value, value: $('w-value').value,
     count: Number($('w-count').value) || 1, min_insync: Number($('w-insync').value) || 0,
+    atomic: $('w-atomic').checked,
   });
 }
+// Bulk editor: `key=value` puts, `-key` deletes; blank lines and `#` comments are skipped.
+function parseBulk() {
+  const items = [], errors = [];
+  $('b-text').value.split('\n').forEach((raw, i) => {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) return;
+    if (line.startsWith('-')) {
+      const key = line.slice(1).trim();
+      key ? items.push({ op: 'delete', key }) : errors.push(`line ${i + 1}: no key after -`);
+      return;
+    }
+    const eq = line.indexOf('=');
+    if (eq <= 0) { errors.push(`line ${i + 1}: expected key=value or -key`); return; }
+    items.push({ op: 'put', key: line.slice(0, eq).trim(), value: line.slice(eq + 1) });
+  });
+  return { items, errors };
+}
+function updateBulkCount() {
+  const { items, errors } = parseBulk();
+  const puts = items.filter(i => i.op === 'put').length;
+  $('b-count').textContent = errors.length ? errors[0]
+    : `${items.length} operation${items.length === 1 ? '' : 's'} (${puts} put, ${items.length - puts} delete)`;
+  $('b-count').style.color = errors.length ? 'var(--bad)' : '';
+}
+function bulk(atomic) {
+  const { items, errors } = parseBulk();
+  if (errors.length) return toast('✗ ' + errors[0], 'bad');
+  if (!items.length) return toast('✗ the bulk editor is empty', 'bad');
+  post('/api/write', { node: $('w-node').value, items, atomic, min_insync: Number($('w-insync').value) || 0 });
+}
+$('b-text').addEventListener('input', updateBulkCount);
+$('b-text').value = 'user:1=alice\nuser:2=bob\nuser:3=carol\n-user:4';
+updateBulkCount();
 async function readKey() {
   const key = $('r-key').value;
   if (!key) return;
