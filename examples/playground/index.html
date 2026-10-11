@@ -89,8 +89,8 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
 .reads td:first-child { width: 44px; }
 .reads tr:last-child td { border-bottom: 0; }
 .mono { font-family: var(--mono); font-size: 12.5px; }
-.switch { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12.5px; color: var(--muted); cursor: pointer; }
-.switch input { accent-color: var(--accent); }
+.bulk-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+.bulk-row .addr { flex: 1; min-width: 200px; font-family: inherit; font-size: 12px; }
 .bulk { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
 .bulk summary { cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
 .bulk textarea { width: 100%; margin-top: 8px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
@@ -223,9 +223,12 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
         <div class="form2">
           <label class="field"><span>Count</span><input id="w-count" type="number" value="1" min="1" max="5000" title="&gt; 1 writes key-0 … key-(count-1)"></label>
           <label class="field"><span>Min in-sync replicas (write concern)</span><input id="w-insync" type="number" value="0" min="0" max="3"></label>
-          <div class="btns"><button class="btn primary" onclick="write_('put')">Put</button><button class="btn" onclick="write_('delete')">Delete</button></div>
+          <div class="btns"><button class="btn primary" onclick="write_('put')" title="One log entry per key">Put</button><button class="btn" onclick="write_('delete')" title="One log entry per key">Delete</button></div>
         </div>
-        <label class="switch" title="Count &gt; 1: all keys in one Batch, one log entry, applied all-or-nothing on every replica"><input type="checkbox" id="w-atomic"> <span>count &gt; 1 as <b>one atomic batch</b> (one log entry) instead of one entry per key</span></label>
+        <div class="bulk-row">
+          <span class="addr">Count &gt; 1 writes key-0 … key-(count−1). <b>Put / Delete</b>: one log entry per key. <b>Bulk</b>: all of them in one atomic batch (one entry, one seq, all-or-nothing on every replica).</span>
+          <div class="btns"><button class="btn primary" onclick="write_('put', true)">Bulk put</button><button class="btn" onclick="write_('delete', true)">Bulk delete</button></div>
+        </div>
         <details class="bulk" id="bulk" open>
           <summary>Bulk editor</summary>
           <textarea id="b-text" rows="7" spellcheck="false" placeholder="one operation per line:&#10;user:1=alice&#10;user:2=bob&#10;-user:3        (a leading - deletes)&#10;# comments and blank lines are ignored"></textarea>
@@ -645,11 +648,11 @@ function act(node, action) {
   toast(`${action.replace('_', ' ')} on ${node}…`, 'info');
   post('/api/action', { node, action, target: u.target, accept_loss: u.loss, accept_split_brain: u.brain });
 }
-function write_(op) {
+function write_(op, atomic = false) {
   post('/api/write', {
     node: $('w-node').value, op, key: $('w-key').value, value: $('w-value').value,
     count: Number($('w-count').value) || 1, min_insync: Number($('w-insync').value) || 0,
-    atomic: $('w-atomic').checked,
+    atomic,
   });
 }
 // Bulk editor: `key=value` puts, `-key` deletes; blank lines and `#` comments are skipped.
