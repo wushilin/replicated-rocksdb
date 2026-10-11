@@ -187,6 +187,7 @@ impl ServerState {
 pub(crate) enum Denied {
     /// Too many failed attempts from this address; the credentials were not checked.
     Throttled,
+    /// The credentials were missing or rejected; counted against the failure limiter.
     Unauthenticated,
     /// The authenticator does not allow this method to this caller.
     Forbidden,

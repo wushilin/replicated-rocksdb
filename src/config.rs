@@ -329,7 +329,7 @@ pub struct ServeConfig {
     /// for the upgrade-order rule.
     pub compression: WireCompression,
     /// Also serves the read-only HTTP endpoints `/v1/status`, `/v1/health`, `/v1/ready` and
-    /// `/metrics` on this port (DESIGN.md §15, §19), behind the same TLS and the same
+    /// `/metrics` on this port (DESIGN.md §19.1), behind the same TLS and the same
     /// `authenticator` as replication (`authorization: Bearer <token>`, checked as the
     /// `Status` method, with the same failure limiter). Default `false`: gRPC only.
     pub http_status: bool,

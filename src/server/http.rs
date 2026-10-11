@@ -1,5 +1,5 @@
 //! Read-only HTTP endpoints on the replication port (`ServeConfig::http_status`, DESIGN.md
-//! §15 and §19): `/v1/status`, `/v1/health`, `/v1/ready` and `/metrics`.
+//! §19.1): `/v1/status`, `/v1/health`, `/v1/ready` and `/metrics`.
 //!
 //! They share the listener, the TLS configuration and the authorization path of the gRPC
 //! service: every request is checked as [`Method::Status`] through
@@ -344,7 +344,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_mtls_peer_identity_reaches_the_authenticator() {
+    async fn a_verified_peer_identity_is_authorized() {
         use crate::auth::MtlsSubjectAllowList;
         let dir = tempfile::tempdir().unwrap();
         let (m, _) = serving_master(dir.path(), |cfg| {
