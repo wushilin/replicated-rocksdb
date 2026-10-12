@@ -99,8 +99,13 @@ pub(crate) fn check_protocol_version(md: &MetadataMap) -> Result<(), Status> {
 
 /// The bearer token from `authorization: Bearer <token>`, if present.
 pub(crate) fn bearer_token(md: &MetadataMap) -> Option<Vec<u8>> {
-    let v = md.get(MD_AUTHORIZATION)?.as_bytes();
-    v.strip_prefix(b"Bearer ").map(<[u8]>::to_vec)
+    parse_bearer(md.get(MD_AUTHORIZATION)?.as_bytes())
+}
+
+/// The token of an `authorization` header value `Bearer <token>` (PROTOCOL.md §3.2), shared by
+/// gRPC metadata and the HTTP status endpoints.
+pub(crate) fn parse_bearer(value: &[u8]) -> Option<Vec<u8>> {
+    value.strip_prefix(b"Bearer ").map(<[u8]>::to_vec)
 }
 
 /// The self-asserted node id from `x-rrdb-node-id`.
