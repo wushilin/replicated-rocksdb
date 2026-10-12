@@ -80,7 +80,7 @@ pub(crate) mod verify;
 pub use codec::{ENVELOPE_VERSION, PROTOCOL_VERSION};
 pub use read::{ReadApi, ReadSnapshot};
 pub use store::read::DbIter;
-pub use tuning::{CfKind, ComparatorRegistry, Compression, RocksTuning, Tunable};
+pub use tuning::{CfKind, CompactionStyle, ComparatorRegistry, Compression, RocksTuning, Tunable};
 pub use verify::{
     CfVersion, Mismatch, MismatchPolicy, VerifyAbort, VerifyConfig, VerifyMode, VerifyReport,
 };

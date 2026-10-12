@@ -383,6 +383,26 @@ impl Node {
         self.with_reader(|r| r.get(cf, key))
     }
 
+    /// [`Master::property`] / [`Slave::property`] of the current role.
+    pub fn property(&self, cf: Option<&str>, name: &str) -> Result<Option<String>> {
+        let g = self.current()?;
+        match &*g {
+            Current::Master(m) => m.property(cf, name),
+            Current::Slave(s) => s.property(cf, name),
+            other => Err(other.unavailable()),
+        }
+    }
+
+    /// [`Master::property_int`] / [`Slave::property_int`] of the current role.
+    pub fn property_int(&self, cf: Option<&str>, name: &str) -> Result<Option<u64>> {
+        let g = self.current()?;
+        match &*g {
+            Current::Master(m) => m.property_int(cf, name),
+            Current::Slave(s) => s.property_int(cf, name),
+            other => Err(other.unavailable()),
+        }
+    }
+
     /// [`ReadApi::get_with_meta`].
     pub fn get_with_meta(&self, cf: &str, key: &[u8]) -> Result<Option<(Vec<u8>, ValueMeta)>> {
         self.with_reader(|r| r.get_with_meta(cf, key))
