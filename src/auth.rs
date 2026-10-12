@@ -48,9 +48,20 @@ pub enum AuthError {
 
 /// Decides whether a call is allowed.
 ///
-/// **Security:** `uses_tokens` defaults to `false`, which fails open. Any implementation that
-/// checks bearer tokens MUST override it to return `true`, otherwise a server can be started
-/// with that authenticator on a plaintext listener without the `allow_plaintext_token` guard.
+/// [`uses_tokens`](Authenticator::uses_tokens) is required, with no default: an authenticator
+/// that checks bearer tokens must say so, otherwise it could run on a plaintext listener
+/// without the `allow_plaintext_token` guard. A wrapper around another authenticator must
+/// delegate to the inner one.
+///
+/// ```compile_fail
+/// use replicated_rocksdb::auth::{AuthError, Authenticator, Method, PeerInfo};
+/// struct Mine;
+/// #[async_trait::async_trait]
+/// impl Authenticator for Mine {
+///     async fn authenticate(&self, _: &PeerInfo, _: Method, _: Option<&[u8]>)
+///         -> Result<(), AuthError> { Ok(()) }
+/// }
+/// ```
 #[async_trait::async_trait]
 pub trait Authenticator: Send + Sync + 'static {
     async fn authenticate(
@@ -62,9 +73,9 @@ pub trait Authenticator: Send + Sync + 'static {
 
     /// True if this authenticator relies on bearer tokens. A server refuses to start with
     /// such an authenticator on a plaintext listener unless `allow_plaintext_token` is set.
-    fn uses_tokens(&self) -> bool {
-        false
-    }
+    /// Required so a token authenticator cannot forget it; wrappers must return the inner
+    /// authenticator's value.
+    fn uses_tokens(&self) -> bool;
 
     /// Checks the authenticator's own configuration; called by `ServeConfig::validate`.
     fn validate(&self) -> Result<()> {
@@ -108,6 +119,10 @@ impl Authenticator for AllowAll {
         _: Option<&[u8]>,
     ) -> Result<(), AuthError> {
         Ok(())
+    }
+
+    fn uses_tokens(&self) -> bool {
+        false
     }
 }
 
@@ -259,6 +274,10 @@ impl Authenticator for MtlsSubjectAllowList {
             Some(methods) if methods.contains(&method) => Ok(()),
             _ => Err(AuthError::PermissionDenied),
         }
+    }
+
+    fn uses_tokens(&self) -> bool {
+        false
     }
 }
 
@@ -479,6 +498,14 @@ fn der_tlv(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn allow_methods_reports_the_inner_uses_tokens() {
+        let tok: Arc<dyn Authenticator> = Arc::new(TokenAuthenticator::new(["s3cret"]));
+        assert!(AllowMethods::new(tok, &[Method::Status]).uses_tokens());
+        let open: Arc<dyn Authenticator> = Arc::new(AllowAll);
+        assert!(!AllowMethods::new(open, &[Method::Status]).uses_tokens());
+    }
+
     use super::*;
 
     fn peer(id: &str, verified: bool) -> PeerInfo {
