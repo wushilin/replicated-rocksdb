@@ -4,6 +4,7 @@
 
 pub(crate) mod bootstrap;
 pub(crate) mod handshake;
+mod http;
 pub(crate) mod replicas;
 pub(crate) mod status;
 mod tail;
@@ -26,6 +27,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tonic::codec::CompressionEncoding;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
@@ -133,32 +135,64 @@ impl ServerState {
         call: &CallInfo,
         method: Method,
     ) -> Result<Arc<dyn LogSource>, Status> {
-        let ip = call.peer.remote_addr.ip();
+        self.check_access(&call.peer, call.token.as_deref(), method)
+            .await
+            .map_err(|denied| match denied {
+                // Throttled, not rejected: the credentials were not even checked. A retryable
+                // answer, so a good replica behind the same address backs off instead of
+                // halting `AuthRejected` (which would let anyone with network access stop it).
+                Denied::Throttled => reason_status(
+                    pb::Reason::Busy,
+                    "too many failed authentication attempts from this address; retry later",
+                ),
+                Denied::Unauthenticated => Status::unauthenticated("authentication failed"),
+                Denied::Forbidden => {
+                    Status::permission_denied(format!("{method:?} is not allowed"))
+                }
+                Denied::Gone(status) => status,
+            })
+    }
+
+    /// The one authorization path of every surface (gRPC and the HTTP status endpoints):
+    /// the per-address failure limiter, then the authenticator for `method`. Only
+    /// `Unauthenticated` counts as a failure.
+    pub(crate) async fn check_access(
+        &self,
+        peer: &PeerInfo,
+        token: Option<&[u8]>,
+        method: Method,
+    ) -> Result<Arc<dyn LogSource>, Denied> {
+        let ip = peer.remote_addr.ip();
         if self.auth_failures.is_blocked(ip, Instant::now()) {
-            // Throttled, not rejected: the credentials were not even checked. A retryable
-            // answer, so a good replica behind the same address backs off instead of halting
-            // `AuthRejected` (which would let anyone with network access stop it).
-            return Err(reason_status(
-                pb::Reason::Busy,
-                "too many failed authentication attempts from this address; retry later",
-            ));
+            return Err(Denied::Throttled);
         }
         match self
             .cfg
             .authenticator
-            .authenticate(&call.peer, method, call.token.as_deref())
+            .authenticate(peer, method, token)
             .await
         {
-            Ok(()) => self.source(),
+            Ok(()) => self.source().map_err(Denied::Gone),
             Err(AuthError::Unauthenticated) => {
                 self.auth_failures.record_failure(ip, Instant::now());
-                Err(Status::unauthenticated("authentication failed"))
+                Err(Denied::Unauthenticated)
             }
-            Err(AuthError::PermissionDenied) => Err(Status::permission_denied(format!(
-                "{method:?} is not allowed"
-            ))),
+            Err(AuthError::PermissionDenied) => Err(Denied::Forbidden),
         }
     }
+}
+
+/// Why [`ServerState::check_access`] refused a call. Each surface maps it to its own answer.
+#[derive(Debug)]
+pub(crate) enum Denied {
+    /// Too many failed attempts from this address; the credentials were not checked.
+    Throttled,
+    /// The credentials were missing or rejected; counted against the failure limiter.
+    Unauthenticated,
+    /// The authenticator does not allow this method to this caller.
+    Forbidden,
+    /// The node is gone (shutting down): the status to answer with.
+    Gone(Status),
 }
 
 /// What a handler extracts from the request before any `.await`.
@@ -193,13 +227,23 @@ pub(crate) fn call_info<T>(req: &Request<T>, method: Method) -> Result<CallInfo,
         .ok_or_else(|| net::invalid_argument("x-rrdb-node-id is required"))?;
     validate_identifier(&node_id)
         .map_err(|e| net::invalid_argument(format!("x-rrdb-node-id: {e}")))?;
+    Ok(CallInfo {
+        peer: peer_info(req, node_id.clone()),
+        token: net::bearer_token(req.metadata()),
+        node_id,
+    })
+}
+
+/// The caller as the authenticator sees it: the verified subject CN of its client
+/// certificate when there is one, otherwise `claimed_id` (unverified).
+pub(crate) fn peer_info<T>(req: &Request<T>, claimed_id: String) -> PeerInfo {
     let remote_addr = req
         .remote_addr()
         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
     let client_cert = req
         .peer_certs()
         .and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()));
-    let peer = match client_cert.as_deref().and_then(subject_common_name) {
+    match client_cert.as_deref().and_then(subject_common_name) {
         Some(cn) => PeerInfo {
             peer_id: cn,
             peer_id_verified: true,
@@ -207,17 +251,12 @@ pub(crate) fn call_info<T>(req: &Request<T>, method: Method) -> Result<CallInfo,
             client_cert,
         },
         None => PeerInfo {
-            peer_id: node_id.clone(),
+            peer_id: claimed_id,
             peer_id_verified: false,
             remote_addr,
             client_cert,
         },
-    };
-    Ok(CallInfo {
-        peer,
-        token: net::bearer_token(req.metadata()),
-        node_id,
-    })
+    }
 }
 
 /// Maps a store error to a status. Corruption and gaps keep their protocol reasons.
@@ -391,6 +430,11 @@ impl ServerHandle {
         self.addr
     }
 
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> &Arc<ServerState> {
+        &self.state
+    }
+
     /// How long a replica may go without being fully caught up and still count as in sync.
     pub(crate) fn replica_lag_time_max(&self) -> Duration {
         self.state.cfg.limits.replica_lag_time_max
@@ -533,15 +577,25 @@ pub(crate) async fn start(
             .tls_config(tls.to_tonic())
             .map_err(|e| Error::Config(format!("server TLS: {e}")))?;
     }
-    let service = ReplicationServer::new(Svc(state.clone()))
-        .max_decoding_message_size(net::MAX_REQUEST_BYTES);
+    let mut service = ReplicationServer::new(Svc(state.clone()))
+        .max_decoding_message_size(net::MAX_REQUEST_BYTES)
+        .accept_compressed(CompressionEncoding::Zstd);
+    if let Some(e) = state.cfg.compression.encoding() {
+        service = service.send_compressed(e);
+    }
     let mut signal = shutdown_rx.clone();
-    let task = tokio::spawn(
+    let router = if state.cfg.http_status {
+        // HTTP/1.1 next to HTTP/2, and the status paths next to the gRPC service.
         builder
-            .add_service(service)
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                stopped(&mut signal).await
-            }),
+            .accept_http1(true)
+            .add_routes(http::routes(state.clone(), service))
+    } else {
+        builder.add_service(service)
+    };
+    let task = tokio::spawn(
+        router.serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+            stopped(&mut signal).await
+        }),
     );
     let sweep = tokio::spawn(sweep_leases(state.clone(), shutdown_rx));
     tracing::info!(%addr, "replication server listening");

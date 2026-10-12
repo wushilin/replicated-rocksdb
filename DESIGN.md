@@ -571,6 +571,7 @@ Built-in implementations:
 - **Token auth without TLS is refused** unless `allow_plaintext_token: true` is set.
 - `method` lets deployments allow `Bootstrap` and `Verify` only to some peers. Those calls expose the whole database.
 - The server limits the rate of failed authentications per remote address (`ServeLimits::max_auth_failures_per_minute`, default 10 within `auth_failure_window`, default 60 s). A throttled call gets `RESOURCE_EXHAUSTED` / `BUSY` without its credentials being checked: a retryable answer, so a correctly configured replica behind the same address backs off and retries instead of halting `AuthRejected`. Only a credential that was checked and failed gets `UNAUTHENTICATED`.
+- The HTTP status endpoints (§19) go through the same authorization path as the RPCs, as `Method::Status`: the same authenticator, `authorization: Bearer <token>`, the mTLS peer identity, and the same per-address failure limiter (an HTTP failure counts toward gRPC's limit and the reverse). Answers: 401 (`Unauthenticated`), 403 (`PermissionDenied`), 429 (throttled), 503 (node shutting down).
 
 ## 15. Listener
 
@@ -630,6 +631,9 @@ pub struct ServeConfig {
     pub tls: Option<TlsServerConfig>,
     pub authenticator: Arc<dyn Authenticator>,
     pub allow_plaintext_token: bool,
+    pub compression: WireCompression, // None (default) | Zstd: what the server sends
+    pub http_status: bool,     // false (default); true also serves /v1/status, /v1/health,
+                               // /v1/ready and /metrics on this port (§19)
     pub limits: ServeLimits,   // #[non_exhaustive]; start from ServeLimits::default()
                                // { max_concurrent_bootstraps: 2, max_verify_sessions: 4,
                                //   bootstrap_chunk_bytes: 1 MiB (at most 16 MiB),
@@ -719,6 +723,7 @@ pub struct UpstreamConfig {
     pub port: u16,
     pub tls: Option<TlsClientConfig>,
     pub credentials: Arc<dyn CredentialsProvider>,
+    pub compression: WireCompression,   // None (default) | Zstd: what the slave sends
 }
 
 pub struct SlaveConfig {
@@ -945,6 +950,8 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 | Bootstrap chunk size | 1 MiB |
 | Tail fetch batching (slave) | `min_batch_bytes` 0 (real-time), `max_wait` 100 ms, `max_batch_bytes` 1 MiB; server cap 4 MiB |
 | In-sync window (`ServeLimits::replica_lag_time_max`) | 10 s |
+| Wire compression (`ServeConfig::compression`, `UpstreamConfig::compression`) | `None`; every node always accepts zstd (PROTOCOL.md §3.4) |
+| HTTP status endpoints (`ServeConfig::http_status`) | off |
 | Verify | off by default; `Quick` when enabled; ranges of 1 000 keys or 4 MiB, listed at ≤ 16 keys; capture timeout 60 s; at most 10 000 key mismatches per report |
 | Verify session timeout | 5 min |
 | Repair (`repair_max_bytes`, network phase) | 64 MiB, 120 s; a larger repair bootstraps |
@@ -955,7 +962,7 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
 
 - **`tracing` spans** named `handshake`, `bootstrap`, `verify`, `repair` and `reaper`, with fields `node_id` (this node), `upstream` (this node's upstream; absent on the master), `seq` and `epoch` (when known). Both ends of a handshake, bootstrap and verify session open one; the server's also carry `client`, and `verify` carries `mode`. `upstream` is the first node id of the server's `upstream_chain` on server spans and the upstream URI on slave spans. `seq` is the local `last_seq` in the slave's `handshake` span, the upstream's `last_seq` (from the handshake) in the slave's `bootstrap` span, and the snapshot seq in the server's `bootstrap` span and in both ends' `verify` spans. Each applied entry is logged at `trace` level only.
 - `SlaveStatus` carries `lag_ms` and `last_verify` (§16).
-- **Status APIs** (`Slave::status`, `Master::replicas`, `Slave::replicas`, `ReplicaStatus`, the `Status` RPC) are the source for metrics. The crate does not depend on a metrics library. A recommended set for applications to export:
+- **Status APIs** (`Slave::status`, `Master::replicas`, `Slave::replicas`, `ReplicaStatus`, the `Status` RPC, and `/metrics` with `ServeConfig::http_status`, §19.1) are the source for metrics. The crate does not depend on a metrics library. A recommended set for applications to export:
   - `applied_seq`, `origin_last_seq`, lag in seqs and `lag_ms`;
   - state (with halt reason), reconnects, bootstraps;
   - entries and bytes applied and served;
@@ -963,6 +970,25 @@ Fully specified in **[PROTOCOL.md](PROTOCOL.md)**: transport and metadata, the h
   - changelog size and `first_retained_seq`;
   - reaper deletes, number of index entries due.
 - Every halt is logged once at `error` level with its reason and the seqs involved, and is reported through `on_state_change`.
+
+### 19.1 HTTP status endpoints
+
+With `ServeConfig::http_status = true` (default `false`) the replication port also answers four read-only HTTP endpoints, for operators and scrapers:
+
+| Path | Answer |
+|---|---|
+| `GET /v1/status` | `200`, JSON: the `Status` RPC's data (`node_id`, `role`, `identity {db_uuid, epoch}`, `epoch_history [{epoch, start_seq, nonce}]`, `last_seq`, `last_entry_crc`, `last_ts_ms`, `node_state`, `upstream`, `replicas [{node_id, applied_seq, in_sync}]`, `max_burned_epoch`). UUIDs are canonical strings; CRCs (`0x%08x`) and nonces (`0x%016x`, full 64-bit values that many JSON parsers cannot hold as numbers) are hex strings; `null` where the RPC has no value. |
+| `GET /v1/health` | `200 {"ok": true}` while the server runs (liveness). |
+| `GET /v1/ready` | `200` when `node_state` is `ready`, otherwise `503`; body `{"ready": bool, "node_state": "..."}`. |
+| `GET /metrics` | Prometheus text format 0.0.4: gauges `rrdb_last_seq`, `rrdb_last_ts_ms`, `rrdb_role{role}` (1 for the current role, 0 for the other), `rrdb_node_ready`, `rrdb_epoch`, and per direct replica `rrdb_replica_applied_seq{node_id}` and `rrdb_replica_in_sync{node_id}`. |
+
+Any other path is `404`, any other method `405`, and a request with a body `400` (bodies are never read). `/v1/status`, `/v1/ready` and `/metrics` are rendered from one `node_info` call, the same function the `Status` RPC answers from, so the two never disagree.
+
+**Same listener.** tonic serves an axum router: the gRPC service owns `/rrdb.replication.v1.Replication/*`, and the status endpoints are the router's fallback; calls to that service are routed exactly as without them. A gRPC call to any other service now reaches the fallback, so it is authenticated like an HTTP request and answered with an HTTP 401/404 instead of `UNIMPLEMENTED` (and a missing token counts against the failure limiter). With the option on, the server also accepts HTTP/1.1 (`accept_http1`) next to HTTP/2; with it off, nothing changes (HTTP/2 only, no fallback). Over TLS the server offers only `h2` in ALPN (tonic's TLS configuration), so HTTPS clients speak HTTP/2 (`curl` negotiates it by itself; `curl --http1.1` fails the TLS handshake); plaintext listeners accept both.
+
+**Same authentication** (§14): every path, `/v1/health` included, needs the credentials the `Status` RPC needs. A load balancer probe therefore sends the token (or a client certificate under mTLS), or uses a TCP check instead. Tokens are never logged.
+
+**Limits.** HTTP/1.1 header sizes are bounded by hyper's defaults (100 headers, about 400 KiB of buffer). Handlers never read a request body. hyper's HTTP/1.1 header-read timeout is not active (tonic configures no HTTP/1.1 timer), like the HTTP/2 side, which has no per-connection idle limit either.
 
 ## 20. Crate layout and dependencies
 
@@ -988,7 +1014,7 @@ replicated-rocksdb/
     vectors.rs        PROTOCOL.md §15 test vectors
 ```
 
-Dependencies: `rocksdb`, `tokio`, `tonic` (tls), `prost`, `tonic-types` (ErrorInfo), `bytes`, `uuid`, `blake3`, `crc32c`, `subtle`, `thiserror`, `tracing`, `async-trait`.
+Dependencies: `rocksdb`, `tokio`, `tonic` (tls), `prost`, `tonic-types` (ErrorInfo), `bytes`, `uuid`, `blake3`, `crc32c`, `subtle`, `thiserror`, `tracing`, `async-trait`, `serde` and `serde_json` (the HTTP status JSON, §19.1; the router is tonic's own axum, re-exported).
 
 ## 21. Test plan (integration, in-process nodes)
 

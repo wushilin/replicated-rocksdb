@@ -91,7 +91,7 @@ pub use auth::{
 };
 pub use config::{
     MAX_BOOTSTRAP_CHUNK_BYTES, MasterConfig, ReaperConfig, Retention, ServeConfig, ServeLimits,
-    TlsClientConfig, TlsIdentity, TlsServerConfig, WriteConcern,
+    TlsClientConfig, TlsIdentity, TlsServerConfig, WireCompression, WriteConcern,
 };
 pub use log::{EntryIter, LogApi};
 pub use master::{DemoteRefused, Master, ReapStats};

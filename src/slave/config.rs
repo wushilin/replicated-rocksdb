@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use crate::auth::{CredentialsProvider, NoCredentials};
 use crate::clock::{Clock, SystemClock};
-use crate::config::{Retention, ServeConfig, TlsClientConfig, validate_identifier};
+use crate::config::{
+    Retention, ServeConfig, TlsClientConfig, WireCompression, validate_identifier,
+};
 use crate::error::{Error, Result};
 use crate::listener::ReplicationListener;
 use crate::tuning::RocksTuning;
@@ -22,6 +24,9 @@ pub struct UpstreamConfig {
     pub port: u16,
     pub tls: Option<TlsClientConfig>,
     pub credentials: Arc<dyn CredentialsProvider>,
+    /// What the slave compresses its requests with. Default `None`; see [`WireCompression`]
+    /// for the upgrade-order rule. Responses are compressed per the server's setting.
+    pub compression: WireCompression,
 }
 
 impl UpstreamConfig {
@@ -31,6 +36,7 @@ impl UpstreamConfig {
             port,
             tls: None,
             credentials: Arc::new(NoCredentials),
+            compression: WireCompression::None,
         }
     }
 

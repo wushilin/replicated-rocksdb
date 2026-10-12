@@ -118,6 +118,15 @@ A token MUST consist only of characters allowed by `b64token` in [RFC 6750] §2.
 - `Status` exposes node ids, positions and epoch histories, but no keys or values.
 - Failures: missing or invalid credentials → `UNAUTHENTICATED`. Valid credentials that are not allowed this RPC → `PERMISSION_DENIED`. The server MUST NOT say which part of the credentials was wrong.
 
+### 3.4 Message compression
+
+Message compression is optional and uses gRPC's own mechanism (`grpc-encoding`, `grpc-accept-encoding`).
+
+- An implementation MUST accept `identity` and `zstd` on every RPC, for requests and responses alike. It MAY send `zstd`.
+- A server compresses a response only when the client advertised `zstd` in `grpc-accept-encoding`. Request compression is not negotiated by gRPC: a client that sends a `zstd` request to a server that does not accept it fails.
+- Upgrade order: upgrade every node to an implementation that accepts `zstd` before configuring any node to send it. Sending `identity` (no compression) is always safe.
+- Compression happens below the protobuf layer and never changes message bytes after decompression, so CRCs, `ops` bytes and verbatim forwarding by slaves are unaffected. The two directions are independent, and chained nodes need not use the same setting.
+
 ## 4. Versioning and compatibility
 
 - `PROTOCOL_VERSION` (a uint32) MUST match **exactly** between client and server. There is no negotiation and no range of supported versions. To upgrade, stop all nodes, upgrade them, and start them again.

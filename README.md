@@ -68,7 +68,7 @@ Master(A) ──► Slave(B) ──► Slave(C)
 - **Security**: TLS (rustls), mTLS subject allow-lists, bearer tokens, per-method authorization
   (`Authenticator`), all pluggable.
 - **Observability**: `tracing` spans, `Slave::status`, `Master::replicas`, a `Status` RPC,
-  and a `ReplicationListener` callback for applied entries, bootstraps, state changes and
+  optional JSON status and Prometheus metrics over HTTP on the replication port, and a `ReplicationListener` callback for applied entries, bootstraps, state changes and
   verify results (handy for maintaining derived indexes or caches).
 - **Normative wire protocol**: gRPC (tonic + prost), specified in [PROTOCOL.md](PROTOCOL.md)
   with test vectors.
@@ -132,6 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `AllowAll` disables authentication; see the `secure_replication` example for TLS and tokens.
+Optional zstd compression of replication traffic is `ServeConfig::compression` /
+`UpstreamConfig::compression` (`WireCompression`, off by default). Every node accepts zstd, but
+upgrade all nodes before enabling it on any: gRPC does not negotiate request compression.
 More runnable programs are listed in [examples/README.md](examples/README.md)
 (`cargo run --example <name>`).
 
@@ -182,6 +185,32 @@ from the bulk editor (`key=value` and `-key` lines); a write concern of 2 on a c
 node at its own downstream (the UI marks it "would loop"; the slave halts `LoopDetected`).
 Options: `--http ADDR`, `--port-base N`, `--dir PATH` (see [examples/README.md](examples/README.md)).
 The page has no authentication: keep `--http` on localhost unless the network is trusted.
+
+## Status over HTTP
+
+Set `ServeConfig::http_status = true` and the replication port also answers four read-only
+HTTP endpoints, behind the same TLS and the same authenticator as replication (checked as the
+`Status` method, with the same failed-attempt limiter):
+
+```sh
+curl --cacert ca.pem -H "authorization: Bearer $TOKEN" https://node:7000/v1/status
+curl --cacert ca.pem -H "authorization: Bearer $TOKEN" https://node:7000/v1/ready
+curl --cacert ca.pem -H "authorization: Bearer $TOKEN" https://node:7000/metrics
+```
+
+- `/v1/status`: the node's position, identity, epoch history, state, upstream and replicas as
+  JSON (the same data as the `Status` RPC).
+- `/v1/health`: `{"ok": true}` while the server runs.
+- `/v1/ready`: `200` when the node is ready, `503` otherwise (bootstrapping, halted,
+  repairing), with `{"ready": ..., "node_state": "..."}`.
+- `/metrics`: Prometheus text (`rrdb_last_seq`, `rrdb_epoch`, `rrdb_node_ready`, per-replica
+  `rrdb_replica_applied_seq` / `rrdb_replica_in_sync`, ...).
+
+Every path needs the credentials, `/v1/health` too: give load-balancer probes the token, or use
+a TCP check. Answers are `401` without valid credentials, `403` when the authenticator does not
+allow `Status`, and `429` after too many failures from one address. Over TLS the server speaks
+HTTP/2 only (curl negotiates it; `--http1.1` fails); a plaintext listener (with
+`allow_plaintext_token` or no tokens) also takes HTTP/1.1. Details: DESIGN.md §19.1.
 
 ## Documentation
 
