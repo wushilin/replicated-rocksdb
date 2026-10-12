@@ -10,6 +10,9 @@ use crate::verify::VerifyReport;
 /// (for example `wait_for_seq`), which would deadlock. A panic is caught and logged; the
 /// listener is then not called again until the process restarts.
 ///
+/// Consecutive entries may be committed together (group commit): when `on_entry(k)` runs,
+/// later entries of the same group may already be committed.
+///
 /// Delivery is at-most-once across crashes. Within a process, `on_entry` seqs are strictly
 /// increasing between bootstraps and rewinds; after `on_bootstrap_complete(S)` or
 /// `on_rewind(S)` delivery continues at `S + 1` (state was replaced wholesale, or in part, so

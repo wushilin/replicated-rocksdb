@@ -160,6 +160,45 @@ impl BackoffState {
     }
 }
 
+/// The most bytes of encoded ops applied in one `WriteBatch` by slave group commit
+/// (DESIGN.md §6). A group ends before an entry that would pass it; a single larger entry
+/// still commits, alone.
+pub(crate) const MAX_GROUP_OPS_BYTES: usize = 4 << 20;
+
+/// Default of [`SlaveConfig::max_group_entries`].
+const DEFAULT_MAX_GROUP_ENTRIES: usize = 256;
+
+/// Test-only override of the default [`SlaveConfig::max_group_entries`], read only with the
+/// non-default feature `test-hooks`: running this crate's test suite with
+/// `--features test-hooks` and `RRDB_TEST_MAX_GROUP_ENTRIES=1` proves that group commit changes
+/// nothing but the number of commits. Default builds never read it.
+#[cfg(feature = "test-hooks")]
+const TEST_MAX_GROUP_ENTRIES_ENV: &str = "RRDB_TEST_MAX_GROUP_ENTRIES";
+
+/// The test override, if set. Anything but a positive integer panics, so a mistyped run
+/// fails loudly instead of testing something else.
+#[cfg(feature = "test-hooks")]
+fn test_max_group_entries() -> Option<usize> {
+    let v = std::env::var(TEST_MAX_GROUP_ENTRIES_ENV).ok()?;
+    Some(parse_test_max_group_entries(&v))
+}
+
+#[cfg(feature = "test-hooks")]
+fn parse_test_max_group_entries(v: &str) -> usize {
+    match v.parse::<usize>() {
+        Ok(n) if n >= 1 => n,
+        _ => panic!("{TEST_MAX_GROUP_ENTRIES_ENV} must be a positive integer, got {v:?}"),
+    }
+}
+
+fn default_max_group_entries() -> usize {
+    #[cfg(feature = "test-hooks")]
+    if let Some(n) = test_max_group_entries() {
+        return n;
+    }
+    DEFAULT_MAX_GROUP_ENTRIES
+}
+
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct SlaveConfig {
@@ -187,6 +226,12 @@ pub struct SlaveConfig {
     /// Fsync every applied entry before acknowledging it. Default `false`: an ack then means
     /// "in the replica's WAL", which survives a process crash but not a machine crash.
     pub sync_writes: bool,
+    /// Group commit (DESIGN.md §6): at most this many consecutive received entries are applied
+    /// in one `WriteBatch`, so with `sync_writes` they share one fsync. An entry is never
+    /// split, CF entries always commit alone, and groups also end at 4 MiB of ops, at a
+    /// verify's capture seq, at a repair's target and at the end of each received batch.
+    /// `1` applies every entry in its own batch. Default 256; must be at least 1.
+    pub max_group_entries: usize,
     /// Heartbeat interval when serving downstream replicas. Default 5 s.
     pub heartbeat: Duration,
     /// TCP connect timeout to the upstream. Default 5 s.
@@ -217,6 +262,7 @@ impl SlaveConfig {
             fetch: FetchConfig::default(),
             repair_max_bytes: 64 << 20,
             sync_writes: false,
+            max_group_entries: default_max_group_entries(),
             heartbeat: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(5),
             rocksdb: RocksTuning::default(),
@@ -246,6 +292,9 @@ impl SlaveConfig {
         }
         if self.repair_max_bytes == 0 {
             return Err(Error::Config("repair_max_bytes must be positive".into()));
+        }
+        if self.max_group_entries == 0 {
+            return Err(Error::Config("max_group_entries must be at least 1".into()));
         }
         if self.heartbeat.is_zero()
             || self.connect_timeout.is_zero()
@@ -281,6 +330,18 @@ mod tests {
         }
         b.reset();
         assert!(b.next_delay() <= Duration::from_millis(100));
+    }
+
+    /// The test override accepts only a positive integer: 0 or garbage fails the run loudly.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn the_group_size_override_rejects_zero_and_garbage() {
+        assert_eq!(parse_test_max_group_entries("1"), 1);
+        assert_eq!(parse_test_max_group_entries("300"), 300);
+        for bad in ["0", "", "x", "-1"] {
+            let r = std::panic::catch_unwind(|| parse_test_max_group_entries(bad));
+            assert!(r.is_err(), "{bad:?} must be refused");
+        }
     }
 
     #[test]
@@ -320,6 +381,22 @@ mod tests {
         assert_eq!(
             SlaveConfig::new("b", "/tmp/x", up.clone()).repair_max_bytes,
             64 << 20
+        );
+        let mut cfg = SlaveConfig::new("b", "/tmp/x", up.clone());
+        cfg.max_group_entries = 0;
+        assert!(
+            matches!(cfg.validate(), Err(Error::Config(m)) if m.contains("max_group_entries"))
+        );
+        cfg.max_group_entries = 1;
+        cfg.validate().unwrap();
+        // 256, unless the suite runs with the test override (then it shows the override works).
+        #[cfg(feature = "test-hooks")]
+        let expected = test_max_group_entries().unwrap_or(256);
+        #[cfg(not(feature = "test-hooks"))]
+        let expected = 256;
+        assert_eq!(
+            SlaveConfig::new("b", "/tmp/x", up.clone()).max_group_entries,
+            expected
         );
         // Serving: the heartbeat must be at most half of the in-sync window.
         let mut cfg = SlaveConfig::new("b", "/tmp/x", up);

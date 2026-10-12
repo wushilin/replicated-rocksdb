@@ -29,6 +29,9 @@ fail = { version = "0.5.1", optional = true }
 
 [features]
 failpoints = ["dep:fail", "fail/failpoints"]
+# Test-only: lets this crate's own test suite override defaults through environment variables
+# (`RRDB_TEST_MAX_GROUP_ENTRIES`). Never enable it in a build that serves data.
+test-hooks = []
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

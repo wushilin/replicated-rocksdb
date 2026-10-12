@@ -241,6 +241,9 @@ pub(crate) struct Inner {
     capture_ids: AtomicU64,
     /// Wakes an applier waiting on a hold.
     capture_changed: Notify,
+    /// Test hook (feature `failpoints`): entries per commit of received entries, in order.
+    #[cfg(feature = "failpoints")]
+    commit_sizes: Mutex<Vec<usize>>,
     /// One verify run at a time.
     pub verify_lock: tokio::sync::Mutex<()>,
     last_verify: Mutex<Option<VerifyReport>>,
@@ -338,6 +341,8 @@ impl Inner {
             capture: Mutex::default(),
             capture_ids: AtomicU64::new(0),
             capture_changed: Notify::new(),
+            #[cfg(feature = "failpoints")]
+            commit_sizes: Mutex::default(),
             verify_lock: tokio::sync::Mutex::new(()),
             last_verify: Mutex::new(None),
             last_applied_ts: AtomicU64::new(last_applied_ts),
@@ -683,9 +688,11 @@ impl Inner {
         }
     }
 
-    /// Pauses the applier before its next commit, until the hold sets a target or is dropped.
-    /// A verify takes it before asking the upstream for its snapshot, so this slave cannot pass
-    /// the snapshot's seq meanwhile.
+    /// Pauses the applier before it starts its next group, until the hold sets a target or is
+    /// dropped. A verify takes it before asking the upstream for its snapshot, so this slave
+    /// cannot pass the snapshot's seq meanwhile. A group already being committed when the hold
+    /// is taken still commits: its entries were received before the hold, so they are at or
+    /// below the snapshot's seq; nothing beyond it is applied.
     pub(crate) fn hold_applier(self: &Arc<Self>) -> CaptureHold {
         let id = self.capture_ids.fetch_add(1, Ordering::SeqCst) + 1;
         let mut slot = self.capture();
@@ -710,6 +717,20 @@ impl Inner {
                 return;
             }
             notified.await;
+        }
+    }
+
+    /// True while a verify holds the applier with no target yet: the applier commits what it
+    /// has and waits ([`Inner::wait_while_held`]).
+    pub(crate) fn applier_held(&self) -> bool {
+        matches!(self.capture().state, Capture::Hold)
+    }
+
+    /// The seq a verify waits to capture, if one is set: the applier ends its group there.
+    pub(crate) fn capture_target(&self) -> Option<Seq> {
+        match &self.capture().state {
+            Capture::At { seq, .. } => Some(*seq),
+            _ => None,
         }
     }
 
@@ -754,6 +775,24 @@ impl Inner {
             Err(CaptureMiss::Passed(seq))
         };
         let _ = tx.send(reply);
+    }
+
+    /// Test hook: records that a commit applied `entries` received entries.
+    #[cfg(feature = "failpoints")]
+    pub(crate) fn record_commit(&self, entries: usize) {
+        self.commit_sizes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(entries);
+    }
+
+    /// Test hook: entries per commit of received entries since the slave opened.
+    #[cfg(feature = "failpoints")]
+    pub(crate) fn commit_sizes(&self) -> Vec<usize> {
+        self.commit_sizes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn set_last_verify(&self, report: VerifyReport) {

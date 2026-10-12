@@ -380,6 +380,12 @@ impl Slave {
 
 #[cfg(feature = "failpoints")]
 impl Slave {
+    /// Test-only (feature `failpoints`): how many received entries each commit applied, in
+    /// order, since this slave opened (group commit, DESIGN.md §6).
+    pub fn commit_sizes(&self) -> Vec<usize> {
+        self.inner.commit_sizes()
+    }
+
     /// Test-only (feature `failpoints`): stops every task at once without any graceful step
     /// and waits until the database is closed, emulating a process crash.
     pub async fn kill(mut self) -> Result<()> {

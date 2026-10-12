@@ -378,7 +378,7 @@ Tail is a bidirectional stream. The client's first message is `start`, carrying 
 1. `Handshake` with `last_seq` (its durable `last_seq`) and `last_crc32c` (the CRC of that entry).
 2. If the decision is `RESUME`: `Tail` with `from_seq = last_seq + 1` and `prev_crc32c = last_crc32c`.
 
-Because the client reads `last_seq` from durable storage, which is written atomically with each applied entry, a resume never skips an entry. If it re-receives entries, they are discarded by the `entry.seq ≤ last_seq` check (§7.4). After a bootstrap at `S`, the client's `last_seq` is `S`, so the same rule gives `from_seq = S + 1`.
+Because the client reads `last_seq` from durable storage, which is written atomically with the applied entries (§7.4), a resume never skips an entry. If it re-receives entries, they are discarded by the `entry.seq ≤ last_seq` check (§7.4). After a bootstrap at `S`, the client's `last_seq` is `S`, so the same rule gives `from_seq = S + 1`.
 
 ### 7.1 Request
 
@@ -445,7 +445,7 @@ For each `entry` of each batch, in order, the client MUST check, in order:
 4. If `entry.seq ≠ last_seq + 1` → `LogGap`.
 5. Decode `ops` and check the rules in §5.2. Failure → `Corrupt`.
 
-Then it applies the entry atomically, together with its own `last_seq` and a copy of the entry (§11.1). Each entry is applied as its own atomic write, even when it arrived in a batch with others, so a crash in the middle of a batch leaves the client at a clean entry boundary.
+Then it applies the entry atomically, together with `last_seq` and a copy of the entry (§11.1). An entry is never split across writes. Consecutive entries of one batch MAY share one atomic write, whose `last_seq` is that of the last of them; a failing check ends such a write before the failing entry. Either way, a crash always leaves the client at a clean entry boundary.
 
 ### 7.5 Fetch batching
 
@@ -648,7 +648,7 @@ Authentication failures use `UNAUTHENTICATED` or `PERMISSION_DENIED` without `Er
 
 ### 11.1 Persistent state
 
-A conforming client keeps, and updates atomically with every applied entry or completed bootstrap:
+A conforming client keeps, and updates atomically with every applied entry (or run of consecutive entries applied in one write, §7.4) or completed bootstrap:
 
 - `identity`, epoch history, `last_seq`, `last_crc32c`;
 - the CF list;
